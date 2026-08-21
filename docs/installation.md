@@ -13,39 +13,41 @@
 
 ## Installation Methods
 
-### Option A: Project-Level Installation (Per Repository)
+### 1. Server Plugin (Tool Gates, Task Lifecycle & Security)
 
-Install into a specific project's `.opencode/plugins/` directory:
-
-```bash
-mkdir -p .opencode/plugins
-cp workflow-guard.ts workflow-guard-ui.ts .opencode/plugins/
-```
-
-- `workflow-guard.ts`: Core server plugin (enforces tool gates, todo discipline, security rules).
-- `workflow-guard-ui.ts`: Companion TUI plugin (displays in TUI Plugins menu & sidebar footer).
-
----
-
-### Option B: Global Installation (All Projects)
-
-Install globally for all OpenCode sessions:
+Install the core server plugin into your plugin directory:
 
 ```bash
+# Global (all projects)
 mkdir -p ~/.config/opencode/plugins
-cp workflow-guard.ts workflow-guard-ui.ts ~/.config/opencode/plugins/
+cp workflow-guard.ts ~/.config/opencode/plugins/
+
+# Project-level (per repo)
+mkdir -p .opencode/plugins
+cp workflow-guard.ts .opencode/plugins/
 ```
+
+Files in `.opencode/plugins/` and `~/.config/opencode/plugins/` are automatically loaded by the OpenCode server process at startup.
 
 ---
 
-### Option C: Via `opencode.json` (NPM / Package Reference)
+### 2. TUI Visual Indicator (Prompt Box Badge)
 
-If installed from npm or a package directory, reference it in `opencode.json` (or `~/.config/opencode/opencode.json`):
+To enable the persistent `🛡️ [Workflow Guard: Active]` badge inside the prompt input bar:
 
+1. Place `workflow-guard-ui.tsx` in your config directory (outside `plugins/`):
+```bash
+mkdir -p ~/.config/opencode/ui
+cp workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
+```
+
+2. Reference it in your `~/.config/opencode/tui.json`:
 ```json
 {
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-workflow-guard"]
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    "file:///var/home/csh/.config/opencode/ui/workflow-guard-ui.tsx"
+  ]
 }
 ```
 
