@@ -1,29 +1,20 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
 
 export const WorkflowGuardTui: TuiPlugin = async (api) => {
-	// 1. Emits a welcome confirmation toast when starting OpenCode TUI
-	try {
-		api.ui?.toast?.({
-			title: "Workflow Guard",
-			message: "Active & protecting session",
-			variant: "success",
-		});
-	} catch {}
-
-	// 2. Registers status indicator in the sidebar footer slot
+	// Registers persistent status indicator in the bottom toolbar (left-aligned)
 	try {
 		api.slots?.register?.({
 			order: 1,
 			slots: {
-				sidebar_footer() {
+				app_bottom() {
 					const theme = () => api.theme.current;
-					// Returns visual ascii indicator
 					return {
 						type: "box",
 						props: {
-							paddingTop: 1,
+							paddingLeft: 1,
+							paddingRight: 1,
 							flexDirection: "row",
-							gap: 1,
+							justifyContent: "flex-start",
 							children: [
 								{
 									type: "text",
@@ -42,6 +33,6 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 };
 
 export default {
-	id: "workflow-guard",
+	id: "workflow-guard-ui",
 	tui: WorkflowGuardTui,
 } satisfies TuiPluginModule;

@@ -2,7 +2,7 @@
 
 A plugin for [OpenCode](https://opencode.ai) that enforces workflow discipline, agent focus, and safety boundaries through **deterministic hooks** — not prompt rules that LLMs can ignore.
 
-Ported from [cline-workflow-guard](https://github.com/ultus-net/cline-workflow-guard), this port integrates with **OpenCode's native todo system** (`todowrite` / `GET /session/:id/todo`), enforces single-task focus, and provides workspace boundary protection.
+Ported and enhanced from [cline-workflow-guard](https://github.com/ultus-net/cline-workflow-guard). This plugin integrates with **OpenCode's native todo system** (`todowrite` / `GET /session/:id/todo`), enforces single-task focus, and provides workspace boundary protection.
 
 ---
 
@@ -11,10 +11,10 @@ Ported from [cline-workflow-guard](https://github.com/ultus-net/cline-workflow-g
 ```
 opencode-workflow-guard/
 ├── workflow-guard.ts          # Core server plugin (tool hooks, task gate, guardrails)
-├── workflow-guard-ui.ts       # Visual TUI companion (shows in Plugins menu & sidebar)
+├── workflow-guard-ui.ts       # Visual TUI companion (registers status indicator)
 ├── package.json               # Package configuration & test scripts
 ├── tsconfig.json              # Strict TypeScript configuration
-├── test.mts                   # 90 in-memory unit tests
+├── test.mts                   # In-memory unit tests
 ├── test-e2e.mts               # Live OpenCode runtime & install tests
 └── docs/                      # Detailed documentation
     ├── installation.md        # Complete install options & companion permissions
@@ -38,7 +38,7 @@ opencode-workflow-guard/
 | **7** | **Feature-Branch Workflow** | On `main`/`master`, edits and history-changing git commands are blocked until a feature branch is created. |
 | **8** | **Workspace Boundary Guard** | Blocks file tools (`edit`, `write`, `apply_patch`) from escaping the workspace root via `../` path traversal. |
 | **9** | **Compaction Focus Hook** | Injects the active sequential task list into `experimental.session.compacting` context to maintain focus across long sessions. |
-| **10** | **TUI Visual Feedback** | Displays `workflow-guard` in the TUI Plugins menu, registers a `🛡️ [Workflow Guard: Active]` sidebar footer, and emits warning toasts when actions are blocked. |
+| **10** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers status indicator feedback in the OpenCode interface. |
 
 For detailed rule descriptions and overrides, see [docs/policies.md](docs/policies.md).
 
@@ -66,7 +66,7 @@ cp workflow-guard.ts workflow-guard-ui.ts ~/.config/opencode/plugins/
 
 ```bash
 npm run typecheck    # Strict TypeScript check (0 errors)
-npm test             # Run 87 unit tests (node test.mts)
+npm test             # Run unit tests (node test.mts)
 npm run test:install # Run live OpenCode runtime install test (node test-e2e.mts)
 npm run test:all     # Run full verification suite
 ```
@@ -75,15 +75,6 @@ See [docs/testing.md](docs/testing.md) for test details.
 
 ---
 
-## Documentation Links
-
-- **[Installation Guide](docs/installation.md)** — Project vs global setup, companion configs.
-- **[Policies & Overrides](docs/policies.md)** — Comprehensive breakdown of all 10 policies and `# allow-live` overrides.
-- **[Troubleshooting Guide](docs/troubleshooting.md)** — Common error messages, root causes, and fixes.
-- **[Testing Guide](docs/testing.md)** — Unit and live runtime test suite reference.
-
----
-
 ## License
 
-[MIT](LICENSE)
+MIT

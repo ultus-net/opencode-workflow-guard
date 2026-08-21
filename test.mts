@@ -10,6 +10,7 @@ import {
 	WorkflowGuard,
 	default as defaultExport,
 } from "./workflow-guard.ts";
+import { WorkflowGuardTui } from "./workflow-guard-ui.ts";
 
 let pass = 0;
 let fail = 0;
@@ -287,14 +288,23 @@ try {
 }
 check("hook allows write with active todos", todoPass);
 
-// Session created event emits welcome toast
-setSdkClient(toastClient);
-toasts = [];
-const eventFn = pluginWithToast["event"];
-if (typeof eventFn === "function") {
-	await eventFn({ event: { id: "e1", type: "session.created", properties: {} } } as any);
-}
-check("event hook emits welcome toast on session.created", toasts.length > 0 && ((toasts[0] as { body?: { message?: string } })?.body?.message?.includes("Active & protecting session") ?? false));
+// Session created event popup is removed
+check("event hook has no intrusive startup toast", !pluginWithToast["event"]);
+
+// TUI companion plugin registers app_bottom status indicator slot
+let registeredSlots: Record<string, Function> = {};
+const fakeTuiApi = {
+	theme: { current: { success: "#00ff00" } },
+	slots: {
+		register: ({ slots }: { slots: Record<string, Function> }) => {
+			registeredSlots = slots;
+		},
+	},
+};
+await WorkflowGuardTui(fakeTuiApi as any);
+check("tui plugin registers app_bottom slot", typeof registeredSlots.app_bottom === "function");
+const bottomOutput = registeredSlots.app_bottom ? registeredSlots.app_bottom() : null;
+check("app_bottom indicator contains Workflow Guard: Active", JSON.stringify(bottomOutput).includes("Workflow Guard: Active"));
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
