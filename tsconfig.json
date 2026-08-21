@@ -11,6 +11,7 @@
   },
   "include": [
     "workflow-guard.ts",
+    "workflow-guard-ui.ts",
     "test.mts",
     "test-e2e.mts"
   ]

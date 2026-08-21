@@ -15,24 +15,25 @@
 
 ### Option A: Project-Level Installation (Per Repository)
 
-Install the plugin into a specific project's `.opencode/plugins/` directory:
+Install into a specific project's `.opencode/plugins/` directory:
 
 ```bash
 mkdir -p .opencode/plugins
-cp workflow-guard.ts .opencode/plugins/
+cp workflow-guard.ts workflow-guard-ui.ts .opencode/plugins/
 ```
 
-OpenCode automatically discovers and loads all `.ts` files inside `.opencode/plugins/` at startup.
+- `workflow-guard.ts`: Core server plugin (enforces tool gates, todo discipline, security rules).
+- `workflow-guard-ui.ts`: Companion TUI plugin (displays in TUI Plugins menu & sidebar footer).
 
 ---
 
 ### Option B: Global Installation (All Projects)
 
-Install the plugin globally for all OpenCode sessions:
+Install globally for all OpenCode sessions:
 
 ```bash
 mkdir -p ~/.config/opencode/plugins
-cp workflow-guard.ts ~/.config/opencode/plugins/
+cp workflow-guard.ts workflow-guard-ui.ts ~/.config/opencode/plugins/
 ```
 
 ---
