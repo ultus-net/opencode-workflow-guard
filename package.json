@@ -20,10 +20,13 @@
     "workflow"
   ],
   "scripts": {
-    "test": "node test.mjs"
+    "test": "node test.mts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
-    "@opencode-ai/plugin": "*"
+    "@opencode-ai/plugin": "*",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
   },
   "devDependenciesMeta_comment": "only needed for type-checking; opencode resolves this itself at runtime"
 }
