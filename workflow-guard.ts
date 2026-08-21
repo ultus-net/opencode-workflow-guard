@@ -654,6 +654,16 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	setWorkspaceRoot(ctx.directory ?? process.cwd());
 	setSdkClient(ctx.client);
 
+	try {
+		await (ctx.client as any)?.app?.log?.({
+			body: {
+				service: "workflow-guard",
+				level: "info",
+				message: `Workflow Guard plugin initialized for ${ctx.directory ?? process.cwd()}`,
+			},
+		});
+	} catch {}
+
 	return {
 		// OpenCode passes the tool args as the SECOND hook parameter
 		// (`output.args` — documented in the tools docs, e.g. apply_patch
