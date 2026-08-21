@@ -30,7 +30,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "*",
     "@opentui/solid": "^0.5.6",
-    "@types/node": "^22.0.0",
+    "@types/node": "^26.2.0",
     "typescript": "^5.5.0"
   },
   "devDependenciesMeta_comment": "only needed for type-checking; opencode resolves this itself at runtime"
