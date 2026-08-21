@@ -1,0 +1,64 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+# Publishing is the only job here — provenance and the npm token are not
+# granted to any other job.
+permissions:
+  contents: write
+  id-token: write      # for npm provenance (sigstore)
+
+jobs:
+  # Gates re-run before publish so a tag cannot ship a broken commit.
+  verify:
+    name: Verify (typecheck + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  publish:
+    name: Publish to npm + GitHub release
+    runs-on: ubuntu-latest
+    needs: verify
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+
+      # The tag is the source of truth for the version; reject mismatch so a
+      # bad tag does not publish an off-version package.
+      - name: Check tag vs package.json version
+        run: |
+          TAG="${GITHUB_REF_NAME}"           # e.g. v1.2.3
+          PKG=$(node -p "require('./package.json').version")
+          if [ "${TAG#v}" != "$PKG" ]; then
+            echo "::error::tag ${TAG} does not match package.json version ${PKG}"
+            exit 1
+          fi
+
+      - name: npm publish (with provenance)
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --latest

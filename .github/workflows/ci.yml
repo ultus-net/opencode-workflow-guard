@@ -1,0 +1,119 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Cancel superseded runs on PRs to keep the queue moving.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ───── Static gates ─────
+  typecheck:
+    name: Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+
+  # ───── Unit tests ─────
+  # The plugin is a TS file auto-loaded by opencode; the fast in-memory unit
+  # suite runs on each supported Node. Node 20 is dropped: GitHub itself is
+  # deprecating it (forcing actions to Node 24), and the guard targets modern
+  # Node by convention (see tsconfig target/lib).
+  test:
+    name: Unit tests (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ["22", "24"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # ───── Heavier checks ─────
+  # The live runtime test needs an `opencode` binary; if one is not on PATH the
+  # test suite exits 0 (SKIP), so it stays optional. When opencode becomes
+  # installable via npm the binary is picked up automatically.
+  e2e:
+    name: E2E (plugin load / opencode)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm run test:install
+
+  # ───── Supply-chain gate ─────
+  audit:
+    name: npm audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+
+  # ───── PR etiquette ─────
+  # Every PR must update CHANGELOG.md — matches the plugin's own Policy 3.
+  changelog:
+    name: Changelog updated
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Required for merge-base below; default --depth=1 hides the base.
+          fetch-depth: 0
+      - name: Require CHANGELOG update in PR
+        run: |
+          MERGE_BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::error::no merge base between origin/${{ github.base_ref }} and HEAD"
+            exit 1
+          fi
+          if git diff --name-only "$MERGE_BASE...HEAD" | grep -q "CHANGELOG.md"; then
+            echo "CHANGELOG.md updated — good."
+          else
+            echo "::error::PR must include a CHANGELOG.md update (Policy 3)."
+            exit 1
+          fi
+
+  # ───── Human-readable summary ─────
+  status:
+    name: Status
+    runs-on: ubuntu-latest
+    needs: [typecheck, test, e2e, audit, changelog]
+    if: always()
+    steps:
+      - name: Report gates
+        run: |
+          echo "typecheck: ${{ needs.typecheck.result }}"
+          echo "test:      ${{ needs.test.result }}"
+          echo "e2e:       ${{ needs.e2e.result }}"
+          echo "audit:     ${{ needs.audit.result }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "changelog: ${{ needs.changelog.result }}"
+          fi

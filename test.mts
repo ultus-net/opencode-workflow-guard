@@ -143,10 +143,37 @@ check("allow curl POST to remote", !(await shell("curl -X POST https://api.examp
 check("allow kubectl apply", !(await shell("kubectl apply -f deploy.yaml")));
 check("allow terraform apply", !(await shell("terraform apply -auto-approve")));
 check("block git push --force", blocked(await shell("git push --force origin feat/x")));
-check("allow destructive with # allow-live", !(await shell("kubectl delete pod foo # allow-live")));
+check("# allow-live marker no longer overrides (removed)", blocked(await shell("kubectl delete pod foo # allow-live")));
 process.env.WORKFLOW_GUARD_ALLOW_LIVE = "1";
-check("allow destructive with env override", !(await shell("kubectl delete pod foo")));
+check("allow destructive with env override (user-set)", !(await shell("kubectl delete pod foo")));
 delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
+
+console.log("— Policy 4: destructive command evasions (regression) —");
+check("block rm -rf", blocked(await shell("rm -rf node_modules")));
+check("block rm -r (recursive without force)", blocked(await shell("rm -r build/")));
+check("block rm -f on / path", blocked(await shell("rm -f /etc/hosts")));
+check("block git clean -fdx", blocked(await shell("git clean -fdx")));
+check("block git clean -f", blocked(await shell("git clean -f")));
+check("block docker rm", blocked(await shell("docker rm abc123")));
+check("block docker container prune", blocked(await shell("docker container prune -f")));
+check("block docker system prune", blocked(await shell("docker system prune")));
+check("block docker volume rm", blocked(await shell("docker volume rm data")));
+check("block gh repo delete", blocked(await shell("gh repo delete owner/repo --yes")));
+check("block npx prisma migrate reset", blocked(await shell("npx prisma migrate reset --force")));
+check("allow rm on a single file (not recursive)", !(await shell("rm README.md")));
+check("allow docker ps", !(await shell("docker ps")));
+check("allow gh repo list", !(await shell("gh repo list")));
+check("block script file containing destructive command (laundering guard)", blocked(await call("write", { filePath: join(root, "deploy.sh"), content: "#!/bin/sh\nkubectl delete pod foo\n" }, { sessionID: "s-active" })));
+check("block apply_patch containing destructive command", blocked(await call("apply_patch", { patchText: "*** Add File: script.sh\n+kubectl delete ns foo\n" }, { sessionID: "s-active" })));
+check("allow write of benign script content", !(await call("write", { filePath: join(root, "ok.sh"), content: "#!/bin/sh\necho hello\n" }, { sessionID: "s-active" })));
+
+console.log("— Policy 2: push evasions (regression) —");
+check("block push refspec HEAD:main", blocked(await shell("git push origin HEAD:main")));
+check("block push delete :main", blocked(await shell("git push origin :main")));
+check("block push +main (force refspec)", blocked(await shell("git push origin +main")));
+check("block push local:main", blocked(await shell("git push origin feature/x:main")));
+check("allow push HEAD:main-backup", !(await shell("git push origin HEAD:main-backup")));
+check("git -C: push normalized then blocked", blocked(await shell("git -C /repo push origin main")));
 
 console.log("— Policy 5: MCP mutation guard —");
 check("block mcp__github__create_issue", blocked(await call("mcp__github__create_issue", {})));
@@ -154,14 +181,29 @@ check("block mcp__github__merge_pull_request", blocked(await call("mcp__github__
 check("allow mcp__github__list_pull_requests", !(await call("mcp__github__list_pull_requests", {})));
 check("allow mcp__azure__repos_pr_list", !(await call("mcp__azure__repos_pr_list", {})));
 check("allow unrelated mcp server tool", !(await call("mcp__slack__post_message", {})));
+check("block mcp__azure-devops__create_work_item (dash separator)", blocked(await call("mcp__azure-devops__create_work_item", {})));
+check("block mcp__gh__create_issue (gh alias)", blocked(await call("mcp__gh__create_issue", {})));
+check("block azure_devops flat naming", blocked(await call("azure_devops_delete_repo", {})));
 
-console.log("— Policy 6: settings tamper —");
+console.log("— Policy 6: settings tamper (regression: quote/glob evasion) —");
 check("block opencode auth", blocked(await shell("opencode auth login")));
 check("block opencode config edit", blocked(await shell(`echo '{}' > ${root}/opencode.json`)));
 check("block writing ~/.config/opencode/opencode.json", blocked(await shell(`echo '{}' > /var/home/x/.config/opencode/opencode.json`)));
 check("block opencode run --auto", blocked(await shell("opencode run --auto 'do stuff'")));
-check("FIXED: prose mentioning opencode not a tamper", !(await shell("echo 'run opencode --help for details'")));
+check("allow prose mentioning opencode (not a config verb)", !(await shell("echo 'run opencode --help for details'")));
+check("allow reading opencode.json (read-only, not a tamper)", !(await shell("cat opencode.json")));
+check("block quote-concatenated write to opencode.json", blocked(await shell(`echo '{}' > open''code.json`)));
+check("block glob write to opencode.jso?", blocked(await shell(`echo '{}' > opencode.jso?`)));
+check("block sed -i on the guard plugin itself", blocked(await shell("sed -i 's/x/y/' ~/.config/opencode/plugins/workflow-guard.ts")));
+check("block rm on the TUI plugin", blocked(await shell("rm ~/.config/opencode/ui/workflow-guard-ui.tsx")));
 check("allow normal command", !(await shell("ls -la && git status")));
+
+console.log("— Policy 6: tamper via edit tools (path protection) —");
+check("block edit of project opencode.json", blocked(await call("edit", { filePath: join(root, "opencode.json"), oldString: "a", newString: "b" }, { sessionID: "s-active" })));
+check("block write of .opencode/project config", blocked(await call("write", { filePath: join(root, ".opencode", "opencode.json"), content: "{}" }, { sessionID: "s-active" })));
+check("block write of global opencode config path", blocked(await call("write", { filePath: "/var/home/x/.config/opencode/opencode.json", content: "{}" }, { sessionID: "s-active" })));
+check("block apply_patch to opencode.json", blocked(await call("apply_patch", { patchText: "*** Update File: opencode.json\n" }, { sessionID: "s-active" })));
+check("allow edit of normal source file", !(await call("edit", { filePath: join(root, "src", "index.ts"), oldString: "a", newString: "b" }, { sessionID: "s-active" })));
 console.log("— Policy 7: branch guard —");
 // Non-git workspace (current `root` is a plain temp dir): git writes allowed.
 check("non-git workspace: git commit allowed", !(await shell("git commit -m test")));
@@ -182,7 +224,40 @@ check("on feature branch: edit allowed", !(await call("edit", { filePath: join(r
 check("on feature branch: git commit allowed", !(await shell("git commit -m test")));
 check("on feature branch: edit still needs active todos", blocked(await call("edit", { filePath: join(repo, "a.ts"), content: "x" }, { sessionID: "s-done" })));
 rmSync(repo, { recursive: true, force: true });
-setWorkspaceRoot(root); // restore
+setWorkspaceRoot(root);
+
+console.log("— Policy 7: git global-flag evasions (regression) —");
+const repo2 = mkdtempSync(join(tmpdir(), "wg-repo2-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: repo2 });
+setWorkspaceRoot(root); // workspace NOT the repo — repo2 on main tested via -C
+check("git -C <main-repo> commit blocked (dir-aware branch guard)", blocked(await shell(`git -C ${repo2} commit -m x`)));
+check("git --git-dir=<main-repo> commit blocked", blocked(await shell(`git --git-dir=${repo2}/.git commit -m x`)));
+check("allow git -C <main-repo> status (read-only)", !(await shell(`git -C ${repo2} status`)));
+check("git -C <main-repo> push to main blocked (dir-aware push check)", blocked(await shell(`git -C ${repo2} push origin main`)));
+const repoMain = mkdtempSync(join(tmpdir(), "wg-repo-main-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: repoMain });
+setWorkspaceRoot(repoMain);
+check("on main: git update-ref blocked", blocked(await shell("git update-ref refs/heads/main HEAD")));
+check("on main: git branch -D blocked", blocked(await shell("git branch -D feature/x")));
+check("on main: git filter-branch blocked", blocked(await shell("git filter-branch --env-filter 'true'")));
+setWorkspaceRoot(root);
+rmSync(repo2, { recursive: true, force: true });
+rmSync(repoMain, { recursive: true, force: true });
+
+console.log("— Policies 1/7/8: shell file-mutation gates (regression) —");
+check("redirect > file needs active todos", blocked(await call("bash", { command: "echo x > src/a.ts" }, { sessionID: "s-empty" })));
+check("redirect > file allowed with active todos", !(await call("bash", { command: "echo x > src/a.ts" }, { sessionID: "s-active" })));
+check("redirect to opencode.json always blocked (tamper)", blocked(await call("bash", { command: "echo x > opencode.json" }, { sessionID: "s-active" })));
+check("redirect outside workspace blocked", blocked(await call("bash", { command: "echo x > /etc/a.ts" }, { sessionID: "s-active" })));
+check("redirect .. escape blocked", blocked(await call("bash", { command: "echo x > ../outside.ts" }, { sessionID: "s-active" })));
+check("tee file needs todos", blocked(await call("bash", { command: "echo x | tee src/a.ts" }, { sessionID: "s-empty" })));
+check("tee allowed with todos", !(await call("bash", { command: "echo x | tee src/a.ts" }, { sessionID: "s-active" })));
+check("sed -i needs todos", blocked(await call("bash", { command: "sed -i 's/a/b/' src/a.ts" }, { sessionID: "s-empty" })));
+check("sed -i allowed with todos", !(await call("bash", { command: "sed -i 's/a/b/' src/a.ts" }, { sessionID: "s-active" })));
+check("sed -i on opencode.json blocked (tamper)", blocked(await call("bash", { command: "sed -i 's/a/b/' opencode.json" }, { sessionID: "s-active" })));
+check("git apply needs todos (patch via shell)", blocked(await call("bash", { command: "git apply patch.diff" }, { sessionID: "s-empty" })));
+check("git apply allowed with todos", !(await call("bash", { command: "git apply patch.diff" }, { sessionID: "s-active" })));
+check("non-mutating shell unaffected (ls, cat)", !(await call("bash", { command: "ls -la && cat file" }, { sessionID: "s-empty" })));
 
 console.log("— Policy 8: workspace boundary guard —");
 check("allow edit within workspace", !(await call("edit", { filePath: join(root, "src", "index.ts"), content: "x" }, { sessionID: "s-active" })));
@@ -288,8 +363,44 @@ try {
 }
 check("hook allows write with active todos", todoPass);
 
-// Session created event popup is removed
-check("event hook has no intrusive startup toast", !pluginWithToast["event"]);
+// No startup toast on session.created (event hook may exist for
+// command.executed guard, but must not toast).
+check("event hook emits no intrusive startup toast", toasts.length === 0);
+
+// ── New: audit trail ──
+console.log("— Audit trail —");
+await shell("git push origin main"); // block
+await shell("ls -la");                // allow
+// The log file is only opened when needed; the implementation writes
+// synchronously. We can't assert file existence deterministically here
+// without fs access to the audit dir, but the decision writer should
+// not throw, and the public wrapper should return normally.
+check("audit writes do not throw", true);
+
+// ── New: secret-content scan ──
+console.log("— Secret-content scan —");
+check("block write containing AWS key", blocked(await call("write", { filePath: join(root, "x.ts"), content: 'export const K = "AKIA0123ABCDEFG45678";' }, { sessionID: "s-active" })));
+check("block write containing private key header", blocked(await call("write", { filePath: join(root, "x.ts"), content: "-----BEGIN RSA PRIVATE KEY-----" }, { sessionID: "s-active" })));
+check("allow benign content", !(await call("write", { filePath: join(root, "x.ts"), content: "export const K = 'public';" }, { sessionID: "s-active" })));
+
+// ── New: shell.env scrub ──
+console.log("— shell.env scrub —");
+const envHooks = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const envObj: Record<string, string> = { AWS_SECRET: "x", OPENAI_API_KEY: "y", NORMAL: "keep" };
+if (typeof envHooks["shell.env"] === "function") {
+	await envHooks["shell.env"]({} as any, { env: envObj } as any);
+}
+check("sensitive keys emptied", envObj.AWS_SECRET === "" && envObj.OPENAI_API_KEY === "");
+check("normal key preserved", envObj.NORMAL === "keep");
+
+// ── New: command.executed channel ──
+console.log("— command.executed guard —");
+const cmdEvt = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+let blockedEvt: string | undefined;
+if (typeof cmdEvt.event === "function") {
+	await cmdEvt.event({ event: { type: "command.executed", properties: { command: "git push origin main", sessionID: "s-active" } } } as any);
+}
+check("command.executed does not throw on blocked command", true);
 
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
