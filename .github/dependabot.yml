@@ -7,6 +7,10 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     versioning-strategy: increase
+    groups:
+      npm-dependencies:
+        patterns:
+          - "*"
 
   # Keep the CI/CD actions themselves up to date.
   - package-ecosystem: github-actions
@@ -14,3 +18,7 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    groups:
+      actions-dependencies:
+        patterns:
+          - "*"

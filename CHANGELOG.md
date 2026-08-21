@@ -4,6 +4,13 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 
 ## [Unreleased]
 
+### Changed
+- **Dependency & CI updates:**
+  - Upgraded GitHub Actions `actions/checkout` and `actions/setup-node` to v7 across CI and Release workflows.
+  - Upgraded `typescript` to `^7.0.2` and `@types/node` to `^26.2.0`.
+  - Configured Dependabot groups for npm and GitHub Actions dependencies to bundle automated updates.
+  - Exempted `dependabot[bot]` from the PR CHANGELOG gate in CI.
+
 ### Added (DX improvements)
 - **Post-edit verification gate (Policy 10).** After every successful `edit`/`write`/`apply_patch`, the guard runs `WORKFLOW_GUARD_VERIFY` (or auto-detects `npm test` from `package.json`) in the background. Marking every todo completed is blocked while the latest verify run is failing — the agent can no longer claim "done" over a red build.
 - **Secret-content scan (Policy 11).** File payloads are blocked at write/edit when they carry AWS keys, private key headers, GitHub tokens (`ghp_`, `github_pat_`, …), LLM/API keys, Google/Slack tokens, or env-style assignments (`AWS_SECRET_ACCESS_KEY=…`).
