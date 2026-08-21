@@ -217,7 +217,7 @@ if (typeof compactFn === "function") {
 }
 check("compaction hook injects active tasks into output.context", compactOutput.context.length > 0 && (compactOutput.context[0]?.includes("Active Tasks") ?? false));
 
-// TUI toast emitted on blocked call
+// Blocked tool call throws cleanly without intrusive popup toasts
 toasts = [];
 const beforeFn = pluginWithToast["tool.execute.before"];
 if (typeof beforeFn === "function") {
@@ -225,7 +225,7 @@ if (typeof beforeFn === "function") {
 		await beforeFn({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "git push origin main" } });
 	} catch {}
 }
-check("tui.showToast called when tool is blocked", toasts.length > 0 && (toasts[0] as { body?: { title?: string } })?.body?.title === "Workflow Guard");
+check("tool block throws clean error without intrusive popup toasts", toasts.length === 0);
 
 console.log("— Input shapes —");
 check("single string command", blocked(await call("bash", "git push origin main")));
@@ -291,7 +291,7 @@ check("hook allows write with active todos", todoPass);
 // Session created event popup is removed
 check("event hook has no intrusive startup toast", !pluginWithToast["event"]);
 
-// TUI companion plugin registers app_bottom status indicator slot
+// TUI companion plugin registers session_prompt_right status indicator slot
 let registeredSlots: Record<string, Function> = {};
 const fakeTuiApi = {
 	theme: { current: { success: "#00ff00" } },
@@ -301,10 +301,10 @@ const fakeTuiApi = {
 		},
 	},
 };
-await WorkflowGuardTui(fakeTuiApi as any);
-check("tui plugin registers app_bottom slot", typeof registeredSlots.app_bottom === "function");
-const bottomOutput = registeredSlots.app_bottom ? registeredSlots.app_bottom() : null;
-check("app_bottom indicator contains Workflow Guard: Active", JSON.stringify(bottomOutput).includes("Workflow Guard: Active"));
+await WorkflowGuardTui(fakeTuiApi as any, undefined, {} as any);
+check("tui plugin registers session_prompt_right slot", typeof registeredSlots.session_prompt_right === "function");
+const promptOutput = registeredSlots.session_prompt_right ? registeredSlots.session_prompt_right() : null;
+check("session_prompt_right indicator contains Workflow Guard: Active", JSON.stringify(promptOutput).includes("Workflow Guard: Active"));
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;

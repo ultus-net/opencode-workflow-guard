@@ -1,29 +1,18 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
 
 export const WorkflowGuardTui: TuiPlugin = async (api) => {
-	// Registers persistent status indicator in the bottom toolbar (left-aligned)
+	// Registers persistent status indicator in the prompt box next to the model indicator
 	try {
 		api.slots?.register?.({
 			order: 1,
 			slots: {
-				app_bottom() {
+				session_prompt_right() {
 					const theme = () => api.theme.current;
 					return {
-						type: "box",
+						type: "text",
 						props: {
-							paddingLeft: 1,
-							paddingRight: 1,
-							flexDirection: "row",
-							justifyContent: "flex-start",
-							children: [
-								{
-									type: "text",
-									props: {
-										fg: theme().success,
-										children: "🛡️ [Workflow Guard: Active]",
-									},
-								},
-							],
+							fg: theme().success,
+							children: "🛡️ [Workflow Guard: Active]",
 						},
 					} as any;
 				},
