@@ -29,16 +29,21 @@ opencode-workflow-guard/
 
 | # | Policy | Summary |
 |---|---|---|
-| **1** | **Task Breakdown & Lifecycle** | File edits (`edit`, `write`, `apply_patch`) are blocked without an active item in OpenCode's native todo list (`todowrite`). Enforces single `in_progress` focus, sequential completion order, and prevents silent task deletion. Subagents inherit parent tasks. |
-| **2** | **No Pushes to Main** | `git push … main/master` is hard-blocked across all shell commands. |
+| **2** | **No Pushes to Main** | `git push … main/master` is hard-blocked, including refspecs (`HEAD:main`, `feature:main`, `:main`) and forced refspecs (`+main`). Git global flags (`-C`, `--git-dir`) are parsed before matching. |
 | **3** | **PR Changelog** | `gh pr create` requires a `Changelog:` section in the PR body or a CHANGELOG file in the diff. |
-| **4** | **Destructive CLI Guard** | Blocks destructive operations (`kubectl delete`, `terraform destroy`, `helm uninstall`, `az/aws/gcloud delete`, database `drop/truncate`, `curl DELETE`, `git push --force`). |
-| **5** | **MCP Mutation Guard** | Mutating GitHub & Azure DevOps MCP tools (`_create`, `_delete`, `_merge`, …) are blocked; read-only tools pass. |
-| **6** | **Settings Tamper Guard** | Prevents the agent from editing `opencode.json`, `~/.config/opencode/*`, or running `opencode auth|config`. |
-| **7** | **Feature-Branch Workflow** | On `main`/`master`, edits and history-changing git commands are blocked until a feature branch is created. |
-| **8** | **Workspace Boundary Guard** | Blocks file tools (`edit`, `write`, `apply_patch`) from escaping the workspace root via `../` path traversal. |
-| **9** | **Compaction Focus Hook** | Injects the active sequential task list into `experimental.session.compacting` context to maintain focus across long sessions. |
-| **10** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers status indicator feedback in the OpenCode interface. |
+| **4** | **Destructive CLI Guard** | Blocks destructive operations (`kubectl delete`, `terraform destroy`, `helm uninstall`, `az/aws/gcloud delete`, `docker rm/prune`, database `drop/truncate`, `rm -rf`, `git clean`, `gh repo delete`, `curl DELETE`, `git push --force`, `prisma migrate reset`). |
+| **5** | **MCP Mutation Guard** | Mutating GitHub & Azure DevOps MCP tools (`create`, `delete`, `merge`, …) are blocked; read-only tools pass. Server-name tokens are split on all non-alphanumerics (`azure-devops`, `gh` aliases match). |
+| **6** | **Settings Tamper Guard** | Prevents the agent from editing `opencode.json[c]`, `~/.config/opencode/*`, `.opencode/*`, or the guard's own plugin files — via shell **or** the edit tools. Quote-concatenation and glob evasion are normalized before matching. Read-only access (`cat`, `grep`) is allowed; only modifications trigger. |
+| **7** | **Feature-Branch Workflow** | On `main`/`master`, edits and history-changing git commands (`commit`, `merge`, `rebase`, `update-ref`, `filter-branch`, `branch -D`, …) are blocked until a feature branch is created. Git `-C`/`--git-dir` are parsed so the correct repo's branch is checked. |
+| **8** | **Workspace Boundary Guard** | Blocks file tools (`edit`, `write`, `apply_patch`) **and** shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`, `git apply`) from escaping the workspace root via `../` path traversal. |
+| **9** | **Script-Laundering Guard** | Content written via `edit`/`write`/`apply_patch` is scanned for destructive patterns, so `write deploy.sh` → `bash deploy.sh` cannot smuggle blocked commands. |
+| **10** | **Post-Edit Verification** | After edits, runs `npm test` (or `WORKFLOW_GUARD_VERIFY`) in the background; blocks "all done" todowrite while verification fails. |
+| **11** | **Secret-Content Scan** | Blocks write payloads containing AWS keys, private keys, GitHub tokens, LLM keys, Google/Slack tokens, or env-style assignments. |
+| **12** | **Shell Env Scrub** | Sensitive vars (`AWS_*`, `OPENAI*`, `KUBE*`, `GH_/GITHUB_*`, etc.) are emptied in agent shells via `shell.env`; the agent cannot carry live credentials by default. |
+| **13** | **Command-Channel Audit** | Slash commands (`command.executed`) are journaled to the audit file so agents cannot run hidden work through user-facing channels. |
+| **14** | **Audit Trail** | Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (durable). |
+| **15** | **Compaction Focus Hook** | Injects the active sequential task list into `experimental.session.compacting` context. |
+| **16** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers status indicator feedback in the OpenCode interface. |
 
 For detailed rule descriptions and overrides, see [docs/policies.md](docs/policies.md).
 
@@ -81,6 +86,19 @@ npm run test:all     # Run full verification suite
 ```
 
 See [docs/testing.md](docs/testing.md) for test details.
+
+---
+
+## CI / CD
+
+GitHub Actions enforces the same gates the plugin enforces on contributors:
+
+| Workflow | Trigger | What runs |
+|---|---|---|
+| **CI** | PR + push to `main` | Typecheck → unit tests (Node 20/22/24) → e2e plugin-load → `npm audit` → CHANGELOG-updated gate |
+| **Release** | push `v*` tag | Re-verify → tag↔version match → `npm publish --provenance` → GitHub release |
+
+Branch protection on `main` should require the `Typecheck`, `Unit tests`, `E2E`, `npm audit`, and (for PRs) `Changelog updated` checks. The `e2e` job gracefully skips when no `opencode` binary is present, so it never blocks merge.
 
 ---
 

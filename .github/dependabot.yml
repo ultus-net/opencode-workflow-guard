@@ -1,0 +1,16 @@
+version: 2
+updates:
+  # Keep runtime/dev dependencies up to date.
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    versioning-strategy: increase
+
+  # Keep the CI/CD actions themselves up to date.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
