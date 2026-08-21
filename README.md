@@ -73,10 +73,11 @@ Pair with OpenCode's native permission config in `opencode.json` for defense in 
 
 ## Test
 
-Run the full test suite locally:
+Run the full test suite and TypeScript typecheck locally:
 
 ```bash
-node test.mjs   # Node >= 22.18 (runs .ts directly); or `bun test.mjs`
+npm test        # Runs node test.mts (Node >= 22.18); or `bun test.mts`
+npm run typecheck # Strict TypeScript check via tsc
 ```
 
 ## Troubleshooting

@@ -2,38 +2,61 @@ import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import type { PluginModule } from "@opencode-ai/plugin";
+import {
+	guardToolCall,
+	setWorkspaceRoot,
+	setSdkClient,
+	WorkflowGuard,
+	default as defaultExport,
+} from "./workflow-guard.ts";
 
-const mod = await import(pathToFileURL(join(import.meta.dirname, "workflow-guard.ts")).href);
-const guard = mod.guardToolCall;
-const setWorkspaceRoot = mod.setWorkspaceRoot;
-const setSdkClient = mod.setSdkClient;
-
-let pass = 0, fail = 0;
-const check = (name, cond) => { cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name)); };
+let pass = 0;
+let fail = 0;
+const check = (name: string, cond: unknown): void => {
+	cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name));
+};
 
 const root = mkdtempSync(join(tmpdir(), "wg-test-"));
 const prevLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 setWorkspaceRoot(root);
 
+interface TestTodo {
+	content: string;
+	status: "pending" | "in_progress" | "completed" | "cancelled";
+	priority: "high" | "medium" | "low";
+}
+
 // ── Fake SDK client mirroring the documented endpoints used by the guard:
 //    GET /session/:id/todo -> { data: Todo[] }, GET /session/:id -> { data: Session }
-const fakeTodos = new Map(); // sessionID -> Todo[]
-const fakeParents = new Map(); // sessionID -> parentID
-const todo = (sessionID, ...items) => fakeTodos.set(sessionID, items);
-const item = (content, status = "pending") => ({ content, status, priority: "medium" });
+const fakeTodos = new Map<string, TestTodo[]>();
+const fakeParents = new Map<string, string>();
+const todo = (sessionID: string, ...items: TestTodo[]): void => {
+	fakeTodos.set(sessionID, items);
+};
+const item = (
+	content: string,
+	status: "pending" | "in_progress" | "completed" | "cancelled" = "pending",
+	priority: "high" | "medium" | "low" = "medium",
+): TestTodo => ({ content, status, priority });
+
 const fakeClient = {
 	session: {
-		todo: async ({ path }) => ({ data: fakeTodos.get(path.id) ?? [] }),
-		get: async ({ path }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+		todo: async ({ path }: { path: { id: string } }) => ({
+			data: fakeTodos.get(path.id) ?? [],
+		}),
+		get: async ({ path }: { path: { id: string } }) => ({
+			data: { id: path.id, parentID: fakeParents.get(path.id) },
+		}),
 	},
 };
 setSdkClient(fakeClient);
 
-const call = (toolName, input, context) => guard(toolName, input, context);
-const shell = (cmd) => call("bash", { command: cmd });
-const blocked = (r) => typeof r === "string";
+const call = (toolName: string, input: unknown, context?: { sessionID?: string }) =>
+	guardToolCall(toolName, input, context);
+const shell = (cmd: string) => call("bash", { command: cmd });
+const blocked = (r: unknown): boolean => typeof r === "string";
 
 console.log("— Policy 1: native todo gate —");
 todo("s-empty");
@@ -151,7 +174,8 @@ check("on main: git commit blocked", blocked(await shell("git commit -m test")))
 check("on main: git merge blocked", blocked(await shell("git merge feature/x")));
 check("on main: git switch -c allowed (branch creation)", !(await shell("git switch -c feat/x")));
 check("on main: git status allowed", !(await shell("git status")));
-check("on main: todowrite allowed (not an edit tool)", !(await call("todowrite", { todos: [item("plan work")] }, { sessionID: "s-active" })));
+todo("s-main-plan");
+check("on main: todowrite allowed (not an edit tool)", !(await call("todowrite", { todos: [item("plan work")] }, { sessionID: "s-main-plan" })));
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo });
 check("on feature branch: edit allowed", !(await call("edit", { filePath: join(repo, "a.ts"), content: "x" }, { sessionID: "s-active" })));
 check("on feature branch: git commit allowed", !(await shell("git commit -m test")));
@@ -168,25 +192,39 @@ check("allow apply_patch within workspace", !(await call("apply_patch", { patchT
 check("block apply_patch escaping workspace", blocked(await call("apply_patch", { patchText: "*** Update File: ../../secret.env\n" }, { sessionID: "s-active" })));
 
 console.log("— Compaction focus preservation & TUI toast —");
-let toasts = [];
+let toasts: unknown[] = [];
 const toastClient = {
 	session: fakeClient.session,
 	tui: {
-		showToast: async (req) => { toasts.push(req); },
+		showToast: async (req: unknown) => { toasts.push(req); },
 	},
 };
-const pluginWithToast = await pluginFn({ directory: root, client: toastClient });
+const pluginWithToast = await (defaultExport?.server ?? WorkflowGuard)({
+	directory: root,
+	client: toastClient as any,
+	project: {} as any,
+	worktree: root,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
 // Compaction hook injects active tasks
-const compactOutput = { context: [] };
-await pluginWithToast["experimental.session.compacting"]({ sessionID: "s-active" }, compactOutput);
-check("compaction hook injects active tasks into output.context", compactOutput.context.length > 0 && compactOutput.context[0].includes("Active Tasks"));
+const compactOutput: { context: string[] } = { context: [] };
+const compactFn = pluginWithToast["experimental.session.compacting"];
+if (typeof compactFn === "function") {
+	await compactFn({ sessionID: "s-active" } as any, compactOutput as any);
+}
+check("compaction hook injects active tasks into output.context", compactOutput.context.length > 0 && (compactOutput.context[0]?.includes("Active Tasks") ?? false));
 
 // TUI toast emitted on blocked call
 toasts = [];
-try {
-	await pluginWithToast["tool.execute.before"]({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "git push origin main" } });
-} catch {}
-check("tui.showToast called when tool is blocked", toasts.length > 0 && toasts[0]?.body?.title === "Workflow Guard");
+const beforeFn = pluginWithToast["tool.execute.before"];
+if (typeof beforeFn === "function") {
+	try {
+		await beforeFn({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "git push origin main" } });
+	} catch {}
+}
+check("tui.showToast called when tool is blocked", toasts.length > 0 && (toasts[0] as { body?: { title?: string } })?.body?.title === "Workflow Guard");
 
 console.log("— Input shapes —");
 check("single string command", blocked(await call("bash", "git push origin main")));
@@ -198,16 +236,28 @@ console.log("— Plugin export shape —");
 // default export combined with the extra named exports would make opencode
 // 1.18+ treat every export as a plugin and crash the server.
 check("default export is a V1 PluginModule with id + server()", (() => {
-	const def = mod.default;
-	return typeof def === "object" && def !== null &&
-		typeof def.id === "string" && def.id.length > 0 &&
-		typeof def.server === "function";
+	const def: unknown = defaultExport;
+	const rec = typeof def === "object" && def !== null ? (def as PluginModule) : undefined;
+	return (
+		typeof rec?.id === "string" &&
+		rec.id.length > 0 &&
+		typeof rec.server === "function"
+	);
 })());
-const pluginFn = mod.WorkflowGuard ?? mod.default?.server;
-const hooks = await pluginFn({ directory: root, client: fakeClient });
+const pluginFn = WorkflowGuard ?? defaultExport?.server;
+const hooks = await pluginFn({
+	directory: root,
+	client: fakeClient as any,
+	project: {} as any,
+	worktree: root,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
 check("plugin returns tool.execute.before hook", typeof hooks["tool.execute.before"] === "function");
 // Real opencode hook contract: args arrive on the SECOND parameter.
-const invoke = (tool, args, sessionID = "s-hook") => hooks["tool.execute.before"]({ tool, sessionID, callID: "c" }, { args });
+const invoke = (tool: string, args: unknown, sessionID = "s-hook") =>
+	hooks["tool.execute.before"]?.({ tool, sessionID, callID: "c" }, { args });
 let threw = false;
 try {
 	await invoke("bash", { command: "git push origin main" });
@@ -241,5 +291,3 @@ rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
-
-
