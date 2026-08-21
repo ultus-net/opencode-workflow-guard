@@ -21,7 +21,10 @@
   ],
   "scripts": {
     "test": "node test.mts",
-    "typecheck": "tsc --noEmit -p tsconfig.json"
+    "test:install": "node test-e2e.mts",
+    "test:all": "npm run typecheck && npm test && npm run test:install",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build": "tsc --noEmit -p tsconfig.json"
   },
   "devDependencies": {
     "@opencode-ai/plugin": "*",
