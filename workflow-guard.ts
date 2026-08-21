@@ -24,6 +24,8 @@
  *     permission config or run `opencode auth` to weaken its own gates.
  *  7. Branch guard: on main/master, edit tools and history-changing git
  *     commands are blocked until a feature branch is created.
+ *  8. Workspace boundary guard: file edits and patches cannot escape the
+ *     workspace root.
  *
  * Install: copy this file into <project>/.opencode/plugins/ or
  * ~/.config/opencode/plugins/ — files there are auto-loaded at startup.
@@ -90,7 +92,6 @@ const CHANGELOG_SECTION_RE = /changelog/i;
 // explicitly note apply_patch is reported as "apply_patch", not "patch").
 const EDIT_TOOL_NAMES = new Set(["edit", "write", "patch", "apply_patch"]);
 
-//
 // Subagent sessions spawn with `todowrite` denied (documented: "This tool
 // is disabled for subagents by default"), so a subagent's own list is
 // usually empty — the gate then falls back to the parent session's list
@@ -99,7 +100,7 @@ const EDIT_TOOL_NAMES = new Set(["edit", "write", "patch", "apply_patch"]);
 
 const ACTIVE_TODO_STATUSES = new Set(["pending", "in_progress"]);
 
-interface TodoItem {
+export interface TodoItem {
 	content?: unknown;
 	status?: unknown;
 }
@@ -107,7 +108,7 @@ interface TodoItem {
 // Minimal structural type for the SDK client (documented endpoints
 // GET /session/:id/todo, GET /session/:id, POST /tui/show-toast). Kept structural —
 // not the generated SDK types — so the plugin tolerates SDK minor-version drift.
-interface TodoSdkClient {
+export interface TodoSdkClient {
 	session?: {
 		todo?: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
 		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown } }>;
@@ -184,7 +185,7 @@ function hasActiveTodo(todos: TodoItem[]): boolean {
  *  3. Task lifecycle: active tasks cannot silently vanish without being marked
  *     'completed' or 'cancelled'.
  */
-function validateTodoLifecycle(
+export function validateTodoLifecycle(
 	newTodos: TodoItem[],
 	existingTodos: TodoItem[] | undefined,
 ): string | undefined {
@@ -344,6 +345,7 @@ function liveMutationIn(command: string): string | undefined {
 	}
 	return undefined;
 }
+
 // ── MCP mutation tool guard ──────────────────────────────────────────────────
 // MCP tools bypass the shell entirely, so they need their own name-based
 // matching. OpenCode exposes MCP tools with names like `mcp__<server>__<tool>`;
@@ -406,6 +408,7 @@ function isSettingsTamper(command: string): boolean {
 		SETTINGS_TAMPER_PATTERNS.some((re) => re.test(segment)),
 	);
 }
+
 // ── PR changelog check ───────────────────────────────────────────────────────
 
 function branchHasChangelogChange(root: string): boolean {
@@ -467,6 +470,7 @@ function prBodyIncludesChangelog(command: string): boolean {
 	}
 	return false;
 }
+
 // ── Core guard (exported for testing) ────────────────────────────────────────
 // Returns a block reason string, or undefined when the call is allowed.
 
@@ -680,21 +684,6 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	} catch {}
 
 	return {
-		// Event listener for session creation and status toasts
-		event: async ({ event }) => {
-			if (event.type === "session.created") {
-				try {
-					await sdkClient?.tui?.showToast?.({
-						body: {
-							title: "Workflow Guard",
-							message: "🛡️ Active & protecting session",
-							variant: "success",
-						},
-					});
-				} catch {}
-			}
-		},
-
 		// OpenCode passes the tool args as the SECOND hook parameter
 		// (`output.args` — documented in the tools docs, e.g. apply_patch
 		// "uses output.args.patchText"; `input` only carries
@@ -708,16 +697,6 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				sessionID: input.sessionID,
 			});
 			if (reason !== undefined) {
-				// Visual toast feedback in TUI (fail-safe)
-				try {
-					await sdkClient?.tui?.showToast?.({
-						body: {
-							title: "Workflow Guard",
-							message: reason.slice(0, 160),
-							variant: "warning",
-						},
-					});
-				} catch {}
 				// Throwing from the hook blocks the tool call (see the
 				// ".env protection" example in the opencode plugin docs).
 				throw new Error(`[workflow-guard] ${reason}`);
@@ -752,20 +731,8 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	};
 };
 
-// Default export MUST be a V1 PluginModule record, not a bare function.
-// OpenCode's plugin loader (1.18+) treats every exported FUNCTION of a
-// legacy-style module as a plugin instance — the extra exports here
-// (guardToolCall, setWorkspaceRoot) would be called as plugins and push
-// `undefined` into the hooks registry, crashing event dispatch
-// ("undefined is not an object (evaluating '…event')") and taking down the
-// whole session. The V1 format takes a dedicated code path where only
-// `server()` is invoked and other exports are ignored. Local file plugins
-// are required to carry an `id`.
+// Default export MUST be a V1 PluginModule record.
 export default {
 	id: "workflow-guard",
 	server: WorkflowGuard,
 } satisfies PluginModule;
-
-
-
-
