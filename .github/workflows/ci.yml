@@ -84,14 +84,12 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Required for merge-base below; default --depth=1 hides the base.
+          fetch-depth: 0
       - name: Require CHANGELOG update in PR
         run: |
-          # Find a merge base (works even when the PR was opened from a branch
-          # longer than the shallow-fetched history), then require CHANGELOG.md
-          # in the diff. This is the exact same check the plugin enforces on
-          # `gh pr create` locally.
-          git fetch origin "${{ github.base_ref }}" --depth=50
-          MERGE_BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD || true)
+          MERGE_BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
           if [ -z "$MERGE_BASE" ]; then
             echo "::error::no merge base between origin/${{ github.base_ref }} and HEAD"
             exit 1
