@@ -5,9 +5,13 @@
  * (https://opencode.ai/docs/plugins/). Throwing from the hook blocks the
  * tool call outright.
  *
- *  1. Task list gate: file-editing tools (edit/write/patch) are blocked
- *     until the workspace has a task list (TASKS.md / TODO.md / PLAN.md /
- *     .opencode/plan.md) containing at least one unchecked item ("- [ ]").
+ *  1. Task gate: file-editing tools (edit/write/apply_patch) are blocked
+ *     until the session's NATIVE todo list (the built-in `todowrite` tool,
+ *     https://opencode.ai/docs/tools/#todowrite) has at least one active
+ *     item (pending/in_progress). Once every item is completed/cancelled,
+ *     edits block again — forcing a fresh breakdown per request. Subagent
+ *     sessions (todowrite is denied for them by default) inherit the todo
+ *     list of their parent session.
  *  2. Git pushes to main/master are hard-blocked.
  *  3. PR creation (gh) requires a changelog — either a CHANGELOG update in
  *     the branch's diff or a "Changelog:" section in the PR body.
@@ -23,12 +27,13 @@
  *
  * Install: copy this file into <project>/.opencode/plugins/ or
  * ~/.config/opencode/plugins/ — files there are auto-loaded at startup.
+ * Requires opencode >= 1.18 (todo endpoint GET /session/:id/todo).
  */
 
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, PluginModule } from "@opencode-ai/plugin";
 
 // OpenCode built-in tools (https://opencode.ai/docs/tools/): bash is the
 // shell tool. Legacy/alias names are kept for compatibility.
@@ -74,28 +79,191 @@ const PUSH_TO_MAIN_RE =
 const PR_CREATE_RE = /\bgh\s+pr\s+create\b/;
 const CHANGELOG_SECTION_RE = /changelog/i;
 
-// ── Task-list gate ───────────────────────────────────────────────────────────
+// ── Task gate (native session todos) ─────────────────────────────────────────
+// opencode has a built-in per-session todo system: the `todowrite` tool
+// stores the list server-side (documented endpoint GET /session/:id/todo,
+// served through the SDK client plugins receive as ctx.client). The task
+// gate requires ACTIVE work in that list before any file edit.
 
-// OpenCode file-mutation tools: `edit`, `write`, `patch` (the `edit`
-// permission covers all three per the permissions docs).
-const EDIT_TOOL_NAMES = new Set(["edit", "write", "patch"]);
-const TASK_LIST_FILES = ["TASKS.md", "TODO.md", "PLAN.md", ".opencode/plan.md"];
-const UNCHECKED_TASK_RE = /^\s*[-*]\s+\[ \]\s+\S/m;
+// OpenCode file-mutation tools: `edit`, `write`, `apply_patch` (the `edit`
+// permission covers all three per the permissions docs; the tools docs
+// explicitly note apply_patch is reported as "apply_patch", not "patch").
+const EDIT_TOOL_NAMES = new Set(["edit", "write", "patch", "apply_patch"]);
 
-function findActiveTaskList(root: string): string | undefined {
-	for (const name of TASK_LIST_FILES) {
-		const path = resolve(root, name);
-		try {
-			const content = readFileSync(path, "utf8");
-			if (UNCHECKED_TASK_RE.test(content)) {
-				return name;
+//
+// Subagent sessions spawn with `todowrite` denied (documented: "This tool
+// is disabled for subagents by default"), so a subagent's own list is
+// usually empty — the gate then falls back to the parent session's list
+// (sessions expose parentID) so delegated work stays gated on the
+// orchestrator's breakdown.
+
+const ACTIVE_TODO_STATUSES = new Set(["pending", "in_progress"]);
+
+interface TodoItem {
+	content?: unknown;
+	status?: unknown;
+}
+
+// Minimal structural type for the SDK client (documented endpoints
+// GET /session/:id/todo, GET /session/:id, POST /tui/show-toast). Kept structural —
+// not the generated SDK types — so the plugin tolerates SDK minor-version drift.
+interface TodoSdkClient {
+	session?: {
+		todo?: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
+		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown } }>;
+	};
+	tui?: {
+		showToast?: (opts: { body: { title?: string; message: string; variant?: string } }) => Promise<unknown>;
+	};
+}
+
+let sdkClient: TodoSdkClient | undefined;
+
+/** Provide the SDK client (the plugin passes ctx.client; tests inject a fake). */
+export function setSdkClient(client: unknown): void {
+	sdkClient = client as TodoSdkClient | undefined;
+}
+
+async function fetchSessionTodos(sessionID: string): Promise<TodoItem[] | undefined> {
+	const session = sdkClient?.session;
+	const todo = session?.todo;
+	if (typeof todo !== "function") return undefined;
+	try {
+		const result = await todo.call(session, { path: { id: sessionID } });
+		const data = (result as { data?: unknown } | undefined)?.data;
+		return Array.isArray(data) ? (data as TodoItem[]) : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+async function fetchParentSessionID(sessionID: string): Promise<string | undefined> {
+	const session = sdkClient?.session;
+	const get = session?.get;
+	if (typeof get !== "function") return undefined;
+	try {
+		const result = await get.call(session, { path: { id: sessionID } });
+		const parent = (result as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
+		return typeof parent === "string" && parent ? parent : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Todos governing a session: its own list, or — when it has none (typically
+ * subagents, which cannot todowrite) — the nearest ancestor session's list.
+ * Returns undefined when the list cannot be determined (client missing or
+ * fetch failed); the gate then fails open instead of bricking the agent.
+ */
+async function effectiveTodos(
+	sessionID: string | undefined,
+): Promise<TodoItem[] | undefined> {
+	if (!sessionID) return undefined;
+	const seen = new Set<string>();
+	let current: string | undefined = sessionID;
+	while (current && !seen.has(current)) {
+		seen.add(current);
+		const todos = await fetchSessionTodos(current);
+		if (todos === undefined) return undefined;
+		if (todos.length > 0) return todos;
+		current = await fetchParentSessionID(current);
+	}
+	return [];
+}
+
+function hasActiveTodo(todos: TodoItem[]): boolean {
+	return todos.some((todo) => ACTIVE_TODO_STATUSES.has(String(todo.status ?? "")));
+}
+
+/**
+ * Validates todo discipline rules:
+ *  1. Focus rule: max one task 'in_progress' at a time.
+ *  2. Sequential execution: task N cannot be marked 'completed' while an earlier
+ *     task 0..N-1 is still 'pending' or 'in_progress'.
+ *  3. Task lifecycle: active tasks cannot silently vanish without being marked
+ *     'completed' or 'cancelled'.
+ */
+function validateTodoLifecycle(
+	newTodos: TodoItem[],
+	existingTodos: TodoItem[] | undefined,
+): string | undefined {
+	// Rule 1: Single in_progress task (focus)
+	const inProgress = newTodos.filter((t) => String(t.status) === "in_progress");
+	if (inProgress.length > 1) {
+		return (
+			`Blocked todowrite: only one task may be 'in_progress' at a time (found ${inProgress.length}). ` +
+			"Maintain narrow focus: finish or pause the current in-progress task before starting another."
+		);
+	}
+
+	// Rule 2: Top-down sequential completion
+	let seenUnfinished: string | undefined;
+	let unfinishedName = "";
+	for (const item of newTodos) {
+		const status = String(item.status ?? "");
+		if (status === "completed" && seenUnfinished !== undefined) {
+			return (
+				`Blocked todowrite: task '${String(item.content ?? "")}' cannot be marked completed ` +
+				`while an earlier task ('${unfinishedName}') is still ${seenUnfinished}. ` +
+				"Work through tasks top to bottom in list order."
+			);
+		}
+		if (status === "pending" || status === "in_progress") {
+			if (seenUnfinished === undefined) {
+				seenUnfinished = status;
+				unfinishedName = String(item.content ?? "");
 			}
-		} catch {
-			// File missing/unreadable — try the next candidate.
 		}
 	}
+
+	// Rule 3: No silent task deletion while active work remains
+	if (existingTodos && existingTodos.length > 0) {
+		const activeExisting = existingTodos.filter((t) => {
+			const s = String(t.status ?? "");
+			return s === "pending" || s === "in_progress";
+		});
+		if (activeExisting.length > 0) {
+			const newContents = new Set(newTodos.map((t) => String(t.content ?? "")));
+			const missing = activeExisting.find(
+				(t) => !newContents.has(String(t.content ?? "")),
+			);
+			if (missing) {
+				return (
+					`Blocked todowrite: active task '${String(missing.content ?? "")}' was removed ` +
+					"without being marked completed or cancelled. Tasks cannot silently disappear."
+				);
+			}
+		}
+	}
+
 	return undefined;
 }
+
+// ── Workspace boundary guard ─────────────────────────────────────────────────
+
+function isPathOutsideWorkspace(targetPath: string, root: string): boolean {
+	if (!targetPath) return false;
+	const resolved = resolve(root, targetPath);
+	const normalizedRoot = root.endsWith("/") ? root : root + "/";
+	return resolved !== root && !resolved.startsWith(normalizedRoot);
+}
+
+function extractPatchPaths(patchText: string): string[] {
+	const paths: string[] = [];
+	const markerRe =
+		/^\*\*\*\s+(?:Add File|Update File|Delete File|Move to|Move from):\s*(\S+)/gm;
+	let match: RegExpExecArray | null;
+	while ((match = markerRe.exec(patchText)) !== null) {
+		if (match[1]) paths.push(match[1]);
+	}
+	const diffRe = /^(?:---|\+\+\+)\s+(?:[ab]\/)?(\S+)/gm;
+	while ((match = diffRe.exec(patchText)) !== null) {
+		if (match[1] && match[1] !== "/dev/null") paths.push(match[1]);
+	}
+	return paths;
+}
+
 // ── Branch guard ─────────────────────────────────────────────────────────────
 
 const PROTECTED_BRANCHES = new Set(["main", "master"]);
@@ -302,10 +470,31 @@ function prBodyIncludesChangelog(command: string): boolean {
 // ── Core guard (exported for testing) ────────────────────────────────────────
 // Returns a block reason string, or undefined when the call is allowed.
 
-export function guardToolCall(toolName: string, input: unknown): string | undefined {
-	// ── Policy 1 & 7: edits require a task list + feature branch ──
-	// Exception: creating/updating the task list file itself.
+export async function guardToolCall(
+	toolName: string,
+	input: unknown,
+	context?: { sessionID?: string },
+): Promise<string | undefined> {
+	// ── Policy 1: todowrite lifecycle & focus validation ──
+	if (toolName === "todowrite") {
+		const record = asRecord(input);
+		const rawTodos = record?.todos;
+		if (Array.isArray(rawTodos)) {
+			const existingTodos = context?.sessionID
+				? await fetchSessionTodos(context.sessionID)
+				: undefined;
+			const err = validateTodoLifecycle(rawTodos as TodoItem[], existingTodos);
+			if (err) {
+				console.error(`[workflow-guard] ${err}`);
+				return err;
+			}
+		}
+		return undefined;
+	}
+
+	// ── Policy 1, 7 & 8: edits require active todos, feature branch & workspace boundary ──
 	if (EDIT_TOOL_NAMES.has(toolName)) {
+		// Workspace boundary check (path traversal guard)
 		const record = asRecord(input);
 		const target =
 			typeof record?.filePath === "string"
@@ -315,24 +504,43 @@ export function guardToolCall(toolName: string, input: unknown): string | undefi
 					: typeof input === "string"
 						? input
 						: "";
-		const isTaskListEdit = TASK_LIST_FILES.some((name) =>
-			resolve(workspaceRoot, target).endsWith(name),
-		);
-		if (!isTaskListEdit && onProtectedBranch(workspaceRoot)) {
+		if (target && isPathOutsideWorkspace(target, workspaceRoot)) {
+			console.error(
+				`[workflow-guard] blocked ${toolName}: path escapes workspace: ${target}`,
+			);
+			return `Blocked: file path '${target}' escapes workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
+		}
+		if (toolName === "apply_patch") {
+			const patchText =
+				typeof record?.patchText === "string" ? record.patchText : "";
+			for (const patchPath of extractPatchPaths(patchText)) {
+				if (isPathOutsideWorkspace(patchPath, workspaceRoot)) {
+					console.error(
+						`[workflow-guard] blocked apply_patch: patch target escapes workspace: ${patchPath}`,
+					);
+					return `Blocked: patch targets file '${patchPath}' outside workspace root (${workspaceRoot}).`;
+				}
+			}
+		}
+
+		if (onProtectedBranch(workspaceRoot)) {
 			console.error(
 				`[workflow-guard] blocked ${toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
 			);
 			return branchGuardReason();
 		}
-		if (!isTaskListEdit && !findActiveTaskList(workspaceRoot)) {
+		const todos = await effectiveTodos(context?.sessionID);
+		if (todos !== undefined && !hasActiveTodo(todos)) {
 			console.error(
-				`[workflow-guard] blocked ${toolName}: no active task list`,
+				`[workflow-guard] blocked ${toolName}: no active todo item (session ${context?.sessionID ?? "?"})`,
 			);
 			return (
-				"Blocked: no active task list found. First create " +
-				"TASKS.md (or TODO.md / PLAN.md / .opencode/plan.md) in the " +
-				"workspace root with the request broken down as '- [ ]' " +
-				"checkbox items, then work through them top to bottom."
+				"Blocked: no active todo item. First break the request down " +
+				"with the todowrite tool (create items with status 'pending' " +
+				"or 'in_progress'), then work them top to bottom, marking " +
+				"each completed via todowrite as you finish it. When every " +
+				"item is completed, create a fresh todo list before " +
+				"starting new work."
 			);
 		}
 		return undefined;
@@ -440,22 +648,83 @@ export function setWorkspaceRoot(root: string): void {
 }
 
 export const WorkflowGuard: Plugin = async (ctx) => {
-	// ctx.directory is the directory opencode was started in.
+	// ctx.directory is the directory opencode was started in; ctx.client is
+	// the SDK client for the built-in server (used for the session todo
+	// list — documented endpoint GET /session/:id/todo).
 	setWorkspaceRoot(ctx.directory ?? process.cwd());
+	setSdkClient(ctx.client);
 
 	return {
-		"tool.execute.before": async (input) => {
-			const reason = guardToolCall(input.tool, input.args);
+		// OpenCode passes the tool args as the SECOND hook parameter
+		// (`output.args` — documented in the tools docs, e.g. apply_patch
+		// "uses output.args.patchText"; `input` only carries
+		// { tool, sessionID, callID }). The fallback covers hypothetical
+		// runtimes that put args on the input.
+		"tool.execute.before": async (input, output) => {
+			const args =
+				(output as { args?: unknown } | undefined)?.args ??
+				(input as { args?: unknown }).args;
+			const reason = await guardToolCall(input.tool, args, {
+				sessionID: input.sessionID,
+			});
 			if (reason !== undefined) {
+				// Visual toast feedback in TUI (fail-safe)
+				try {
+					await sdkClient?.tui?.showToast?.({
+						body: {
+							title: "Workflow Guard",
+							message: reason.slice(0, 160),
+							variant: "warning",
+						},
+					});
+				} catch {}
 				// Throwing from the hook blocks the tool call (see the
 				// ".env protection" example in the opencode plugin docs).
 				throw new Error(`[workflow-guard] ${reason}`);
 			}
 		},
+
+		// Focus preservation across context compaction (documented in
+		// https://opencode.ai/docs/plugins/#compaction-hooks).
+		"experimental.session.compacting": async (input, output) => {
+			try {
+				const sessionID = (input as { sessionID?: string })?.sessionID;
+				const todos = await effectiveTodos(sessionID);
+				const active = todos?.filter((t) => {
+					const s = String(t.status ?? "");
+					return s === "pending" || s === "in_progress";
+				});
+				if (active && active.length > 0) {
+					const lines = active.map(
+						(t) =>
+							`- [${String(t.status) === "in_progress" ? "IN PROGRESS" : "PENDING"}] ${String(t.content ?? "")}`,
+					);
+					const contextPrompt =
+						"## Active Tasks (Sequential Order Required)\n" +
+						lines.join("\n") +
+						"\nStrict focus rule: complete the in-progress task before starting another.";
+					if (Array.isArray(output?.context)) {
+						output.context.push(contextPrompt);
+					}
+				}
+			} catch {}
+		},
 	};
 };
 
-export default WorkflowGuard;
+// Default export MUST be a V1 PluginModule record, not a bare function.
+// OpenCode's plugin loader (1.18+) treats every exported FUNCTION of a
+// legacy-style module as a plugin instance — the extra exports here
+// (guardToolCall, setWorkspaceRoot) would be called as plugins and push
+// `undefined` into the hooks registry, crashing event dispatch
+// ("undefined is not an object (evaluating '…event')") and taking down the
+// whole session. The V1 format takes a dedicated code path where only
+// `server()` is invoked and other exports are ignored. Local file plugins
+// are required to carry an `id`.
+export default {
+	id: "workflow-guard",
+	server: WorkflowGuard,
+} satisfies PluginModule;
 
 
 

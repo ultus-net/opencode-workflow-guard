@@ -7,6 +7,7 @@ import { pathToFileURL } from "node:url";
 const mod = await import(pathToFileURL(join(import.meta.dirname, "workflow-guard.ts")).href);
 const guard = mod.guardToolCall;
 const setWorkspaceRoot = mod.setWorkspaceRoot;
+const setSdkClient = mod.setSdkClient;
 
 let pass = 0, fail = 0;
 const check = (name, cond) => { cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name)); };
@@ -16,21 +17,79 @@ const prevLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 setWorkspaceRoot(root);
 
-const call = async (toolName, input) => guard(toolName, input);
+// ── Fake SDK client mirroring the documented endpoints used by the guard:
+//    GET /session/:id/todo -> { data: Todo[] }, GET /session/:id -> { data: Session }
+const fakeTodos = new Map(); // sessionID -> Todo[]
+const fakeParents = new Map(); // sessionID -> parentID
+const todo = (sessionID, ...items) => fakeTodos.set(sessionID, items);
+const item = (content, status = "pending") => ({ content, status, priority: "medium" });
+const fakeClient = {
+	session: {
+		todo: async ({ path }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+		get: async ({ path }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+	},
+};
+setSdkClient(fakeClient);
+
+const call = (toolName, input, context) => guard(toolName, input, context);
 const shell = (cmd) => call("bash", { command: cmd });
 const blocked = (r) => typeof r === "string";
 
-console.log("— Policy 1: task-list gate —");
-writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n- [x] done\n");
-check("edit allowed with unchecked task", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" })));
-check("write allowed with unchecked task", !(await call("write", { filePath: join(root, "a.ts"), content: "x" })));
-check("patch allowed with unchecked task", !(await call("patch", { content: "*** x" })));
-writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [x] all done\n");
-check("edit blocked when all tasks checked", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" })));
-rmSync(join(root, "TASKS.md"));
-check("edit blocked with no task list", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" })));
-writeFileSync(join(root, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
-check("task-list file itself exempt", !(await call("edit", { filePath: join(root, "TASKS.md"), content: "x" })));
+console.log("— Policy 1: native todo gate —");
+todo("s-empty");
+todo("s-done", item("a", "completed"), item("b", "completed"));
+todo("s-cancelled", item("a", "completed"), item("b", "cancelled"));
+todo("s-active", item("a", "pending"));
+todo("s-progress", item("a", "in_progress"));
+todo("s-mixed", item("a", "completed"), item("b", "pending"));
+check("edit blocked with no todos", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-empty" })));
+check("write blocked with no todos", blocked(await call("write", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-empty" })));
+check("apply_patch blocked with no todos", blocked(await call("apply_patch", { patchText: "*** x" }, { sessionID: "s-empty" })));
+check("edit blocked when all todos completed", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-done" })));
+check("edit blocked when all todos completed/cancelled", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-cancelled" })));
+check("edit allowed with pending todo", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-active" })));
+check("edit allowed with in_progress todo", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-progress" })));
+check("edit allowed with mixed pending/completed", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-mixed" })));
+check("task gate is per session (other session's todos don't help)", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-empty" })));
+
+console.log("— Policy 1: todowrite focus & lifecycle validation —");
+// Focus rule: only 1 in_progress
+check("todowrite allows 1 in_progress", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "pending")] }, { sessionID: "s-empty" })));
+check("todowrite blocks >1 in_progress (focus rule)", blocked(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
+// Sequential rule: cannot complete task 2 while task 1 is pending
+check("todowrite allows sequential completion", !(await call("todowrite", { todos: [item("a", "completed"), item("b", "in_progress"), item("c", "pending")] }, { sessionID: "s-empty" })));
+check("todowrite blocks out-of-order completion", blocked(await call("todowrite", { todos: [item("a", "pending"), item("b", "completed")] }, { sessionID: "s-empty" })));
+// No silent deletion: active task cannot silently vanish
+todo("s-lifecycle", item("task 1", "completed"), item("task 2", "in_progress"), item("task 3", "pending"));
+check("todowrite allows updating active tasks to completed/cancelled", !(await call("todowrite", { todos: [item("task 1", "completed"), item("task 2", "completed"), item("task 3", "cancelled")] }, { sessionID: "s-lifecycle" })));
+check("todowrite blocks silently dropping task 2 without completion", blocked(await call("todowrite", { todos: [item("task 1", "completed"), item("task 3", "pending")] }, { sessionID: "s-lifecycle" })));
+// Fresh list allowed once all previous tasks are finished
+todo("s-finished", item("old 1", "completed"), item("old 2", "cancelled"));
+check("todowrite allows fresh list when previous list is 100% finished", !(await call("todowrite", { todos: [item("new 1", "pending")] }, { sessionID: "s-finished" })));
+
+console.log("— Policy 1: subagent parent-chain inheritance —");
+fakeParents.set("s-sub", "s-active");
+check("subagent inherits parent's active todos", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-sub" })));
+fakeParents.set("s-sub2", "s-mid");
+todo("s-mid"); // empty middle hop
+fakeParents.set("s-mid", "s-active");
+check("subagent walks up to grandparent's todos", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-sub2" })));
+fakeParents.set("s-sub3", "s-active");
+todo("s-sub3", item("own work", "completed"));
+check("subagent's own todos take precedence (all completed -> blocked)", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-sub3" })));
+fakeParents.set("s-sub-done", "s-done");
+check("subagent blocked when parent's todos all completed", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-sub-done" })));
+fakeParents.set("s-cycle-a", "s-cycle-b");
+fakeParents.set("s-cycle-b", "s-cycle-a");
+check("parent-chain cycles terminate (blocked, no hang)", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-cycle-a" })));
+
+console.log("— Policy 1: fail-open when todos can't be determined —");
+setSdkClient({ session: { todo: async () => { throw new Error("boom"); } } });
+check("fetch failure fails open", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-active" })));
+setSdkClient(undefined);
+check("missing client fails open", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-active" })));
+check("missing sessionID fails open", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" })));
+setSdkClient(fakeClient);
 
 console.log("— Policy 2: push to main/master —");
 check("block git push origin main", blocked(await shell("git push origin main")));
@@ -82,23 +141,52 @@ check("allow normal command", !(await shell("ls -la && git status")));
 console.log("— Policy 7: branch guard —");
 // Non-git workspace (current `root` is a plain temp dir): git writes allowed.
 check("non-git workspace: git commit allowed", !(await shell("git commit -m test")));
-check("non-git workspace: edit allowed", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" })));
+check("non-git workspace: edit allowed", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-active" })));
 // Real git repo on main.
 const repo = mkdtempSync(join(tmpdir(), "wg-repo-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: repo });
 setWorkspaceRoot(repo); // point the guard at the repo
-writeFileSync(join(repo, "TASKS.md"), "# Tasks\n- [ ] do thing\n");
-check("on main: edit blocked", blocked(await call("edit", { filePath: join(repo, "a.ts"), content: "x" })));
+check("on main: edit blocked (branch reason, todos active)", ((await call("edit", { filePath: join(repo, "a.ts"), content: "x" }, { sessionID: "s-active" })) ?? "").includes("protected branch"));
 check("on main: git commit blocked", blocked(await shell("git commit -m test")));
 check("on main: git merge blocked", blocked(await shell("git merge feature/x")));
 check("on main: git switch -c allowed (branch creation)", !(await shell("git switch -c feat/x")));
 check("on main: git status allowed", !(await shell("git status")));
-check("on main: task-list file edit still exempt", !(await call("edit", { filePath: join(repo, "TASKS.md"), content: "x" })));
+check("on main: todowrite allowed (not an edit tool)", !(await call("todowrite", { todos: [item("plan work")] }, { sessionID: "s-active" })));
 spawnSync("git", ["switch", "-c", "feat/x"], { cwd: repo });
-check("on feature branch: edit allowed", !(await call("edit", { filePath: join(repo, "a.ts"), content: "x" })));
+check("on feature branch: edit allowed", !(await call("edit", { filePath: join(repo, "a.ts"), content: "x" }, { sessionID: "s-active" })));
 check("on feature branch: git commit allowed", !(await shell("git commit -m test")));
+check("on feature branch: edit still needs active todos", blocked(await call("edit", { filePath: join(repo, "a.ts"), content: "x" }, { sessionID: "s-done" })));
 rmSync(repo, { recursive: true, force: true });
 setWorkspaceRoot(root); // restore
+
+console.log("— Policy 8: workspace boundary guard —");
+check("allow edit within workspace", !(await call("edit", { filePath: join(root, "src", "index.ts"), content: "x" }, { sessionID: "s-active" })));
+check("allow write relative path within workspace", !(await call("write", { filePath: "src/a.ts", content: "x" }, { sessionID: "s-active" })));
+check("block edit traversing outside workspace (../)", blocked(await call("edit", { filePath: join(root, "..", "outside.ts"), content: "x" }, { sessionID: "s-active" })));
+check("block write to /etc/passwd", blocked(await call("write", { filePath: "/etc/passwd", content: "x" }, { sessionID: "s-active" })));
+check("allow apply_patch within workspace", !(await call("apply_patch", { patchText: "*** Update File: src/app.ts\n" }, { sessionID: "s-active" })));
+check("block apply_patch escaping workspace", blocked(await call("apply_patch", { patchText: "*** Update File: ../../secret.env\n" }, { sessionID: "s-active" })));
+
+console.log("— Compaction focus preservation & TUI toast —");
+let toasts = [];
+const toastClient = {
+	session: fakeClient.session,
+	tui: {
+		showToast: async (req) => { toasts.push(req); },
+	},
+};
+const pluginWithToast = await pluginFn({ directory: root, client: toastClient });
+// Compaction hook injects active tasks
+const compactOutput = { context: [] };
+await pluginWithToast["experimental.session.compacting"]({ sessionID: "s-active" }, compactOutput);
+check("compaction hook injects active tasks into output.context", compactOutput.context.length > 0 && compactOutput.context[0].includes("Active Tasks"));
+
+// TUI toast emitted on blocked call
+toasts = [];
+try {
+	await pluginWithToast["tool.execute.before"]({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "git push origin main" } });
+} catch {}
+check("tui.showToast called when tool is blocked", toasts.length > 0 && toasts[0]?.body?.title === "Workflow Guard");
 
 console.log("— Input shapes —");
 check("single string command", blocked(await call("bash", "git push origin main")));
@@ -106,23 +194,48 @@ check("legacy tool name run_commands", blocked(await call("run_commands", { comm
 check("plain args object command field", blocked(await call("bash", { command: "git push origin main" })));
 
 console.log("— Plugin export shape —");
-const pluginFn = mod.default ?? mod.WorkflowGuard;
-const hooks = await pluginFn({ directory: root });
+// The default export must be a V1 PluginModule record — a bare function
+// default export combined with the extra named exports would make opencode
+// 1.18+ treat every export as a plugin and crash the server.
+check("default export is a V1 PluginModule with id + server()", (() => {
+	const def = mod.default;
+	return typeof def === "object" && def !== null &&
+		typeof def.id === "string" && def.id.length > 0 &&
+		typeof def.server === "function";
+})());
+const pluginFn = mod.WorkflowGuard ?? mod.default?.server;
+const hooks = await pluginFn({ directory: root, client: fakeClient });
 check("plugin returns tool.execute.before hook", typeof hooks["tool.execute.before"] === "function");
+// Real opencode hook contract: args arrive on the SECOND parameter.
+const invoke = (tool, args, sessionID = "s-hook") => hooks["tool.execute.before"]({ tool, sessionID, callID: "c" }, { args });
 let threw = false;
 try {
-	await hooks["tool.execute.before"]({ tool: "bash", args: { command: "git push origin main" } });
+	await invoke("bash", { command: "git push origin main" });
 } catch {
 	threw = true;
 }
-check("hook throws to block disallowed call", threw);
+check("hook throws to block disallowed call (args on 2nd param)", threw);
 let noThrow = true;
 try {
-	await hooks["tool.execute.before"]({ tool: "bash", args: { command: "ls -la" } });
+	await invoke("bash", { command: "ls -la" });
 } catch {
 	noThrow = false;
 }
 check("hook passes allowed call through", noThrow);
+let todoThrew = false;
+try {
+	await invoke("write", { filePath: join(root, "a.ts"), content: "x" }, "s-empty");
+} catch (e) {
+	todoThrew = String(e).includes("no active todo item");
+}
+check("hook blocks write without todos (uses input.sessionID)", todoThrew);
+let todoPass = true;
+try {
+	await invoke("write", { filePath: join(root, "a.ts"), content: "x" }, "s-active");
+} catch {
+	todoPass = false;
+}
+check("hook allows write with active todos", todoPass);
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
