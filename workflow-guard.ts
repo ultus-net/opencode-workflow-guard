@@ -470,6 +470,21 @@ function prBodyIncludesChangelog(command: string): boolean {
 // ── Core guard (exported for testing) ────────────────────────────────────────
 // Returns a block reason string, or undefined when the call is allowed.
 
+function logBlock(message: string): void {
+	// In OpenCode TUI, writing to process.stderr / console.error writes directly
+	// to the terminal screen and pollutes the interactive chat prompt input box.
+	// We route blocked action logs to the OpenCode app logger instead.
+	try {
+		(sdkClient as any)?.app?.log?.({
+			body: {
+				service: "workflow-guard",
+				level: "warn",
+				message,
+			},
+		});
+	} catch {}
+}
+
 export async function guardToolCall(
 	toolName: string,
 	input: unknown,
@@ -485,7 +500,7 @@ export async function guardToolCall(
 				: undefined;
 			const err = validateTodoLifecycle(rawTodos as TodoItem[], existingTodos);
 			if (err) {
-				console.error(`[workflow-guard] ${err}`);
+				logBlock(`[workflow-guard] ${err}`);
 				return err;
 			}
 		}
@@ -505,7 +520,7 @@ export async function guardToolCall(
 						? input
 						: "";
 		if (target && isPathOutsideWorkspace(target, workspaceRoot)) {
-			console.error(
+			logBlock(
 				`[workflow-guard] blocked ${toolName}: path escapes workspace: ${target}`,
 			);
 			return `Blocked: file path '${target}' escapes workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
@@ -515,7 +530,7 @@ export async function guardToolCall(
 				typeof record?.patchText === "string" ? record.patchText : "";
 			for (const patchPath of extractPatchPaths(patchText)) {
 				if (isPathOutsideWorkspace(patchPath, workspaceRoot)) {
-					console.error(
+					logBlock(
 						`[workflow-guard] blocked apply_patch: patch target escapes workspace: ${patchPath}`,
 					);
 					return `Blocked: patch targets file '${patchPath}' outside workspace root (${workspaceRoot}).`;
@@ -524,14 +539,14 @@ export async function guardToolCall(
 		}
 
 		if (onProtectedBranch(workspaceRoot)) {
-			console.error(
+			logBlock(
 				`[workflow-guard] blocked ${toolName}: on protected branch ${currentGitBranch(workspaceRoot)}`,
 			);
 			return branchGuardReason();
 		}
 		const todos = await effectiveTodos(context?.sessionID);
 		if (todos !== undefined && !hasActiveTodo(todos)) {
-			console.error(
+			logBlock(
 				`[workflow-guard] blocked ${toolName}: no active todo item (session ${context?.sessionID ?? "?"})`,
 			);
 			return (
@@ -553,7 +568,7 @@ export async function guardToolCall(
 	if (!allowLive) {
 		const mcpWhat = mcpMutationTool(toolName);
 		if (mcpWhat) {
-			console.error(
+			logBlock(
 				`[workflow-guard] blocked MCP tool ${toolName} (${mcpWhat} mutation)`,
 			);
 			return (
@@ -575,7 +590,7 @@ export async function guardToolCall(
 
 		// ── Policy 7: changes only on feature branches ───────────
 		if (GIT_WRITE_RE.test(command) && onProtectedBranch(workspaceRoot)) {
-			console.error(
+			logBlock(
 				`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`,
 			);
 			return branchGuardReason();
@@ -583,7 +598,7 @@ export async function guardToolCall(
 
 		// ── Policy 6: block self-modification of approval gates ──
 		if (isSettingsTamper(command)) {
-			console.error(
+			logBlock(
 				`[workflow-guard] blocked settings tamper: ${command.slice(0, 120)}`,
 			);
 			return (
@@ -597,7 +612,7 @@ export async function guardToolCall(
 		if (!allowLive && !ALLOW_LIVE_MARKER.test(command)) {
 			const what = liveMutationIn(command);
 			if (what) {
-				console.error(
+				logBlock(
 					`[workflow-guard] blocked ${what}: ${command.slice(0, 120)}`,
 				);
 				return (
@@ -612,7 +627,7 @@ export async function guardToolCall(
 
 		// ── Policy 2: block git push to main/master ──────────────────
 		if (PUSH_TO_MAIN_RE.test(command)) {
-			console.error(
+			logBlock(
 				`[workflow-guard] blocked push to main/master: ${command}`,
 			);
 			return (
@@ -627,7 +642,7 @@ export async function guardToolCall(
 				prBodyIncludesChangelog(command) ||
 				branchHasChangelogChange(workspaceRoot);
 			if (!hasChangelog) {
-				console.error(
+				logBlock(
 					"[workflow-guard] blocked gh pr create: no changelog found",
 				);
 				return (
@@ -665,6 +680,21 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	} catch {}
 
 	return {
+		// Event listener for session creation and status toasts
+		event: async ({ event }) => {
+			if (event.type === "session.created") {
+				try {
+					await sdkClient?.tui?.showToast?.({
+						body: {
+							title: "Workflow Guard",
+							message: "🛡️ Active & protecting session",
+							variant: "success",
+						},
+					});
+				} catch {}
+			}
+		},
+
 		// OpenCode passes the tool args as the SECOND hook parameter
 		// (`output.args` — documented in the tools docs, e.g. apply_patch
 		// "uses output.args.patchText"; `input` only carries
