@@ -46,16 +46,25 @@ For detailed rule descriptions and overrides, see [docs/policies.md](docs/polici
 
 ## Quick Install
 
-Copy `workflow-guard.ts` (and optional visual companion `workflow-guard-ui.ts`) into your plugin directory:
-
 ```bash
-# Project-level (per repo)
-mkdir -p .opencode/plugins
-cp workflow-guard.ts workflow-guard-ui.ts .opencode/plugins/
-
-# Global (all projects)
+# Server plugin (required) — global example
 mkdir -p ~/.config/opencode/plugins
-cp workflow-guard.ts workflow-guard-ui.ts ~/.config/opencode/plugins/
+cp workflow-guard.ts ~/.config/opencode/plugins/
+
+# Optional TUI badge (do NOT put this in plugins/)
+mkdir -p ~/.config/opencode/ui
+cp workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
+```
+
+Then add `~/.config/opencode/tui.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": [
+    "file:///absolute/path/to/.config/opencode/ui/workflow-guard-ui.tsx"
+  ]
+}
 ```
 
 *Requires OpenCode >= 1.18.* See [docs/installation.md](docs/installation.md) for full configuration options.
