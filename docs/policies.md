@@ -57,6 +57,10 @@
 ### 8. Workspace Boundary Guard
 - File modification tools (`edit`, `write`, `apply_patch`) and shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`, `git apply`/`git am`) are validated to ensure targets cannot escape the current workspace root via `../` traversal or absolute paths.
 
+### 9. Script-Laundering Guard
+- Content written via `edit`, `write`, or `apply_patch` is scanned for destructive CLI commands and settings tamper payloads.
+- Prevents agents from bypassing shell guards by writing destructive commands to script files (e.g. `write deploy.sh` → `bash deploy.sh`).
+
 ### 10. Post-Edit Verification
 - After every successful `edit`/`write`/`apply_patch`, the guard runs a verify command (`WORKFLOW_GUARD_VERIFY` env, or auto-detected `npm test` from `package.json`) in the background.
 - When the agent tries to mark **every** todo completed (finalize), the todowrite is blocked while the latest verify run is failing, with the command's tail output provided.

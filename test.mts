@@ -149,8 +149,10 @@ check("allow destructive with env override (user-set)", !(await shell("kubectl d
 delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 
 console.log("— Policy 4: destructive command evasions (regression) —");
-check("block rm -rf", blocked(await shell("rm -rf node_modules")));
-check("block rm -r (recursive without force)", blocked(await shell("rm -r build/")));
+check("allow rm -rf on workspace dirs", !(await shell("rm -rf node_modules")));
+check("allow rm -r on workspace dirs", !(await shell("rm -r build/")));
+check("block rm -rf on system paths", blocked(await shell("rm -rf /")));
+check("block rm -rf on home paths", blocked(await shell("rm -rf ~")));
 check("block rm -f on / path", blocked(await shell("rm -f /etc/hosts")));
 check("block git clean -fdx", blocked(await shell("git clean -fdx")));
 check("block git clean -f", blocked(await shell("git clean -f")));

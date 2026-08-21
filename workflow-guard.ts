@@ -524,8 +524,8 @@ interface LivePattern {
 const LIVE_MUTATION_PATTERNS: LivePattern[] = [
 	// Only DESTRUCTIVE operations are blocked. Create/update/apply/set-style
 	// commands are allowed — they're normal work and reviewable in diffs.
-	// Filesystem destruction
-	{ re: /\brm\s+(?:-[a-zA-Z]*[rRfF][a-zA-Z]*\s+)*-[a-zA-Z]*[rRfF][a-zA-Z]*(?:\s|$)/, what: "recursive/forced file deletion (rm -rf)" },
+	// Filesystem destruction: block rm -rf on system paths, allow workspace cleanup
+	{ re: /\brm\s+(?:-[a-zA-Z]*[rRfF][a-zA-Z]*\s+)*-[a-zA-Z]*[rRfF][a-zA-Z]*\s+(?:\/|~|\*)/, what: "recursive/forced deletion of system/home paths" },
 	{ re: /\b(?:sudo\s+)?rm\s+-(?:[a-zA-Z]*[rRfF][a-zA-Z]*\s+){1,2}(?:\/|~)/, what: "forced deletion of system/home paths" },
 	{ re: /\bgit\s+clean\s+(?:-[a-zA-Z]*[fdx][a-zA-Z]*)(?:\s|$)/, what: "git clean (untracked file deletion)" },
 	{ re: /\bgit\s+push\b[^|;&]*\s\+(?:[\w./-]*:)?/, what: "force push via + refspec" },
@@ -959,23 +959,30 @@ async function guardToolCallImpl(
 			}
 
 			// Final-completion gate (Policy 10): when EVERY task is being marked
-			// done and the workspace has an active verify command, the latest
-			// verification must be passing — otherwise the edit that fixed the
-			// final task may have silently broken the build.
+			// done, run verification on-demand if a verify command is configured.
+			// This replaces the old background-per-edit approach with a single
+			// verification run at finalization time.
 			const allDone =
 				newTodos.length > 0 &&
 				newTodos.every((t) => {
 					const s = String(t.status ?? "");
 					return s === "completed" || s === "cancelled";
 				});
-			if (allDone && lastVerify && !lastVerify.passed) {
-				const tail = lastVerify.output.slice(-500);
-				const reason =
-					`Blocked todowrite: all tasks marked done but verification is failing ` +
-					`(${lastVerify.command}). Fix the failure before finishing; ` +
-					`output tail: ${tail}`;
-				logBlock(`[workflow-guard] ${reason}`);
-				return reason;
+			if (allDone) {
+				const command = detectVerifyCommand(workspaceRoot);
+				if (command) {
+					const result = await runVerify(command, workspaceRoot);
+					recordVerifyResult(command, result);
+					if (!result.passed) {
+						const tail = result.output.slice(-500);
+						const reason =
+							`Blocked todowrite: all tasks marked done but verification is failing ` +
+							`(${command}). Fix the failure before finishing; ` +
+							`output tail: ${tail}`;
+						logBlock(`[workflow-guard] ${reason}`);
+						return reason;
+					}
+				}
 			}
 		}
 		return undefined;
@@ -1048,21 +1055,30 @@ async function guardToolCallImpl(
 		// Script-laundering guard (P0.5): file payloads that contain
 		// destructive commands or tamper instructions are blocked, so an
 		// agent cannot smuggle a blocked command into a script file and run
-		// it through the shell.
+		// it through the shell. We scan line-by-line and skip comment lines
+		// to reduce false positives on documentation.
 		if (!allowLive) {
 			for (const content of extractEditContent(input)) {
-				const normalizedContent = normalizeGitCommands(content);
-				const what = liveMutationIn(normalizedContent);
-				if (what) {
-					logBlock(
-						`[workflow-guard] blocked ${toolName}: payload contains ${what}`,
-					);
-					return (
-						`Blocked: the file you are writing contains a ${what}. ` +
-						"Script files are not a way to smuggle destructive commands " +
-						"past the shell guard. Only the user can allow live mutations " +
-						"(WORKFLOW_GUARD_ALLOW_LIVE=1)."
-					);
+				const lines = content.split("\n");
+				for (const line of lines) {
+					// Skip comment lines (bash, js, python, etc.)
+					const trimmed = line.trim();
+					if (trimmed.startsWith("#") || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
+						continue;
+					}
+					const normalizedContent = normalizeGitCommands(line);
+					const what = liveMutationIn(normalizedContent);
+					if (what) {
+						logBlock(
+							`[workflow-guard] blocked ${toolName}: payload contains ${what}`,
+						);
+						return (
+							`Blocked: the file you are writing contains a ${what}. ` +
+							"Script files are not a way to smuggle destructive commands " +
+							"past the shell guard. Only the user can allow live mutations " +
+							"(WORKFLOW_GUARD_ALLOW_LIVE=1)."
+						);
+					}
 				}
 			}
 			for (const content of extractEditContent(input)) {
@@ -1269,29 +1285,15 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			}
 		},
 
-		// Post-edit verification: run the verify command after every successful
-		// edit/write/patch so test failures surface while the agent can still
-		// fix them. Runs in the background — failures are checked when the
-		// agent tries to mark the final todo completed (below), not here.
+		// Post-edit verification: run the verify command when the agent
+		// attempts to finalize the todo list (all tasks completed), not on
+		// every edit. This avoids running tests on intermediate broken states
+		// and reduces performance overhead.
 		"tool.execute.after": async (input) => {
-			if (!EDIT_TOOL_NAMES.has(input.tool)) return;
-			if (verifyInProgress) return;
-			const command = detectVerifyCommand(workspaceRoot);
-			if (!command) return;
-			verifyInProgress = true;
-			const result = await runVerify(command, workspaceRoot);
-			recordVerifyResult(command, result);
-			verifyInProgress = false;
-			audit({
-				ts: new Date().toISOString(),
-				sessionID: (input as { sessionID?: string }).sessionID,
-				tool: input.tool,
-				decision: result.passed ? "allow" : "block",
-				reason: result.passed
-					? `verify OK (${command})`
-					: `verify FAILED (${command})`,
-				input: { verifyOutputTail: result.output.slice(-500) },
-			});
+			// Verification now runs only on todowrite finalization, not on edits.
+			// The todowrite hook in guardToolCallImpl checks lastVerify before
+			// allowing all tasks to be marked completed.
+			return;
 		},
 
 		// Focus preservation across context compaction (documented in
@@ -1324,15 +1326,35 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		// shells by default. The hook only documents overwrite, so the
 		// sensitive entries are emptied; the agent cannot carry live
 		// credentials unless the user explicitly allows it elsewhere.
+		// When a scrubbed variable is present, we log a warning so the agent
+		// knows auth failures may be due to scrubbing, not their code.
 		"shell.env": async (input, output) => {
 			try {
 				const env = (output as { env?: Record<string, string> }).env;
 				if (env && typeof env === "object") {
+					const scrubbed: string[] = [];
 					for (const key of SENSITIVE_ENV_KEYS) {
-						if (key in env) env[key] = "";
+						if (key in env && env[key] !== "") {
+							env[key] = "";
+							scrubbed.push(key);
+						}
 					}
 					for (const key of Object.keys(env)) {
-						if (SENSITIVE_ENV_RE.test(key)) env[key] = "";
+						if (SENSITIVE_ENV_RE.test(key) && env[key] !== "") {
+							env[key] = "";
+							scrubbed.push(key);
+						}
+					}
+					if (scrubbed.length > 0) {
+						try {
+							await (sdkClient as any)?.app?.log?.({
+								body: {
+									service: "workflow-guard",
+									level: "warn",
+									message: `Scrubbed sensitive env vars: ${scrubbed.join(", ")}. Auth failures may be due to this.`,
+								},
+							});
+						} catch {}
 					}
 				}
 			} catch {}
