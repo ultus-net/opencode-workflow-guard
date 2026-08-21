@@ -26,16 +26,18 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
 
-  # ───── Unit tests (all Node versions) ─────
-  # The plugin is a TS file auto-loaded by opencode; we run the fast in-memory
-  # unit suite everywhere, and the heavier plugin-load test once.
+  # ───── Unit tests ─────
+  # The plugin is a TS file auto-loaded by opencode; the fast in-memory unit
+  # suite runs on each supported Node. Node 20 is dropped: GitHub itself is
+  # deprecating it (forcing actions to Node 24), and the guard targets modern
+  # Node by convention (see tsconfig target/lib).
   test:
     name: Unit tests (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        node: ["20", "22", "24"]
+        node: ["22", "24"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -84,8 +86,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Require CHANGELOG update in PR
         run: |
-          git fetch origin "${{ github.base_ref }}" --depth=1
-          if git diff --name-only "origin/${{ github.base_ref }}...HEAD" | grep -q "CHANGELOG.md"; then
+          # Find a merge base (works even when the PR was opened from a branch
+          # longer than the shallow-fetched history), then require CHANGELOG.md
+          # in the diff. This is the exact same check the plugin enforces on
+          # `gh pr create` locally.
+          git fetch origin "${{ github.base_ref }}" --depth=50
+          MERGE_BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD || true)
+          if [ -z "$MERGE_BASE" ]; then
+            echo "::error::no merge base between origin/${{ github.base_ref }} and HEAD"
+            exit 1
+          fi
+          if git diff --name-only "$MERGE_BASE...HEAD" | grep -q "CHANGELOG.md"; then
             echo "CHANGELOG.md updated — good."
           else
             echo "::error::PR must include a CHANGELOG.md update (Policy 3)."
