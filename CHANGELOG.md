@@ -4,6 +4,15 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 
 ## [Unreleased]
 
+### Fixed
+- **README policy table now starts at Policy 1.** The "Summary of Enforced Policies" table omitted Policy 1 (Task Gate & Lifecycle) and began at 2; the row is restored. `docs/policies.md` also regains its missing Policy 9 (Script-Laundering Guard) section.
+
+### Changed
+- **Targeted `rm -rf` guard (Policy 4).** Recursive/forced deletion is now blocked only when it targets system/home/wildcard paths (`/`, `~`, `*`); workspace-local cleanup (`rm -rf node_modules`, `rm -rf dist/`, `rm -r build/`) is allowed, removing a routine false positive.
+- **Verification runs at finalization, not per-edit (Policy 10).** The verify command (`WORKFLOW_GUARD_VERIFY` / auto-detected `npm test`) no longer spawns in the background after every edit — it runs once, on demand, when the agent attempts to mark every todo completed. This eliminates test churn on intermediate broken states and the CPU cost of per-edit runs.
+- **Shell env scrub announces itself (Policy 12).** When the `shell.env` hook empties sensitive variables, a warning is logged naming the scrubbed keys so auth failures are diagnosable instead of silent.
+- **Script-laundering scan skips comment lines (Policy 9).** Payloads are scanned line-by-line; lines starting with `#`, `//`, `/*`, or `*` are ignored, reducing false positives on documented cleanup commands while keeping executable lines covered.
+
 ### Changed
 - **Dependency & CI updates:**
   - Upgraded GitHub Actions `actions/checkout` and `actions/setup-node` to v7 across CI and Release workflows.
