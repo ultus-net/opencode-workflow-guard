@@ -10,10 +10,11 @@ Ported from [cline-workflow-guard](https://github.com/ultus-net/cline-workflow-g
 
 ```
 opencode-workflow-guard/
-├── workflow-guard.ts          # Core plugin source (OpenCode V1 PluginModule)
+├── workflow-guard.ts          # Core server plugin (tool hooks, task gate, guardrails)
+├── workflow-guard-ui.ts       # Visual TUI companion (shows in Plugins menu & sidebar)
 ├── package.json               # Package configuration & test scripts
 ├── tsconfig.json              # Strict TypeScript configuration
-├── test.mts                   # 87 in-memory unit tests
+├── test.mts                   # 90 in-memory unit tests
 ├── test-e2e.mts               # Live OpenCode runtime & install tests
 └── docs/                      # Detailed documentation
     ├── installation.md        # Complete install options & companion permissions
@@ -37,7 +38,7 @@ opencode-workflow-guard/
 | **7** | **Feature-Branch Workflow** | On `main`/`master`, edits and history-changing git commands are blocked until a feature branch is created. |
 | **8** | **Workspace Boundary Guard** | Blocks file tools (`edit`, `write`, `apply_patch`) from escaping the workspace root via `../` path traversal. |
 | **9** | **Compaction Focus Hook** | Injects the active sequential task list into `experimental.session.compacting` context to maintain focus across long sessions. |
-| **10** | **TUI Visual Feedback** | Emits real-time warning toasts via `tui.showToast` when a policy triggers. |
+| **10** | **TUI Visual Feedback** | Displays `workflow-guard` in the TUI Plugins menu, registers a `🛡️ [Workflow Guard: Active]` sidebar footer, and emits warning toasts when actions are blocked. |
 
 For detailed rule descriptions and overrides, see [docs/policies.md](docs/policies.md).
 
@@ -45,16 +46,16 @@ For detailed rule descriptions and overrides, see [docs/policies.md](docs/polici
 
 ## Quick Install
 
-Copy `workflow-guard.ts` into your project or global OpenCode plugin directory:
+Copy `workflow-guard.ts` (and optional visual companion `workflow-guard-ui.ts`) into your plugin directory:
 
 ```bash
 # Project-level (per repo)
 mkdir -p .opencode/plugins
-cp workflow-guard.ts .opencode/plugins/
+cp workflow-guard.ts workflow-guard-ui.ts .opencode/plugins/
 
 # Global (all projects)
 mkdir -p ~/.config/opencode/plugins
-cp workflow-guard.ts ~/.config/opencode/plugins/
+cp workflow-guard.ts workflow-guard-ui.ts ~/.config/opencode/plugins/
 ```
 
 *Requires OpenCode >= 1.18.* See [docs/installation.md](docs/installation.md) for full configuration options.

@@ -287,6 +287,28 @@ try {
 }
 check("hook allows write with active todos", todoPass);
 
+console.log("— TUI Companion Plugin export shape —");
+import { default as tuiExport } from "./workflow-guard-ui.ts";
+check("TUI companion exports valid V1 TuiPluginModule with id + tui()", (() => {
+	const def: unknown = tuiExport;
+	const rec = typeof def === "object" && def !== null ? (def as { id?: string; tui?: Function }) : undefined;
+	return typeof rec?.id === "string" && rec.id.length > 0 && typeof rec.tui === "function";
+})());
+let tuiToastCalled = false;
+let slotRegistered = false;
+const fakeTuiApi = {
+	ui: {
+		toast: (req: unknown) => { tuiToastCalled = true; },
+	},
+	slots: {
+		register: (req: unknown) => { slotRegistered = true; },
+	},
+	theme: { current: {} },
+};
+await tuiExport.tui(fakeTuiApi as any, undefined, {} as any);
+check("TUI plugin initializes and triggers startup toast", tuiToastCalled);
+check("TUI plugin registers sidebar slot indicator", slotRegistered);
+
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
 console.log(`\n${pass} passed, ${fail} failed`);
