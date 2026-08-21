@@ -1,24 +1,45 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
+import type { JSX } from "@opentui/solid";
+import { createElement, insert, setProp } from "@opentui/solid";
+
+type Child = JSX.Element | string | number | null | undefined | false;
+
+function element(
+	tag: string,
+	props: Record<string, unknown>,
+	children: Child[] = [],
+) {
+	const node = createElement(tag);
+	for (const [key, value] of Object.entries(props)) {
+		if (value !== undefined) setProp(node, key, value);
+	}
+	for (const child of children) {
+		if (child === null || child === undefined || child === false) continue;
+		insert(node, child);
+	}
+	return node as unknown as JSX.Element;
+}
+
+function text(props: Record<string, unknown>, children: Child[]) {
+	return element("text", props, children);
+}
+
+const BADGE = "🛡️ [Workflow Guard: Active]";
 
 export const WorkflowGuardTui: TuiPlugin = async (api) => {
-	// Registers persistent status indicator in the prompt box next to the model indicator
-	try {
-		api.slots?.register?.({
-			order: 1,
-			slots: {
-				session_prompt_right() {
-					const theme = () => api.theme.current;
-					return {
-						type: "text",
-						props: {
-							fg: theme().success,
-							children: "🛡️ [Workflow Guard: Active]",
-						},
-					} as any;
-				},
+	api.slots.register({
+		order: 1,
+		slots: {
+			home_prompt_right() {
+				const theme = api.theme.current;
+				return text({ fg: theme.success }, [BADGE]);
 			},
-		});
-	} catch {}
+			session_prompt_right() {
+				const theme = api.theme.current;
+				return text({ fg: theme.success }, [BADGE]);
+			},
+		},
+	});
 };
 
 export default {

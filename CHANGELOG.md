@@ -2,6 +2,15 @@
 
 All notable changes to `opencode-workflow-guard` will be documented in this file.
 
+## [1.1.1] - 2026-08-21
+
+### Fixed
+- TUI badge now renders via `@opentui/solid` slot elements so `[Workflow Guard: Active]` actually appears in OpenCode 1.18+.
+- Documented that the UI companion must live under `ui/` + `tui.json`, not `plugins/` (server loader rejects TUI-only modules).
+
+### Changed
+- Badge registers both `home_prompt_right` and `session_prompt_right`.
+
 ## [1.1.0] - 2026-08-21
 
 ### Added

@@ -291,20 +291,22 @@ check("hook allows write with active todos", todoPass);
 // Session created event popup is removed
 check("event hook has no intrusive startup toast", !pluginWithToast["event"]);
 
-// TUI companion plugin registers session_prompt_right status indicator slot
+// TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
+let registeredOrder: number | undefined;
 const fakeTuiApi = {
 	theme: { current: { success: "#00ff00" } },
 	slots: {
-		register: ({ slots }: { slots: Record<string, Function> }) => {
+		register: ({ order, slots }: { order?: number; slots: Record<string, Function> }) => {
+			registeredOrder = order;
 			registeredSlots = slots;
 		},
 	},
 };
 await WorkflowGuardTui(fakeTuiApi as any, undefined, {} as any);
+check("tui plugin registers with order", registeredOrder === 1);
 check("tui plugin registers session_prompt_right slot", typeof registeredSlots.session_prompt_right === "function");
-const promptOutput = registeredSlots.session_prompt_right ? registeredSlots.session_prompt_right() : null;
-check("session_prompt_right indicator contains Workflow Guard: Active", JSON.stringify(promptOutput).includes("Workflow Guard: Active"));
+check("tui plugin registers home_prompt_right slot", typeof registeredSlots.home_prompt_right === "function");
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;

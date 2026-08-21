@@ -46,10 +46,12 @@ cp workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "file:///var/home/csh/.config/opencode/ui/workflow-guard-ui.tsx"
+    "file:///absolute/path/to/.config/opencode/ui/workflow-guard-ui.tsx"
   ]
 }
 ```
+
+The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). OpenCode resolves that package from its own runtime; no extra install is required when running inside OpenCode. For local typecheck of this repo, `@opentui/solid` is a devDependency.
 
 ---
 
