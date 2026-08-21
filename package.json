@@ -1,0 +1,29 @@
+{
+  "name": "opencode-workflow-guard",
+  "version": "1.0.0",
+  "description": "OpenCode plugin enforcing workflow discipline through deterministic tool.execute.before hooks",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ultus-net/opencode-workflow-guard.git"
+  },
+  "files": [
+    "workflow-guard.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "guard",
+    "workflow"
+  ],
+  "scripts": {
+    "test": "node test.mjs"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependenciesMeta_comment": "only needed for type-checking; opencode resolves this itself at runtime"
+}
