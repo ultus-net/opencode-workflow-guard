@@ -12,9 +12,18 @@ import {
 	getCleanEnv,
 	resetVerifyState,
 	recordMutation,
+	getMutationCount,
 	getLastMutationTimestamp,
 	getLastVerifyResult,
 	recordVerifyResult,
+	snipVerifyOutput,
+	getCurrentGitCommitHash,
+	getGitStatusSummary,
+	getVerifyCacheFilePath,
+	persistVerifyCache,
+	loadVerifyCache,
+	isEnvFilePath,
+	generateMaskedEnvSchema,
 	getAuditFilePath,
 	getRecentAuditEntries,
 	buildReviewRubric,
@@ -981,6 +990,62 @@ check(
 	!(await shell("gh pr create --title t --body 'Changelog: added feature'")),
 );
 delete process.env.WORKFLOW_GUARD_REQUIRE_DOCS;
+
+// 15. New Ecosystem DX & Safety Features (Features 1 - 6)
+console.log("- Ecosystem Features: Safe .env Masking, Output Snip, Git Snapshot, Durable Cache -");
+
+// Feature 1: Safe .env schema inspection
+check("isEnvFilePath identifies .env", isEnvFilePath(".env"));
+check("isEnvFilePath identifies .env.local", isEnvFilePath(".env.local"));
+check("isEnvFilePath rejects .env.example (safe fixture)", !isEnvFilePath(".env.example"));
+check("isEnvFilePath rejects id_rsa", !isEnvFilePath("id_rsa"));
+
+const sampleEnv = "# Database credentials\nDATABASE_URL=postgres://user:secret@localhost:5432/db\nAPI_KEY=sk_live_123456789\nPORT=3000\n";
+const maskedSchema = generateMaskedEnvSchema(sampleEnv);
+check("generateMaskedEnvSchema preserves keys and comments but redacts values", maskedSchema.includes("DATABASE_URL=********") && maskedSchema.includes("API_KEY=********") && !maskedSchema.includes("sk_live_123456789"));
+
+const envTestFile = join(root, ".env.production");
+writeFileSync(envTestFile, "STRIPE_SECRET=sk_live_99999\nPUBLIC_APP=myapp\n");
+const envReadBlock = await call("read", { filePath: envTestFile });
+check("read on .env file returns blocked message with masked variable schema hint", blocked(envReadBlock) && (envReadBlock as string).includes("STRIPE_SECRET=********") && !(envReadBlock as string).includes("sk_live_99999"));
+
+// Feature 2: Verification output snipping
+const verbosePassingLogs = Array.from({ length: 100 }, (_, i) => `PASS: test #${i} passed successfully`).join("\n");
+const snippedPass = snipVerifyOutput(verbosePassingLogs, true, 20);
+check("snipVerifyOutput truncates verbose passing logs", snippedPass.includes("lines omitted") && snippedPass.split("\n").length < 30);
+
+const verboseFailingLogs = Array.from({ length: 80 }, (_, i) => i === 40 ? "FAIL: AssertionError: expected true to be false\n    at Object.<anonymous> (test.ts:42:1)" : `info log line ${i}`).join("\n");
+const snippedFail = snipVerifyOutput(verboseFailingLogs, false, 20);
+check("snipVerifyOutput preserves failure keywords on fail", snippedFail.includes("AssertionError") || snippedFail.includes("FAIL:"));
+
+// Feature 3: Git snapshot & mutation counts
+check("getCurrentGitCommitHash returns commit string in git repo", typeof getCurrentGitCommitHash(conflictRepo) === "string");
+check("getGitStatusSummary returns status string in git repo", typeof getGitStatusSummary(conflictRepo) === "string");
+
+resetVerifyState();
+check("initial mutation count is 0", getMutationCount() === 0);
+recordMutation("s-mut-test");
+check("mutation count increments after recordMutation", getMutationCount() === 1 && getMutationCount("s-mut-test") === 1);
+
+// Feature 4: Subagent role attribution in compaction hook
+const subagentCompactingContext: { context: string[] } = { context: [] };
+fakeParents.set("s-sub-agent-child", "s-active");
+const compactSubagentFn = pluginWithToast["experimental.session.compacting"];
+if (typeof compactSubagentFn === "function") {
+	await compactSubagentFn({ sessionID: "s-sub-agent-child" } as any, subagentCompactingContext as any);
+}
+check("compaction context includes subagent session & parent attribution", subagentCompactingContext.context.length > 0 && subagentCompactingContext.context[0]?.includes("Subagent session: s-sub-agent-child"));
+
+// Feature 5: Durable verification cache
+const testVerifyCache = {
+	command: "npm test",
+	passed: true,
+	output: "All 10 tests passed.",
+	timestamp: Date.now(),
+};
+persistVerifyCache(testVerifyCache);
+const loadedCache = loadVerifyCache();
+check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);

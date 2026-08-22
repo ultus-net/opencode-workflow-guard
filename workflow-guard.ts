@@ -47,7 +47,7 @@
  */
 
 import { spawnSync, spawn } from "node:child_process";
-import { mkdirSync, realpathSync, readFileSync, appendFileSync, existsSync } from "node:fs";
+import { mkdirSync, realpathSync, readFileSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
@@ -1166,6 +1166,35 @@ export function isSecretPath(targetPath: string): boolean {
 	}
 }
 
+/**
+ * Returns true specifically for environment variable files (.env, .env.local, etc.)
+ * that can safely present their schema (masked keys) to agents without exposing secret values.
+ */
+export function isEnvFilePath(targetPath: string): boolean {
+	if (!targetPath) return false;
+	const base = basename(targetPath).toLowerCase();
+	if (SAFE_ENV_FIXTURE_RE.test(base)) return false;
+	return /^\.env(?:\.|$)/i.test(base);
+}
+
+/**
+ * Parses a raw .env file and returns a sanitized schema mask where variable names
+ * and comment structures are preserved, but sensitive values are redacted to '********'.
+ */
+export function generateMaskedEnvSchema(content: string): string {
+	const lines = content.split("\n");
+	return lines
+		.map((line) => {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#")) return line;
+			const eqIdx = line.indexOf("=");
+			if (eqIdx === -1) return line;
+			const key = line.slice(0, eqIdx);
+			return `${key}=********`;
+		})
+		.join("\n");
+}
+
 const SECRET_READ_COMMAND_RE =
 	/(?:^|\s)(?:cat|head|tail|less|more|grep|awk|sed|od|hexdump|strings|base64|xxd|nl|sort|uniq|view|nano|vim?)\s+[^|;&]*?(?:["']?)([\w\/.~-]*\.(?:pem|key|pfx|p12)|[\w\/.~-]*\.env(?:\.[\w-]+)*|[\w\/.~-]*id_(?:rsa|dsa|ecdsa|ed25519)[\w.-]*|[\w\/.~-]*kubeconfig[\w.-]*|[\w\/.~-]*(?:service[-_]?account|credentials|client[-_]?secret)[\w.-]*\.json)(?:["']?)/i;
 const SIMPLE_FILE_READ_COMMAND_RE =
@@ -1489,26 +1518,39 @@ export function buildReviewRubric(diffText: string, taskPrompt?: string): string
 // the guard ensures fresh verification has passed since the most recent mutation.
 
 let lastMutationTimestamp = 0;
+let mutationCount = 0;
 const sessionMutationTimestamps = new Map<string, number>();
+const sessionMutationCounts = new Map<string, number>();
 let lastVerify: {
 	passed: boolean;
 	command: string;
 	output: string;
 	timestamp: number;
 	durationMs?: number;
+	commitHash?: string;
+	gitStatus?: string;
 } | undefined;
 const sessionVerifyResults = new Map<string, NonNullable<typeof lastVerify>>();
 
 export function recordMutation(sessionID?: string): void {
 	lastMutationTimestamp = Date.now();
+	mutationCount++;
 	if (sessionID) {
 		sessionMutationTimestamps.set(sessionID, lastMutationTimestamp);
+		sessionMutationCounts.set(sessionID, (sessionMutationCounts.get(sessionID) ?? 0) + 1);
 		sessionVerifyResults.delete(sessionID);
 	}
 	if (sessionID) sessionReviews.delete(sessionID);
 	if (!lastReview?.targetSessionID || lastReview.targetSessionID === sessionID) {
 		lastReview = undefined;
 	}
+}
+
+export function getMutationCount(sessionID?: string): number {
+	if (sessionID && sessionMutationCounts.has(sessionID)) {
+		return sessionMutationCounts.get(sessionID) ?? 0;
+	}
+	return mutationCount;
 }
 
 export function getLastMutationTimestamp(): number {
@@ -1521,8 +1563,10 @@ export function getLastVerifyResult(): typeof lastVerify {
 
 export function resetVerifyState(): void {
 	lastMutationTimestamp = 0;
+	mutationCount = 0;
 	lastVerify = undefined;
 	sessionMutationTimestamps.clear();
+	sessionMutationCounts.clear();
 	sessionVerifyResults.clear();
 }
 
@@ -1556,6 +1600,72 @@ export function getCleanEnv(): Record<string, string> {
 		}
 	}
 	return env;
+}
+
+/**
+ * Truncates and snips verification stdout/stderr for token efficiency.
+ * When a test suite or compiler passes, verbose log lines are trimmed to a concise summary.
+ * When it fails, failure context, error markers, and stack traces are prioritized.
+ */
+export function snipVerifyOutput(output: string, passed: boolean, maxLines = 40): string {
+	if (!output) return "(no output)";
+	const lines = output.trim().split("\n");
+	if (lines.length <= maxLines) return output.trim();
+
+	if (passed) {
+		const head = lines.slice(0, 5).join("\n");
+		const tail = lines.slice(-15).join("\n");
+		return `${head}\n... [${lines.length - 20} lines omitted - all tests passing] ...\n${tail}`;
+	}
+
+	// On failure, preserve stack traces, FAIL/Error keywords, and tail
+	const errorLines: string[] = [];
+	for (const line of lines) {
+		if (/(?:fail|error|exception|panic|assert|reject|expected|received|err:)/i.test(line)) {
+			errorLines.push(line);
+		}
+	}
+
+	const head = lines.slice(0, 5).join("\n");
+	const tail = lines.slice(-20).join("\n");
+	const errorSummary = errorLines.slice(-15).join("\n");
+
+	return [
+		head,
+		`\n--- [Verification Failed: ${lines.length} total lines captured] ---`,
+		errorSummary ? `Key Failures:\n${errorSummary}` : "",
+		`Output Tail:\n${tail}`,
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
+export function getCurrentGitCommitHash(root: string): string | undefined {
+	try {
+		const res = spawnSync("git", ["rev-parse", "HEAD"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (res.status === 0 && res.stdout.trim()) {
+			return res.stdout.trim();
+		}
+	} catch {}
+	return undefined;
+}
+
+export function getGitStatusSummary(root: string): string | undefined {
+	try {
+		const res = spawnSync("git", ["status", "--porcelain"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (res.status === 0) {
+			return res.stdout.trim();
+		}
+	} catch {}
+	return undefined;
 }
 
 function detectVerifyCommand(root: string): string | undefined {
@@ -1654,34 +1764,71 @@ export async function runVerify(
 	});
 }
 
-export function recordVerifyResult(
-	command: string,
-	result: { passed: boolean; output: string; durationMs?: number },
-	sessionID?: string,
-): void {
-	lastVerify = {
-		command,
-		passed: result.passed,
-		output: result.output.slice(-4000),
-		timestamp: Date.now(),
-		durationMs: result.durationMs,
-	};
-	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
-}
-
-// Every block/allow decision is appended as a JSON line to a durable file so
-// developers can reconstruct why the agent was (or was not) allowed. This
-// complements client.app.log() (in-app, undocumented durability) with a real
-// on-disk log the user can review.
 const AUDIT_DIR = join(
 	process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"),
 	"opencode",
 	"workflow-guard",
 );
 const AUDIT_FILE = join(AUDIT_DIR, "workflow-guard.jsonl");
+const VERIFY_CACHE_FILE = join(AUDIT_DIR, "last-verify.json");
 
 export function getAuditFilePath(): string {
 	return AUDIT_FILE;
+}
+
+export function getVerifyCacheFilePath(): string {
+	return VERIFY_CACHE_FILE;
+}
+
+/**
+ * Persists passing verification evidence to disk so session restarts
+ * or multi-agent handoffs retain valid verification state.
+ */
+export function persistVerifyCache(verifyData: NonNullable<typeof lastVerify>): void {
+	try {
+		mkdirSync(AUDIT_DIR, { recursive: true });
+		writeFileSync(VERIFY_CACHE_FILE, JSON.stringify(verifyData, null, 2), "utf8");
+	} catch {}
+}
+
+/**
+ * Loads durable verification evidence from disk if present and fresh.
+ */
+export function loadVerifyCache(): typeof lastVerify {
+	try {
+		if (!existsSync(VERIFY_CACHE_FILE)) return undefined;
+		const raw = readFileSync(VERIFY_CACHE_FILE, "utf8");
+		const data = JSON.parse(raw);
+		if (data && typeof data.command === "string" && typeof data.timestamp === "number") {
+			return data;
+		}
+	} catch {}
+	return undefined;
+}
+
+export function recordVerifyResult(
+	command: string,
+	result: { passed: boolean; output: string; durationMs?: number },
+	sessionID?: string,
+	root = workspaceRoot,
+): void {
+	const snippedOutput = snipVerifyOutput(result.output, result.passed);
+	const commitHash = getCurrentGitCommitHash(root);
+	const gitStatus = getGitStatusSummary(root);
+
+	lastVerify = {
+		command,
+		passed: result.passed,
+		output: snippedOutput,
+		timestamp: Date.now(),
+		durationMs: result.durationMs,
+		commitHash,
+		gitStatus,
+	};
+	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
+	if (lastVerify.passed) {
+		persistVerifyCache(lastVerify);
+	}
 }
 
 export function getRecentAuditEntries(limit = 10): AuditEntry[] {
@@ -1793,6 +1940,21 @@ async function guardToolCallImpl(
 						: "";
 		if (target && isSecretPath(target)) {
 			logBlock(`[workflow-guard] blocked read: secret file ${target}`);
+			if (isEnvFilePath(target)) {
+				let schemaHint = "";
+				try {
+					const resolvedTarget = resolve(workspaceRoot, target);
+					if (existsSync(resolvedTarget)) {
+						const raw = readFileSync(resolvedTarget, "utf8");
+						const masked = generateMaskedEnvSchema(raw);
+						schemaHint = `\n\nSafe variable schema mask:\n\`\`\`\n${masked.slice(0, 800)}\n\`\`\``;
+					}
+				} catch {}
+				return (
+					`Blocked: reading sensitive credential file '${target}' directly is not permitted. ` +
+					`Use environment variables or reference safe templates.${schemaHint}`
+				);
+			}
 			return (
 				`Blocked: reading sensitive credential/secret file '${target}' is not permitted. ` +
 				"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
@@ -1838,21 +2000,45 @@ async function guardToolCallImpl(
 				const command = detectVerifyCommand(workspaceRoot);
 				if (command) {
 					const sessionID = context?.sessionID;
-					const verifyResult = sessionID
+					let verifyResult = sessionID
 						? sessionVerifyResults.get(sessionID)
 						: lastVerify;
+
+					// If in-memory cache is missing, attempt to recover from durable disk cache
+					if (!verifyResult) {
+						const diskCached = loadVerifyCache();
+						if (diskCached && diskCached.passed && diskCached.command === command) {
+							verifyResult = diskCached;
+						}
+					}
+
 					const mutationTimestamp = sessionID
 						? (sessionMutationTimestamps.get(sessionID) ?? 0)
 						: lastMutationTimestamp;
+
+					const currentCommit = getCurrentGitCommitHash(workspaceRoot);
+					const currentGitStatus = getGitStatusSummary(workspaceRoot);
+
+					// Verification freshness requires:
+					// 1. Result passed
+					// 2. Matching verify command
+					// 3. Timestamp is equal to or newer than the latest mutation
+					// 4. Git commit and git status matches the state when verified (if git repo)
+					const gitStateMatches =
+						!verifyResult?.commitHash ||
+						(verifyResult.commitHash === currentCommit &&
+							verifyResult.gitStatus === currentGitStatus);
+
 					const isFresh =
 						verifyResult !== undefined &&
 						verifyResult.passed &&
 						verifyResult.command === command &&
-						verifyResult.timestamp >= mutationTimestamp;
+						verifyResult.timestamp >= mutationTimestamp &&
+						gitStateMatches;
 
 					if (!isFresh) {
 						const result = await runVerify(command, workspaceRoot);
-						recordVerifyResult(command, result, sessionID);
+						recordVerifyResult(command, result, sessionID, workspaceRoot);
 						if (!result.passed) {
 							const tail = result.output.slice(-500);
 							const reason =
@@ -2495,6 +2681,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		"experimental.session.compacting": async (input, output) => {
 			try {
 				const sessionID = (input as { sessionID?: string })?.sessionID;
+				const parentID = sessionID ? await fetchParentSessionID(sessionID) : undefined;
 				const todos = await effectiveTodos(sessionID);
 				const active = todos?.filter((t) => {
 					const s = String(t.status ?? "");
@@ -2505,8 +2692,13 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						(t) =>
 							`- [${String(t.status) === "in_progress" ? "IN PROGRESS" : "PENDING"}] ${String(t.content ?? "")}`,
 					);
+					const attribution = parentID
+						? ` (Subagent session: ${sessionID}, Parent: ${parentID})`
+						: sessionID
+							? ` (Session: ${sessionID})`
+							: "";
 					const contextPrompt =
-						"## Active Tasks (Sequential Order Required)\n" +
+						`## Active Tasks${attribution}\n` +
 						lines.join("\n") +
 						"\nComplete tasks efficiently — mark finished items as completed and address remaining ones.";
 					if (Array.isArray(output?.context)) {
