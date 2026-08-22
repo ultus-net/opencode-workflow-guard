@@ -1501,17 +1501,21 @@ export function sendDesktopNotification(title: string, message: string): void {
 
 	try {
 		if (process.platform === "darwin") {
-			spawn(
+			const child = spawn(
 				"osascript",
 				["-e", `display notification "${safeMsg}" with title "${safeTitle}"`],
 				{ stdio: "ignore", detached: true },
-			).unref();
+			);
+			child.on("error", () => {});
+			child.unref();
 		} else if (process.platform === "linux") {
-			spawn(
+			const child = spawn(
 				"notify-send",
 				[safeTitle, safeMsg],
 				{ stdio: "ignore", detached: true },
-			).unref();
+			);
+			child.on("error", () => {});
+			child.unref();
 		}
 	} catch {}
 }
