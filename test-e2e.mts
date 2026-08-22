@@ -9,7 +9,7 @@ const check = (name: string, cond: unknown): void => {
 	cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name));
 };
 
-console.log("— OpenCode Plugin Installation & Runtime Load Test —");
+console.log("- OpenCode Plugin Installation & Runtime Load Test -");
 
 // 1. Verify opencode binary is available
 const opencodeCheck = spawnSync("opencode", ["--version"], { encoding: "utf8" });
