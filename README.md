@@ -50,6 +50,8 @@ opencode-workflow-guard/
 | **19** | **Conflict-Free Pre-Flight** | Verifies via `git merge-tree` that the branch has zero merge conflicts with the base branch (`origin/main`) before allowing PR creation or final task handoff. |
 | **20** | **Merged Branch & Freshness** | Blocks pushing to branches already merged or associated with closed PRs (GitHub & Azure DevOps), and blocks creating fresh branches when the local base is behind remote. |
 | **21** | **Documentation Synchronization** | Verifies that relevant documentation (`README.md` or `docs/`) is reviewed and updated when introducing new features, tools, or policy changes before opening a PR. |
+| **22** | **Non-Interactive Shell & TTY Hang Guard** | Blocks interactive terminal tools (`nano`, `vim`, `less`, `top`, `sudo`, `git rebase -i`, `npm init` / `apt-get` without `-y`) to prevent AI agents from hanging waiting on TTY stdin. Emits native OS desktop notifications on blocks and verification completions. |
+| **23** | **Package Supply-Chain & Dependency Hygiene** | Blocks destructive package commands (`npm audit fix --force`, global unversioned package installs `npm i -g`, direct subshell `npm publish`, and `pip --force-reinstall`) to prevent breaking downgrades and machine state pollution. |
 
 For detailed rule descriptions and overrides, see [docs/policies.md](docs/policies.md).
 

@@ -39,6 +39,9 @@ import {
 	checkBranchBaseIsUpToDate,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
+	checkInteractiveTtyCommand,
+	checkPackageHygiene,
+	sendDesktopNotification,
 	default as defaultExport,
 } from "./workflow-guard.ts";
 import { WorkflowGuardTui } from "./workflow-guard-ui.ts";
@@ -1046,6 +1049,53 @@ const testVerifyCache = {
 persistVerifyCache(testVerifyCache);
 const loadedCache = loadVerifyCache();
 check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
+
+// 16. Policy 22: Non-Interactive Shell & TTY Hang Guard
+console.log("- Policy 22: Non-Interactive Shell & TTY Hang Guard -");
+check("checkInteractiveTtyCommand detects vim", checkInteractiveTtyCommand("vim file.txt").isInteractive);
+check("checkInteractiveTtyCommand detects nano", checkInteractiveTtyCommand("nano /tmp/foo").isInteractive);
+check("checkInteractiveTtyCommand detects less", checkInteractiveTtyCommand("less file.txt").isInteractive);
+check("checkInteractiveTtyCommand detects top", checkInteractiveTtyCommand("top").isInteractive);
+check("checkInteractiveTtyCommand detects sudo", checkInteractiveTtyCommand("sudo apt-get update").isInteractive);
+check("checkInteractiveTtyCommand detects git rebase -i", checkInteractiveTtyCommand("git rebase -i HEAD~2").isInteractive);
+check("checkInteractiveTtyCommand detects npm init without -y", checkInteractiveTtyCommand("npm init").isInteractive);
+check("checkInteractiveTtyCommand permits npm init -y", !checkInteractiveTtyCommand("npm init -y").isInteractive);
+check("checkInteractiveTtyCommand permits npm init --yes", !checkInteractiveTtyCommand("npm init --yes").isInteractive);
+check("checkInteractiveTtyCommand detects apt-get install without -y", checkInteractiveTtyCommand("apt-get install curl").isInteractive);
+check("checkInteractiveTtyCommand permits apt-get install -y", !checkInteractiveTtyCommand("apt-get install -y curl").isInteractive);
+check("checkInteractiveTtyCommand permits regular non-interactive command", !checkInteractiveTtyCommand("ls -la && git status").isInteractive);
+
+check("shell tool blocks nano", blocked(await shell("nano README.md")));
+check("shell tool blocks less", blocked(await shell("less package.json")));
+check("shell tool blocks top", blocked(await shell("top")));
+check("shell tool blocks npm init without flag", blocked(await shell("npm init")));
+check("shell tool allows npm init -y", !(await shell("npm init -y")));
+
+// Desktop notifications dispatch test
+check("sendDesktopNotification runs without throwing", (() => {
+	try {
+		sendDesktopNotification("Test Title", "Test Message");
+		return true;
+	} catch {
+		return false;
+	}
+})());
+
+// 17. Policy 23: Package Supply-Chain & Dependency Hygiene Guard
+console.log("- Policy 23: Package Supply-Chain & Dependency Hygiene Guard -");
+check("checkPackageHygiene detects npm audit fix --force", checkPackageHygiene("npm audit fix --force").isViolating);
+check("checkPackageHygiene detects global npm install", checkPackageHygiene("npm install -g typescript").isViolating);
+check("checkPackageHygiene detects global pnpm add", checkPackageHygiene("pnpm add -g turbo").isViolating);
+check("checkPackageHygiene detects pip force-reinstall", checkPackageHygiene("pip install --force-reinstall requests").isViolating);
+check("checkPackageHygiene detects direct npm publish", checkPackageHygiene("npm publish").isViolating);
+check("checkPackageHygiene permits regular npm install", !checkPackageHygiene("npm install --save-dev typescript").isViolating);
+check("checkPackageHygiene permits regular npm audit", !checkPackageHygiene("npm audit").isViolating);
+check("checkPackageHygiene permits regular npm audit fix", !checkPackageHygiene("npm audit fix").isViolating);
+
+check("shell tool blocks npm audit fix --force", blocked(await shell("npm audit fix --force")));
+check("shell tool blocks global npm install", blocked(await shell("npm i -g tsx")));
+check("shell tool blocks direct npm publish", blocked(await shell("npm publish --access public")));
+check("shell tool allows regular npm install", !(await shell("npm install lodash")));
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);
