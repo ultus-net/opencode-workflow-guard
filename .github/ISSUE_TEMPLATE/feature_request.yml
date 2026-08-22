@@ -1,0 +1,46 @@
+name: Feature Request
+description: Propose a new guard policy, tool, or enhancement
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before proposing a new policy, check `docs/policies.md` to avoid
+        duplicates. Consider whether the enforcement can be done with a
+        deterministic hook rather than a prompt rule.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What workflow violation or DX gap does this address?
+      placeholder: |
+        Agents often do `X`, which causes Y problem. The guard should...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed Policy / Change
+      description: How should the guard detect and respond to this?
+      placeholder: |
+        Block `some-command` via `guardToolCall`, emit warning toast,
+        require user override via WORKFLOW_GUARD_ALLOW_* ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: Why not a prompt rule, permission setting, or CI check?
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: test
+    attributes:
+      label: Testing
+      options:
+        - label: I will contribute regression tests with this feature

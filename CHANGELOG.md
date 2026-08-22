@@ -4,6 +4,19 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 
 ## Unreleased
 
+### Developer Experience
+- Added `.editorconfig` and `.prettierrc` for editor and formatting consistency.
+- Added `.githooks/pre-commit` hook that runs typecheck + unit tests before every commit (activate with `git config core.hooksPath .githooks`).
+- Added `CONTRIBUTING.md` with contributor guide covering test patterns, policy additions, and PR requirements.
+- Added `SECURITY.md` with vulnerability disclosure process for bypass reports.
+- Added `Makefile` with `make test`, `make typecheck`, `make audit` shortcuts.
+- Added `.vscode/launch.json` for debugging unit tests in VSCode.
+- Added GitHub issue templates (`bug_report.yml`, `feature_request.yml`) and `PULL_REQUEST_TEMPLATE.md`.
+- Added `.opencode/opencode.json` for dogfooding — the guard is now self-hosted during development.
+- Added `.opencode/.gitignore` matching upstream OpenCode patterns.
+- Added `dogfood` CI job that loads the guard in a live OpenCode session and verifies `guard_status` responds.
+- Updated `ci.yml` `status` job to depend on the new `dogfood` check.
+
 ### Security & Correctness
 - Hardened PR detection for normal `gh` global-option forms and require an actual `Changelog:`/Changelog heading instead of accepting any mention of the word.
 - Made configured project `verifyCommand` effective and scoped verification freshness to the session that produced the mutation.

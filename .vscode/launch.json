@@ -1,0 +1,25 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Run unit tests",
+			"type": "node",
+			"request": "launch",
+			"program": "${workspaceFolder}/test.mts",
+			"runtimeArgs": ["--experimental-strip-types"],
+			"console": "integratedTerminal",
+			"cwd": "${workspaceFolder}",
+			"skipFiles": ["<node_internals>/**"]
+		},
+		{
+			"name": "Run typecheck",
+			"type": "node",
+			"request": "launch",
+			"runtimeExecutable": "npx",
+			"runtimeArgs": ["tsc", "--noEmit", "-p", "tsconfig.json"],
+			"console": "integratedTerminal",
+			"cwd": "${workspaceFolder}",
+			"skipFiles": ["<node_internals>/**"]
+		}
+	]
+}
