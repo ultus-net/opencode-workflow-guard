@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,17 @@ import {
 	setWorkspaceRoot,
 	setSdkClient,
 	WorkflowGuard,
+	runVerify,
+	getCleanEnv,
+	resetVerifyState,
+	recordMutation,
+	getLastMutationTimestamp,
+	recordVerifyResult,
+	getAuditFilePath,
+	buildReviewRubric,
+	recordReviewResult,
+	getLastReviewResult,
+	resetReviewState,
 	default as defaultExport,
 } from "./workflow-guard.ts";
 import { WorkflowGuardTui } from "./workflow-guard-ui.ts";
@@ -59,7 +70,7 @@ const call = (toolName: string, input: unknown, context?: { sessionID?: string }
 const shell = (cmd: string) => call("bash", { command: cmd });
 const blocked = (r: unknown): boolean => typeof r === "string";
 
-console.log("— Policy 1: native todo gate —");
+console.log("- Policy 1: native todo gate -");
 todo("s-empty");
 todo("s-done", item("a", "completed"), item("b", "completed"));
 todo("s-cancelled", item("a", "completed"), item("b", "cancelled"));
@@ -76,13 +87,12 @@ check("edit allowed with in_progress todo", !(await call("edit", { filePath: joi
 check("edit allowed with mixed pending/completed", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-mixed" })));
 check("task gate is per session (other session's todos don't help)", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-empty" })));
 
-console.log("— Policy 1: todowrite focus & lifecycle validation —");
+console.log("- Policy 1: todowrite focus & lifecycle validation -");
 // Focus rule: only 1 in_progress
 check("todowrite allows 1 in_progress", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "pending")] }, { sessionID: "s-empty" })));
 check("todowrite blocks >1 in_progress (focus rule)", blocked(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
-// Sequential rule: cannot complete task 2 while task 1 is pending
-check("todowrite allows sequential completion", !(await call("todowrite", { todos: [item("a", "completed"), item("b", "in_progress"), item("c", "pending")] }, { sessionID: "s-empty" })));
-check("todowrite blocks out-of-order completion", blocked(await call("todowrite", { todos: [item("a", "pending"), item("b", "completed")] }, { sessionID: "s-empty" })));
+// Flexible out-of-order completion allows finishing independent items without artificial sequential blockers
+check("todowrite allows flexible out-of-order completion", !(await call("todowrite", { todos: [item("a", "pending"), item("b", "completed")] }, { sessionID: "s-empty" })));
 // No silent deletion: active task cannot silently vanish
 todo("s-lifecycle", item("task 1", "completed"), item("task 2", "in_progress"), item("task 3", "pending"));
 check("todowrite allows updating active tasks to completed/cancelled", !(await call("todowrite", { todos: [item("task 1", "completed"), item("task 2", "completed"), item("task 3", "cancelled")] }, { sessionID: "s-lifecycle" })));
@@ -91,7 +101,7 @@ check("todowrite blocks silently dropping task 2 without completion", blocked(aw
 todo("s-finished", item("old 1", "completed"), item("old 2", "cancelled"));
 check("todowrite allows fresh list when previous list is 100% finished", !(await call("todowrite", { todos: [item("new 1", "pending")] }, { sessionID: "s-finished" })));
 
-console.log("— Policy 1: subagent parent-chain inheritance —");
+console.log("- Policy 1: subagent parent-chain inheritance -");
 fakeParents.set("s-sub", "s-active");
 check("subagent inherits parent's active todos", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-sub" })));
 fakeParents.set("s-sub2", "s-mid");
@@ -107,7 +117,7 @@ fakeParents.set("s-cycle-a", "s-cycle-b");
 fakeParents.set("s-cycle-b", "s-cycle-a");
 check("parent-chain cycles terminate (blocked, no hang)", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-cycle-a" })));
 
-console.log("— Policy 1: fail-open when todos can't be determined —");
+console.log("- Policy 1: fail-open when todos can't be determined -");
 setSdkClient({ session: { todo: async () => { throw new Error("boom"); } } });
 check("fetch failure fails open", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-active" })));
 setSdkClient(undefined);
@@ -115,20 +125,25 @@ check("missing client fails open", !(await call("edit", { filePath: join(root, "
 check("missing sessionID fails open", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" })));
 setSdkClient(fakeClient);
 
-console.log("— Policy 2: push to main/master —");
+console.log("- Policy 2: push to main/master -");
 check("block git push origin main", blocked(await shell("git push origin main")));
 check("block git push origin master", blocked(await shell("git push origin master")));
 check("block git push --force origin main", blocked(await shell("git push --force origin main")));
 check("allow git push origin feature/x", !(await shell("git push origin feature/x")));
 check("allow push to main-backup (ref-like path)", !(await shell("git push origin main-backup")));
 
-console.log("— Policy 3: PR changelog —");
+console.log("- Policy 3: PR changelog (GitHub & Azure DevOps) -");
 check("block gh pr create without changelog", blocked(await shell("gh pr create --title t --body 'no changes here'")));
 check("allow gh pr create with Changelog: body", !(await shell("gh pr create --title t --body 'Changelog: fixed stuff'")));
 const bodyFile = join(root, "pr-body.md");
 writeFileSync(bodyFile, "## Changelog\n- fix\n");
 check("allow gh pr create with -F body-file containing changelog", !(await shell(`gh pr create -F ${bodyFile}`)));
-console.log("— Policy 4: destructive commands —");
+check("block az repos pr create without changelog", blocked(await shell("az repos pr create --title t --description 'no changes here'")));
+check("allow az repos pr create with Changelog: description", !(await shell("az repos pr create --title t --description 'Changelog: added feature'")));
+check("allow az repos pr create with -d Changelog", !(await shell("az repos pr create --title t -d 'Changelog: added feature'")));
+check("allow az repos pr create with --description-file containing changelog", !(await shell(`az repos pr create --description-file ${bodyFile}`)));
+check("allow git commit message mentioning gh pr create without changelog block", !(await shell("git commit -m 'feat: add gh pr create support'")));
+console.log("- Policy 4: destructive commands -");
 check("block kubectl delete", blocked(await shell("kubectl delete pod foo")));
 check("block helm uninstall", blocked(await shell("helm uninstall my-release")));
 check("block terraform destroy", blocked(await shell("terraform destroy -auto-approve")));
@@ -148,7 +163,7 @@ process.env.WORKFLOW_GUARD_ALLOW_LIVE = "1";
 check("allow destructive with env override (user-set)", !(await shell("kubectl delete pod foo")));
 delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 
-console.log("— Policy 4: destructive command evasions (regression) —");
+console.log("- Policy 4: destructive command evasions (regression) -");
 check("allow rm -rf on workspace dirs", !(await shell("rm -rf node_modules")));
 check("allow rm -r on workspace dirs", !(await shell("rm -r build/")));
 check("block rm -rf on system paths", blocked(await shell("rm -rf /")));
@@ -169,7 +184,7 @@ check("block script file containing destructive command (laundering guard)", blo
 check("block apply_patch containing destructive command", blocked(await call("apply_patch", { patchText: "*** Add File: script.sh\n+kubectl delete ns foo\n" }, { sessionID: "s-active" })));
 check("allow write of benign script content", !(await call("write", { filePath: join(root, "ok.sh"), content: "#!/bin/sh\necho hello\n" }, { sessionID: "s-active" })));
 
-console.log("— Policy 2: push evasions (regression) —");
+console.log("- Policy 2: push evasions (regression) -");
 check("block push refspec HEAD:main", blocked(await shell("git push origin HEAD:main")));
 check("block push delete :main", blocked(await shell("git push origin :main")));
 check("block push +main (force refspec)", blocked(await shell("git push origin +main")));
@@ -177,7 +192,7 @@ check("block push local:main", blocked(await shell("git push origin feature/x:ma
 check("allow push HEAD:main-backup", !(await shell("git push origin HEAD:main-backup")));
 check("git -C: push normalized then blocked", blocked(await shell("git -C /repo push origin main")));
 
-console.log("— Policy 5: MCP mutation guard —");
+console.log("- Policy 5: MCP mutation guard -");
 check("block mcp__github__create_issue", blocked(await call("mcp__github__create_issue", {})));
 check("block mcp__github__merge_pull_request", blocked(await call("mcp__github__merge_pull_request", {})));
 check("allow mcp__github__list_pull_requests", !(await call("mcp__github__list_pull_requests", {})));
@@ -187,7 +202,7 @@ check("block mcp__azure-devops__create_work_item (dash separator)", blocked(awai
 check("block mcp__gh__create_issue (gh alias)", blocked(await call("mcp__gh__create_issue", {})));
 check("block azure_devops flat naming", blocked(await call("azure_devops_delete_repo", {})));
 
-console.log("— Policy 6: settings tamper (regression: quote/glob evasion) —");
+console.log("- Policy 6: settings tamper (regression: quote/glob evasion) -");
 check("block opencode auth", blocked(await shell("opencode auth login")));
 check("block opencode config edit", blocked(await shell(`echo '{}' > ${root}/opencode.json`)));
 check("block writing ~/.config/opencode/opencode.json", blocked(await shell(`echo '{}' > /var/home/x/.config/opencode/opencode.json`)));
@@ -200,13 +215,13 @@ check("block sed -i on the guard plugin itself", blocked(await shell("sed -i 's/
 check("block rm on the TUI plugin", blocked(await shell("rm ~/.config/opencode/ui/workflow-guard-ui.tsx")));
 check("allow normal command", !(await shell("ls -la && git status")));
 
-console.log("— Policy 6: tamper via edit tools (path protection) —");
+console.log("- Policy 6: tamper via edit tools (path protection) -");
 check("block edit of project opencode.json", blocked(await call("edit", { filePath: join(root, "opencode.json"), oldString: "a", newString: "b" }, { sessionID: "s-active" })));
 check("block write of .opencode/project config", blocked(await call("write", { filePath: join(root, ".opencode", "opencode.json"), content: "{}" }, { sessionID: "s-active" })));
 check("block write of global opencode config path", blocked(await call("write", { filePath: "/var/home/x/.config/opencode/opencode.json", content: "{}" }, { sessionID: "s-active" })));
 check("block apply_patch to opencode.json", blocked(await call("apply_patch", { patchText: "*** Update File: opencode.json\n" }, { sessionID: "s-active" })));
 check("allow edit of normal source file", !(await call("edit", { filePath: join(root, "src", "index.ts"), oldString: "a", newString: "b" }, { sessionID: "s-active" })));
-console.log("— Policy 7: branch guard —");
+console.log("- Policy 7: branch guard -");
 // Non-git workspace (current `root` is a plain temp dir): git writes allowed.
 check("non-git workspace: git commit allowed", !(await shell("git commit -m test")));
 check("non-git workspace: edit allowed", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-active" })));
@@ -228,10 +243,10 @@ check("on feature branch: edit still needs active todos", blocked(await call("ed
 rmSync(repo, { recursive: true, force: true });
 setWorkspaceRoot(root);
 
-console.log("— Policy 7: git global-flag evasions (regression) —");
+console.log("- Policy 7: git global-flag evasions (regression) -");
 const repo2 = mkdtempSync(join(tmpdir(), "wg-repo2-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: repo2 });
-setWorkspaceRoot(root); // workspace NOT the repo — repo2 on main tested via -C
+setWorkspaceRoot(root); // workspace NOT the repo - repo2 on main tested via -C
 check("git -C <main-repo> commit blocked (dir-aware branch guard)", blocked(await shell(`git -C ${repo2} commit -m x`)));
 check("git --git-dir=<main-repo> commit blocked", blocked(await shell(`git --git-dir=${repo2}/.git commit -m x`)));
 check("allow git -C <main-repo> status (read-only)", !(await shell(`git -C ${repo2} status`)));
@@ -246,7 +261,7 @@ setWorkspaceRoot(root);
 rmSync(repo2, { recursive: true, force: true });
 rmSync(repoMain, { recursive: true, force: true });
 
-console.log("— Policies 1/7/8: shell file-mutation gates (regression) —");
+console.log("- Policies 1/7/8: shell file-mutation gates (regression) -");
 check("redirect > file needs active todos", blocked(await call("bash", { command: "echo x > src/a.ts" }, { sessionID: "s-empty" })));
 check("redirect > file allowed with active todos", !(await call("bash", { command: "echo x > src/a.ts" }, { sessionID: "s-active" })));
 check("redirect to opencode.json always blocked (tamper)", blocked(await call("bash", { command: "echo x > opencode.json" }, { sessionID: "s-active" })));
@@ -261,7 +276,7 @@ check("git apply needs todos (patch via shell)", blocked(await call("bash", { co
 check("git apply allowed with todos", !(await call("bash", { command: "git apply patch.diff" }, { sessionID: "s-active" })));
 check("non-mutating shell unaffected (ls, cat)", !(await call("bash", { command: "ls -la && cat file" }, { sessionID: "s-empty" })));
 
-console.log("— Policy 8: workspace boundary guard —");
+console.log("- Policy 8: workspace boundary guard -");
 check("allow edit within workspace", !(await call("edit", { filePath: join(root, "src", "index.ts"), content: "x" }, { sessionID: "s-active" })));
 check("allow write relative path within workspace", !(await call("write", { filePath: "src/a.ts", content: "x" }, { sessionID: "s-active" })));
 check("block edit traversing outside workspace (../)", blocked(await call("edit", { filePath: join(root, "..", "outside.ts"), content: "x" }, { sessionID: "s-active" })));
@@ -269,7 +284,7 @@ check("block write to /etc/passwd", blocked(await call("write", { filePath: "/et
 check("allow apply_patch within workspace", !(await call("apply_patch", { patchText: "*** Update File: src/app.ts\n" }, { sessionID: "s-active" })));
 check("block apply_patch escaping workspace", blocked(await call("apply_patch", { patchText: "*** Update File: ../../secret.env\n" }, { sessionID: "s-active" })));
 
-console.log("— Compaction focus preservation & TUI toast —");
+console.log("- Compaction focus preservation & TUI toast -");
 let toasts: unknown[] = [];
 const toastClient = {
 	session: fakeClient.session,
@@ -304,13 +319,13 @@ if (typeof beforeFn === "function") {
 }
 check("tool block throws clean error without intrusive popup toasts", toasts.length === 0);
 
-console.log("— Input shapes —");
+console.log("- Input shapes -");
 check("single string command", blocked(await call("bash", "git push origin main")));
 check("legacy tool name run_commands", blocked(await call("run_commands", { commands: ["git push origin main"] })));
 check("plain args object command field", blocked(await call("bash", { command: "git push origin main" })));
 
-console.log("— Plugin export shape —");
-// The default export must be a V1 PluginModule record — a bare function
+console.log("- Plugin export shape -");
+// The default export must be a V1 PluginModule record - a bare function
 // default export combined with the extra named exports would make opencode
 // 1.18+ treat every export as a plugin and crash the server.
 check("default export is a V1 PluginModule with id + server()", (() => {
@@ -370,7 +385,7 @@ check("hook allows write with active todos", todoPass);
 check("event hook emits no intrusive startup toast", toasts.length === 0);
 
 // ── New: audit trail ──
-console.log("— Audit trail —");
+console.log("- Audit trail -");
 await shell("git push origin main"); // block
 await shell("ls -la");                // allow
 // The log file is only opened when needed; the implementation writes
@@ -380,13 +395,13 @@ await shell("ls -la");                // allow
 check("audit writes do not throw", true);
 
 // ── New: secret-content scan ──
-console.log("— Secret-content scan —");
+console.log("- Secret-content scan -");
 check("block write containing AWS key", blocked(await call("write", { filePath: join(root, "x.ts"), content: 'export const K = "AKIA0123ABCDEFG45678";' }, { sessionID: "s-active" })));
 check("block write containing private key header", blocked(await call("write", { filePath: join(root, "x.ts"), content: "-----BEGIN RSA PRIVATE KEY-----" }, { sessionID: "s-active" })));
 check("allow benign content", !(await call("write", { filePath: join(root, "x.ts"), content: "export const K = 'public';" }, { sessionID: "s-active" })));
 
 // ── New: shell.env scrub ──
-console.log("— shell.env scrub —");
+console.log("- shell.env scrub -");
 const envHooks = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
 const envObj: Record<string, string> = { AWS_SECRET: "x", OPENAI_API_KEY: "y", NORMAL: "keep" };
 if (typeof envHooks["shell.env"] === "function") {
@@ -396,7 +411,7 @@ check("sensitive keys emptied", envObj.AWS_SECRET === "" && envObj.OPENAI_API_KE
 check("normal key preserved", envObj.NORMAL === "keep");
 
 // ── New: command.executed channel ──
-console.log("— command.executed guard —");
+console.log("- command.executed guard -");
 const cmdEvt = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
 let blockedEvt: string | undefined;
 if (typeof cmdEvt.event === "function") {
@@ -420,6 +435,193 @@ await WorkflowGuardTui(fakeTuiApi as any, undefined, {} as any);
 check("tui plugin registers with order", registeredOrder === 1);
 check("tui plugin registers session_prompt_right slot", typeof registeredSlots.session_prompt_right === "function");
 check("tui plugin registers home_prompt_right slot", typeof registeredSlots.home_prompt_right === "function");
+
+// ── Adversarial tests & hardened invariants ──
+console.log("- Adversarial tests & hardened invariants -");
+
+// 1. Symlink escape via path traversal
+const outsideDir = mkdtempSync(join(tmpdir(), "wg-outside-"));
+const symlinkPath = join(root, "symlink_dir");
+try {
+	symlinkSync(outsideDir, symlinkPath);
+	check(
+		"symlink pointing outside workspace is blocked on edit",
+		blocked(
+			await call(
+				"edit",
+				{ filePath: join(symlinkPath, "target.txt"), content: "pwn" },
+				{ sessionID: "s-active" },
+			),
+		),
+	);
+} catch (e) {
+	console.log("  skip symlink test (symlink creation not supported)", e);
+} finally {
+	rmSync(outsideDir, { recursive: true, force: true });
+}
+
+// 2. Compound shell mutation evasion (benign first, destructive / escaping second)
+check(
+	"compound shell: benign first, escaping second is blocked",
+	blocked(
+		await call(
+			"bash",
+			{ command: "echo ok > src/a.ts && echo x > /etc/passwd" },
+			{ sessionID: "s-active" },
+		),
+	),
+);
+check(
+	"compound shell: benign first, settings tamper second is blocked",
+	blocked(
+		await call(
+			"bash",
+			{ command: "echo ok > src/a.ts && echo x > opencode.json" },
+			{ sessionID: "s-active" },
+		),
+	),
+);
+
+// 3. Git chained command normalization
+check(
+	"chained git command normalization (true && git push origin main)",
+	blocked(await shell("true && git push origin main")),
+);
+
+// 4. Git external repository mutation outside workspace
+const externalRepo = mkdtempSync(join(tmpdir(), "wg-external-repo-"));
+spawnSync("git", ["init", "-b", "feat/external"], { cwd: externalRepo });
+check(
+	"git -C to external repository outside workspace is blocked for writes",
+	blocked(await shell(`git -C ${externalRepo} commit -m test`)),
+);
+rmSync(externalRepo, { recursive: true, force: true });
+
+// 5. Verification isolation and privilege checks
+const verifyDestructive = await runVerify("kubectl delete pod foo", root);
+check(
+	"runVerify blocks destructive live commands in verify script",
+	!verifyDestructive.passed &&
+		verifyDestructive.output.includes("destructive command"),
+);
+
+const verifyTamper = await runVerify("echo {} > opencode.json", root);
+check(
+	"runVerify blocks settings tamper in verify script",
+	!verifyTamper.passed &&
+		verifyTamper.output.includes("settings tamper"),
+);
+
+const verifyTimeout = await runVerify("sleep 5", root, 100);
+check(
+	"runVerify terminates timed-out verification commands safely",
+	!verifyTimeout.passed && verifyTimeout.output.includes("timed out"),
+);
+
+const cleanEnv = getCleanEnv();
+check(
+	"getCleanEnv strips sensitive keys",
+	cleanEnv.AWS_SECRET === undefined &&
+		cleanEnv.OPENAI_API_KEY === undefined &&
+		cleanEnv.GITHUB_TOKEN === undefined,
+);
+
+// 6. Verification freshness & todowrite finalization
+const verifyRepo = mkdtempSync(join(tmpdir(), "wg-verify-repo-"));
+writeFileSync(
+	join(verifyRepo, "package.json"),
+	JSON.stringify({
+		scripts: {
+			test: "node -e 'process.exit(0)'",
+		},
+	}),
+);
+setWorkspaceRoot(verifyRepo);
+resetVerifyState();
+todo("s-verify-flow", item("work item", "in_progress"));
+
+// Edit file -> records mutation
+await call(
+	"edit",
+	{ filePath: join(verifyRepo, "code.ts"), content: "hello" },
+	{ sessionID: "s-verify-flow" },
+);
+check(
+	"mutation timestamp recorded after edit",
+	typeof getLastMutationTimestamp() === "number" && getLastMutationTimestamp() > 0,
+);
+
+// Finalize todos -> triggers runVerify on package.json test script
+const finalRes = await call(
+	"todowrite",
+	{ todos: [item("work item", "completed")] },
+	{ sessionID: "s-verify-flow" },
+);
+check("todowrite finalization succeeds when test passes", !blocked(finalRes));
+
+// Now change test to fail in package.json
+writeFileSync(
+	join(verifyRepo, "package.json"),
+	JSON.stringify({
+		scripts: {
+			test: "node -e 'process.exit(1)'",
+		},
+	}),
+);
+resetVerifyState();
+todo("s-verify-fail", item("failing work", "in_progress"));
+await call(
+	"edit",
+	{ filePath: join(verifyRepo, "code.ts"), content: "new change" },
+	{ sessionID: "s-verify-fail" },
+);
+const failFinalRes = await call(
+	"todowrite",
+	{ todos: [item("failing work", "completed")] },
+	{ sessionID: "s-verify-fail" },
+);
+check(
+	"todowrite finalization blocked when verification script fails",
+	blocked(failFinalRes),
+);
+
+rmSync(verifyRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
+// 7. Audit log structure
+const auditFile = getAuditFilePath();
+check("audit file path is valid string", typeof auditFile === "string" && auditFile.length > 0);
+if (existsSync(auditFile)) {
+	try {
+		const lines = readFileSync(auditFile, "utf8").trim().split("\n");
+		const lastLine = lines[lines.length - 1];
+		if (lastLine) {
+			const parsed = JSON.parse(lastLine);
+			check(
+				"audit log entry parses as valid JSON with ts, tool, and decision",
+				Boolean(parsed.ts && parsed.tool && parsed.decision),
+			);
+		}
+	} catch (e) {
+		check("audit log entry valid JSON", false);
+	}
+}
+
+// 8. Secondary Review Spoke checks
+console.log("- Secondary Review Spoke & Rubric -");
+const sampleDiff = "diff --git a/src/index.ts b/src/index.ts\n+export function add(a: number, b: number) { return a + b; }";
+const rubric = buildReviewRubric(sampleDiff, "Add math utilities");
+check("buildReviewRubric includes Test Integrity axis", rubric.includes("Test Integrity"));
+check("buildReviewRubric includes Task Completeness axis", rubric.includes("Task Completeness"));
+check("buildReviewRubric includes Security & Safety axis", rubric.includes("Security & Safety"));
+check("buildReviewRubric includes Azure DevOps & GitHub fit", rubric.includes("Azure DevOps"));
+check("buildReviewRubric embeds diff", rubric.includes("export function add"));
+
+resetReviewState();
+check("getLastReviewResult initial state is undefined", getLastReviewResult() === undefined);
+recordReviewResult("reviewer-subagent", "All checks passed. Real unit tests verified.", true);
+const reviewRes = getLastReviewResult();
+check("recordReviewResult records passed reviewer and summary", reviewRes?.passed === true && reviewRes?.reviewer === "reviewer-subagent");
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;

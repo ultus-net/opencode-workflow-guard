@@ -4,12 +4,24 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 
 ## [Unreleased]
 
+### Security & Robustness
+- **Privilege-isolated verification execution (Policy 10).** Verification runs with scrubbed credentials (`getCleanEnv()`), output caps, safety checks against destructive commands, and a 30s timeout to prevent process hangs or credential exfiltration.
+- **Multi-segment shell mutation scanning (Policy 8).** Fixed compound command parsing in `guardShellMutation()` to inspect all segments rather than returning early on the first match, preventing evasion via benign prefix commands.
+- **Symlink-aware workspace boundary enforcement (Policy 8).** Uses `realpathSync` to ensure target paths and existing ancestor directories cannot traverse outside the workspace root via symlinks.
+- **External Git repository protection (Policy 7/8).** Confines mutating Git operations (`git -C /other-repo commit`) to repositories within the workspace boundary unless `WORKFLOW_GUARD_ALLOW_LIVE=1` is set.
+
+### Developer Experience & Accountability
+- **Flexible task execution (Policy 1).** Relaxed strict top-down sequential completion blockers while maintaining single-task `in_progress` focus and silent deletion prevention.
+- **Evidence-based verification freshness (Policy 10).** Associates mutation timestamps with verification runs, ensuring test evidence is fresh before allowing finalization.
+- **Enhanced audit logging (Policy 14).** Expanded audit records with mutation targets, verification command results, duration, and authorization context.
+- **Comprehensive adversarial test suite.** Added unit and adversarial tests covering symlink escapes, compound shell mutations, verification timeouts, privilege scrubbing, and external Git targets (169 tests total).
+
 ### Fixed
 - **README policy table now starts at Policy 1.** The "Summary of Enforced Policies" table omitted Policy 1 (Task Gate & Lifecycle) and began at 2; the row is restored. `docs/policies.md` also regains its missing Policy 9 (Script-Laundering Guard) section.
 
 ### Changed
 - **Targeted `rm -rf` guard (Policy 4).** Recursive/forced deletion is now blocked only when it targets system/home/wildcard paths (`/`, `~`, `*`); workspace-local cleanup (`rm -rf node_modules`, `rm -rf dist/`, `rm -r build/`) is allowed, removing a routine false positive.
-- **Verification runs at finalization, not per-edit (Policy 10).** The verify command (`WORKFLOW_GUARD_VERIFY` / auto-detected `npm test`) no longer spawns in the background after every edit — it runs once, on demand, when the agent attempts to mark every todo completed. This eliminates test churn on intermediate broken states and the CPU cost of per-edit runs.
+- **Verification runs at finalization, not per-edit (Policy 10).** The verify command (`WORKFLOW_GUARD_VERIFY` / auto-detected `npm test`) no longer spawns in the background after every edit - it runs once, on demand, when the agent attempts to mark every todo completed. This eliminates test churn on intermediate broken states and the CPU cost of per-edit runs.
 - **Shell env scrub announces itself (Policy 12).** When the `shell.env` hook empties sensitive variables, a warning is logged naming the scrubbed keys so auth failures are diagnosable instead of silent.
 - **Script-laundering scan skips comment lines (Policy 9).** Payloads are scanned line-by-line; lines starting with `#`, `//`, `/*`, or `*` are ignored, reducing false positives on documented cleanup commands while keeping executable lines covered.
 
@@ -21,7 +33,7 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
   - Exempted `dependabot[bot]` from the PR CHANGELOG gate in CI.
 
 ### Added (DX improvements)
-- **Post-edit verification gate (Policy 10).** After every successful `edit`/`write`/`apply_patch`, the guard runs `WORKFLOW_GUARD_VERIFY` (or auto-detects `npm test` from `package.json`) in the background. Marking every todo completed is blocked while the latest verify run is failing — the agent can no longer claim "done" over a red build.
+- **Post-edit verification gate (Policy 10).** After every successful `edit`/`write`/`apply_patch`, the guard runs `WORKFLOW_GUARD_VERIFY` (or auto-detects `npm test` from `package.json`) in the background. Marking every todo completed is blocked while the latest verify run is failing - the agent can no longer claim "done" over a red build.
 - **Secret-content scan (Policy 11).** File payloads are blocked at write/edit when they carry AWS keys, private key headers, GitHub tokens (`ghp_`, `github_pat_`, …), LLM/API keys, Google/Slack tokens, or env-style assignments (`AWS_SECRET_ACCESS_KEY=…`).
 - **Shell environment scrub (Policy 12).** `shell.env` empties sensitive vars (`AWS_*`, `KUBE*`, `OPENAI*`, `ANTHROPIC*`, `GH_/GITHUB_*`, `GOOGLE_/GCP_`, `AZURE_`, `SLACK_`, `NPM_`, `DOCKER_`, `KUBECONFIG`, plus fixed names like `GITHUB_TOKEN`, `OPENAI_API_KEY`, `NPM_TOKEN`) so the agent cannot carry live credentials into shell sessions by default.
 - **Command-channel audit (Policy 13).** `command.executed` events are journaled to the durable audit trail alongside tool decisions.
@@ -35,7 +47,7 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 
 ### Security (Fixed Holes)
 - **Removed `# allow-live` in-command override.** The marker let the agent grant itself live-system access, and the block message advertised how. The `WORKFLOW_GUARD_ALLOW_LIVE=1` environment variable (set by the user before launch) is now the only override.
-- **Tamper guard closes edit-tool hole.** `edit`/`write`/`apply_patch` were unchecked on path tamper — a project-level `opencode.json`/`.opencode/` was directly editable. `isProtectedPath()` is now enforced on all edit-tool targets (not just shell).
+- **Tamper guard closes edit-tool hole.** `edit`/`write`/`apply_patch` were unchecked on path tamper - a project-level `opencode.json`/`.opencode/` was directly editable. `isProtectedPath()` is now enforced on all edit-tool targets (not just shell).
 - **Guard no longer defeats itself.** Tamper patterns now cover the guard's own plugin and TUI files (`~/.config/opencode/plugins/*`, `~/.config/opencode/ui/*`) with any extension, closing the `sed -i … workflow-guard.ts` hole.
 - **Shell file mutations now gated.** The edit-tool gates (todo activity, branch, boundary) were bypassed by shell redirect (`>`), `tee`, `sed -i`, `cp`/`mv`, and `git apply`/`git am`. `guardShellMutation()` applies the same gates to those idioms.
 - **Script-laundering guard.** `write`/`apply_patch` payloads are scanned for destructive patterns so `write deploy.sh` → `bash deploy.sh` no longer smuggles blocked commands.

@@ -77,7 +77,7 @@ jobs:
       - run: npm audit --audit-level=high
 
   # ───── PR etiquette ─────
-  # Every PR must update CHANGELOG.md — matches the plugin's own Policy 3.
+  # Every PR must update CHANGELOG.md - matches the plugin's own Policy 3.
   changelog:
     name: Changelog updated
     runs-on: ubuntu-latest
@@ -85,17 +85,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
-          # Required for merge-base below; default --depth=1 hides the base.
           fetch-depth: 0
-      - name: Require CHANGELOG update in PR
+      - name: Verify CHANGELOG modified
         run: |
-          MERGE_BASE=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
-          if [ -z "$MERGE_BASE" ]; then
-            echo "::error::no merge base between origin/${{ github.base_ref }} and HEAD"
+          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -qi '^CHANGELOG\.md$'; then
+            echo "CHANGELOG.md updated - good."
+          else
+            echo "::error::PR diff must include changes to CHANGELOG.md"
             exit 1
           fi
           if git diff --name-only "$MERGE_BASE...HEAD" | grep -q "CHANGELOG.md"; then
-            echo "CHANGELOG.md updated — good."
+            echo "CHANGELOG.md updated - good."
           else
             echo "::error::PR must include a CHANGELOG.md update (Policy 3)."
             exit 1

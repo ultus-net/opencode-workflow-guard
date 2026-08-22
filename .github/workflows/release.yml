@@ -4,7 +4,7 @@ on:
   push:
     tags: ["v*"]
 
-# Publishing is the only job here — provenance and the npm token are not
+# Publishing is the only job here - provenance and the npm token are not
 # granted to any other job.
 permissions:
   contents: write

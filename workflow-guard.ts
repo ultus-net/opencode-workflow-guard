@@ -1,5 +1,5 @@
 /**
- * Workflow Guard Plugin for OpenCode (hooks-only — no prompt rules)
+ * Workflow Guard Plugin for OpenCode (hooks-only - no prompt rules)
  *
  * Deterministic enforcement via the `tool.execute.before` plugin hook
  * (https://opencode.ai/docs/plugins/). Throwing from the hook blocks the
@@ -9,27 +9,27 @@
  *     until the session's NATIVE todo list (the built-in `todowrite` tool,
  *     https://opencode.ai/docs/tools/#todowrite) has at least one active
  *     item (pending/in_progress). Once every item is completed/cancelled,
- *     edits block again — forcing a fresh breakdown per request. Subagent
+ *     edits block again - forcing a fresh breakdown per request. Subagent
  *     sessions (todowrite is denied for them by default) inherit the todo
  *     list of their parent session.
  *  2. Git pushes to main/master (incl. refspecs like HEAD:main or :main)
  *     are hard-blocked.
- *  3. PR creation (gh) requires a changelog — either a CHANGELOG update in
+ *  3. PR creation (gh) requires a changelog - either a CHANGELOG update in
  *     the branch's diff or a "Changelog:" section in the PR body.
  *  4. Live-system guard: destructive commands targeting infrastructure,
  *     databases, or remote APIs are blocked unless the USER overrides with
  *     WORKFLOW_GUARD_ALLOW_LIVE=1 in the environment before launch. There
- *     is deliberately no in-command override — the agent cannot grant it
+ *     is deliberately no in-command override - the agent cannot grant it
  *     to itself.
  *  5. MCP mutation guard: GitHub / Azure DevOps MCP tools with mutation
  *     verbs in their names are blocked (read-only verbs pass).
  *  6. Settings tamper guard: the agent cannot edit opencode.json /
- *     permission config / the guard's own plugin files — via shell OR via
- *     the file-editing tools — or run `opencode auth` to weaken its gates.
+ *     permission config / the guard's own plugin files - via shell OR via
+ *     the file-editing tools - or run `opencode auth` to weaken its gates.
  *  7. Branch guard: on main/master, file mutations and history-changing
  *     git commands are blocked until a feature branch is created.
  *  8. Workspace boundary guard: file mutations cannot escape the workspace
- *     root — via edit tools, patches, or shell redirection/copy commands.
+ *     root - via edit tools, patches, or shell redirection/copy commands.
  *  9. Script laundering guard: content written via edit/write/apply_patch
  *     is scanned for destructive commands, so `write deploy.sh` followed by
  *     `bash deploy.sh` cannot smuggle blocked operations past the shell
@@ -42,7 +42,7 @@
  * for hard guarantees.
  *
  * Install: copy this file into <project>/.opencode/plugins/ or
- * ~/.config/opencode/plugins/ — files there are auto-loaded at startup.
+ * ~/.config/opencode/plugins/ - files there are auto-loaded at startup.
  * Requires opencode >= 1.18 (todo endpoint GET /session/:id/todo).
  */
 
@@ -98,12 +98,18 @@ function normalize(cmd: string): string {
 // Matches a direct push of main|master: "git push origin main",
 // "git push main", "git push origin local:main" (refspec), "git push
 // origin :main" (branch deletion), "git push origin +HEAD:master" (forced
-// refspec). The right-hand side of a refspec must be exactly main/master —
+// refspec). The right-hand side of a refspec must be exactly main/master -
 // feature/main-fix or HEAD:main-backup are fine.
 const PUSH_TO_MAIN_RE =
 	/\bgit\s+push\b[^|;&]*(?:^|\s)\+?[\w./-]*:(?:main|master)(?![\w./-])|\bgit\s+push\b[^|;&]*(?:\s|\/)(?:main|master)(?![\w./-])/;
-const PR_CREATE_RE = /\bgh\s+pr\s+create\b/;
+const PR_CREATE_INVOCATION_RE = /^(?:gh\s+pr\s+create|az\s+repos\s+pr\s+create)\b/;
 const CHANGELOG_SECTION_RE = /changelog/i;
+
+function hasPrCreateInvocation(command: string): boolean {
+	return command
+		.split(/[\n|;&]+/)
+		.some((seg) => PR_CREATE_INVOCATION_RE.test(seg.trim()));
+}
 
 // ── Task gate (native session todos) ─────────────────────────────────────────
 // opencode has a built-in per-session todo system: the `todowrite` tool
@@ -118,7 +124,7 @@ const EDIT_TOOL_NAMES = new Set(["edit", "write", "patch", "apply_patch"]);
 
 // Subagent sessions spawn with `todowrite` denied (documented: "This tool
 // is disabled for subagents by default"), so a subagent's own list is
-// usually empty — the gate then falls back to the parent session's list
+// usually empty - the gate then falls back to the parent session's list
 // (sessions expose parentID) so delegated work stays gated on the
 // orchestrator's breakdown.
 
@@ -130,8 +136,8 @@ export interface TodoItem {
 }
 
 // Minimal structural type for the SDK client (documented endpoints
-// GET /session/:id/todo, GET /session/:id, POST /tui/show-toast). Kept structural —
-// not the generated SDK types — so the plugin tolerates SDK minor-version drift.
+// GET /session/:id/todo, GET /session/:id, POST /tui/show-toast). Kept structural -
+// not the generated SDK types - so the plugin tolerates SDK minor-version drift.
 export interface TodoSdkClient {
 	session?: {
 		todo?: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
@@ -176,8 +182,8 @@ async function fetchParentSessionID(sessionID: string): Promise<string | undefin
 }
 
 /**
- * Todos governing a session: its own list, or — when it has none (typically
- * subagents, which cannot todowrite) — the nearest ancestor session's list.
+ * Todos governing a session: its own list, or - when it has none (typically
+ * subagents, which cannot todowrite) - the nearest ancestor session's list.
  * Returns undefined when the list cannot be determined (client missing or
  * fetch failed); the gate then fails open instead of bricking the agent.
  */
@@ -204,9 +210,7 @@ function hasActiveTodo(todos: TodoItem[]): boolean {
 /**
  * Validates todo discipline rules:
  *  1. Focus rule: max one task 'in_progress' at a time.
- *  2. Sequential execution: task N cannot be marked 'completed' while an earlier
- *     task 0..N-1 is still 'pending' or 'in_progress'.
- *  3. Task lifecycle: active tasks cannot silently vanish without being marked
+ *  2. Task lifecycle: active tasks cannot silently vanish without being marked
  *     'completed' or 'cancelled'.
  */
 export function validateTodoLifecycle(
@@ -222,36 +226,16 @@ export function validateTodoLifecycle(
 		);
 	}
 
-	// Rule 2: Top-down sequential completion
-	let seenUnfinished: string | undefined;
-	let unfinishedName = "";
-	for (const item of newTodos) {
-		const status = String(item.status ?? "");
-		if (status === "completed" && seenUnfinished !== undefined) {
-			return (
-				`Blocked todowrite: task '${String(item.content ?? "")}' cannot be marked completed ` +
-				`while an earlier task ('${unfinishedName}') is still ${seenUnfinished}. ` +
-				"Work through tasks top to bottom in list order."
-			);
-		}
-		if (status === "pending" || status === "in_progress") {
-			if (seenUnfinished === undefined) {
-				seenUnfinished = status;
-				unfinishedName = String(item.content ?? "");
-			}
-		}
-	}
-
-	// Rule 3: No silent task deletion while active work remains
+	// Rule 2: No silent task deletion while active work remains
 	if (existingTodos && existingTodos.length > 0) {
 		const activeExisting = existingTodos.filter((t) => {
 			const s = String(t.status ?? "");
 			return s === "pending" || s === "in_progress";
 		});
 		if (activeExisting.length > 0) {
-			const newContents = new Set(newTodos.map((t) => String(t.content ?? "")));
+			const newContents = new Set(newTodos.map((t) => String(t.content ?? "").trim()));
 			const missing = activeExisting.find(
-				(t) => !newContents.has(String(t.content ?? "")),
+				(t) => !newContents.has(String(t.content ?? "").trim()),
 			);
 			if (missing) {
 				return (
@@ -271,7 +255,34 @@ function isPathOutsideWorkspace(targetPath: string, root: string): boolean {
 	if (!targetPath) return false;
 	const resolved = resolve(root, targetPath);
 	const normalizedRoot = root.endsWith("/") ? root : root + "/";
-	return resolved !== root && !resolved.startsWith(normalizedRoot);
+	if (resolved !== root && !resolved.startsWith(normalizedRoot)) {
+		return true;
+	}
+	// Verify symlink resolution against workspaceRootReal
+	try {
+		const real = realpathSync(resolved);
+		const realRoot = workspaceRootReal.endsWith("/") ? workspaceRootReal : workspaceRootReal + "/";
+		if (real !== workspaceRootReal && !real.startsWith(realRoot)) {
+			return true;
+		}
+	} catch {
+		// Target does not exist yet (e.g. creating new file). Check closest existing ancestor directory.
+		let curr = resolved;
+		while (curr && curr !== "/" && curr !== ".") {
+			const parent = resolve(curr, "..");
+			if (parent === curr) break;
+			curr = parent;
+			try {
+				const realParent = realpathSync(curr);
+				const realRoot = workspaceRootReal.endsWith("/") ? workspaceRootReal : workspaceRootReal + "/";
+				if (realParent !== workspaceRootReal && !realParent.startsWith(realRoot)) {
+					return true;
+				}
+				break;
+			} catch {}
+		}
+	}
+	return false;
 }
 
 function extractPatchPaths(patchText: string): string[] {
@@ -360,11 +371,13 @@ async function guardShellMutation(
 	sessionID: string | undefined,
 ): Promise<string | undefined> {
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
+	let hasMutation = false;
 	for (const segment of command.split(/[\n|;&]+/)) {
 		const mutation = shellMutationIn(segment.trim());
 		if (!mutation) continue;
+		hasMutation = true;
 		const target = mutation.target ?? "";
-		// git apply/am has no explicit filename target — treat as workspace
+		// git apply/am has no explicit filename target - treat as workspace
 		// mutation: subject to todo + branch gates, boundary implicit.
 		if (target && isProtectedPath(target)) {
 			return PROTECTED_PATH_REASON;
@@ -388,7 +401,9 @@ async function guardShellMutation(
 				"sed -i, cp/mv and git apply as to the edit tools)."
 			);
 		}
-		return undefined; // one gated mutation per segment is enough
+	}
+	if (hasMutation) {
+		recordMutation();
 	}
 	return undefined;
 }
@@ -464,12 +479,17 @@ function parseGitInvocation(command: string): GitInvocation | undefined {
  */
 function normalizeGitCommands(command: string): string {
 	return command
-		.split("\n")
-		.map((line) => {
-			const parsed = parseGitInvocation(line);
-			return parsed ? `git ${parsed.rest}` : line;
+		.split(/([\n|;&]+)/)
+		.map((segment) => {
+			const parsed = parseGitInvocation(segment.trim());
+			if (parsed) {
+				const leading = segment.match(/^\s*/)?.[0] ?? "";
+				const trailing = segment.match(/\s*$/)?.[0] ?? "";
+				return `${leading}git ${parsed.rest}${trailing}`;
+			}
+			return segment;
 		})
-		.join("\n");
+		.join("");
 }
 
 const GIT_WRITE_RE =
@@ -490,9 +510,9 @@ function currentGitBranch(root: string): string | undefined {
 		const match = head.match(/^ref:\s+refs\/heads\/(\S+)/);
 		if (match) return match[1];
 	} catch {
-		// Not a repo (or worktree without .git dir) — no gate.
+		// Not a repo (or worktree without .git dir) - no gate.
 	}
-	if (result.status === 0) return ""; // detached HEAD — treat as unprotected
+	if (result.status === 0) return ""; // detached HEAD - treat as unprotected
 	return undefined;
 }
 
@@ -504,8 +524,8 @@ function onProtectedBranch(root: string): boolean {
 function branchGuardReason(): string {
 	return (
 		"Blocked: the workspace is on a protected branch (main/master). " +
-		"Create a feature branch first — e.g. " +
-		"`git switch -c feat/description` — and make all changes there, " +
+		"Create a feature branch first - e.g. " +
+		"`git switch -c feat/description` - and make all changes there, " +
 		"then open a PR. Direct changes on main/master are not allowed."
 	);
 }
@@ -523,7 +543,7 @@ interface LivePattern {
 
 const LIVE_MUTATION_PATTERNS: LivePattern[] = [
 	// Only DESTRUCTIVE operations are blocked. Create/update/apply/set-style
-	// commands are allowed — they're normal work and reviewable in diffs.
+	// commands are allowed - they're normal work and reviewable in diffs.
 	// Filesystem destruction: block rm -rf on system paths, allow workspace cleanup
 	{ re: /\brm\s+(?:-[a-zA-Z]*[rRfF][a-zA-Z]*\s+)*-[a-zA-Z]*[rRfF][a-zA-Z]*\s+(?:\/|~|\*)/, what: "recursive/forced deletion of system/home paths" },
 	{ re: /\b(?:sudo\s+)?rm\s+-(?:[a-zA-Z]*[rRfF][a-zA-Z]*\s+){1,2}(?:\/|~)/, what: "forced deletion of system/home paths" },
@@ -567,7 +587,7 @@ function liveMutationIn(command: string): string | undefined {
 
 // ── Secret content scan ──────────────────────────────────────────────────────
 // Common credential shapes that must never end up committed to a repo. This
-// list is intentionally conservative — it aims to catch obvious accidents
+// list is intentionally conservative - it aims to catch obvious accidents
 // (env-file contents, keys copied into source) rather than every secret on
 // earth. False positives return an actionable error.
 
@@ -669,7 +689,7 @@ function mcpMutationTool(toolName: string): string | undefined {
 
 /**
  * True when a filesystem path targets OpenCode's own configuration, plugin,
- * or auth state — anything the agent could modify to weaken the guard.
+ * or auth state - anything the agent could modify to weaken the guard.
  * Checked against the path resolved from the workspace root.
  */
 function isProtectedPath(targetPath: string): boolean {
@@ -715,16 +735,16 @@ function normalizeGlobPathEvasion(text: string): string {
 // &) so that tokens appearing on unrelated lines of a multi-line command can't
 // combine into a false match. Patterns that target config PATHS require a
 // write verb or redirect, so merely READING a config file (cat, less, grep)
-// is allowed — only modification attempts are blocked.
+// is allowed - only modification attempts are blocked.
 const SETTINGS_TAMPER_PATTERNS: RegExp[] = [
-	// Shell writes to opencode config paths — write verb/redirect required.
+	// Shell writes to opencode config paths - write verb/redirect required.
 	/(?:^|\s)(?:sed\s+-i|tee|mv|cp|rm|chmod|chown|ln|install|truncate|dd)\s+[^|;&]*?(?:[\w\/.~-]*opencode\.jsonc?|[\w\/.~-]*\.config\/opencode|[\w\/.~-]*\.opencode\/)/i,
 	/>\s*["']?[\w\/.~-]*(?:opencode\.jsonc?|\.config\/opencode|\.opencode\/)/i,
 	// Editing the guard plugin itself or its TUI companion (any file,
-	// not just config) — self-protection.
+	// not just config) - self-protection.
 	/(?:^|\s)(?:sed\s+-i|tee|mv|cp|rm|chmod|chown|truncate|dd)\s+[^|;&]*?[\w\/.~-]*\.config\/opencode\/(?:plugins|ui)\//i,
 	/>\s*["']?[\w\/.~-]*\.config\/opencode\/(?:plugins|ui)\//i,
-	// CLI config/auth commands — matched as command verbs, not bare words.
+	// CLI config/auth commands - matched as command verbs, not bare words.
 	/\bopencode\s+(?:auth|config|permission)\b/i,
 	// Blanket auto-approval flags on the CLI.
 	/\bopencode\s+(?:run\s+)?--auto\b/i,
@@ -784,15 +804,17 @@ function branchHasChangelogChange(root: string): boolean {
 }
 
 function prBodyIncludesChangelog(command: string): boolean {
-	// Handle inline --body "..." with a Changelog section.
-	const bodyMatch = command.match(/--body\s+(?:"([^"]*)"|'([^']*)')/);
+	// Handle inline --body / --description / -d / -b "..." with a Changelog section.
+	const bodyMatch = command.match(
+		/(?:--body|--description|-d|-b)\s+(?:"([^"]*)"|'([^']*)')/,
+	);
 	const body = bodyMatch?.[1] ?? bodyMatch?.[2] ?? "";
 	if (CHANGELOG_SECTION_RE.test(body)) {
 		return true;
 	}
-	// Handle --body-file <path> / -F <path>: read the referenced file.
+	// Handle --body-file <path> / --description-file <path> / -F <path>: read the referenced file.
 	const bodyFileMatch = command.match(
-		/(?:--body-file|-F)\s+(?:"([^"]*)"|'([^']*)'|(\S+))/,
+		/(?:--body-file|--description-file|-F)\s+(?:"([^"]*)"|'([^']*)'|(\S+))/,
 	);
 	const bodyFile =
 		bodyFileMatch?.[1] ?? bodyFileMatch?.[2] ?? bodyFileMatch?.[3];
@@ -808,18 +830,114 @@ function prBodyIncludesChangelog(command: string): boolean {
 	return false;
 }
 
+// ── Secondary Agent Review Spoke ─────────────────────────────────────────────
+// Supports multi-agent accountability and code review quality gates before PR
+// or final delivery. Ties into the `code-review-and-quality` and
+// `doubt-driven-development` agent skills with a structured evaluation rubric.
+
+let lastReview:
+	| {
+			passed: boolean;
+			reviewer: string;
+			summary: string;
+			timestamp: number;
+	  }
+	| undefined;
+
+export function recordReviewResult(
+	reviewer: string,
+	summary: string,
+	passed: boolean,
+): void {
+	lastReview = {
+		reviewer,
+		summary: summary.slice(-4000),
+		passed,
+		timestamp: Date.now(),
+	};
+}
+
+export function getLastReviewResult(): typeof lastReview {
+	return lastReview;
+}
+
+export function resetReviewState(): void {
+	lastReview = undefined;
+}
+
+/**
+ * Builds a structured, adversarial review rubric prompt for a secondary review agent
+ * or subagent (combining `code-review-and-quality` and `doubt-driven-development`).
+ */
+export function buildReviewRubric(diffText: string, taskPrompt?: string): string {
+	return [
+		"# Secondary Review Agent Quality Gate",
+		"",
+		"Evaluate this code change independently with fresh context across these 5 core axes:",
+		"",
+		"### 1. Test Integrity & Truthfulness (CRITICAL)",
+		"- Are test assertions testing real behavioral outcomes rather than trivial passes (e.g. `expect(true).toBe(true)`)?",
+		"- Were existing tests disabled, bypassed, or weakened?",
+		"- Are edge cases and error paths covered?",
+		"",
+		"### 2. Task Completeness & Intent Alignment",
+		"- Does the implementation genuinely satisfy the user request without shortcut stubs (`// TODO`, `throw new Error('not implemented')`)?",
+		"- Does it introduce regressions in surrounding code?",
+		"",
+		"### 3. Code Cleanliness & Hygiene",
+		"- Is there any orphaned dead code, commented-out code blocks, or temporary debugging logs?",
+		"- Is the logic straightforward and free of unnecessary cognitive complexity?",
+		"",
+		"### 4. Security & Safety Boundaries",
+		"- Are there any hardcoded secrets, unprotected tokens, or unvalidated user inputs?",
+		"- Does the code respect workspace confinement and safe environment practices?",
+		"",
+		"### 5. Platform & Architecture Fit (GitHub & Azure DevOps)",
+		"- Does the change fit established repository patterns and CI/CD pipelines?",
+		"",
+		taskPrompt ? `### User Request / Context:\n${taskPrompt}\n` : "",
+		"### Code Diff Under Review:",
+		"```diff",
+		diffText.slice(0, 30_000),
+		"```",
+		"",
+		"Provide your verdict: `[APPROVE]` or `[REQUEST_CHANGES]` with concise, actionable findings.",
+	].join("\n");
+}
+
 // ── Core guard (exported for testing) ────────────────────────────────────────
 // Returns a block reason string, or undefined when the call is allowed.
 
 // ── Post-edit verification gate ─────────────────────────────────────────────
-// The guard currently blocks edits before they happen, but never verifies the
-// result. Agents routinely mark the final todo "completed" without ever
-// running the test suite. VERIFY_COMMAND (env) or an auto-detected `npm test`
-// is run after every edit/write/patch, and todowrite is blocked from marking
-// its last task completed while verification is failing.
+// The guard blocks edits before they happen, and validates verification evidence
+// before final completion. When the agent attempts to mark all tasks completed/cancelled,
+// the guard ensures fresh verification has passed since the most recent mutation.
 
-let lastVerify: { passed: boolean; command: string; output: string } | undefined;
-let verifyInProgress = false;
+let lastMutationTimestamp = 0;
+let lastVerify: {
+	passed: boolean;
+	command: string;
+	output: string;
+	timestamp: number;
+	durationMs?: number;
+} | undefined;
+
+export function recordMutation(): void {
+	lastMutationTimestamp = Date.now();
+}
+
+export function getLastMutationTimestamp(): number {
+	return lastMutationTimestamp;
+}
+
+export function getLastVerifyResult(): typeof lastVerify {
+	return lastVerify;
+}
+
+export function resetVerifyState(): void {
+	lastMutationTimestamp = 0;
+	lastVerify = undefined;
+}
 
 // Sensitive environment variables scrubbed from agent shells by the
 // shell.env hook. Prefix matches (AWS_*, KUBE*) and exact names are both
@@ -840,6 +958,19 @@ const SENSITIVE_ENV_KEYS = [
 ];
 const SENSITIVE_ENV_RE = /^(AWS_|KUBE|OPENAI|ANTHROPIC|GH_|GITHUB_|GOOGLE_|GCP_|AZURE_|SLACK_|NPM_|DOCKER_|KUBECONFIG)/;
 
+export function getCleanEnv(): Record<string, string> {
+	const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+	for (const key of SENSITIVE_ENV_KEYS) {
+		delete env[key];
+	}
+	for (const key of Object.keys(env)) {
+		if (SENSITIVE_ENV_RE.test(key)) {
+			delete env[key];
+		}
+	}
+	return env;
+}
+
 function detectVerifyCommand(root: string): string | undefined {
 	if (process.env.WORKFLOW_GUARD_VERIFY !== undefined) {
 		const cmd = process.env.WORKFLOW_GUARD_VERIFY.trim();
@@ -854,20 +985,96 @@ function detectVerifyCommand(root: string): string | undefined {
 	return undefined;
 }
 
-async function runVerify(command: string, root: string): Promise<{ passed: boolean; output: string }> {
+export async function runVerify(
+	command: string,
+	root: string,
+	timeoutMs = 30_000,
+): Promise<{ passed: boolean; output: string; durationMs: number }> {
+	const start = Date.now();
+	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
+
+	// Guard against privileged execution of destructive commands or settings tampering in verify scripts
+	if (!allowLive) {
+		const normalized = normalizeGitCommands(normalize(command));
+		const liveCheck = liveMutationIn(normalized);
+		if (liveCheck) {
+			return {
+				passed: false,
+				output: `Verification command blocked: contains live destructive command (${liveCheck})`,
+				durationMs: 0,
+			};
+		}
+		if (isSettingsTamper(command)) {
+			return {
+				passed: false,
+				output: "Verification command blocked: contains settings tamper command",
+				durationMs: 0,
+			};
+		}
+	}
+
 	return new Promise((resolve) => {
-		const child = spawn(command, { cwd: root, shell: true, encoding: "utf8" } as never);
 		let output = "";
-		child.stdout?.on("data", (d) => (output += d));
-		child.stderr?.on("data", (d) => (output += d));
-		child.on("close", (code) => resolve({ passed: code === 0, output }));
-		child.on("error", () => resolve({ passed: false, output: "(spawn failed)" }));
+		let timer: NodeJS.Timeout | undefined;
+		let child: ReturnType<typeof spawn>;
+		try {
+			child = spawn(command, {
+				cwd: root,
+				shell: true,
+				env: getCleanEnv(),
+				stdio: ["ignore", "pipe", "pipe"],
+			});
+		} catch (err: any) {
+			return resolve({
+				passed: false,
+				output: `(spawn failed: ${err?.message ?? "unknown error"})`,
+				durationMs: Date.now() - start,
+			});
+		}
+
+		timer = setTimeout(() => {
+			try {
+				child.kill("SIGKILL");
+			} catch {}
+			resolve({
+				passed: false,
+				output: output + `\n(Verification timed out after ${Math.round(timeoutMs / 1000)}s)`,
+				durationMs: Date.now() - start,
+			});
+		}, timeoutMs);
+
+		child.stdout?.on("data", (d) => {
+			output += d.toString();
+			if (output.length > 50_000) output = output.slice(-50_000);
+		});
+		child.stderr?.on("data", (d) => {
+			output += d.toString();
+			if (output.length > 50_000) output = output.slice(-50_000);
+		});
+		child.on("close", (code) => {
+			if (timer) clearTimeout(timer);
+			resolve({ passed: code === 0, output, durationMs: Date.now() - start });
+		});
+		child.on("error", (err) => {
+			if (timer) clearTimeout(timer);
+			resolve({ passed: false, output: `(spawn failed: ${err.message})`, durationMs: Date.now() - start });
+		});
 	});
 }
 
-function recordVerifyResult(command: string, result: { passed: boolean; output: string }): void {
-	lastVerify = { command, passed: result.passed, output: result.output.slice(-4000) };
+export function recordVerifyResult(
+	command: string,
+	result: { passed: boolean; output: string; durationMs?: number },
+): void {
+	lastVerify = {
+		command,
+		passed: result.passed,
+		output: result.output.slice(-4000),
+		timestamp: Date.now(),
+		durationMs: result.durationMs,
+	};
 }
+
 // Every block/allow decision is appended as a JSON line to a durable file so
 // developers can reconstruct why the agent was (or was not) allowed. This
 // complements client.app.log() (in-app, undocumented durability) with a real
@@ -879,13 +1086,28 @@ const AUDIT_DIR = join(
 );
 const AUDIT_FILE = join(AUDIT_DIR, "workflow-guard.jsonl");
 
-interface AuditEntry {
+export function getAuditFilePath(): string {
+	return AUDIT_FILE;
+}
+
+export interface AuditEntry {
 	ts: string;
 	sessionID?: string;
 	tool: string;
 	decision: "allow" | "block";
 	reason?: string;
 	input?: unknown;
+	evidence?: {
+		mutation?: boolean;
+		targetPath?: string;
+		verification?: {
+			command: string;
+			passed: boolean;
+			fresh: boolean;
+			durationMs?: number;
+		};
+		allowLive?: boolean;
+	};
 }
 
 function audit(entry: AuditEntry): void {
@@ -902,6 +1124,7 @@ function logDecision(
 	input: unknown,
 	context: { sessionID?: string } | undefined,
 	reason: string | undefined,
+	evidence?: AuditEntry["evidence"],
 ): void {
 	audit({
 		ts: new Date().toISOString(),
@@ -910,6 +1133,7 @@ function logDecision(
 		decision: reason ? "block" : "allow",
 		reason,
 		input: summarizeInput(input),
+		evidence,
 	});
 }
 
@@ -971,16 +1195,24 @@ async function guardToolCallImpl(
 			if (allDone) {
 				const command = detectVerifyCommand(workspaceRoot);
 				if (command) {
-					const result = await runVerify(command, workspaceRoot);
-					recordVerifyResult(command, result);
-					if (!result.passed) {
-						const tail = result.output.slice(-500);
-						const reason =
-							`Blocked todowrite: all tasks marked done but verification is failing ` +
-							`(${command}). Fix the failure before finishing; ` +
-							`output tail: ${tail}`;
-						logBlock(`[workflow-guard] ${reason}`);
-						return reason;
+					const isFresh =
+						lastVerify !== undefined &&
+						lastVerify.passed &&
+						lastVerify.command === command &&
+						lastVerify.timestamp >= lastMutationTimestamp;
+
+					if (!isFresh) {
+						const result = await runVerify(command, workspaceRoot);
+						recordVerifyResult(command, result);
+						if (!result.passed) {
+							const tail = result.output.slice(-500);
+							const reason =
+								`Blocked todowrite: all tasks marked done but verification is failing ` +
+								`(${command}). Fix the failure before finishing; ` +
+								`output tail: ${tail}`;
+							logBlock(`[workflow-guard] ${reason}`);
+							return reason;
+						}
 					}
 				}
 			}
@@ -1111,6 +1343,7 @@ async function guardToolCallImpl(
 				"starting new work."
 			);
 		}
+		recordMutation();
 		return undefined;
 	}
 
@@ -1125,7 +1358,7 @@ async function guardToolCallImpl(
 				`[workflow-guard] blocked MCP tool ${toolName} (${mcpWhat} mutation)`,
 			);
 			return (
-				`Blocked: ${toolName} mutates ${mcpWhat} — a live ` +
+				`Blocked: ${toolName} mutates ${mcpWhat} - a live ` +
 				"system. Changes must be made in code unless the user " +
 				"explicitly allows live changes. Only the user can override " +
 				"this, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment " +
@@ -1146,6 +1379,14 @@ async function guardToolCallImpl(
 		const normalizedCommand = normalizeGitCommands(command);
 		const gitInvocation = parseGitInvocation(command);
 		const effectiveRoot = gitInvocation?.repoDir ?? workspaceRoot;
+
+		// Workspace boundary check for external git repo targets
+		if (isPathOutsideWorkspace(effectiveRoot, workspaceRoot) && !allowLive) {
+			if (GIT_WRITE_RE.test(normalizedCommand) || /\bgit\s+push\b/.test(normalizedCommand)) {
+				logBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${effectiveRoot}`);
+				return `Blocked: git command targets repository '${effectiveRoot}' outside workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
+			}
+		}
 
 		// ── Policy 7: changes only on feature branches ───────────
 		if (GIT_WRITE_RE.test(normalizedCommand) && onProtectedBranch(effectiveRoot)) {
@@ -1203,19 +1444,22 @@ async function guardToolCallImpl(
 			);
 		}
 
-		// ── Policy 3: PRs must include a changelog ─────────────────────
-		if (PR_CREATE_RE.test(normalizedCommand)) {
+		// ── Policy 3: PRs must include a changelog (GitHub & Azure DevOps) ──
+		if (hasPrCreateInvocation(normalizedCommand)) {
 			const hasChangelog =
 				prBodyIncludesChangelog(command) ||
 				branchHasChangelogChange(workspaceRoot);
 			if (!hasChangelog) {
+				const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
+				const prTool = isAz ? "az repos pr create" : "gh pr create";
+				const descFlag = isAz ? "--description" : "--body";
 				logBlock(
-					"[workflow-guard] blocked gh pr create: no changelog found",
+					`[workflow-guard] blocked ${prTool}: no changelog found`,
 				);
 				return (
-					"Blocked: PR must include a changelog. Either update a " +
-					"CHANGELOG file in this branch's diff, or include a " +
-					"'Changelog:' section in the PR body (--body)."
+					`Blocked: PR must include a changelog. Either update a ` +
+					`CHANGELOG file in this branch's diff, or include a ` +
+					`'Changelog:' section in the PR description (${descFlag}).`
 				);
 			}
 		}
@@ -1234,7 +1478,28 @@ export async function guardToolCall(
 	context?: { sessionID?: string },
 ): Promise<string | undefined> {
 	const reason = await guardToolCallImpl(toolName, input, context);
-	logDecision(toolName, input, context, reason);
+	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
+	const isMutation = EDIT_TOOL_NAMES.has(toolName);
+	const record = asRecord(input);
+	const targetPath =
+		typeof record?.filePath === "string"
+			? record.filePath
+			: typeof record?.path === "string"
+				? record.path
+				: undefined;
+	logDecision(toolName, input, context, reason, {
+		mutation: isMutation,
+		targetPath,
+		allowLive,
+		verification: lastVerify
+			? {
+					command: lastVerify.command,
+					passed: lastVerify.passed,
+					fresh: lastVerify.timestamp >= lastMutationTimestamp,
+					durationMs: lastVerify.durationMs,
+				}
+			: undefined,
+	});
 	return reason;
 }
 
@@ -1251,7 +1516,7 @@ export function setWorkspaceRoot(root: string): void {
 export const WorkflowGuard: Plugin = async (ctx) => {
 	// ctx.directory is the directory opencode was started in; ctx.client is
 	// the SDK client for the built-in server (used for the session todo
-	// list — documented endpoint GET /session/:id/todo).
+	// list - documented endpoint GET /session/:id/todo).
 	setWorkspaceRoot(ctx.directory ?? process.cwd());
 	setSdkClient(ctx.client);
 
@@ -1267,7 +1532,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 
 	return {
 		// OpenCode passes the tool args as the SECOND hook parameter
-		// (`output.args` — documented in the tools docs, e.g. apply_patch
+		// (`output.args` - documented in the tools docs, e.g. apply_patch
 		// "uses output.args.patchText"; `input` only carries
 		// { tool, sessionID, callID }). The fallback covers hypothetical
 		// runtimes that put args on the input.
