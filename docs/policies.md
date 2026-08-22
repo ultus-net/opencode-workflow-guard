@@ -17,8 +17,11 @@
 - Git global options (`-C`, `--git-dir`, `--work-tree`, `-c`) are parsed before matching, so `git -C /repo push origin main` is gated on `/repo`'s branch.
 - Normal pushes and force-pushes to feature branches are allowed.
 
-### 3. PR Changelog Requirement
-- `gh pr create` and `az repos pr create` are blocked unless the PR description (`--body`, `--description`, or `--body-file`/`-F`) contains a `Changelog:` section or the branch diff modifies a CHANGELOG file.
+### 3. PR Changelog & Changesets Requirement
+- `gh pr create` and `az repos pr create` are blocked unless:
+  - The branch diff modifies a `CHANGELOG` file, OR
+  - The branch diff adds/modifies a `.changeset/*.md` fragment file (Changesets workflow), OR
+  - The PR description (`--body`, `--description`, or `--body-file`/`-F`) contains a `Changelog:` section.
 
 ### 4. Destructive CLI Operations Guard
 - Blocks destructive filesystem, infrastructure, cloud, database, and git operations unless the **user** explicitly overrides via environment variable.

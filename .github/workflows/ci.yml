@@ -77,24 +77,23 @@ jobs:
       - run: npm audit --audit-level=high
 
   # ───── PR etiquette ─────
-  # Every PR must update CHANGELOG.md - matches the plugin's own Policy 3.
+  # Every PR must update CHANGELOG.md or add a .changeset/*.md fragment (Policy 3).
   changelog:
-    name: Changelog updated
+    name: Changelog / Changeset updated
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Verify CHANGELOG modified
+      - name: Verify CHANGELOG or Changeset modified
         run: |
           BASE="origin/${{ github.base_ref }}"
-          if git diff --name-only "${BASE}...HEAD" | grep -qi '^CHANGELOG\.md$'; then
-            echo "CHANGELOG.md updated relative to base branch - good."
-          elif git diff --name-only HEAD~1...HEAD | grep -qi '^CHANGELOG\.md$'; then
-            echo "CHANGELOG.md updated in latest commit - good."
+          DIFF_FILES=$(git diff --name-only "${BASE}...HEAD" || git diff --name-only HEAD~1...HEAD)
+          if echo "$DIFF_FILES" | grep -qiE '^(CHANGELOG\.md|\.changeset\/[^\/]+\.md)$'; then
+            echo "CHANGELOG.md or .changeset/*.md updated relative to base branch - good."
           else
-            echo "::error::PR diff must include changes to CHANGELOG.md (Policy 3)"
+            echo "::error::PR diff must include changes to CHANGELOG.md or a .changeset/*.md file (Policy 3)"
             exit 1
           fi
 
