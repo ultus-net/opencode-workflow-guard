@@ -89,6 +89,22 @@
 ### 16. TUI Visual Feedback
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.
 
+### 17. Secret-File READ Block
+- Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool or shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`).
+- Standard non-secret fixtures (`.env.example`, `.env.sample`, `.env.template`) remain readable.
+
+### 18. Interpreter Inline Evasion Scanner
+- Decodes and inspects inline interpreter payloads (`python -c`, `node -e`, `perl -e`, `ruby -e`, `osascript -e`, `powershell -enc`, `echo <base64> | base64 -d | sh`) to prevent smuggling live destructive commands or settings tampering past shell pattern checks.
+
+### 19. Conflict-Free Pre-Flight Guard
+- Evaluates `git merge-tree` against the base branch (`origin/main`, `origin/master`, `main`) before PR creation or final task handoff, ensuring changes can be merged cleanly without conflicts.
+
+### 20. Merged Branch & Base Freshness Guard
+- Blocks pushing to branches already merged or associated with closed PRs in GitHub or Azure DevOps.
+- Blocks creating fresh feature branches when the local base branch is behind the remote, prompting the agent to pull latest changes first.
+
+### 21. Documentation Review & Synchronization Guard
+- Ensures that relevant documentation (`README.md` or `docs/`) is updated whenever changes introduce new features, policies, or public tools before PR creation. Configurable via `.opencode/workflow-guard.json` (`requireDocumentation: true`) or `WORKFLOW_GUARD_REQUIRE_DOCS=1`.
 ---
 
 ## Overrides ("Unless Otherwise Specified")

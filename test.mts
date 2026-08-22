@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,10 +15,20 @@ import {
 	getLastMutationTimestamp,
 	recordVerifyResult,
 	getAuditFilePath,
+	getRecentAuditEntries,
 	buildReviewRubric,
 	recordReviewResult,
 	getLastReviewResult,
 	resetReviewState,
+	isSecretPath,
+	loadProjectConfig,
+	reloadProjectConfig,
+	extractInterpreterPayload,
+	isBranchAlreadyMergedOrClosed,
+	checkMergeConflicts,
+	checkBranchBaseIsUpToDate,
+	branchHasDocumentationChange,
+	isDocumentationRequired,
 	default as defaultExport,
 } from "./workflow-guard.ts";
 import { WorkflowGuardTui } from "./workflow-guard-ui.ts";
@@ -309,7 +319,7 @@ if (typeof compactFn === "function") {
 }
 check("compaction hook injects active tasks into output.context", compactOutput.context.length > 0 && (compactOutput.context[0]?.includes("Active Tasks") ?? false));
 
-// Blocked tool call throws cleanly without intrusive popup toasts
+// Blocked tool call emits warning toast via tui.showToast
 toasts = [];
 const beforeFn = pluginWithToast["tool.execute.before"];
 if (typeof beforeFn === "function") {
@@ -317,7 +327,7 @@ if (typeof beforeFn === "function") {
 		await beforeFn({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "git push origin main" } });
 	} catch {}
 }
-check("tool block throws clean error without intrusive popup toasts", toasts.length === 0);
+check("tool block emits warning toast via tui.showToast", toasts.length === 1 && (toasts[0] as any)?.body?.variant === "warning");
 
 console.log("- Input shapes -");
 check("single string command", blocked(await call("bash", "git push origin main")));
@@ -380,8 +390,10 @@ try {
 }
 check("hook allows write with active todos", todoPass);
 
-// No startup toast on session.created (event hook may exist for
-// command.executed guard, but must not toast).
+toasts = [];
+if (typeof pluginWithToast.event === "function") {
+	await pluginWithToast.event({ event: { type: "session.created", properties: {} } } as any);
+}
 check("event hook emits no intrusive startup toast", toasts.length === 0);
 
 // ── New: audit trail ──
@@ -623,6 +635,222 @@ recordReviewResult("reviewer-subagent", "All checks passed. Real unit tests veri
 const reviewRes = getLastReviewResult();
 check("recordReviewResult records passed reviewer and summary", reviewRes?.passed === true && reviewRes?.reviewer === "reviewer-subagent");
 
+// 9. Secret-File READ Blocks (Policy 17)
+console.log("- Policy 17: Secret-File READ Blocks -");
+check("isSecretPath detects .env", isSecretPath(".env"));
+check("isSecretPath detects .env.production", isSecretPath(".env.production"));
+check("isSecretPath detects id_rsa", isSecretPath("~/.ssh/id_rsa"));
+check("isSecretPath detects id_ed25519", isSecretPath("~/.ssh/id_ed25519"));
+check("isSecretPath detects server.key", isSecretPath("certs/server.key"));
+check("isSecretPath detects server.pem", isSecretPath("certs/server.pem"));
+check("isSecretPath detects kubeconfig", isSecretPath("~/.kube/config"));
+check("isSecretPath detects credentials.json", isSecretPath("config/credentials.json"));
+check("isSecretPath detects service-account.json", isSecretPath("service-account.json"));
+check("isSecretPath permits .env.example (safe fixture)", !isSecretPath(".env.example"));
+check("isSecretPath permits .env.template (safe fixture)", !isSecretPath(".env.template"));
+check("isSecretPath permits .env.sample", !isSecretPath(".env.sample"));
+
+check("read tool blocks .env", blocked(await call("read", { filePath: join(root, ".env") })));
+check("read tool blocks id_rsa", blocked(await call("read", { filePath: join(root, "id_rsa") })));
+check("read tool blocks credentials.json", blocked(await call("read", { filePath: join(root, "credentials.json") })));
+check("read tool allows .env.example", !(await call("read", { filePath: join(root, ".env.example") })));
+
+check("shell cat .env is blocked", blocked(await shell("cat .env")));
+check("shell cat .env.local is blocked", blocked(await shell("cat .env.local")));
+check("shell less id_rsa is blocked", blocked(await shell("less ~/.ssh/id_rsa")));
+check("shell grep in credentials.json is blocked", blocked(await shell("grep -i password credentials.json")));
+check("shell cat .env.example is allowed", !(await shell("cat .env.example")));
+
+// 10. Interpreter Inline Evasion Scanner (Policy 18)
+console.log("- Policy 18: Interpreter Inline Evasion Scanner -");
+check("extractInterpreterPayload extracts python -c", extractInterpreterPayload('python3 -c "import os; os.system(\'ls\')"' ).length > 0);
+check("extractInterpreterPayload extracts node -e", extractInterpreterPayload('node -e "console.log(1)"').length > 0);
+
+check("python -c destructive command is blocked", blocked(await shell('python3 -c "import os; os.system(\'kubectl delete pod foo\')"' )));
+check("python -c rm -rf / is blocked", blocked(await shell('python -c "import os; os.system(\'rm -rf /\')"' )));
+check("node -e destructive command is blocked", blocked(await shell('node -e "require(\'child_process\').execSync(\'terraform destroy\')"' )));
+check("python -c benign script is allowed", !(await shell('python3 -c "print(\'hello world\')"' )));
+
+const b64Destructive = Buffer.from("kubectl delete pod foo").toString("base64");
+check("base64 pipe destructive command is blocked", blocked(await shell(`echo "${b64Destructive}" | base64 -d | sh`)));
+check("powershell -enc destructive command is blocked", blocked(await shell(`powershell -enc ${b64Destructive}`)));
+
+// 11. Worktree & Project Config (.opencode/workflow-guard.json)
+console.log("- Project Configuration & Custom Rules -");
+const projectConfigDir = mkdtempSync(join(tmpdir(), "wg-cfg-repo-"));
+mkdirSync(join(projectConfigDir, ".opencode"), { recursive: true });
+writeFileSync(
+	join(projectConfigDir, ".opencode", "workflow-guard.json"),
+	JSON.stringify({
+		protectedBranches: ["release/prod", "staging"],
+		verifyCommand: "node -e 'process.exit(0)'",
+		requireReview: true,
+	}),
+);
+setWorkspaceRoot(projectConfigDir);
+reloadProjectConfig(projectConfigDir);
+
+const loadedCfg = loadProjectConfig(projectConfigDir);
+check("project config loads protectedBranches", loadedCfg.protectedBranches?.includes("release/prod") ?? false);
+check("project config loads verifyCommand", loadedCfg.verifyCommand === "node -e 'process.exit(0)'");
+check("project config loads requireReview", loadedCfg.requireReview === true);
+
+// Branch guard honors custom protected branches from config
+spawnSync("git", ["init", "-b", "release/prod"], { cwd: projectConfigDir });
+check(
+	"custom protected branch release/prod blocks direct edits",
+	blocked(await call("edit", { filePath: join(projectConfigDir, "a.ts"), content: "x" }, { sessionID: "s-active" })),
+);
+
+// Review Requirement gating on PR creation
+resetReviewState();
+check(
+	"PR creation blocked when requireReview is true and no review recorded",
+	blocked(await shell("gh pr create --title t --body 'Changelog: update'")),
+);
+recordReviewResult("reviewer-agent", "LGTM - 5 axes verified", true);
+check(
+	"PR creation allowed once approved review is recorded",
+	!(await shell("gh pr create --title t --body 'Changelog: update'")),
+);
+
+rmSync(projectConfigDir, { recursive: true, force: true });
+setWorkspaceRoot(root);
+reloadProjectConfig(root);
+resetReviewState();
+
+// 12. Custom Plugin Tools & Event Auditing
+console.log("- Custom Tools & Event Auditing -");
+const customPlugin = await (defaultExport?.server ?? WorkflowGuard)({
+	directory: root,
+	worktree: root,
+	client: fakeClient as any,
+	project: {} as any,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+
+check("plugin registers guard_status tool", typeof customPlugin.tool?.guard_status?.execute === "function");
+check("plugin registers guard_audit tool", typeof customPlugin.tool?.guard_audit?.execute === "function");
+check("plugin registers guard_why tool", typeof customPlugin.tool?.guard_why?.execute === "function");
+check("plugin registers record_review tool", typeof customPlugin.tool?.record_review?.execute === "function");
+
+const statusResult = await customPlugin.tool?.guard_status?.execute({}, {} as any);
+check("guard_status executes and returns JSON string", typeof statusResult === "string" && statusResult.includes("workspaceRoot"));
+
+const whyResultBlocked = await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, {} as any);
+check("guard_why explains blocked command", typeof whyResultBlocked === "string" && whyResultBlocked.startsWith("BLOCKED:"));
+
+const whyResultAllowed = await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "ls -la" } }, {} as any);
+check("guard_why confirms allowed command", typeof whyResultAllowed === "string" && whyResultAllowed.startsWith("ALLOWED:"));
+
+const reviewToolResult = await customPlugin.tool?.record_review?.execute(
+	{ reviewer: "subagent-1", summary: "Real tests pass, zero stubs.", passed: true },
+	{} as any,
+);
+check("record_review tool execution succeeds", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+
+// Event hook handles permission events
+if (typeof customPlugin.event === "function") {
+	await customPlugin.event({
+		event: {
+			type: "permission.replied",
+			properties: { sessionID: "s-active", permissionID: "perm-1", response: "allow" } as any,
+		},
+	});
+}
+const recentAudits = getRecentAuditEntries(5);
+check("getRecentAuditEntries returns array with permission events", Array.isArray(recentAudits) && recentAudits.some((e) => e.tool === "permission.replied"));
+
+// 13. Merged Branch & Conflict Pre-Flight Guards (Policies 19 & 20)
+console.log("- Policies 19 & 20: Merged Branch & Conflict Pre-Flight Guards -");
+const conflictRepo = mkdtempSync(join(tmpdir(), "wg-conflict-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: conflictRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: conflictRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: conflictRepo });
+writeFileSync(join(conflictRepo, "file.txt"), "base content\n");
+spawnSync("git", ["add", "file.txt"], { cwd: conflictRepo });
+spawnSync("git", ["commit", "-m", "initial commit"], { cwd: conflictRepo });
+
+// Create a branch already merged into main
+spawnSync("git", ["switch", "-c", "feat/already-merged"], { cwd: conflictRepo });
+setWorkspaceRoot(conflictRepo);
+
+const mergedCheck = isBranchAlreadyMergedOrClosed(conflictRepo, "feat/already-merged");
+check("isBranchAlreadyMergedOrClosed identifies branch with 0 diff from main", mergedCheck.merged);
+check("git push on already merged branch is blocked", blocked(await shell("git push origin feat/already-merged")));
+
+// Create a branch with a genuine merge conflict against main
+spawnSync("git", ["switch", "main"], { cwd: conflictRepo });
+spawnSync("git", ["switch", "-c", "feat/conflict-branch"], { cwd: conflictRepo });
+writeFileSync(join(conflictRepo, "file.txt"), "conflict branch content\n");
+spawnSync("git", ["commit", "-am", "branch edit"], { cwd: conflictRepo });
+
+spawnSync("git", ["switch", "main"], { cwd: conflictRepo });
+writeFileSync(join(conflictRepo, "file.txt"), "main different content\n");
+spawnSync("git", ["commit", "-am", "main edit"], { cwd: conflictRepo });
+
+spawnSync("git", ["switch", "feat/conflict-branch"], { cwd: conflictRepo });
+const conflictResult = checkMergeConflicts(conflictRepo);
+check("checkMergeConflicts detects merge conflict with main", conflictResult.hasConflicts);
+
+// PR creation is blocked when merge conflict exists
+check(
+	"gh pr create blocked when branch has merge conflicts with base",
+	blocked(await shell("gh pr create --title t --body 'Changelog: fix'")),
+);
+check(
+	"az repos pr create blocked when branch has merge conflicts with base",
+	blocked(await shell("az repos pr create --title t --description 'Changelog: fix'")),
+);
+
+// Base freshness pre-flight check (when local base is behind remote)
+// Simulate remote origin/main ahead of local HEAD
+spawnSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: conflictRepo });
+const baseUpToDateCheck = checkBranchBaseIsUpToDate(conflictRepo);
+check("checkBranchBaseIsUpToDate passes when equal to remote", !baseUpToDateCheck.isBehind);
+
+// 14. Documentation Review & Synchronization Guard (Policy 21)
+console.log("- Policy 21: Documentation Review & Synchronization Guard -");
+const docRepo = mkdtempSync(join(tmpdir(), "wg-doc-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: docRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: docRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: docRepo });
+writeFileSync(join(docRepo, "README.md"), "# Initial Docs\n");
+writeFileSync(join(docRepo, "code.ts"), "export const a = 1;\n");
+spawnSync("git", ["add", "-A"], { cwd: docRepo });
+spawnSync("git", ["commit", "-m", "init"], { cwd: docRepo });
+
+spawnSync("git", ["switch", "-c", "feat/undocumented"], { cwd: docRepo });
+writeFileSync(join(docRepo, "code.ts"), "export const a = 2;\n");
+spawnSync("git", ["commit", "-am", "update code without docs"], { cwd: docRepo });
+setWorkspaceRoot(docRepo);
+
+check("branchHasDocumentationChange returns false when only code was modified", !branchHasDocumentationChange(docRepo));
+
+// Enable requireDocumentation in env
+process.env.WORKFLOW_GUARD_REQUIRE_DOCS = "1";
+check(
+	"gh pr create is blocked when documentation update is required and missing",
+	blocked(await shell("gh pr create --title t --body 'Changelog: added feature'")),
+);
+
+// Now update README.md or docs
+writeFileSync(join(docRepo, "README.md"), "# Updated Docs\n");
+spawnSync("git", ["commit", "-am", "docs: update README"], { cwd: docRepo });
+check("branchHasDocumentationChange returns true once docs are modified", branchHasDocumentationChange(docRepo));
+check(
+	"gh pr create passes once documentation update is present",
+	!(await shell("gh pr create --title t --body 'Changelog: added feature'")),
+);
+delete process.env.WORKFLOW_GUARD_REQUIRE_DOCS;
+
+rmSync(docRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
+rmSync(conflictRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
 console.log(`\n${pass} passed, ${fail} failed`);
