@@ -24,7 +24,7 @@ const testDir = mkdtempSync(join(tmpdir(), "wg-install-test-"));
 const pluginsDir = join(testDir, ".opencode", "plugins");
 mkdirSync(pluginsDir, { recursive: true });
 
-const sourcePlugin = join(import.meta.dirname, "workflow-guard.ts");
+const sourcePlugin = join(import.meta.dirname, "..", "src", "workflow-guard.ts");
 const targetPlugin = join(pluginsDir, "workflow-guard.ts");
 copyFileSync(sourcePlugin, targetPlugin);
 check("plugin copied to .opencode/plugins/ successfully", existsSync(targetPlugin));

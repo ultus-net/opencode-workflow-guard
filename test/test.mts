@@ -43,8 +43,8 @@ import {
 	checkPackageHygiene,
 	sendDesktopNotification,
 	default as defaultExport,
-} from "./workflow-guard.ts";
-import { WorkflowGuardTui } from "./workflow-guard-ui.ts";
+} from "../src/workflow-guard.ts";
+import { WorkflowGuardTui } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
 let fail = 0;
