@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,6 +15,7 @@ import {
 	getLastMutationTimestamp,
 	recordVerifyResult,
 	getAuditFilePath,
+	getRecentAuditEntries,
 	buildReviewRubric,
 	recordReviewResult,
 	getLastReviewResult,
@@ -318,7 +319,7 @@ if (typeof compactFn === "function") {
 }
 check("compaction hook injects active tasks into output.context", compactOutput.context.length > 0 && (compactOutput.context[0]?.includes("Active Tasks") ?? false));
 
-// Blocked tool call throws cleanly without intrusive popup toasts
+// Blocked tool call emits warning toast via tui.showToast
 toasts = [];
 const beforeFn = pluginWithToast["tool.execute.before"];
 if (typeof beforeFn === "function") {
@@ -326,7 +327,7 @@ if (typeof beforeFn === "function") {
 		await beforeFn({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "git push origin main" } });
 	} catch {}
 }
-check("tool block throws clean error without intrusive popup toasts", toasts.length === 0);
+check("tool block emits warning toast via tui.showToast", toasts.length === 1 && (toasts[0] as any)?.body?.variant === "warning");
 
 console.log("- Input shapes -");
 check("single string command", blocked(await call("bash", "git push origin main")));
@@ -389,8 +390,10 @@ try {
 }
 check("hook allows write with active todos", todoPass);
 
-// No startup toast on session.created (event hook may exist for
-// command.executed guard, but must not toast).
+toasts = [];
+if (typeof pluginWithToast.event === "function") {
+	await pluginWithToast.event({ event: { type: "session.created", properties: {} } } as any);
+}
 check("event hook emits no intrusive startup toast", toasts.length === 0);
 
 // ── New: audit trail ──
@@ -752,19 +755,13 @@ check("record_review tool execution succeeds", typeof reviewToolResult === "stri
 if (typeof customPlugin.event === "function") {
 	await customPlugin.event({
 		event: {
-			type: "permission.asked",
-			properties: { sessionID: "s-active", permission: "bash", pattern: "npm test" },
-		},
-	});
-	await customPlugin.event({
-		event: {
 			type: "permission.replied",
-			properties: { sessionID: "s-active", permission: "bash", decision: "allow" },
+			properties: { sessionID: "s-active", permissionID: "perm-1", response: "allow" } as any,
 		},
 	});
 }
 const recentAudits = getRecentAuditEntries(5);
-check("getRecentAuditEntries returns array with permission events", Array.isArray(recentAudits) && recentAudits.some((e) => e.tool === "permission.asked"));
+check("getRecentAuditEntries returns array with permission events", Array.isArray(recentAudits) && recentAudits.some((e) => e.tool === "permission.replied"));
 
 // 13. Merged Branch & Conflict Pre-Flight Guards (Policies 19 & 20)
 console.log("- Policies 19 & 20: Merged Branch & Conflict Pre-Flight Guards -");

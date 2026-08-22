@@ -47,10 +47,10 @@
  */
 
 import { spawnSync, spawn } from "node:child_process";
-import { mkdirSync, realpathSync, readFileSync, appendFileSync } from "node:fs";
+import { mkdirSync, realpathSync, readFileSync, appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve } from "node:path";
-import type { Plugin, PluginModule } from "@opencode-ai/plugin";
+import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
 
 // OpenCode built-in tools (https://opencode.ai/docs/tools/): bash is the
 // shell tool. Legacy/alias names are kept for compatibility.
@@ -516,17 +516,60 @@ function currentGitBranch(root: string): string | undefined {
 	return undefined;
 }
 
+// ── Project-level configuration (.opencode/workflow-guard.json) ───────────────
+
+export interface ProjectConfig {
+	protectedBranches?: string[];
+	verifyCommand?: string;
+	requireReview?: boolean;
+	requireDocumentation?: boolean;
+}
+
+let cachedProjectConfig: ProjectConfig | undefined;
+
+export function loadProjectConfig(root: string): ProjectConfig {
+	const candidates = [
+		join(root, ".opencode", "workflow-guard.json"),
+		join(root, ".opencode", "workflow-guard.jsonc"),
+		join(root, "workflow-guard.json"),
+		join(root, "workflow-guard.jsonc"),
+	];
+	for (const candidate of candidates) {
+		try {
+			const raw = readFileSync(candidate, "utf8");
+			return JSON.parse(raw);
+		} catch {}
+	}
+	return {};
+}
+
+export function reloadProjectConfig(root: string): void {
+	cachedProjectConfig = loadProjectConfig(root);
+}
+
+export function isReviewRequired(root: string): boolean {
+	if (process.env.WORKFLOW_GUARD_REQUIRE_REVIEW === "1") return true;
+	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
+	return cfg.requireReview === true;
+}
+
 function onProtectedBranch(root: string): boolean {
 	const branch = currentGitBranch(root);
-	return branch !== undefined && PROTECTED_BRANCHES.has(branch);
+	if (!branch) return false;
+	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
+	const customBranches = Array.isArray(cfg.protectedBranches)
+		? cfg.protectedBranches
+		: [];
+	const allProtected = new Set([...PROTECTED_BRANCHES, ...customBranches]);
+	return allProtected.has(branch);
 }
 
 function branchGuardReason(): string {
 	return (
-		"Blocked: the workspace is on a protected branch (main/master). " +
+		"Blocked: the workspace is on a protected branch. " +
 		"Create a feature branch first - e.g. " +
 		"`git switch -c feat/description` - and make all changes there, " +
-		"then open a PR. Direct changes on main/master are not allowed."
+		"then open a PR. Direct changes on protected branches are not allowed."
 	);
 }
 
@@ -831,7 +874,7 @@ function mcpMutationTool(toolName: string): string | undefined {
  * or auth state - anything the agent could modify to weaken the guard.
  * Checked against the path resolved from the workspace root.
  */
-function isProtectedPath(targetPath: string): boolean {
+export function isProtectedPath(targetPath: string): boolean {
 	if (!targetPath) return false;
 	const resolved = resolve(workspaceRoot, targetPath);
 	const base = basename(resolved);
@@ -839,12 +882,107 @@ function isProtectedPath(targetPath: string): boolean {
 	return (
 		// opencode.json / opencode.jsonc anywhere (project config)
 		/^opencode\.jsonc?$/i.test(base) ||
+		// workflow-guard.json / workflow-guard.jsonc anywhere
+		/^workflow-guard\.jsonc?$/i.test(base) ||
 		// anything under a .opencode directory (project plugins, agents)
 		lower.includes(`${"/"}.opencode/`) ||
 		// anything under ~/.config/opencode (global config, plugins, ui)
 		lower.includes("/.config/opencode/") ||
 		lower.includes("/.config/opencode.json")
 	);
+}
+
+// ── Sensitive file READ guard (.env*, keys, credentials, kubeconfig) ─────────
+// Reading live secrets into model context leaks credentials. Read-only fixtures
+// (.env.example, .env.sample, .env.template) are safe and permitted.
+
+const SAFE_ENV_FIXTURE_RE =
+	/\.env\.(example|sample|template|dist|schema)(\.[\w-]+)*$/i;
+
+export function isSecretPath(targetPath: string): boolean {
+	if (!targetPath) return false;
+	const resolved = resolve(workspaceRoot, targetPath);
+	const base = basename(resolved).toLowerCase();
+	const full = resolved.toLowerCase();
+
+	// Safe fixtures
+	if (SAFE_ENV_FIXTURE_RE.test(base)) {
+		return false;
+	}
+
+	// .env files (e.g. .env, .env.local, .env.prod, .env.secret)
+	if (/^\.env(?:\.|$)/i.test(base)) {
+		return true;
+	}
+
+	// SSH & TLS key material
+	if (
+		/^(id_rsa|id_dsa|id_ecdsa|id_ed25519)(?:\.|$)/i.test(base) ||
+		/\.(pem|key|pkcs12|pfx|p12)$/i.test(base)
+	) {
+		return true;
+	}
+
+	// Cloud / cluster / service account credentials
+	if (
+		/kubeconfig/i.test(base) ||
+		full.includes("/.kube/config") ||
+		/^(service[-_]?account|client[-_]?secret).*\.json$/i.test(base) ||
+		/credentials\.json$/i.test(base) ||
+		full.includes("/.aws/credentials") ||
+		full.includes("/.docker/config.json") ||
+		base === ".netrc" ||
+		base === ".git-credentials"
+	) {
+		return true;
+	}
+
+	return false;
+}
+
+const SECRET_READ_COMMAND_RE =
+	/(?:^|\s)(?:cat|head|tail|less|more|grep|awk|sed|od|hexdump|strings|base64|xxd|nl|sort|uniq|view|nano|vim?)\s+[^|;&]*?(?:["']?)([\w\/.~-]*\.(?:pem|key|pfx|p12)|[\w\/.~-]*\.env(?:\.[\w-]+)*|[\w\/.~-]*id_(?:rsa|dsa|ecdsa|ed25519)[\w.-]*|[\w\/.~-]*kubeconfig[\w.-]*|[\w\/.~-]*(?:service[-_]?account|credentials|client[-_]?secret)[\w.-]*\.json)(?:["']?)/i;
+
+function secretFileReadIn(segment: string): string | undefined {
+	const match = segment.match(SECRET_READ_COMMAND_RE);
+	if (match?.[1] && isSecretPath(match[1])) {
+		return match[1];
+	}
+	return undefined;
+}
+
+// ── Interpreter inline evasion scanner ───────────────────────────────────────
+// Extracts inline script payloads (python -c, node -e, perl -e, ruby -e,
+// powershell -enc, base64 | sh) so the live-mutation and settings-tamper
+// scanners can inspect the actual script content.
+
+export function extractInterpreterPayload(segment: string): string[] {
+	const payloads: string[] = [];
+	const inlineMatch = segment.match(
+		/\b(?:python3?|node|perl|ruby|osascript)\s+(?:-[a-zA-Z]*[ce]\s+)(?:"([^"]*)"|'([^']*)')/i,
+	);
+	if (inlineMatch?.[1] || inlineMatch?.[2]) {
+		payloads.push(inlineMatch[1] ?? inlineMatch[2] ?? "");
+	}
+	const psMatch = segment.match(
+		/\b(?:powershell|pwsh)\s+(?:-[a-zA-Z]*enc[a-zA-Z]*\s+)([A-Za-z0-9+/=]+)/i,
+	);
+	if (psMatch?.[1]) {
+		try {
+			const buf = Buffer.from(psMatch[1], "base64");
+			payloads.push(buf.toString("utf8"), buf.toString("utf16le"));
+		} catch {}
+	}
+	const b64PipeMatch = segment.match(
+		/echo\s+["']?([A-Za-z0-9+/=]{4,})["']?\s*\|\s*base64\s+(?:-[a-zA-Z]*d[a-zA-Z]*|--decode)\s*\|\s*(?:bash|sh|zsh)/i,
+	);
+	if (b64PipeMatch?.[1]) {
+		try {
+			const buf = Buffer.from(b64PipeMatch[1], "base64");
+			payloads.push(buf.toString("utf8"), buf.toString("utf16le"));
+		} catch {}
+	}
+	return payloads;
 }
 
 /**
@@ -1285,6 +1423,25 @@ export function getAuditFilePath(): string {
 	return AUDIT_FILE;
 }
 
+export function getRecentAuditEntries(limit = 10): AuditEntry[] {
+	try {
+		if (!existsSync(AUDIT_FILE)) return [];
+		const lines = readFileSync(AUDIT_FILE, "utf8").trim().split("\n");
+		const entries: AuditEntry[] = [];
+		for (let i = lines.length - 1; i >= 0 && entries.length < limit; i--) {
+			const line = lines[i]?.trim();
+			if (line) {
+				try {
+					entries.push(JSON.parse(line));
+				} catch {}
+			}
+		}
+		return entries;
+	} catch {
+		return [];
+	}
+}
+
 export interface AuditEntry {
 	ts: string;
 	sessionID?: string;
@@ -1362,6 +1519,27 @@ async function guardToolCallImpl(
 	input: unknown,
 	context?: { sessionID?: string },
 ): Promise<string | undefined> {
+	// ── Policy 17: Secret file READ guard (.env*, keys, kubeconfig, credentials) ──
+	if (toolName === "read") {
+		const record = asRecord(input);
+		const target =
+			typeof record?.filePath === "string"
+				? record.filePath
+				: typeof record?.path === "string"
+					? record.path
+					: typeof input === "string"
+						? input
+						: "";
+		if (target && isSecretPath(target)) {
+			logBlock(`[workflow-guard] blocked read: secret file ${target}`);
+			return (
+				`Blocked: reading sensitive credential/secret file '${target}' is not permitted. ` +
+				"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
+			);
+		}
+		return undefined;
+	}
+
 	// ── Policy 1: todowrite lifecycle & focus validation ──
 	if (toolName === "todowrite") {
 		const record = asRecord(input);
@@ -1442,6 +1620,13 @@ async function guardToolCallImpl(
 			logBlock(`[workflow-guard] blocked ${toolName}: protected path ${target}`);
 			return PROTECTED_PATH_REASON;
 		}
+		if (target && isSecretPath(target) && !allowLive) {
+			logBlock(`[workflow-guard] blocked ${toolName}: secret file path ${target}`);
+			return (
+				`Blocked: modifying secret file '${target}' directly is not permitted. ` +
+				"Store credentials in environment variables or safe secret stores instead."
+			);
+		}
 		if (toolName === "apply_patch") {
 			const patchText =
 				typeof record?.patchText === "string" ? record.patchText : "";
@@ -1451,6 +1636,12 @@ async function guardToolCallImpl(
 						`[workflow-guard] blocked apply_patch: protected path ${patchPath}`,
 					);
 					return PROTECTED_PATH_REASON;
+				}
+				if (isSecretPath(patchPath) && !allowLive) {
+					logBlock(
+						`[workflow-guard] blocked apply_patch: secret file path ${patchPath}`,
+					);
+					return `Blocked: modifying secret file '${patchPath}' directly is not permitted.`;
 				}
 				if (isPathOutsideWorkspace(patchPath, workspaceRoot)) {
 					logBlock(
@@ -1616,6 +1807,42 @@ async function guardToolCallImpl(
 				`[workflow-guard] blocked settings tamper: ${command.slice(0, 120)}`,
 			);
 			return PROTECTED_PATH_REASON;
+		}
+
+		// ── Policy 17: Secret file reads via shell (cat .env, grep id_rsa, etc.) ──
+		if (!allowLive) {
+			for (const segment of command.split(/[\n|;&]+/)) {
+				const secretFile = secretFileReadIn(segment.trim());
+				if (secretFile) {
+					logBlock(
+						`[workflow-guard] blocked shell read of secret file: ${secretFile}`,
+					);
+					return (
+						`Blocked: reading sensitive credential/secret file '${secretFile}' via shell is not permitted. ` +
+						"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
+					);
+				}
+			}
+		}
+
+		// ── Policy 18: Interpreter inline evasion scanner ────────
+		if (!allowLive) {
+			for (const payload of extractInterpreterPayload(command)) {
+				const normPayload = normalizeGitCommands(normalize(payload));
+				const liveCheck = liveMutationIn(normPayload);
+				if (liveCheck) {
+					logBlock(
+						`[workflow-guard] blocked interpreter payload containing ${liveCheck}`,
+					);
+					return `Blocked: inline interpreter script contains a ${liveCheck}. Interpreter payloads cannot smuggle live destructive commands past the guard.`;
+				}
+				if (isSettingsTamper(payload)) {
+					logBlock(
+						`[workflow-guard] blocked interpreter payload with settings tamper`,
+					);
+					return PROTECTED_PATH_REASON;
+				}
+			}
 		}
 
 		// ── Policies 1, 7 & 8: shell file mutations get the same gates as edits ──
@@ -1793,24 +2020,139 @@ export function setWorkspaceRoot(root: string): void {
 	}
 }
 
+async function showBlockToast(message: string): Promise<void> {
+	try {
+		await sdkClient?.tui?.showToast?.({
+			body: {
+				title: "Workflow Guard Blocked",
+				message: message.slice(0, 180),
+				variant: "warning",
+			},
+		});
+	} catch {}
+}
+
 export const WorkflowGuard: Plugin = async (ctx) => {
-	// ctx.directory is the directory opencode was started in; ctx.client is
-	// the SDK client for the built-in server (used for the session todo
-	// list - documented endpoint GET /session/:id/todo).
-	setWorkspaceRoot(ctx.directory ?? process.cwd());
+	// Honor worktree if present (e.g. opencode worktrees or devcontainers)
+	// so worktree plugins cannot punch through boundary gates.
+	const effectiveRoot = ctx.worktree || ctx.directory || process.cwd();
+	setWorkspaceRoot(effectiveRoot);
 	setSdkClient(ctx.client);
+	reloadProjectConfig(effectiveRoot);
 
 	try {
 		await (ctx.client as any)?.app?.log?.({
 			body: {
 				service: "workflow-guard",
 				level: "info",
-				message: `Workflow Guard plugin initialized for ${ctx.directory ?? process.cwd()}`,
+				message: `Workflow Guard plugin initialized for ${effectiveRoot}`,
 			},
 		});
 	} catch {}
 
 	return {
+		// Custom inspection and review tools registered in OpenCode
+		tool: {
+			guard_status: tool({
+				description:
+					"Inspect active guardrails, current branch protection, and verification/review status.",
+				args: {},
+				execute: async () => {
+					const branch = currentGitBranch(workspaceRoot) ?? "unknown";
+					const isProtected = onProtectedBranch(workspaceRoot);
+					const lastV = getLastVerifyResult();
+					const lastR = getLastReviewResult();
+					const lastMut = getLastMutationTimestamp();
+					const cfg = loadProjectConfig(workspaceRoot);
+					return JSON.stringify(
+						{
+							workspaceRoot,
+							branch,
+							onProtectedBranch: isProtected,
+							lastMutationTimestamp: lastMut,
+							lastVerify: lastV
+								? {
+										command: lastV.command,
+										passed: lastV.passed,
+										fresh: lastV.timestamp >= lastMut,
+									}
+								: null,
+							lastReview: lastR
+								? {
+										reviewer: lastR.reviewer,
+										passed: lastR.passed,
+										summary: lastR.summary,
+									}
+								: null,
+							projectConfig: {
+								protectedBranches: cfg.protectedBranches ?? ["main", "master"],
+								verifyCommand: detectVerifyCommand(workspaceRoot) ?? null,
+								requireReview: isReviewRequired(workspaceRoot),
+								requireDocumentation: isDocumentationRequired(workspaceRoot),
+							},
+						},
+						null,
+						2,
+					);
+				},
+			}),
+			guard_audit: tool({
+				description:
+					"View recent audit entries recorded by opencode-workflow-guard.",
+				args: {
+					limit: tool.schema
+						.number()
+						.optional()
+						.describe("Maximum entries to return (default 10)"),
+				},
+				execute: async (args) => {
+					const limit =
+						typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10;
+					return JSON.stringify(getRecentAuditEntries(limit), null, 2);
+				},
+			}),
+			guard_why: tool({
+				description:
+					"Simulate and explain whether a specific tool call or command would be blocked by guardrails.",
+				args: {
+					tool: tool.schema
+						.string()
+						.describe("Tool name (e.g. bash, edit, write, read, apply_patch)"),
+					input: tool.schema
+						.record(tool.schema.string(), tool.schema.any())
+						.optional()
+						.describe("Tool input arguments"),
+				},
+				execute: async (args) => {
+					const reason = await guardToolCallImpl(args.tool, args.input ?? {});
+					return reason
+						? `BLOCKED: ${reason}`
+						: "ALLOWED: Satisfies all current guardrails.";
+				},
+			}),
+			record_review: tool({
+				description:
+					"Record a secondary reviewer agent's approval or critique of the current changes.",
+				args: {
+					reviewer: tool.schema
+						.string()
+						.describe("Identifier/name of the reviewer subagent"),
+					summary: tool.schema
+						.string()
+						.describe("Review findings summary across the 5 core review axes"),
+					passed: tool.schema
+						.boolean()
+						.describe("True if change is approved, false if changes requested"),
+				},
+				execute: async (args) => {
+					recordReviewResult(args.reviewer, args.summary, args.passed);
+					return args.passed
+						? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.`
+						: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
+				},
+			}),
+		},
+
 		// OpenCode passes the tool args as the SECOND hook parameter
 		// (`output.args` - documented in the tools docs, e.g. apply_patch
 		// "uses output.args.patchText"; `input` only carries
@@ -1824,8 +2166,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				sessionID: input.sessionID,
 			});
 			if (reason !== undefined) {
-				// Throwing from the hook blocks the tool call (see the
-				// ".env protection" example in the opencode plugin docs).
+				await showBlockToast(reason);
 				throw new Error(`[workflow-guard] ${reason}`);
 			}
 		},
@@ -1835,9 +2176,6 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		// every edit. This avoids running tests on intermediate broken states
 		// and reduces performance overhead.
 		"tool.execute.after": async (input) => {
-			// Verification now runs only on todowrite finalization, not on edits.
-			// The todowrite hook in guardToolCallImpl checks lastVerify before
-			// allowing all tasks to be marked completed.
 			return;
 		},
 
@@ -1905,22 +2243,25 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			} catch {}
 		},
 
-		// Command-channel audit: `command.executed` events (documented) are
-		// logged so developers can audit what slash/user commands ran. The
-		// guard's enforcement happens in tool.execute.before; this is
-		// deliberately informational only (event handlers that throw can
-		// destabilize a session).
-		event: async ({ event }: { event: { type?: string; properties?: unknown } }) => {
-			if (event?.type !== "command.executed") return;
-			audit({
-				ts: new Date().toISOString(),
-				sessionID: (event.properties as { sessionID?: string })?.sessionID,
-				tool: "command.executed",
-				decision: "allow",
-				input: {
-					command: (event.properties as { command?: unknown })?.command ?? "(unknown)",
-				},
-			});
+		// Command & permission event audit trail: journal user commands,
+		// permission requests, and session creations.
+		event: async ({
+			event,
+		}: { event: { type?: string; properties?: unknown } }) => {
+			if (
+				event?.type === "command.executed" ||
+				event?.type === "permission.updated" ||
+				event?.type === "permission.replied" ||
+				event?.type === "session.created"
+			) {
+				audit({
+					ts: new Date().toISOString(),
+					sessionID: (event.properties as { sessionID?: string })?.sessionID,
+					tool: event.type ?? "event",
+					decision: "allow",
+					input: summarizeInput(event.properties),
+				});
+			}
 		},
 	};
 };
