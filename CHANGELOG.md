@@ -4,6 +4,9 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 
 ## Unreleased
 
+### Changed
+- Removed single-task focus rule (Policy 1). Multiple tasks may now be `in_progress` simultaneously, enabling concurrent subagent work on different tasks. Only "no silent deletion" and "all-done verification" remain enforced.
+
 ### Developer Experience
 - Added `.editorconfig` and `.prettierrc` for editor and formatting consistency.
 - Added `.githooks/pre-commit` hook that runs typecheck + unit tests before every commit (activate with `git config core.hooksPath .githooks`).

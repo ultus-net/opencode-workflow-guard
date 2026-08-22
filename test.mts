@@ -98,10 +98,9 @@ check("edit allowed with in_progress todo", !(await call("edit", { filePath: joi
 check("edit allowed with mixed pending/completed", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-mixed" })));
 check("task gate is per session (other session's todos don't help)", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-empty" })));
 
-console.log("- Policy 1: todowrite focus & lifecycle validation -");
-// Focus rule: only 1 in_progress
-check("todowrite allows 1 in_progress", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "pending")] }, { sessionID: "s-empty" })));
-check("todowrite blocks >1 in_progress (focus rule)", blocked(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
+console.log("- Policy 1: todowrite lifecycle validation -");
+// Multiple in_progress allowed (no single-task focus rule)
+check("todowrite allows multiple in_progress tasks", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
 // Flexible out-of-order completion allows finishing independent items without artificial sequential blockers
 check("todowrite allows flexible out-of-order completion", !(await call("todowrite", { todos: [item("a", "pending"), item("b", "completed")] }, { sessionID: "s-empty" })));
 // No silent deletion: active task cannot silently vanish

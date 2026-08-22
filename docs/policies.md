@@ -8,8 +8,7 @@
 
 ### 1. Task Breakdown & Lifecycle (`todowrite`)
 - **Pre-edit Gate:** All file-editing tools (`edit`, `write`, `apply_patch`) are blocked until the session has an active task list in OpenCode's native todo system (`todowrite`, persisted at `GET /session/:id/todo`).
-- **Focus Rule:** Only one task may be `in_progress` at any given time. The agent is prevented from scattering focus across multiple parallel tasks.
-- **Flexible Task Execution:** Tasks can be completed flexibly as work concludes without artificial sequential blockers, maintaining maximum pair-programming DX.
+- **Flexible Task Execution:** Tasks can be completed in any order as work concludes without artificial sequential blockers, maintaining maximum pair-programming DX.
 - **No Silent Deletion:** Active tasks cannot be deleted without being explicitly marked `completed` or `cancelled`.
 - **Subagent Inheritance:** Subagents (which have `todowrite` denied by default) automatically inherit active tasks from their parent session via the `parentID` hierarchy.
 
