@@ -530,6 +530,145 @@ function branchGuardReason(): string {
 	);
 }
 
+// ── Merged / Closed PR branch check (GitHub & Azure DevOps) ──────────────────
+
+export function isBranchAlreadyMergedOrClosed(
+	root: string,
+	branch: string,
+): { merged: boolean; reason?: string } {
+	if (!branch || PROTECTED_BRANCHES.has(branch)) {
+		return { merged: false };
+	}
+
+	// 1. Check local / remote git ancestors: is branch already fully merged into main/master?
+	for (const base of ["origin/HEAD", "origin/main", "origin/master", "main", "master"]) {
+		const check = spawnSync("git", ["merge-base", "--is-ancestor", branch, base], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (check.status === 0) {
+			const unmerged = spawnSync("git", ["rev-list", `${base}..${branch}`, "--count"], {
+				cwd: root,
+				encoding: "utf8",
+				timeout: 5_000,
+			});
+			if (unmerged.status === 0 && unmerged.stdout.trim() === "0") {
+				return {
+					merged: true,
+					reason: `Branch '${branch}' is already merged into '${base}'. Create a fresh feature branch for new changes.`,
+				};
+			}
+		}
+	}
+
+	// 2. Check GitHub PR state if gh CLI is present
+	try {
+		const ghRes = spawnSync(
+			"gh",
+			["pr", "list", "--head", branch, "--state", "all", "--json", "number,state,title", "--limit", "1"],
+			{ cwd: root, encoding: "utf8", timeout: 8_000 },
+		);
+		if (ghRes.status === 0 && ghRes.stdout.trim()) {
+			const prs = JSON.parse(ghRes.stdout.trim());
+			if (Array.isArray(prs) && prs.length > 0) {
+				const pr = prs[0];
+				if (pr && (pr.state === "MERGED" || pr.state === "CLOSED")) {
+					return {
+						merged: true,
+						reason: `Branch '${branch}' is associated with an already ${pr.state.toLowerCase()} GitHub PR (#${pr.number}: ${pr.title ?? ""}). Create a fresh feature branch for new changes.`,
+					};
+				}
+			}
+		}
+	} catch {}
+
+	// 3. Check Azure DevOps PR state if az CLI is present
+	try {
+		const azRes = spawnSync(
+			"az",
+			["repos", "pr", "list", "--source-branch", branch, "--status", "all", "--query", "[0].{id:pullRequestId, status:status, title:title}", "-o", "json"],
+			{ cwd: root, encoding: "utf8", timeout: 8_000 },
+		);
+		if (azRes.status === 0 && azRes.stdout.trim()) {
+			const pr = JSON.parse(azRes.stdout.trim());
+			if (pr && typeof pr === "object" && (pr.status === "completed" || pr.status === "abandoned")) {
+				return {
+					merged: true,
+					reason: `Branch '${branch}' is associated with an already ${pr.status} Azure DevOps PR (#${pr.id}: ${pr.title ?? ""}). Create a fresh feature branch for new changes.`,
+				};
+			}
+		}
+	} catch {}
+
+	return { merged: false };
+}
+
+// ── Merge conflict pre-flight check ──────────────────────────────────────────
+
+export function checkMergeConflicts(root: string): {
+	hasConflicts: boolean;
+	baseBranch?: string;
+	reason?: string;
+} {
+	const candidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
+	for (const base of candidates) {
+		const mergeBaseRes = spawnSync("git", ["merge-base", "HEAD", base], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (mergeBaseRes.status !== 0 || !mergeBaseRes.stdout.trim()) continue;
+		const mergeBase = mergeBaseRes.stdout.trim();
+
+		const treeRes = spawnSync("git", ["merge-tree", mergeBase, "HEAD", base], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 10_000,
+		});
+		if (treeRes.status === 0 && treeRes.stdout.includes("<<<<<<<")) {
+			return {
+				hasConflicts: true,
+				baseBranch: base,
+				reason: `Branch has merge conflicts with base branch '${base}'. Rebase or merge '${base}' to resolve all conflicts before opening a PR or handing off.`,
+			};
+		}
+	}
+	return { hasConflicts: false };
+}
+
+// ── Base branch freshness pre-flight check ───────────────────────────────────
+
+const GIT_BRANCH_CREATE_RE =
+	/\bgit\s+(?:checkout\s+-b|switch\s+(?:-c|--create))\b/;
+
+export function checkBranchBaseIsUpToDate(root: string): {
+	isBehind: boolean;
+	count?: number;
+	baseRef?: string;
+	reason?: string;
+} {
+	for (const base of ["origin/HEAD", "origin/main", "origin/master"]) {
+		const res = spawnSync("git", ["rev-list", `HEAD..${base}`, "--count"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (res.status === 0 && res.stdout.trim()) {
+			const count = parseInt(res.stdout.trim(), 10);
+			if (!isNaN(count) && count > 0) {
+				return {
+					isBehind: true,
+					count,
+					baseRef: base,
+					reason: `Local base branch is ${count} commit(s) behind remote (${base}). Run 'git pull' or 'git fetch' on main before creating a fresh feature branch to prevent upstream conflicts.`,
+				};
+			}
+		}
+	}
+	return { isBehind: false };
+}
+
 // ── Live-system guard ────────────────────────────────────────────────────────
 // The ONLY override is the WORKFLOW_GUARD_ALLOW_LIVE=1 environment variable,
 // which the user must set before launching the agent. There is deliberately
@@ -801,6 +940,62 @@ function branchHasChangelogChange(root: string): boolean {
 	} catch {
 		return false;
 	}
+}
+
+// ── Documentation review & synchronization check (Policy 21) ─────────────────
+
+export function branchHasDocumentationChange(root: string): boolean {
+	try {
+		const baseCandidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
+		for (const base of baseCandidates) {
+			const mergeBase = spawnSync("git", ["merge-base", "HEAD", base], {
+				cwd: root,
+				encoding: "utf8",
+				timeout: 5_000,
+			});
+			if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) continue;
+			const diff = spawnSync(
+				"git",
+				["diff", "--name-only", `${mergeBase.stdout.trim()}...HEAD`],
+				{ cwd: root, encoding: "utf8", timeout: 8_000 },
+			);
+			if (diff.status !== 0) continue;
+			const files = diff.stdout.split("\n").filter(Boolean);
+			if (
+				files.some(
+					(f) =>
+						/\.md$/i.test(f) ||
+						f.startsWith("docs/") ||
+						f.toLowerCase() === "readme.md",
+				)
+			) {
+				return true;
+			}
+		}
+		const last = spawnSync("git", ["diff", "--name-only", "HEAD~1"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (last.status === 0) {
+			const files = last.stdout.split("\n").filter(Boolean);
+			return files.some(
+				(f) =>
+					/\.md$/i.test(f) ||
+					f.startsWith("docs/") ||
+					f.toLowerCase() === "readme.md",
+			);
+		}
+		return false;
+	} catch {
+		return false;
+	}
+}
+
+export function isDocumentationRequired(root: string): boolean {
+	if (process.env.WORKFLOW_GUARD_REQUIRE_DOCS === "1") return true;
+	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
+	return cfg.requireDocumentation === true;
 }
 
 function prBodyIncludesChangelog(command: string): boolean {
@@ -1193,6 +1388,14 @@ async function guardToolCallImpl(
 					return s === "completed" || s === "cancelled";
 				});
 			if (allDone) {
+				// Conflict-free mergeability gate before task completion/handoff
+				const conflictCheck = checkMergeConflicts(workspaceRoot);
+				if (conflictCheck.hasConflicts) {
+					const reason = `Blocked todowrite: ${conflictCheck.reason}`;
+					logBlock(`[workflow-guard] ${reason}`);
+					return reason;
+				}
+
 				const command = detectVerifyCommand(workspaceRoot);
 				if (command) {
 					const isFresh =
@@ -1396,6 +1599,17 @@ async function guardToolCallImpl(
 			return branchGuardReason();
 		}
 
+		// Check if creating a fresh branch while local base is behind remote
+		if (GIT_BRANCH_CREATE_RE.test(normalizedCommand)) {
+			const behindCheck = checkBranchBaseIsUpToDate(effectiveRoot);
+			if (behindCheck.isBehind) {
+				logBlock(
+					`[workflow-guard] blocked branch creation: base is behind remote ${behindCheck.baseRef}`,
+				);
+				return `Blocked: ${behindCheck.reason}`;
+			}
+		}
+
 		// ── Policy 6: block self-modification of approval gates ──
 		if (isSettingsTamper(command)) {
 			logBlock(
@@ -1444,8 +1658,74 @@ async function guardToolCallImpl(
 			);
 		}
 
+		// ── Policy 20: block push to already merged / closed PR branches ──
+		if (/\bgit\s+push\b/.test(normalizedCommand)) {
+			const branch = currentGitBranch(effectiveRoot);
+			if (branch) {
+				const mergedStatus = isBranchAlreadyMergedOrClosed(
+					effectiveRoot,
+					branch,
+				);
+				if (mergedStatus.merged) {
+					logBlock(
+						`[workflow-guard] blocked push to merged/closed branch: ${branch}`,
+					);
+					return `Blocked: ${mergedStatus.reason}`;
+				}
+			}
+		}
+
 		// ── Policy 3: PRs must include a changelog (GitHub & Azure DevOps) ──
 		if (hasPrCreateInvocation(normalizedCommand)) {
+			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
+			const prTool = isAz ? "az repos pr create" : "gh pr create";
+			const descFlag = isAz ? "--description" : "--body";
+
+			// Policy 19: Conflict-free mergeability gate before opening PR
+			const conflictCheck = checkMergeConflicts(workspaceRoot);
+			if (conflictCheck.hasConflicts) {
+				logBlock(`[workflow-guard] blocked ${prTool}: merge conflicts detected`);
+				return `Blocked: ${conflictCheck.reason}`;
+			}
+
+			// Policy 20: Check if branch is already merged/closed
+			const branch = currentGitBranch(workspaceRoot);
+			if (branch) {
+				const mergedStatus = isBranchAlreadyMergedOrClosed(
+					workspaceRoot,
+					branch,
+				);
+				if (mergedStatus.merged) {
+					logBlock(
+						`[workflow-guard] blocked ${prTool}: branch already merged/closed`,
+					);
+					return `Blocked: ${mergedStatus.reason}`;
+				}
+			}
+
+			if (isReviewRequired(workspaceRoot)) {
+				const review = getLastReviewResult();
+				if (!review || !review.passed) {
+					logBlock(`[workflow-guard] blocked ${prTool}: review approval required`);
+					return (
+						`Blocked: PR creation requires a passing review approval. ` +
+						"Invoke a secondary review subagent to record an approval using the record_review tool first."
+					);
+				}
+			}
+
+			// Policy 21: Documentation review & update check
+			if (isDocumentationRequired(workspaceRoot)) {
+				const hasDocChange = branchHasDocumentationChange(workspaceRoot);
+				if (!hasDocChange) {
+					logBlock(`[workflow-guard] blocked ${prTool}: documentation update required`);
+					return (
+						`Blocked: PR requires documentation updates (Policy 21). ` +
+						"Update README.md or relevant documentation in docs/ before opening a PR."
+					);
+				}
+			}
+
 			const hasChangelog =
 				prBodyIncludesChangelog(command) ||
 				branchHasChangelogChange(workspaceRoot);

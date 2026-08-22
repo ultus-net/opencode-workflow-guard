@@ -44,7 +44,12 @@ opencode-workflow-guard/
 | **13** | **Command-Channel Audit** | Slash commands (`command.executed`) are journaled to the audit file so agents cannot run hidden work through user-facing channels. |
 | **14** | **Audit Trail** | Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (durable). |
 | **15** | **Compaction Focus Hook** | Injects the active sequential task list into `experimental.session.compacting` context. |
-| **16** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers status indicator feedback in the OpenCode interface. |
+| **16** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers status indicator feedback in the OpenCode interface and emits toasts on blocked actions. |
+| **17** | **Secret-File Read Block** | Blocks reading `.env*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`, `kubeconfig`, `credentials.json`, or service account keys via the `read` tool or shell commands (`cat`, `less`, `grep`). Safe templates (`.env.example`) remain readable. |
+| **18** | **Interpreter Inline Evasion** | Decodes and scans inline interpreter scripts (`python -c`, `node -e`, `perl -e`, `ruby -e`, `powershell -enc`, `base64 | sh`) for destructive commands or settings tampering. |
+| **19** | **Conflict-Free Pre-Flight** | Verifies via `git merge-tree` that the branch has zero merge conflicts with the base branch (`origin/main`) before allowing PR creation or final task handoff. |
+| **20** | **Merged Branch & Freshness** | Blocks pushing to branches already merged or associated with closed PRs (GitHub & Azure DevOps), and blocks creating fresh branches when the local base is behind remote. |
+| **21** | **Documentation Synchronization** | Verifies that relevant documentation (`README.md` or `docs/`) is reviewed and updated when introducing new features, tools, or policy changes before opening a PR. |
 
 For detailed rule descriptions and overrides, see [docs/policies.md](docs/policies.md).
 
@@ -52,8 +57,23 @@ For detailed rule descriptions and overrides, see [docs/policies.md](docs/polici
 
 ## Quick Install
 
+### Option A: npm Package Configuration (Recommended)
+
+Add to your project's `opencode.json` or global `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-workflow-guard"
+  ]
+}
+```
+
+### Option B: Local Plugin Copy
+
 ```bash
-# Server plugin (required) - global example
+# Server plugin - global example
 mkdir -p ~/.config/opencode/plugins
 cp workflow-guard.ts ~/.config/opencode/plugins/
 
@@ -74,6 +94,16 @@ Then add `~/.config/opencode/tui.json`:
 ```
 
 *Requires OpenCode >= 1.18.* See [docs/installation.md](docs/installation.md) for full configuration options.
+
+---
+
+## Custom Tools
+
+The plugin registers custom tools available in OpenCode sessions:
+- `guard_status`: Inspect active guardrails, current branch protection, verification status, and review approval.
+- `guard_audit`: View recent audit log entries recorded in `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl`.
+- `guard_why`: Simulate and explain whether a specific tool call or command would be blocked.
+- `record_review`: Record a secondary reviewer subagent's approval or critique across the 5 core review axes.
 
 ---
 

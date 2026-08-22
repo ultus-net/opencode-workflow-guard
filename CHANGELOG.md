@@ -2,19 +2,29 @@
 
 All notable changes to `opencode-workflow-guard` will be documented in this file.
 
-## [Unreleased]
+## [1.2.0] - 2026-08-22
 
-### Security & Robustness
-- **Privilege-isolated verification execution (Policy 10).** Verification runs with scrubbed credentials (`getCleanEnv()`), output caps, safety checks against destructive commands, and a 30s timeout to prevent process hangs or credential exfiltration.
-- **Multi-segment shell mutation scanning (Policy 8).** Fixed compound command parsing in `guardShellMutation()` to inspect all segments rather than returning early on the first match, preventing evasion via benign prefix commands.
-- **Symlink-aware workspace boundary enforcement (Policy 8).** Uses `realpathSync` to ensure target paths and existing ancestor directories cannot traverse outside the workspace root via symlinks.
-- **External Git repository protection (Policy 7/8).** Confines mutating Git operations (`git -C /other-repo commit`) to repositories within the workspace boundary unless `WORKFLOW_GUARD_ALLOW_LIVE=1` is set.
+### Security & Invariant Hardening
+- **Secret-File READ Block (Policy 17).** Blocks reading `.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, and `service-account*.json` via the `read` tool or shell inspection commands (`cat`, `less`, `grep`, `awk`, `head`, `tail`, `base64`). Non-secret fixtures (`.env.example`, `.env.sample`, `.env.template`) remain readable.
+- **Interpreter Inline Evasion Scanner (Policy 18).** Decodes and scans inline interpreter payloads (`python -c`, `node -e`, `perl -e`, `ruby -e`, `osascript -e`, `powershell -enc`, `echo <base64> | base64 -d | sh`) to prevent smuggling destructive commands or settings tampering.
+- **Conflict-Free Pre-Flight Guard (Policy 19).** Uses `git merge-tree` to verify the branch has zero merge conflicts with the base branch (`origin/main`) before PR creation or final task handoff.
+- **Merged Branch & Base Freshness Guard (Policy 20).** Blocks pushing to branches already merged or associated with closed PRs (GitHub & Azure DevOps), and blocks creating fresh branches when the local base is behind remote.
+- **Privilege-Isolated Verification Execution (Policy 10).** Verification runs with scrubbed credentials (`getCleanEnv()`), output caps, safety checks against destructive commands, and a 30s timeout to prevent process hangs or credential exfiltration.
+- **Multi-Segment Shell Mutation Scanning (Policy 8).** Fixed compound command parsing in `guardShellMutation()` to inspect all segments rather than returning early on the first match.
+- **Symlink-Aware Workspace Boundary Enforcement (Policy 8).** Uses `realpathSync` to ensure target paths and existing ancestor directories cannot traverse outside the workspace root via symlinks.
+- **External Git Repository Protection (Policy 7/8).** Confines mutating Git operations (`git -C /other-repo commit`) to repositories within the workspace boundary unless `WORKFLOW_GUARD_ALLOW_LIVE=1` is set.
 
-### Developer Experience & Accountability
-- **Flexible task execution (Policy 1).** Relaxed strict top-down sequential completion blockers while maintaining single-task `in_progress` focus and silent deletion prevention.
-- **Evidence-based verification freshness (Policy 10).** Associates mutation timestamps with verification runs, ensuring test evidence is fresh before allowing finalization.
-- **Enhanced audit logging (Policy 14).** Expanded audit records with mutation targets, verification command results, duration, and authorization context.
-- **Comprehensive adversarial test suite.** Added unit and adversarial tests covering symlink escapes, compound shell mutations, verification timeouts, privilege scrubbing, and external Git targets (169 tests total).
+### Developer Experience & Multi-Agent Accountability
+- **Azure DevOps & GitHub PR Parity (Policy 3).** Full PR changelog support for `az repos pr create` alongside `gh pr create`.
+- **Secondary Review Spoke & Rubric.** Added `buildReviewRubric` and `recordReviewResult` integrating `code-review-and-quality` and `doubt-driven-development` skills to verify real behavioral tests and zero shortcut stubs.
+- **Worktree & Devcontainer Root Resolution.** Initializes workspace root from `ctx.worktree || ctx.directory || process.cwd()`.
+- **Project Configuration (`.opencode/workflow-guard.json`).** Supports repository overrides for custom protected branches, custom verify commands, and review enforcement.
+- **Custom Inspection Tools.** Registers `guard_status`, `guard_audit`, `guard_why`, and `record_review` in OpenCode sessions.
+- **Toast Notifications on Block (Policy 16).** Emits real-time warning toasts via `tui.showToast` on blocked actions.
+- **Flexible Task Execution (Policy 1).** Relaxed strict top-down sequential completion blockers while maintaining single-task `in_progress` focus and silent deletion prevention.
+- **Evidence-Based Verification Freshness (Policy 10).** Associates mutation timestamps with verification runs, ensuring test evidence is fresh before allowing finalization.
+- **Documentation Synchronization Guard (Policy 21).** Verifies relevant documentation (`README.md` or `docs/`) is reviewed and updated when changes alter features or policies before PR creation.
+- **Comprehensive Adversarial Test Suite.** 235 passing unit and adversarial tests covering all policies and evasion vectors.
 
 ### Fixed
 - **README policy table now starts at Policy 1.** The "Summary of Enforced Policies" table omitted Policy 1 (Task Gate & Lifecycle) and began at 2; the row is restored. `docs/policies.md` also regains its missing Policy 9 (Script-Laundering Guard) section.
