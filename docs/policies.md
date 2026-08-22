@@ -110,6 +110,11 @@
 
 ### 21. Documentation Review & Synchronization Guard
 - Ensures that relevant documentation (`README.md` or `docs/`) is updated whenever changes introduce new features, policies, or public tools before PR creation. Configurable via `.opencode/workflow-guard.json` (`requireDocumentation: true`) or `WORKFLOW_GUARD_REQUIRE_DOCS=1`.
+
+### 22. Non-Interactive Shell & TTY Hang Guard
+- Blocks commands that spawn interactive text editors (`nano`, `vim`, `emacs`), interactive pagers (`less`, `more`), interactive monitors (`top`, `htop`), interactive rebase/patch prompts (`git rebase -i`, `git add -p`), `sudo`, or package managers missing non-interactive confirmation flags (`npm init` without `-y`, `apt-get` without `-y`).
+- Prevents subshell agents from hanging indefinitely waiting for user stdin in background execution.
+- **Desktop Notifications:** Emits native OS notifications (Linux `notify-send`, macOS `osascript`) when a policy blocks a command or when verification runs finish, keeping developers informed when their terminal is backgrounded. Configurable via `WORKFLOW_GUARD_NOTIFY=0`.
 ---
 
 ## Overrides ("Unless Otherwise Specified")

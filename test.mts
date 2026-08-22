@@ -39,6 +39,8 @@ import {
 	checkBranchBaseIsUpToDate,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
+	checkInteractiveTtyCommand,
+	sendDesktopNotification,
 	default as defaultExport,
 } from "./workflow-guard.ts";
 import { WorkflowGuardTui } from "./workflow-guard-ui.ts";
@@ -1046,6 +1048,37 @@ const testVerifyCache = {
 persistVerifyCache(testVerifyCache);
 const loadedCache = loadVerifyCache();
 check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
+
+// 16. Policy 22: Non-Interactive Shell & TTY Hang Guard
+console.log("- Policy 22: Non-Interactive Shell & TTY Hang Guard -");
+check("checkInteractiveTtyCommand detects vim", checkInteractiveTtyCommand("vim file.txt").isInteractive);
+check("checkInteractiveTtyCommand detects nano", checkInteractiveTtyCommand("nano /tmp/foo").isInteractive);
+check("checkInteractiveTtyCommand detects less", checkInteractiveTtyCommand("less file.txt").isInteractive);
+check("checkInteractiveTtyCommand detects top", checkInteractiveTtyCommand("top").isInteractive);
+check("checkInteractiveTtyCommand detects sudo", checkInteractiveTtyCommand("sudo apt-get update").isInteractive);
+check("checkInteractiveTtyCommand detects git rebase -i", checkInteractiveTtyCommand("git rebase -i HEAD~2").isInteractive);
+check("checkInteractiveTtyCommand detects npm init without -y", checkInteractiveTtyCommand("npm init").isInteractive);
+check("checkInteractiveTtyCommand permits npm init -y", !checkInteractiveTtyCommand("npm init -y").isInteractive);
+check("checkInteractiveTtyCommand permits npm init --yes", !checkInteractiveTtyCommand("npm init --yes").isInteractive);
+check("checkInteractiveTtyCommand detects apt-get install without -y", checkInteractiveTtyCommand("apt-get install curl").isInteractive);
+check("checkInteractiveTtyCommand permits apt-get install -y", !checkInteractiveTtyCommand("apt-get install -y curl").isInteractive);
+check("checkInteractiveTtyCommand permits regular non-interactive command", !checkInteractiveTtyCommand("ls -la && git status").isInteractive);
+
+check("shell tool blocks nano", blocked(await shell("nano README.md")));
+check("shell tool blocks less", blocked(await shell("less package.json")));
+check("shell tool blocks top", blocked(await shell("top")));
+check("shell tool blocks npm init without flag", blocked(await shell("npm init")));
+check("shell tool allows npm init -y", !(await shell("npm init -y")));
+
+// Desktop notifications dispatch test
+check("sendDesktopNotification runs without throwing", (() => {
+	try {
+		sendDesktopNotification("Test Title", "Test Message");
+		return true;
+	} catch {
+		return false;
+	}
+})());
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);

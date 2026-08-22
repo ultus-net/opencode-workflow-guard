@@ -1392,6 +1392,95 @@ export function branchHasDocumentationChange(root: string): boolean {
 	}
 }
 
+// ── Non-interactive shell & TTY hang guard (Policy 22) ───────────────────────
+// AI agents running in non-interactive terminal subshells will hang indefinitely
+// if an interactive prompt (e.g. vim, nano, less, top, sudo, npm init without -y,
+// apt-get without -y, git rebase -i) waits for TTY input.
+
+const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice: string }> = [
+	{
+		regex: /\b(?:nano|vim?|emacs|pico|joe|micro)\b/i,
+		name: "interactive text editor",
+		advice: "Use the edit, write, or apply_patch tools instead of interactive terminal editors.",
+	},
+	{
+		regex: /\b(?:less|more|most)\b/i,
+		name: "terminal pager",
+		advice: "Use cat, head, or grep with non-interactive pipes instead of interactive pagers.",
+	},
+	{
+		regex: /\b(?:top|htop|btop|atop|glances)\b/i,
+		name: "interactive process monitor",
+		advice: "Use ps aux, uptime, or batch flags (e.g. top -b -n 1) instead of interactive monitors.",
+	},
+	{
+		regex: /\bsudo\b/i,
+		name: "sudo with password prompt",
+		advice: "Avoid sudo in agent sessions; run commands directly or request user execution.",
+	},
+	{
+		regex: /\bgit\s+rebase\s+-[a-zA-Z]*i/i,
+		name: "git interactive rebase",
+		advice: "Use non-interactive git commands or explicit cherry-pick/merge sequences.",
+	},
+	{
+		regex: /\bgit\s+add\s+-[a-zA-Z]*p/i,
+		name: "git interactive patch",
+		advice: "Use git add <file> or git apply rather than interactive patch selection.",
+	},
+	{
+		regex: /\bnpm\s+init\b(?!\s+(?:-y|--yes|--force))\b/i,
+		name: "npm init without non-interactive flag",
+		advice: "Add -y or --yes flag: npm init -y",
+	},
+	{
+		regex: /\b(?:apt|apt-get)\s+(?:install|remove|purge|upgrade|dist-upgrade)\b(?!\s+(?:-y|--yes|--assume-yes))\b/i,
+		name: "apt command without non-interactive flag",
+		advice: "Add -y flag to avoid interactive confirmation prompts (e.g. apt-get install -y <pkg>).",
+	},
+	{
+		regex: /\b(?:yum|dnf)\s+(?:install|remove|upgrade)\b(?!\s+-y)\b/i,
+		name: "yum/dnf command without non-interactive flag",
+		advice: "Add -y flag to avoid interactive confirmation prompts (e.g. dnf install -y <pkg>).",
+	},
+];
+
+export function checkInteractiveTtyCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
+	for (const { regex, name, advice } of INTERACTIVE_COMMAND_PATTERNS) {
+		if (regex.test(command)) {
+			return { isInteractive: true, name, advice };
+		}
+	}
+	return { isInteractive: false };
+}
+
+/**
+ * Dispatches a native OS desktop notification (macOS osascript or Linux notify-send)
+ * on important guard events (policy blocks, verification completion).
+ * Non-blocking, fails gracefully.
+ */
+export function sendDesktopNotification(title: string, message: string): void {
+	if (process.env.WORKFLOW_GUARD_NOTIFY === "0") return;
+	const safeTitle = title.replace(/"/g, '\\"');
+	const safeMsg = message.slice(0, 150).replace(/"/g, '\\"');
+
+	try {
+		if (process.platform === "darwin") {
+			spawn(
+				"osascript",
+				["-e", `display notification "${safeMsg}" with title "${safeTitle}"`],
+				{ stdio: "ignore", detached: true },
+			).unref();
+		} else if (process.platform === "linux") {
+			spawn(
+				"notify-send",
+				[safeTitle, safeMsg],
+				{ stdio: "ignore", detached: true },
+			).unref();
+		}
+	} catch {}
+}
+
 export function isDocumentationRequired(root: string): boolean {
 	if (process.env.WORKFLOW_GUARD_REQUIRE_DOCS === "1") return true;
 	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
@@ -2222,6 +2311,17 @@ async function guardToolCallImpl(
 	const commands = extractCommands(input);
 	for (const raw of commands) {
 		const command = normalize(raw);
+
+		// ── Policy 22: Non-interactive shell & TTY hang guard ───────
+		const ttyCheck = checkInteractiveTtyCommand(command);
+		if (ttyCheck.isInteractive) {
+			logBlock(`[workflow-guard] blocked interactive TTY command: ${command.slice(0, 100)}`);
+			return (
+				`Blocked: '${command.slice(0, 60)}' is an ${ttyCheck.name} and will hang non-interactive agent execution. ` +
+				`${ttyCheck.advice}`
+			);
+		}
+
 		// Rewrite `git [global-opts] <sub>` to `git <sub>` so global flags
 		// cannot smuggle a guarded subcommand past the regexes.
 		const normalizedCommand = normalizeGitCommands(command);
@@ -2509,6 +2609,7 @@ export function setWorkspaceRoot(root: string): void {
 
 async function showBlockToast(message: string): Promise<void> {
 	try {
+		sendDesktopNotification("Workflow Guard Blocked", message);
 		await sdkClient?.tui?.showToast?.({
 			body: {
 				title: "Workflow Guard Blocked",
