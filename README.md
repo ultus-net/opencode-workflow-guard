@@ -135,6 +135,12 @@ Branch protection on `main` should require the `Typecheck`, `Unit tests`, `E2E`,
 
 ---
 
+## Acknowledgements
+
+`opencode-workflow-guard` draws design inspiration and best practices from projects in the broader OpenCode community. See [ACKNOWLEDGEMENTS.md](ACKNOWLEDGEMENTS.md) for full community project credits.
+
+---
+
 ## License
 
 MIT
