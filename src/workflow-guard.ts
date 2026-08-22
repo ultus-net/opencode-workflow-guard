@@ -755,19 +755,48 @@ export function isReviewRequired(root: string): boolean {
 }
 
 /**
- * True when `branch` is protected for this repository: the built-in
+ * The full protected-branch set for this repository: the built-in
  * main/master set plus any branches configured in
  * `.opencode/workflow-guard.json` (`protectedBranches`). Shared by the
  * branch guard, the push guard and the native worktree tools so every
  * path enforces the same set.
  */
-export function isProtectedBranchName(branch: string, root = workspaceRoot): boolean {
-	if (!branch) return false;
+export function getProtectedBranches(root = workspaceRoot): Set<string> {
 	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
 	const customBranches = Array.isArray(cfg.protectedBranches)
 		? cfg.protectedBranches
 		: [];
-	return new Set([...PROTECTED_BRANCHES, ...customBranches]).has(branch);
+	return new Set([...PROTECTED_BRANCHES, ...customBranches]);
+}
+
+/** True when `branch` is protected for the repository at `root`. */
+export function isProtectedBranchName(branch: string, root = workspaceRoot): boolean {
+	if (!branch) return false;
+	return getProtectedBranches(root).has(branch);
+}
+
+/** Regex-escape a literal string for embedding in a RegExp. */
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Returns the protected branch a `git push` command targets as its
+ * destination, if any. Covers bare refspecs (`git push origin <branch>`)
+ * and colon forms (`git push origin HEAD:<branch>`, `:<branch>` deletion,
+ * `+<branch>` forced), for every protected branch - built-in and
+ * configured - of the repository at `root`.
+ */
+function pushedProtectedBranchIn(pushCommand: string, root: string): string | undefined {
+	for (const branch of getProtectedBranches(root)) {
+		const escaped = escapeRegExp(branch);
+		const re = new RegExp(
+			`(?:^|\\s)\\+?[\\w./-]*:${escaped}(?![\\w./-])` +
+				`|(?:\\s|\\/)${escaped}(?![\\w./-])`,
+		);
+		if (re.test(pushCommand)) return branch;
+	}
+	return undefined;
 }
 
 function onProtectedBranch(root: string): boolean {
@@ -2721,6 +2750,22 @@ async function guardToolCallImpl(
 				"Blocked: direct pushes to main/master are not allowed. " +
 				"Create a feature branch and open a PR instead."
 			);
+		}
+		// Policy 2 (cont.): configured protected branches receive the same
+		// destination-side push protection as main/master.
+		for (const invocation of gitInvocations) {
+			const pushText = `git ${invocation.rest}`;
+			if (!/\bgit\s+push\b/.test(pushText)) continue;
+			const pushedBranch = pushedProtectedBranchIn(pushText, invocation.repoDir);
+			if (pushedBranch) {
+				logBlock(
+					`[workflow-guard] blocked push to protected branch '${pushedBranch}': ${command}`,
+				);
+				return (
+					`Blocked: direct pushes to protected branch '${pushedBranch}' are not allowed. ` +
+					"Create a feature branch and open a PR instead."
+				);
+			}
 		}
 		// ── Policy 20: block push from protected or already-merged branches ──
 		for (const invocation of gitInvocations) {
