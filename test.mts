@@ -40,6 +40,7 @@ import {
 	branchHasDocumentationChange,
 	isDocumentationRequired,
 	checkInteractiveTtyCommand,
+	checkPackageHygiene,
 	sendDesktopNotification,
 	default as defaultExport,
 } from "./workflow-guard.ts";
@@ -1079,6 +1080,22 @@ check("sendDesktopNotification runs without throwing", (() => {
 		return false;
 	}
 })());
+
+// 17. Policy 23: Package Supply-Chain & Dependency Hygiene Guard
+console.log("- Policy 23: Package Supply-Chain & Dependency Hygiene Guard -");
+check("checkPackageHygiene detects npm audit fix --force", checkPackageHygiene("npm audit fix --force").isViolating);
+check("checkPackageHygiene detects global npm install", checkPackageHygiene("npm install -g typescript").isViolating);
+check("checkPackageHygiene detects global pnpm add", checkPackageHygiene("pnpm add -g turbo").isViolating);
+check("checkPackageHygiene detects pip force-reinstall", checkPackageHygiene("pip install --force-reinstall requests").isViolating);
+check("checkPackageHygiene detects direct npm publish", checkPackageHygiene("npm publish").isViolating);
+check("checkPackageHygiene permits regular npm install", !checkPackageHygiene("npm install --save-dev typescript").isViolating);
+check("checkPackageHygiene permits regular npm audit", !checkPackageHygiene("npm audit").isViolating);
+check("checkPackageHygiene permits regular npm audit fix", !checkPackageHygiene("npm audit fix").isViolating);
+
+check("shell tool blocks npm audit fix --force", blocked(await shell("npm audit fix --force")));
+check("shell tool blocks global npm install", blocked(await shell("npm i -g tsx")));
+check("shell tool blocks direct npm publish", blocked(await shell("npm publish --access public")));
+check("shell tool allows regular npm install", !(await shell("npm install lodash")));
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);

@@ -115,6 +115,13 @@
 - Blocks commands that spawn interactive text editors (`nano`, `vim`, `emacs`), interactive pagers (`less`, `more`), interactive monitors (`top`, `htop`), interactive rebase/patch prompts (`git rebase -i`, `git add -p`), `sudo`, or package managers missing non-interactive confirmation flags (`npm init` without `-y`, `apt-get` without `-y`).
 - Prevents subshell agents from hanging indefinitely waiting for user stdin in background execution.
 - **Desktop Notifications:** Emits native OS notifications (Linux `notify-send`, macOS `osascript`) when a policy blocks a command or when verification runs finish, keeping developers informed when their terminal is backgrounded. Configurable via `WORKFLOW_GUARD_NOTIFY=0`.
+
+### 23. Package Supply-Chain & Dependency Hygiene Guard
+- Blocks destructive package manager actions that break dependency trees or pollute machines:
+  - `npm audit fix --force`: Prevents major version downgrades that break application runtime.
+  - Global package installations (`npm i -g`, `pnpm add -g`, `yarn global add`): Directs agents to use project `devDependencies` or `npx`/`bunx`.
+  - Direct agent publishing (`npm publish`, `pnpm publish`): Enforces automated CI/CD release pipelines.
+  - `pip install --force-reinstall`: Enforces pinned requirements.
 ---
 
 ## Overrides ("Unless Otherwise Specified")

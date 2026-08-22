@@ -1392,7 +1392,42 @@ export function branchHasDocumentationChange(root: string): boolean {
 	}
 }
 
-// ── Non-interactive shell & TTY hang guard (Policy 22) ───────────────────────
+// ── Package supply-chain & dependency hygiene guard (Policy 23) ──────────────
+// AI agents frequently run dangerous package manager flags (e.g. npm audit fix --force,
+// npm install --ignore-scripts, pip install --no-verify, global unversioned installs)
+// that introduce breaking changes, downgrade packages insecurely, or execute arbitrary code.
+
+const PACKAGE_HYGIENE_PATTERNS: Array<{ regex: RegExp; name: string; advice: string }> = [
+	{
+		regex: /\bnpm\s+audit\s+fix\s+--force\b/i,
+		name: "destructive npm audit fix --force",
+		advice: "Run 'npm audit' or update dependencies individually in package.json. '--force' introduces breaking major version downgrades.",
+	},
+	{
+		regex: /\b(?:npm|pnpm|yarn|bun)\s+(?:install|i|add)\s+-[a-zA-Z]*g\b/i,
+		name: "global package installation",
+		advice: "Install packages locally as devDependencies (--save-dev) or execute with npx/bunx rather than polluting global machine state.",
+	},
+	{
+		regex: /\bpip\s+install\s+(?:--upgrade\s+)?--force-reinstall\b/i,
+		name: "destructive pip force reinstall",
+		advice: "Specify exact versions in requirements.txt or pyproject.toml instead of force reinstalling.",
+	},
+	{
+		regex: /\b(?:npm|yarn|pnpm|bun)\s+publish\b/i,
+		name: "direct package publish from agent subshell",
+		advice: "Package publishing must be managed by automated release workflows or explicit user release commands.",
+	},
+];
+
+export function checkPackageHygiene(command: string): { isViolating: boolean; name?: string; advice?: string } {
+	for (const { regex, name, advice } of PACKAGE_HYGIENE_PATTERNS) {
+		if (regex.test(command)) {
+			return { isViolating: true, name, advice };
+		}
+	}
+	return { isViolating: false };
+}
 // AI agents running in non-interactive terminal subshells will hang indefinitely
 // if an interactive prompt (e.g. vim, nano, less, top, sudo, npm init without -y,
 // apt-get without -y, git rebase -i) waits for TTY input.
@@ -2319,6 +2354,16 @@ async function guardToolCallImpl(
 			return (
 				`Blocked: '${command.slice(0, 60)}' is an ${ttyCheck.name} and will hang non-interactive agent execution. ` +
 				`${ttyCheck.advice}`
+			);
+		}
+
+		// ── Policy 23: Package supply-chain & dependency hygiene guard ────
+		const packageCheck = checkPackageHygiene(command);
+		if (packageCheck.isViolating && !allowLive) {
+			logBlock(`[workflow-guard] blocked package supply-chain violation: ${command.slice(0, 100)}`);
+			return (
+				`Blocked: '${command.slice(0, 60)}' is a ${packageCheck.name}. ` +
+				`${packageCheck.advice}`
 			);
 		}
 
