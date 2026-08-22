@@ -1,0 +1,66 @@
+name: Bug Report
+description: Report a guard bypass, false positive, or invariant violation
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to fill out this bug report.
+        If this is a **security bypass**, do NOT file here — see SECURITY.md.
+
+  - type: input
+    id: policy
+    attributes:
+      label: Affected Policy
+      description: Which policy number is affected? (see docs/policies.md)
+      placeholder: "e.g., Policy 4, Policy 7"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened vs what should have happened?
+      placeholder: |
+        The guard allowed `X` when it should have blocked it, or blocked
+        `Y` when it should have allowed it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Exact command or tool call that triggers the behavior.
+      placeholder: |
+        git push origin main  # should be blocked but wasn't
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected Behavior
+      description: What should the guard have done?
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Plugin Version
+      description: Version from package.json or CHANGELOG
+      placeholder: "1.2.0"
+    validations:
+      required: true
+
+  - type: input
+    id: opencode-version
+    attributes:
+      label: OpenCode Version
+      description: Output of `opencode --version`
+      placeholder: "1.18.0+"
+    validations:
+      required: true

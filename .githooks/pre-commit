@@ -1,0 +1,12 @@
+#!/bin/sh
+# Pre-commit hook for opencode-workflow-guard
+# Install: git config core.hooksPath .githooks
+set -e
+
+echo "→ Pre-commit: typecheck..."
+npm run typecheck
+
+echo "→ Pre-commit: unit tests..."
+npm test
+
+echo "→ Pre-commit: all checks passed"
