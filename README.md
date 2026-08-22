@@ -128,10 +128,10 @@ GitHub Actions enforces the same gates the plugin enforces on contributors:
 
 | Workflow | Trigger | What runs |
 |---|---|---|
-| **CI** | PR + push to `main` | Typecheck -> unit tests (Node 20/22/24) -> e2e plugin-load -> `npm audit` -> CHANGELOG-updated gate |
-| **Release** | push `v*` tag | Re-verify -> tag/version match -> `npm publish --provenance` -> GitHub release |
+| **CI** | PR + push to `main` | Typecheck -> unit tests (Node 22/24) -> e2e plugin-load -> `npm audit` -> Changeset / Changelog gate |
+| **Release** | Push to `main` | Runs `@changesets/action`: maintains automated "Version Packages" PR or publishes to npm with provenance + GitHub Release on PR merge |
 
-Branch protection on `main` should require the `Typecheck`, `Unit tests`, `E2E`, `npm audit`, and (for PRs) `Changelog updated` checks. The `e2e` job gracefully skips when no `opencode` binary is present, so it never blocks merge.
+Branch protection on `main` should require the `Typecheck`, `Unit tests`, `E2E`, `npm audit`, and (for PRs) `Changelog / Changeset updated` checks. The `e2e` job gracefully skips when no `opencode` binary is present, so it never blocks merge.
 
 ---
 
