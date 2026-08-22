@@ -66,8 +66,10 @@
 
 ### 10. Evidence-Based Verification
 - When the agent attempts to mark **every** task completed (finalizing the request), the guard requires passing verification evidence.
-- Verification (`WORKFLOW_GUARD_VERIFY` env, project `verifyCommand`, or auto-detected `npm test` from `package.json`) executes in an isolated environment with scrubbed credentials, output caps, and strict timeout protection. Environment configuration takes precedence over project configuration.
-- If edits occurred after the previous verification run, fresh verification is executed. If verification fails, finalization is blocked with the error output tail.
+- Verification (`WORKFLOW_GUARD_VERIFY` env, project `verifyCommand`, or auto-detected `npm test` from `package.json`) executes in an isolated environment with scrubbed credentials, output caps, token-efficient stdout/stderr snipping, and strict timeout protection. Environment configuration takes precedence over project configuration.
+- **Git State & Snapshot Binding:** Verification evidence records the current git commit hash (`git rev-parse HEAD`) and working tree status. If unverified edits or index modifications occur after verification, fresh verification is enforced.
+- **Durable Disk Cache:** Passing verification results are cached to `~/.local/state/opencode/workflow-guard/last-verify.json`, allowing session restarts and multi-agent handoffs to retain valid verification evidence without redundant test runs.
+- If verification fails, finalization is blocked with a structured summary of error markers, stack traces, and failure output.
 - The verify command is **disabled** when `WORKFLOW_GUARD_VERIFY` is empty (`""`).
 
 ### 11. Secret-Content Scan
@@ -82,17 +84,18 @@
 - User-triggered slash commands (`command.executed` events) are journaled to the audit trail so agents cannot perform hidden work through a user-facing side channel.
 
 ### 14. Audit Trail
-- Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with a timestamp, session id, tool name, decision, and reason - a durable record.
+- Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with a timestamp, session id, tool name, decision, subagent/parent session attribution, and reason - a durable record.
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
 ### 15. Compaction Focus Preservation
-- Integrates with OpenCode's `experimental.session.compacting` hook to inject the active sequential task list into `output.context` before context summarization, ensuring the model retains its plan across long sessions.
+- Integrates with OpenCode's `experimental.session.compacting` hook to inject active tasks with session and subagent parent attribution into `output.context` before context summarization, ensuring the model retains its plan and identity across long sessions.
 
 ### 16. TUI Visual Feedback
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.
 
-### 17. Secret-File READ Block
+### 17. Secret-File READ Block & Safe Schema Masking
 - Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool or shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`).
+- **Safe Schema Masking:** On `.env*` reads via the `read` tool, the guard parses the variable names and comments, and returns a safe redacted schema mask with secret values masked as `********`, enabling agents to inspect variable existence without leaking secrets into model context.
 - Standard non-secret fixtures (`.env.example`, `.env.sample`, `.env.template`) remain readable.
 
 ### 18. Interpreter Inline Evasion Scanner
