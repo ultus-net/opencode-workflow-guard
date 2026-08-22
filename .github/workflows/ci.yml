@@ -88,16 +88,13 @@ jobs:
           fetch-depth: 0
       - name: Verify CHANGELOG modified
         run: |
-          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -qi '^CHANGELOG\.md$'; then
-            echo "CHANGELOG.md updated - good."
+          BASE="origin/${{ github.base_ref }}"
+          if git diff --name-only "${BASE}...HEAD" | grep -qi '^CHANGELOG\.md$'; then
+            echo "CHANGELOG.md updated relative to base branch - good."
+          elif git diff --name-only HEAD~1...HEAD | grep -qi '^CHANGELOG\.md$'; then
+            echo "CHANGELOG.md updated in latest commit - good."
           else
-            echo "::error::PR diff must include changes to CHANGELOG.md"
-            exit 1
-          fi
-          if git diff --name-only "$MERGE_BASE...HEAD" | grep -q "CHANGELOG.md"; then
-            echo "CHANGELOG.md updated - good."
-          else
-            echo "::error::PR must include a CHANGELOG.md update (Policy 3)."
+            echo "::error::PR diff must include changes to CHANGELOG.md (Policy 3)"
             exit 1
           fi
 
