@@ -1,13 +1,74 @@
 # Changelog
 
+## 1.1.0
+
+### Minor Changes
+
+- b51ace8: Ecosystem-inspired DX and safety enhancements across verification, secret inspection, and multi-agent coordination:
+    - **Safe .env Schema Masking (Policy 17):** Reading `.env*` files returns a sanitized variable schema mask (`KEY=********`) allowing agents to discover required environment variable names without exposing live secret values.
+    - **Verification Output Snipping (Policy 10):** Truncates verbose passing/failing verification stdout/stderr (`snipVerifyOutput`) prioritizing error keywords and stack traces to minimize context bloat.
+    - **Git State & Snapshot Binding (Policy 10):** Verification results now capture git commit hash (`git rev-parse HEAD`) and working tree status (`git status --porcelain`) to invalidate stale verification on external changes.
+    - **Durable Verification Disk Cache (Policy 10/14):** Passing verification results are cached to disk (`~/.local/state/opencode/workflow-guard/last-verify.json`) across session restarts and multi-agent handoffs.
+    - **Subagent Attribution & Breadcrumb Tagging (Policy 1/14/15):** Compaction hooks and audit trail entries now preserve subagent role identity and parent hierarchy links.
+    - **Mutation Accounting (Policy 10):** Added `getMutationCount()` tracking for audit and lifecycle verification.
+- b338d86: Enrich Policy 15 compaction hook with full operational guard state:
+    - Injects active tasks with status badges and subagent/parent session attribution
+    - Injects active Git branch name and protected branch status
+    - Injects test verification evidence (status, verify command, and commit hash)
+    - Injects secondary review verdict (reviewer name and approval status)
+    - Injects session mutation count
+    - Ensures complete context continuity across OpenCode session compactions
+- 68d8a14: Harden guard boundaries and evidence integrity:
+    - `mv` source validation: moving files from outside the workspace, or moving protected settings/plugin files to innocuous names, is now blocked (mv mutates its sources)
+    - The workspace boundary (Policy 8) has no override: `WORKFLOW_GUARD_ALLOW_LIVE=1` no longer weakens shell or external-repository git confinement
+    - The exact `.opencode` directory itself is protected, not only paths nested inside it
+    - Durable verification evidence is workspace-bound: a cached passing run from one project can no longer satisfy finalization in another (critical for non-git workspaces)
+    - Policy 21 documentation gate accepts only README.md and `docs/` changes; changeset fragments and other markdown no longer satisfy it
+    - Audit-trail and command-event tests now assert real behavior instead of unconditional `true`
+- e36b48d: Integrate Changesets (@changesets/cli) for fragment-based changelog and version management:
+    - Policy 3 now accepts `.changeset/*.md` diffs in addition to `CHANGELOG.md` and PR body `Changelog:` sections
+    - CI changelog check accepts `.changeset/*.md` fragment files to prevent merge conflicts between parallel PRs
+    - Added `package.json` scripts: `changeset` and `version-packages`
+- 1f8b87f: Add native in-process Git worktree lifecycle tools:
+    - `guard_worktree_create(branch, baseBranch?)`: creates an isolated git worktree under `~/.local/share/opencode/worktrees/<repo-name>/` (override with `WORKFLOW_GUARD_WORKTREE_DIR`), validates branch names via `git check-ref-format`, rejects built-in and config-defined protected branches, and symlinks the parent `node_modules` for zero-reinstall tooling
+    - `guard_worktree_cleanup(worktreePath)`: commits a final auto-snapshot (excluding the plugin-created `node_modules` symlink) before removing the worktree; aborts with the worktree intact when the snapshot cannot be established
+    - Cleanup is ownership-validated: only registered worktrees of the current repository under the configured storage directory are removed — arbitrary directories, other repos' worktrees, and the primary working tree are refused, and there is no raw-deletion fallback
+    - Both tools enforce the todo gate and invalidate stale verification/review evidence on mutation
+    - Spawned git commands run with a sanitized environment (git context variables such as `GIT_INDEX_FILE` are stripped), so the tools work reliably even when invoked from inside git hook contexts
+    - Branches configured via `protectedBranches` in `.opencode/workflow-guard.json` now receive destination-side push protection, matching the built-in main/master rules (`git push origin feature/x:release/prod` is blocked)
+    - Enables fully isolated concurrent subagent execution with no external dependencies or terminal spawning
+- 150f40c: Implement Policy 22 (Non-Interactive Shell & TTY Hang Guard) and Native Desktop Notifications:
+    - **Policy 22:** Deterministically blocks interactive text editors (`nano`, `vim`), pagers (`less`), process monitors (`top`), `sudo`, and package manager invocations lacking non-interactive flags (`npm init` / `apt-get` without `-y`) to prevent subshell freezes.
+    - **Native OS Desktop Notifications:** Non-blocking notification dispatch (`notify-send` / `osascript`) on blocked actions and verification completions.
+    - **CI & Package Audit:** Updated dependency tree and validated `npm audit` passing at high security threshold.
+- 150f40c: Implement Policy 23 (Package Supply-Chain & Dependency Hygiene Guard):
+    - Blocks destructive `npm audit fix --force` downgrades
+    - Blocks global package installations (`npm i -g`, `pnpm add -g`) in agent sessions
+    - Blocks direct CLI package publishing (`npm publish`, `pnpm publish`)
+    - Blocks unpinned `pip --force-reinstall` commands
+- a08c64f: Refactor repository folder layout and streamline documentation:
+    - Shift production TypeScript plugin files into `src/` (`src/workflow-guard.ts`, `src/workflow-guard-ui.ts`)
+    - Shift unit and runtime tests into `test/` (`test/test.mts`, `test/test-e2e.mts`)
+    - Update `package.json` entry files and test script paths
+    - Update `tsconfig.json` include patterns
+    - Significantly streamline and shorten `README.md`, directing detailed policy references to standalone docs
+    - Update repository documentation tree
+
+### Patch Changes
+
+- 8395c78: Add ACKNOWLEDGEMENTS.md to credit community projects and ecosystem inspirations.
+- 1c89b23: Automate Changesets versioning and npm releases via @changesets/action in release.yml.
+
 All notable changes to `opencode-workflow-guard` will be documented in this file.
 
 ## Unreleased
 
 ### Changed
+
 - Removed single-task focus rule (Policy 1). Multiple tasks may now be `in_progress` simultaneously, enabling concurrent subagent work on different tasks. Only "no silent deletion" and "all-done verification" remain enforced.
 
 ### Developer Experience
+
 - Added `.editorconfig` and `.prettierrc` for editor and formatting consistency.
 - Added `.githooks/pre-commit` hook that runs typecheck + unit tests before every commit (activate with `git config core.hooksPath .githooks`).
 - Added `CONTRIBUTING.md` with contributor guide covering test patterns, policy additions, and PR requirements.
@@ -21,6 +82,7 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 - Updated `ci.yml` `status` job to depend on the new `dogfood` check.
 
 ### Security & Correctness
+
 - Hardened PR detection for normal `gh` global-option forms and require an actual `Changelog:`/Changelog heading instead of accepting any mention of the word.
 - Made configured project `verifyCommand` effective and scoped verification freshness to the session that produced the mutation.
 - Invalidated review approval after new mutations, scoped tool-recorded reviews to their parent session/workspace, and rejected `record_review` self-approval from non-subagent sessions.
@@ -34,6 +96,7 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 ## [1.2.0] - 2026-08-22
 
 ### Security & Invariant Hardening
+
 - **Secret-File READ Block (Policy 17).** Blocks reading `.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, and `service-account*.json` via the `read` tool or shell inspection commands (`cat`, `less`, `grep`, `awk`, `head`, `tail`, `base64`). Non-secret fixtures (`.env.example`, `.env.sample`, `.env.template`) remain readable.
 - **Interpreter Inline Evasion Scanner (Policy 18).** Decodes and scans inline interpreter payloads (`python -c`, `node -e`, `perl -e`, `ruby -e`, `osascript -e`, `powershell -enc`, `echo <base64> | base64 -d | sh`) to prevent smuggling destructive commands or settings tampering.
 - **Conflict-Free Pre-Flight Guard (Policy 19).** Uses `git merge-tree` to verify the branch has zero merge conflicts with the base branch (`origin/main`) before PR creation or final task handoff.
@@ -44,6 +107,7 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 - **External Git Repository Protection (Policy 7/8).** Confines mutating Git operations (`git -C /other-repo commit`) to repositories within the workspace boundary unless `WORKFLOW_GUARD_ALLOW_LIVE=1` is set.
 
 ### Developer Experience & Multi-Agent Accountability
+
 - **Azure DevOps & GitHub PR Parity (Policy 3).** Full PR changelog support for `az repos pr create` alongside `gh pr create`.
 - **Secondary Review Spoke & Rubric.** Added `buildReviewRubric` and `recordReviewResult` integrating `code-review-and-quality` and `doubt-driven-development` skills to verify real behavioral tests and zero shortcut stubs.
 - **Worktree & Devcontainer Root Resolution.** Initializes workspace root from `ctx.worktree || ctx.directory || process.cwd()`.
@@ -56,22 +120,26 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 - **Comprehensive Adversarial Test Suite.** 235 passing unit and adversarial tests covering all policies and evasion vectors.
 
 ### Fixed
+
 - **README policy table now starts at Policy 1.** The "Summary of Enforced Policies" table omitted Policy 1 (Task Gate & Lifecycle) and began at 2; the row is restored. `docs/policies.md` also regains its missing Policy 9 (Script-Laundering Guard) section.
 
 ### Changed
+
 - **Targeted `rm -rf` guard (Policy 4).** Recursive/forced deletion is now blocked only when it targets system/home/wildcard paths (`/`, `~`, `*`); workspace-local cleanup (`rm -rf node_modules`, `rm -rf dist/`, `rm -r build/`) is allowed, removing a routine false positive.
 - **Verification runs at finalization, not per-edit (Policy 10).** The verify command (`WORKFLOW_GUARD_VERIFY` / auto-detected `npm test`) no longer spawns in the background after every edit - it runs once, on demand, when the agent attempts to mark every todo completed. This eliminates test churn on intermediate broken states and the CPU cost of per-edit runs.
 - **Shell env scrub announces itself (Policy 12).** When the `shell.env` hook empties sensitive variables, a warning is logged naming the scrubbed keys so auth failures are diagnosable instead of silent.
 - **Script-laundering scan skips comment lines (Policy 9).** Payloads are scanned line-by-line; lines starting with `#`, `//`, `/*`, or `*` are ignored, reducing false positives on documented cleanup commands while keeping executable lines covered.
 
 ### Changed
+
 - **Dependency & CI updates:**
-  - Upgraded GitHub Actions `actions/checkout` and `actions/setup-node` to v7 across CI and Release workflows.
-  - Upgraded `typescript` to `^7.0.2` and `@types/node` to `^26.2.0`.
-  - Configured Dependabot groups for npm and GitHub Actions dependencies to bundle automated updates.
-  - Exempted `dependabot[bot]` from the PR CHANGELOG gate in CI.
+    - Upgraded GitHub Actions `actions/checkout` and `actions/setup-node` to v7 across CI and Release workflows.
+    - Upgraded `typescript` to `^7.0.2` and `@types/node` to `^26.2.0`.
+    - Configured Dependabot groups for npm and GitHub Actions dependencies to bundle automated updates.
+    - Exempted `dependabot[bot]` from the PR CHANGELOG gate in CI.
 
 ### Added (DX improvements)
+
 - **Post-edit verification gate (Policy 10).** After every successful `edit`/`write`/`apply_patch`, the guard runs `WORKFLOW_GUARD_VERIFY` (or auto-detects `npm test` from `package.json`) in the background. Marking every todo completed is blocked while the latest verify run is failing - the agent can no longer claim "done" over a red build.
 - **Secret-content scan (Policy 11).** File payloads are blocked at write/edit when they carry AWS keys, private key headers, GitHub tokens (`ghp_`, `github_pat_`, …), LLM/API keys, Google/Slack tokens, or env-style assignments (`AWS_SECRET_ACCESS_KEY=…`).
 - **Shell environment scrub (Policy 12).** `shell.env` empties sensitive vars (`AWS_*`, `KUBE*`, `OPENAI*`, `ANTHROPIC*`, `GH_/GITHUB_*`, `GOOGLE_/GCP_`, `AZURE_`, `SLACK_`, `NPM_`, `DOCKER_`, `KUBECONFIG`, plus fixed names like `GITHUB_TOKEN`, `OPENAI_API_KEY`, `NPM_TOKEN`) so the agent cannot carry live credentials into shell sessions by default.
@@ -79,12 +147,14 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 - **Audit trail (Policy 14).** Every block/allow decision is appended as JSON to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected), giving developers a durable, machine-readable record of guard activity for review.
 
 ### Security (Fixed Holes)
+
 - **CI pipeline** (`.github/workflows/ci.yml`): typecheck → unit-test matrix (Node 20/22/24) → live plugin-load e2e → `npm audit` → CHANGELOG-updated PR gate. `e2e` skips cleanly when no `opencode` binary is installed.
 - **Release workflow** (`.github/workflows/release.yml`): `v*` tag → re-verify → tag/version consistency check → `npm publish --provenance` → GitHub release with generated notes.
 - **Dependabot** (`.github/dependabot.yml`): weekly npm + GitHub Actions updates.
 - **README** CI/CD section documenting triggers and required branch protection checks.
 
 ### Security (Fixed Holes)
+
 - **Removed `# allow-live` in-command override.** The marker let the agent grant itself live-system access, and the block message advertised how. The `WORKFLOW_GUARD_ALLOW_LIVE=1` environment variable (set by the user before launch) is now the only override.
 - **Tamper guard closes edit-tool hole.** `edit`/`write`/`apply_patch` were unchecked on path tamper - a project-level `opencode.json`/`.opencode/` was directly editable. `isProtectedPath()` is now enforced on all edit-tool targets (not just shell).
 - **Guard no longer defeats itself.** Tamper patterns now cover the guard's own plugin and TUI files (`~/.config/opencode/plugins/*`, `~/.config/opencode/ui/*`) with any extension, closing the `sed -i … workflow-guard.ts` hole.
@@ -100,26 +170,31 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 - **Adversarial regression suite.** Adds test coverage for every fixed evasion above (147 tests total).
 
 ### Changed
+
 - Updated `docs/policies.md` with the new override model, policy numbering, and a "Known Limits" section clarifying pattern-matching is a deterrent, not a sandbox.
 
 ## [1.1.1] - 2026-08-21
 
 ### Fixed
+
 - TUI badge now renders via `@opentui/solid` slot elements so `[Workflow Guard: Active]` actually appears in OpenCode 1.18+.
 - Documented that the UI companion must live under `ui/` + `tui.json`, not `plugins/` (server loader rejects TUI-only modules).
 
 ### Changed
+
 - Badge registers both `home_prompt_right` and `session_prompt_right`.
 
 ## [1.1.0] - 2026-08-21
 
 ### Added
+
 - Persistent TUI status indicator slot on the bottom-left toolbar (`app_bottom`).
 - Workspace boundary guard enforcing that edits and patch targets stay within the workspace root.
 - Native OpenCode todo lifecycle validation with focus enforcement (single `in_progress` item, sequential progression, no silent deletion).
 - Session compaction hook preserving active task lists across context compaction.
 
 ### Changed
+
 - Removed intrusive session startup toast notifications in favor of the permanent bottom toolbar indicator.
 - Routed plugin block warnings to the OpenCode app logger to avoid TUI screen pollution.
 - Updated plugin export structure to V1 PluginModule format supporting both server hooks and TUI plugins.
