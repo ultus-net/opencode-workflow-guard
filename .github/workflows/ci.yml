@@ -113,7 +113,7 @@ jobs:
           if ! command -v opencode &>/dev/null; then echo "SKIP"; exit 0; fi
           TMP=$(mktemp -d)
           mkdir -p "$TMP/.opencode/plugins"
-          cp workflow-guard.ts "$TMP/.opencode/plugins/"
+          cp src/workflow-guard.ts "$TMP/.opencode/plugins/"
           cd "$TMP"
           echo '{"plugin":["file://./.opencode/plugins/workflow-guard.ts"]}' > opencode.json
           opencode run --no-tui "guard_status" 2>&1 | grep -q "workspaceRoot"

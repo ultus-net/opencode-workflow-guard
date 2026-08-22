@@ -9,10 +9,10 @@
     "url": "https://github.com/ultus-net/opencode-workflow-guard.git"
   },
   "files": [
-    "workflow-guard.ts",
-    "workflow-guard-ui.ts",
+    "src/",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "ACKNOWLEDGEMENTS.md"
   ],
   "keywords": [
     "opencode",
@@ -21,8 +21,8 @@
     "workflow"
   ],
   "scripts": {
-    "test": "node test.mts",
-    "test:install": "node test-e2e.mts",
+    "test": "node test/test.mts",
+    "test:install": "node test/test-e2e.mts",
     "test:all": "npm run typecheck && npm test && npm run test:install",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc --noEmit -p tsconfig.json",
