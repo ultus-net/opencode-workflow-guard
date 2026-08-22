@@ -128,6 +128,28 @@
   - Global package installations (`npm i -g`, `pnpm add -g`, `yarn global add`): Directs agents to use project `devDependencies` or `npx`/`bunx`.
   - Direct agent publishing (`npm publish`, `pnpm publish`): Enforces automated CI/CD release pipelines.
   - `pip install --force-reinstall`: Enforces pinned requirements.
+
+---
+
+## Custom Tools
+
+Besides enforcement hooks, the guard registers companion tools in OpenCode:
+
+### `guard_worktree_create`
+- Creates an isolated git worktree for concurrent subagent execution: `guard_worktree_create(branch, baseBranch?)`.
+- Branch names are validated against git ref rules (control characters, shell metacharacters, `..`, leading `-`/`.` are rejected) and protected branches (`main`/`master`) are refused.
+- Worktrees are stored outside the repository under `~/.local/share/opencode/worktrees/<repo-name>/` (override with `WORKFLOW_GUARD_WORKTREE_DIR`), and the parent's `node_modules` is symlinked into the new worktree so tooling works without a fresh install.
+- If the branch already exists, the worktree is checked out on it; otherwise it is created from `baseBranch` (default `HEAD`).
+
+### `guard_worktree_cleanup`
+- Commits a final snapshot of any remaining changes (`chore(worktree): auto-snapshot before cleanup`) and then removes the worktree directory with `git worktree remove --force`, pruning stale worktree metadata if needed.
+
+### Hook-Context Safety
+- All spawned git commands run with a sanitized environment: inherited git context variables (`GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`, ...) are stripped so the tools resolve the repository from their working directory alone. This makes them safe to invoke from inside git hooks, which export those variables.
+
+### Inspection Tools
+- `guard_status`, `guard_audit`, `guard_why`, and `record_review` provide runtime introspection of guardrail state, audit entries, block explanations, and reviewer decisions.
+
 ---
 
 ## Overrides ("Unless Otherwise Specified")

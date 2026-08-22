@@ -88,6 +88,8 @@ opencode-workflow-guard/
 * `guard_audit`: View recent audit log entries recorded in `workflow-guard.jsonl`.
 * `guard_why`: Simulate and explain whether a specific tool call or command would be blocked.
 * `record_review`: Record secondary reviewer subagent approval or critique across the 5 core review axes.
+* `guard_worktree_create`: Create an isolated git worktree (with shared `node_modules` symlink) for concurrent subagent execution; rejects invalid and protected branch names.
+* `guard_worktree_cleanup`: Snapshot-commit remaining changes and remove an isolated worktree directory.
 
 ---
 

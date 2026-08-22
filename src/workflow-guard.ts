@@ -47,7 +47,7 @@
  */
 
 import { spawnSync, spawn } from "node:child_process";
-import { mkdirSync, realpathSync, readFileSync, writeFileSync, appendFileSync, existsSync } from "node:fs";
+import { mkdirSync, realpathSync, readFileSync, writeFileSync, appendFileSync, existsSync, symlinkSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, relative, resolve } from "node:path";
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
@@ -1520,6 +1520,143 @@ export function sendDesktopNotification(title: string, message: string): void {
 	} catch {}
 }
 
+export function getWorktreeStorageDir(root = workspaceRoot): string {
+	const base = process.env.WORKFLOW_GUARD_WORKTREE_DIR ??
+		join(process.env.XDG_DATA_HOME ?? join(homedir(), ".local", "share"), "opencode", "worktrees");
+	const repoName = basename(root);
+	return join(base, repoName);
+}
+
+/**
+ * Returns a copy of process.env with git context variables removed so spawned
+ * git commands resolve the repository from their cwd alone. Without this, a
+ * caller nested inside a git hook (which exports GIT_INDEX_FILE and friends)
+ * would make `git worktree add` fail: the internal checkout of the new
+ * worktree resolves the inherited relative GIT_INDEX_FILE against the new
+ * worktree root, where `.git` is a file, not a directory.
+ */
+export function getCleanGitEnv(): Record<string, string> {
+	const env: Record<string, string> = { ...(process.env as Record<string, string>) };
+	for (const key of [
+		"GIT_INDEX_FILE",
+		"GIT_DIR",
+		"GIT_WORK_TREE",
+		"GIT_COMMON_DIR",
+		"GIT_OBJECT_DIRECTORY",
+		"GIT_ALTERNATE_OBJECT_DIRECTORIES",
+		"GIT_PREFIX",
+	]) {
+		delete env[key];
+	}
+	return env;
+}
+
+export function isValidBranchName(name: string): boolean {
+	if (!name || name.length > 255) return false;
+	for (let i = 0; i < name.length; i++) {
+		const code = name.charCodeAt(i);
+		if (code <= 0x1f || code === 0x7f) return false;
+	}
+	if (/[~^:?*[\]\\;&|`$()]/.test(name)) return false;
+	if (name.startsWith("-") || name.startsWith(".") || name.endsWith(".") || name.endsWith(".lock")) return false;
+	if (name.startsWith("/") || name.endsWith("/") || name.includes("//") || name.includes("..") || name.includes("@{")) return false;
+	return true;
+}
+
+export function createGitWorktree(
+	branch: string,
+	baseBranch = "HEAD",
+	root = workspaceRoot,
+): { success: boolean; worktreePath?: string; error?: string } {
+	if (!branch || !isValidBranchName(branch) || branch.startsWith("-") || branch.includes("..")) {
+		return { success: false, error: `Invalid branch name '${branch}' for worktree creation.` };
+	}
+	if (PROTECTED_BRANCHES.has(branch.toLowerCase())) {
+		return { success: false, error: `Cannot create worktree on protected branch '${branch}'.` };
+	}
+
+	const storageBase = getWorktreeStorageDir(root);
+	const targetPath = join(storageBase, branch.replace(/[/\\:]/g, "-"));
+
+	try {
+		mkdirSync(storageBase, { recursive: true });
+
+		const branchCheck = spawnSync("git", ["rev-parse", "--verify", branch], {
+			cwd: root,
+			env: getCleanGitEnv(),
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		const exists = branchCheck.status === 0;
+
+		const gitArgs = exists
+			? ["worktree", "add", targetPath, branch]
+			: ["worktree", "add", "-b", branch, targetPath, baseBranch];
+
+		const addRes = spawnSync("git", gitArgs, {
+			cwd: root,
+			env: getCleanGitEnv(),
+			encoding: "utf8",
+			timeout: 15_000,
+		});
+
+		if (addRes.status !== 0) {
+			return { success: false, error: addRes.stderr.trim() || `git worktree add failed` };
+		}
+
+		const nodeModulesSrc = join(root, "node_modules");
+		const nodeModulesDest = join(targetPath, "node_modules");
+		if (existsSync(nodeModulesSrc) && !existsSync(nodeModulesDest)) {
+			try {
+				symlinkSync(nodeModulesSrc, nodeModulesDest, "dir");
+			} catch {}
+		}
+
+		return { success: true, worktreePath: targetPath };
+	} catch (e: any) {
+		return { success: false, error: e?.message ?? String(e) };
+	}
+}
+
+export function cleanupGitWorktree(
+	worktreePath: string,
+	root = workspaceRoot,
+): { success: boolean; error?: string } {
+	try {
+		if (!existsSync(worktreePath)) {
+			return { success: false, error: `Worktree path '${worktreePath}' does not exist.` };
+		}
+
+		spawnSync("git", ["add", "-A"], { cwd: worktreePath, env: getCleanGitEnv(), timeout: 5_000 });
+		spawnSync("git", ["commit", "-m", "chore(worktree): auto-snapshot before cleanup", "--allow-empty"], {
+			cwd: worktreePath,
+			env: getCleanGitEnv(),
+			timeout: 5_000,
+		});
+
+		const res = spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
+			cwd: root,
+			env: getCleanGitEnv(),
+			encoding: "utf8",
+			timeout: 10_000,
+		});
+
+		if (res.status !== 0) {
+			try {
+				rmSync(worktreePath, { recursive: true, force: true });
+				spawnSync("git", ["worktree", "prune"], { cwd: root, env: getCleanGitEnv(), timeout: 5_000 });
+				return { success: true };
+			} catch (err: any) {
+				return { success: false, error: res.stderr.trim() || err?.message };
+			}
+		}
+
+		return { success: true };
+	} catch (e: any) {
+		return { success: false, error: e?.message ?? String(e) };
+	}
+}
+
 export function isDocumentationRequired(root: string): boolean {
 	if (process.env.WORKFLOW_GUARD_REQUIRE_DOCS === "1") return true;
 	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
@@ -2796,6 +2933,47 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					return args.passed
 						? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.`
 						: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
+				},
+			}),
+			guard_worktree_create: tool({
+				description:
+					"Create an isolated git worktree directory for concurrent subagent execution.",
+				args: {
+					branch: tool.schema
+						.string()
+						.describe("Branch name for the isolated worktree (e.g. 'feat/subagent-task')"),
+					baseBranch: tool.schema
+						.string()
+						.optional()
+						.describe("Base branch to branch off of (defaults to HEAD)"),
+				},
+				execute: async (args, toolContext) => {
+					const effectiveRoot = toolContext.worktree || toolContext.directory || workspaceRoot;
+					const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", effectiveRoot);
+					if (!res.success) {
+						return `[workflow-guard] Failed to create worktree: ${res.error}`;
+					}
+					return (
+						`[workflow-guard] Worktree created successfully at: ${res.worktreePath}\n` +
+						`Run subagent tasks or pass worktree directory context to isolate file mutations.`
+					);
+				},
+			}),
+			guard_worktree_cleanup: tool({
+				description:
+					"Commit a final snapshot and remove an isolated git worktree directory.",
+				args: {
+					worktreePath: tool.schema
+						.string()
+						.describe("Path of the worktree directory to clean up"),
+				},
+				execute: async (args, toolContext) => {
+					const effectiveRoot = toolContext.worktree || toolContext.directory || workspaceRoot;
+					const res = cleanupGitWorktree(args.worktreePath, effectiveRoot);
+					if (!res.success) {
+						return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
+					}
+					return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
 				},
 			}),
 		},
