@@ -87,8 +87,14 @@
 - Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with a timestamp, session id, tool name, decision, subagent/parent session attribution, and reason - a durable record.
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
-### 15. Compaction Focus Preservation
-- Integrates with OpenCode's `experimental.session.compacting` hook to inject active tasks with session and subagent parent attribution into `output.context` before context summarization, ensuring the model retains its plan and identity across long sessions.
+### 15. Compaction State & Focus Preservation
+- Integrates with OpenCode's `experimental.session.compacting` hook to inject the full active operational state into `output.context` before context summarization:
+  - Active `todowrite` tasks with status badges and subagent hierarchy attribution.
+  - Active Git branch name and protected branch status.
+  - Test verification status (passed/failed, test command, and commit hash).
+  - Secondary review verdicts (reviewer name and approval status).
+  - Uncommitted mutation counts.
+- Ensures the model retains its operational context, security posture, and task roadmap across session compactions without hallucinations.
 
 ### 16. TUI Visual Feedback
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.

@@ -1030,14 +1030,21 @@ check("initial mutation count is 0", getMutationCount() === 0);
 recordMutation("s-mut-test");
 check("mutation count increments after recordMutation", getMutationCount() === 1 && getMutationCount("s-mut-test") === 1);
 
-// Feature 4: Subagent role attribution in compaction hook
+// Feature 4: Subagent role attribution & operational state in compaction hook
 const subagentCompactingContext: { context: string[] } = { context: [] };
 fakeParents.set("s-sub-agent-child", "s-active");
+recordVerifyResult("npm test", { passed: true, output: "ok" }, "s-active");
+recordReviewResult("senior-reviewer", "LGTM - 5 axes approved", true, "s-active");
 const compactSubagentFn = pluginWithToast["experimental.session.compacting"];
 if (typeof compactSubagentFn === "function") {
 	await compactSubagentFn({ sessionID: "s-sub-agent-child" } as any, subagentCompactingContext as any);
 }
-check("compaction context includes subagent session & parent attribution", subagentCompactingContext.context.length > 0 && subagentCompactingContext.context[0]?.includes("Subagent session: s-sub-agent-child"));
+const compactText = subagentCompactingContext.context[0] ?? "";
+check("compaction context includes subagent session & parent attribution", compactText.includes("Subagent session: s-sub-agent-child"));
+check("compaction context includes Operational Guard State header", compactText.includes("Operational Guard State"));
+check("compaction context includes Git Branch status", compactText.includes("Git Branch:"));
+check("compaction context includes Test Verification status", compactText.includes("Test Verification:"));
+check("compaction context includes Secondary Review status", compactText.includes("Secondary Review:"));
 
 // Feature 5: Durable verification cache
 const testVerifyCache = {
