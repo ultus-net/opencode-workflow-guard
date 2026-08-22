@@ -52,8 +52,10 @@ See `docs/testing.md` for the full coverage matrix.
 
 ## PR Requirements
 
-- Every PR must include a `Changelog:` section in the body or modify
-  `CHANGELOG.md` (mirrors Policy 3 that the plugin itself enforces).
+- Every PR must document its change using one of these methods (mirrors Policy 3):
+  - **Preferred:** Add a changeset file with `npx changeset` (creates `.changeset/<name>.md`), avoiding merge conflicts with parallel PRs.
+  - Add a `Changelog:` section in the PR description.
+  - Update `CHANGELOG.md` directly.
 - Keep documentation synchronized — if you change behavior, update README,
   policy docs, and troubleshooting guide.
 - The `record_review` custom tool should be used for secondary review

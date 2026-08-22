@@ -1274,6 +1274,9 @@ function isSettingsTamper(command: string): boolean {
 }
 
 // ── PR changelog check ───────────────────────────────────────────────────────
+// Accepts either a CHANGELOG file modification or a .changeset/*.md file.
+
+const CHANGELOG_OR_CHANGESET_RE = /(?:changelog|\.changeset\/[^/]+\.md$)/i;
 
 function branchHasChangelogChange(root: string): boolean {
 	try {
@@ -1291,7 +1294,7 @@ function branchHasChangelogChange(root: string): boolean {
 				{ cwd: root, encoding: "utf8", timeout: 10_000 },
 			);
 			if (diff.status !== 0) continue;
-			if (diff.stdout.split("\n").some((f) => /changelog/i.test(f))) {
+			if (diff.stdout.split("\n").some((f) => CHANGELOG_OR_CHANGESET_RE.test(f))) {
 				return true;
 			}
 		}
@@ -1303,7 +1306,7 @@ function branchHasChangelogChange(root: string): boolean {
 		});
 		return (
 			last.status === 0 &&
-			last.stdout.split("\n").some((f) => /changelog/i.test(f))
+			last.stdout.split("\n").some((f) => CHANGELOG_OR_CHANGESET_RE.test(f))
 		);
 	} catch {
 		return false;

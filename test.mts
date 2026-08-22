@@ -162,6 +162,25 @@ check("env option cannot hide gh pr create", blocked(await shell("env -u GH_TOKE
 check("gh pr create accepts --body= changelog form", !(await shell("gh pr create --title t --body='Changelog: fixed'")));
 check("gh pr create preserves multiline Changelog section", !(await shell("gh pr create --title t --body 'Summary\n\nChangelog:\n- fixed'")));
 check("each chained PR create requires its own changelog", blocked(await shell("gh pr create --title one --body 'Changelog: first' && gh pr create --title two --body 'no release notes'")));
+
+// Changeset support: branches modifying .changeset/*.md satisfy Policy 3
+const changesetRepo = mkdtempSync(join(tmpdir(), "wg-changeset-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: changesetRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: changesetRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: changesetRepo });
+writeFileSync(join(changesetRepo, "code.ts"), "export const a = 1;\n");
+spawnSync("git", ["add", "-A"], { cwd: changesetRepo });
+spawnSync("git", ["commit", "-m", "init"], { cwd: changesetRepo });
+spawnSync("git", ["switch", "-c", "feat/with-changeset"], { cwd: changesetRepo });
+mkdirSync(join(changesetRepo, ".changeset"), { recursive: true });
+writeFileSync(join(changesetRepo, ".changeset", "my-change.md"), "---\n\"pkg\": patch\n---\nFixed bug\n");
+spawnSync("git", ["add", "-A"], { cwd: changesetRepo });
+spawnSync("git", ["commit", "-m", "add changeset"], { cwd: changesetRepo });
+setWorkspaceRoot(changesetRepo);
+check("branch with .changeset/*.md satisfies PR changelog check (no body needed)", !(await shell("gh pr create --title t --body 'clean pr description'")));
+rmSync(changesetRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
 console.log("- Policy 4: destructive commands -");
 check("block kubectl delete", blocked(await shell("kubectl delete pod foo")));
 check("block helm uninstall", blocked(await shell("helm uninstall my-release")));
