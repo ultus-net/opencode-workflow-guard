@@ -842,6 +842,18 @@ check(
 );
 check("custom protected branch release/prod blocks pushes", blocked(await shell("git push origin release/prod")));
 
+// Destination-side protection: pushing a feature branch refspec INTO a
+// configured protected branch is blocked even from a feature branch.
+spawnSync("git", ["switch", "-c", "feat/from-prod"], { cwd: projectConfigDir });
+check(
+	"custom protected branch blocks destination refspec push (feat:release/prod)",
+	blocked(await shell("git push origin feat/from-prod:release/prod")),
+);
+check(
+	"custom protected branch blocks bare destination push from feature branch",
+	blocked(await shell("git push origin staging")),
+);
+
 // Review Requirement gating on PR creation
 resetReviewState();
 check(

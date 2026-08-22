@@ -14,6 +14,7 @@
 
 ### 2. No Pushes to Protected Branches
 - `git push ... main` and `git push ... master` are blocked in all shell commands, including direct refs, refspecs (`git push origin HEAD:main`, `git push origin feature/x:main`), deletion refspecs (`git push origin :main`), and forced refspecs (`git push origin +main`).
+- Branches configured via `protectedBranches` in `.opencode/workflow-guard.json` receive the same destination-side push protection (`git push origin feature/x:release/prod` is blocked).
 - Git global options (`-C`, `--git-dir`, `--work-tree`, `-c`) are parsed before matching, so `git -C /repo push origin main` is gated on `/repo`'s branch.
 - Normal pushes and force-pushes to feature branches are allowed.
 

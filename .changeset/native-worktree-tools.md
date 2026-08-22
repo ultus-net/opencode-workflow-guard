@@ -8,4 +8,5 @@ Add native in-process Git worktree lifecycle tools:
 - Cleanup is ownership-validated: only registered worktrees of the current repository under the configured storage directory are removed — arbitrary directories, other repos' worktrees, and the primary working tree are refused, and there is no raw-deletion fallback
 - Both tools enforce the todo gate and invalidate stale verification/review evidence on mutation
 - Spawned git commands run with a sanitized environment (git context variables such as `GIT_INDEX_FILE` are stripped), so the tools work reliably even when invoked from inside git hook contexts
+- Branches configured via `protectedBranches` in `.opencode/workflow-guard.json` now receive destination-side push protection, matching the built-in main/master rules (`git push origin feature/x:release/prod` is blocked)
 - Enables fully isolated concurrent subagent execution with no external dependencies or terminal spawning
