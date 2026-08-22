@@ -14,6 +14,7 @@
 
 ### 2. No Pushes to Protected Branches
 - `git push ... main` and `git push ... master` are blocked in all shell commands, including direct refs, refspecs (`git push origin HEAD:main`, `git push origin feature/x:main`), deletion refspecs (`git push origin :main`), and forced refspecs (`git push origin +main`).
+- Branches configured via `protectedBranches` in `.opencode/workflow-guard.json` receive the same destination-side push protection (`git push origin feature/x:release/prod` is blocked).
 - Git global options (`-C`, `--git-dir`, `--work-tree`, `-c`) are parsed before matching, so `git -C /repo push origin main` is gated on `/repo`'s branch.
 - Normal pushes and force-pushes to feature branches are allowed.
 
@@ -45,7 +46,7 @@
 
 ### 6. Settings Tamper Guard
 - Prevents the agent from weakening its own permission gates **via shell or edit tools**:
-  - Shell writes/redirects to `opencode.json[c]`, `~/.config/opencode/*`, `.opencode/*`, or the guard's own plugin/TUI files (`~/.config/opencode/plugins/*`, `~/.config/opencode/ui/*`)
+  - Shell writes/redirects to `opencode.json[c]`, `~/.config/opencode/*`, `.opencode/*` (including the `.opencode` directory itself), or the guard's own plugin/TUI files (`~/.config/opencode/plugins/*`, `~/.config/opencode/ui/*`)
   - Direct edits of the same paths through the `edit`/`write`/`apply_patch` tools
   - Shell commands invoking `opencode auth`, `opencode config`, `opencode permission`, or `opencode run --auto`
   - Evasion-normalized: quote-concatenation (`open''code.json`), escapes (`open\c\ode`), and glob wildcards (`opencode.jso?`) are stripped before matching.
@@ -58,7 +59,9 @@
 
 ### 8. Workspace Boundary Guard
 - File modification tools (`edit`, `write`, `apply_patch`) and common shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`/`ln`, `touch`, `mkdir`, `rm`, `git apply`/`git am`) are validated to ensure targets cannot escape the current workspace root via `../` traversal, symlinks, or absolute paths.
+- `mv` sources are validated too: moving a file from outside the workspace (or a protected settings/plugin file to an innocuous name) is blocked, since `mv` mutates the source.
 - External repository git writes (`git -C /other-repo commit`) are also confined to the workspace.
+- The boundary has **no override**: `WORKFLOW_GUARD_ALLOW_LIVE=1` covers live-system commands only and never weakens the workspace confinement.
 
 ### 9. Script-Laundering Guard
 - Content written via `edit`, `write`, or `apply_patch` is scanned for destructive CLI commands and settings tamper payloads.
@@ -68,7 +71,7 @@
 - When the agent attempts to mark **every** task completed (finalizing the request), the guard requires passing verification evidence.
 - Verification (`WORKFLOW_GUARD_VERIFY` env, project `verifyCommand`, or auto-detected `npm test` from `package.json`) executes in an isolated environment with scrubbed credentials, output caps, token-efficient stdout/stderr snipping, and strict timeout protection. Environment configuration takes precedence over project configuration.
 - **Git State & Snapshot Binding:** Verification evidence records the current git commit hash (`git rev-parse HEAD`) and working tree status. If unverified edits or index modifications occur after verification, fresh verification is enforced.
-- **Durable Disk Cache:** Passing verification results are cached to `~/.local/state/opencode/workflow-guard/last-verify.json`, allowing session restarts and multi-agent handoffs to retain valid verification evidence without redundant test runs.
+- **Durable Disk Cache:** Passing verification results are cached to `~/.local/state/opencode/workflow-guard/last-verify.json`, allowing session restarts and multi-agent handoffs to retain valid verification evidence without redundant test runs. Durable evidence is **workspace-bound**: a cached result is only accepted for the workspace that produced it, so a passing run in one project can never satisfy finalization in another.
 - If verification fails, finalization is blocked with a structured summary of error markers, stack traces, and failure output.
 - The verify command is **disabled** when `WORKFLOW_GUARD_VERIFY` is empty (`""`).
 
@@ -115,7 +118,8 @@
 - Blocks creating fresh feature branches when the local base branch is behind the remote, prompting the agent to pull latest changes first.
 
 ### 21. Documentation Review & Synchronization Guard
-- Ensures that relevant documentation (`README.md` or `docs/`) is updated whenever changes introduce new features, policies, or public tools before PR creation. Configurable via `.opencode/workflow-guard.json` (`requireDocumentation: true`) or `WORKFLOW_GUARD_REQUIRE_DOCS=1`.
+- Ensures that relevant documentation is updated whenever changes introduce new features, policies, or public tools before PR creation. Configurable via `.opencode/workflow-guard.json` (`requireDocumentation: true`) or `WORKFLOW_GUARD_REQUIRE_DOCS=1`.
+- Only **README.md** (root or package level) and files under **`docs/`** count as documentation updates; arbitrary markdown (e.g. `.changeset/*.md` fragments or `CHANGELOG.md`) does not satisfy this gate.
 
 ### 22. Non-Interactive Shell & TTY Hang Guard
 - Blocks commands that spawn interactive text editors (`nano`, `vim`, `emacs`), interactive pagers (`less`, `more`), interactive monitors (`top`, `htop`), interactive rebase/patch prompts (`git rebase -i`, `git add -p`), `sudo`, or package managers missing non-interactive confirmation flags (`npm init` without `-y`, `apt-get` without `-y`).
@@ -137,12 +141,15 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 
 ### `guard_worktree_create`
 - Creates an isolated git worktree for concurrent subagent execution: `guard_worktree_create(branch, baseBranch?)`.
-- Branch names are validated against git ref rules (control characters, shell metacharacters, `..`, leading `-`/`.` are rejected) and protected branches (`main`/`master`) are refused.
+- Branch names are validated with `git check-ref-format --branch`; protected branches — the built-in `main`/`master` plus any configured via `protectedBranches` in `.opencode/workflow-guard.json` — are refused.
 - Worktrees are stored outside the repository under `~/.local/share/opencode/worktrees/<repo-name>/` (override with `WORKFLOW_GUARD_WORKTREE_DIR`), and the parent's `node_modules` is symlinked into the new worktree so tooling works without a fresh install.
-- If the branch already exists, the worktree is checked out on it; otherwise it is created from `baseBranch` (default `HEAD`).
+- If the branch already exists (as a local branch), the worktree is checked out on it; otherwise it is created from `baseBranch` (default `HEAD`).
+- Subject to the same todo gate as other mutations, and successful worktree mutations invalidate stale verification/review evidence.
 
 ### `guard_worktree_cleanup`
-- Commits a final snapshot of any remaining changes (`chore(worktree): auto-snapshot before cleanup`) and then removes the worktree directory with `git worktree remove --force`, pruning stale worktree metadata if needed.
+- Commits a final snapshot of any remaining changes (`chore(worktree): auto-snapshot before cleanup`, excluding the plugin-created `node_modules` symlink) and then removes the worktree directory with `git worktree remove --force`.
+- **Ownership validation:** only registered worktrees of the current repository under the configured worktree storage directory can be cleaned up — arbitrary directories, other repositories' worktrees, and the primary working tree are refused. A failed `git worktree remove` is an error, never a fallback to raw directory deletion.
+- **Lossless by construction:** if the snapshot commit cannot be established (failing hook, missing identity, lock error), cleanup aborts and the worktree is left fully intact.
 
 ### Hook-Context Safety
 - All spawned git commands run with a sanitized environment: inherited git context variables (`GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`, ...) are stripped so the tools resolve the repository from their working directory alone. This makes them safe to invoke from inside git hooks, which export those variables.

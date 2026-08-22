@@ -47,9 +47,9 @@
  */
 
 import { spawnSync, spawn } from "node:child_process";
-import { mkdirSync, realpathSync, readFileSync, writeFileSync, appendFileSync, existsSync, symlinkSync, rmSync } from "node:fs";
+import { mkdirSync, realpathSync, readFileSync, writeFileSync, appendFileSync, existsSync, symlinkSync, rmSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
 
 // OpenCode built-in tools (https://opencode.ai/docs/tools/): bash is the
@@ -548,12 +548,26 @@ async function guardShellMutation(
 	command: string,
 	sessionID: string | undefined,
 ): Promise<string | undefined> {
-	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	let hasMutation = false;
 	for (const segment of command.split(/[\n|;&]+/)) {
 		const secretSource = secretSourceInFilesystemCommand(segment);
 		if (secretSource) {
 			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;
+		}
+		// mv mutates its SOURCES too (they are removed from their origin), so
+		// sources must respect the same boundaries as mutation targets: no
+		// moving files in from outside the workspace, no moving protected
+		// (settings/plugin) files to innocuous names.
+		const transfer = filesystemTransferInfo(segment);
+		if (transfer && shellWords(unwrapShellCommand(segment))[0] === "mv") {
+			for (const source of transfer.sources) {
+				if (isProtectedPath(source)) {
+					return PROTECTED_PATH_REASON;
+				}
+				if (isPathOutsideWorkspace(source, workspaceRoot)) {
+					return `Blocked: mv would remove source '${source}' from outside the workspace root (${workspaceRoot}). File mutations must stay within the workspace.`;
+				}
+			}
 		}
 		const simpleMutations = simpleFilesystemMutations(segment);
 		const fallbackMutation = shellMutationIn(segment.trim());
@@ -575,11 +589,10 @@ async function guardShellMutation(
 				return PROTECTED_PATH_REASON;
 			}
 			if (target && isPathOutsideWorkspace(target, workspaceRoot)) {
-				// A redirect OUT of the workspace is also a live-system write.
-				if (!allowLive) {
-					return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
-				}
-				continue;
+				// The workspace boundary has no override: a write outside the
+				// workspace is out of bounds even with WORKFLOW_GUARD_ALLOW_LIVE
+				// (that override covers live-system commands, not the boundary).
+				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
 			}
 			if (onProtectedBranch(workspaceRoot)) {
 				return branchGuardReason();
@@ -754,15 +767,53 @@ export function isReviewRequired(root: string): boolean {
 	return cfg.requireReview === true;
 }
 
-function onProtectedBranch(root: string): boolean {
-	const branch = currentGitBranch(root);
-	if (!branch) return false;
+/**
+ * The full protected-branch set for this repository: the built-in
+ * main/master set plus any branches configured in
+ * `.opencode/workflow-guard.json` (`protectedBranches`). Shared by the
+ * branch guard, the push guard and the native worktree tools so every
+ * path enforces the same set.
+ */
+export function getProtectedBranches(root = workspaceRoot): Set<string> {
 	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
 	const customBranches = Array.isArray(cfg.protectedBranches)
 		? cfg.protectedBranches
 		: [];
-	const allProtected = new Set([...PROTECTED_BRANCHES, ...customBranches]);
-	return allProtected.has(branch);
+	return new Set([...PROTECTED_BRANCHES, ...customBranches]);
+}
+
+/** True when `branch` is protected for the repository at `root`. */
+export function isProtectedBranchName(branch: string, root = workspaceRoot): boolean {
+	if (!branch) return false;
+	return getProtectedBranches(root).has(branch);
+}
+
+/** Regex-escape a literal string for embedding in a RegExp. */
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Returns the protected branch a `git push` command targets as its
+ * destination, if any. Covers bare refspecs (`git push origin <branch>`)
+ * and colon forms (`git push origin HEAD:<branch>`, `:<branch>` deletion,
+ * `+<branch>` forced), for every protected branch - built-in and
+ * configured - of the repository at `root`.
+ */
+function pushedProtectedBranchIn(pushCommand: string, root: string): string | undefined {
+	for (const branch of getProtectedBranches(root)) {
+		const escaped = escapeRegExp(branch);
+		const re = new RegExp(
+			`(?:^|\\s)\\+?[\\w./-]*:${escaped}(?![\\w./-])` +
+				`|(?:\\s|\\/)${escaped}(?![\\w./-])`,
+		);
+		if (re.test(pushCommand)) return branch;
+	}
+	return undefined;
+}
+
+function onProtectedBranch(root: string): boolean {
+	return isProtectedBranchName(currentGitBranch(root) ?? "", root);
 }
 
 function branchGuardReason(): string {
@@ -1086,7 +1137,11 @@ export function isProtectedPath(targetPath: string): boolean {
 		/^opencode\.jsonc?$/i.test(base) ||
 		// workflow-guard.json / workflow-guard.jsonc anywhere
 		/^workflow-guard\.jsonc?$/i.test(base) ||
-		// anything under a .opencode directory (project plugins, agents)
+		// the .opencode directory itself and anything under it (project
+		// plugins, agents) - including the exact directory, not just paths
+		// nested inside it
+		lower === ".opencode" ||
+		lower.endsWith("/.opencode") ||
 		lower.includes(`${"/"}.opencode/`) ||
 		// anything under ~/.config/opencode (global config, plugins, ui)
 		lower.includes("/.config/opencode/") ||
@@ -1344,6 +1399,19 @@ function branchHasChangelogChange(root: string): boolean {
 
 // ── Documentation review & synchronization check (Policy 21) ─────────────────
 
+/**
+ * True for user-facing documentation files: README.md (root or package
+ * level) and anything under a docs/ directory. Deliberately excludes
+ * arbitrary markdown (e.g. .changeset/*.md, CHANGELOG.md) so the
+ * documentation gate cannot be satisfied by a changeset fragment.
+ */
+function isDocumentationFile(filePath: string): boolean {
+	const lower = filePath.toLowerCase();
+	if (lower === "readme.md" || lower.endsWith("/readme.md")) return true;
+	if (lower === "docs" || lower.startsWith("docs/") || lower.includes("/docs/")) return true;
+	return false;
+}
+
 export function branchHasDocumentationChange(root: string): boolean {
 	try {
 		const baseCandidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
@@ -1361,14 +1429,7 @@ export function branchHasDocumentationChange(root: string): boolean {
 			);
 			if (diff.status !== 0) continue;
 			const files = diff.stdout.split("\n").filter(Boolean);
-			if (
-				files.some(
-					(f) =>
-						/\.md$/i.test(f) ||
-						f.startsWith("docs/") ||
-						f.toLowerCase() === "readme.md",
-				)
-			) {
+			if (files.some((f) => isDocumentationFile(f))) {
 				return true;
 			}
 		}
@@ -1379,12 +1440,7 @@ export function branchHasDocumentationChange(root: string): boolean {
 		});
 		if (last.status === 0) {
 			const files = last.stdout.split("\n").filter(Boolean);
-			return files.some(
-				(f) =>
-					/\.md$/i.test(f) ||
-					f.startsWith("docs/") ||
-					f.toLowerCase() === "readme.md",
-			);
+			return files.some((f) => isDocumentationFile(f));
 		}
 		return false;
 	} catch {
@@ -1551,16 +1607,32 @@ export function getCleanGitEnv(): Record<string, string> {
 	return env;
 }
 
+/**
+ * Validates a branch name using git itself (`git check-ref-format
+ * --branch`), with fast local pre-filters for names that must never be
+ * passed as arguments at all (leading dash would be parsed as an option).
+ */
 export function isValidBranchName(name: string): boolean {
 	if (!name || name.length > 255) return false;
-	for (let i = 0; i < name.length; i++) {
-		const code = name.charCodeAt(i);
-		if (code <= 0x1f || code === 0x7f) return false;
-	}
-	if (/[~^:?*[\]\\;&|`$()]/.test(name)) return false;
 	if (name.startsWith("-") || name.startsWith(".") || name.endsWith(".") || name.endsWith(".lock")) return false;
-	if (name.startsWith("/") || name.endsWith("/") || name.includes("//") || name.includes("..") || name.includes("@{")) return false;
-	return true;
+	if (name.includes("..") || name.includes("@{") || name.includes("//")) return false;
+	const res = spawnSync("git", ["check-ref-format", "--branch", name], {
+		encoding: "utf8",
+		timeout: 5_000,
+		env: getCleanGitEnv(),
+	});
+	return res.status === 0;
+}
+
+/** True when `refs/heads/<branch>` exists in the repository at `root`. */
+function localBranchExists(branch: string, root: string): boolean {
+	const res = spawnSync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+		env: getCleanGitEnv(),
+	});
+	return res.status === 0;
 }
 
 export function createGitWorktree(
@@ -1568,10 +1640,10 @@ export function createGitWorktree(
 	baseBranch = "HEAD",
 	root = workspaceRoot,
 ): { success: boolean; worktreePath?: string; error?: string } {
-	if (!branch || !isValidBranchName(branch) || branch.startsWith("-") || branch.includes("..")) {
+	if (!branch || !isValidBranchName(branch)) {
 		return { success: false, error: `Invalid branch name '${branch}' for worktree creation.` };
 	}
-	if (PROTECTED_BRANCHES.has(branch.toLowerCase())) {
+	if (isProtectedBranchName(branch, root)) {
 		return { success: false, error: `Cannot create worktree on protected branch '${branch}'.` };
 	}
 
@@ -1581,13 +1653,7 @@ export function createGitWorktree(
 	try {
 		mkdirSync(storageBase, { recursive: true });
 
-		const branchCheck = spawnSync("git", ["rev-parse", "--verify", branch], {
-			cwd: root,
-			env: getCleanGitEnv(),
-			encoding: "utf8",
-			timeout: 5_000,
-		});
-		const exists = branchCheck.status === 0;
+		const exists = localBranchExists(branch, root);
 
 		const gitArgs = exists
 			? ["worktree", "add", targetPath, branch]
@@ -1618,6 +1684,25 @@ export function createGitWorktree(
 	}
 }
 
+/**
+ * Lists the worktree paths registered for the repository at `root`
+ * (primary worktree first), or undefined when git cannot be consulted.
+ */
+function registeredWorktreePaths(root: string): string[] | undefined {
+	const res = spawnSync("git", ["worktree", "list", "--porcelain"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+		env: getCleanGitEnv(),
+	});
+	if (res.status !== 0) return undefined;
+	return res.stdout
+		.split("\n")
+		.filter((line) => line.startsWith("worktree "))
+		.map((line) => line.slice("worktree ".length))
+		.filter((path) => path.length > 0);
+}
+
 export function cleanupGitWorktree(
 	worktreePath: string,
 	root = workspaceRoot,
@@ -1627,12 +1712,68 @@ export function cleanupGitWorktree(
 			return { success: false, error: `Worktree path '${worktreePath}' does not exist.` };
 		}
 
-		spawnSync("git", ["add", "-A"], { cwd: worktreePath, env: getCleanGitEnv(), timeout: 5_000 });
-		spawnSync("git", ["commit", "-m", "chore(worktree): auto-snapshot before cleanup", "--allow-empty"], {
+		// Ownership validation: the path must live under the configured
+		// worktree storage directory AND be a registered worktree of this
+		// repository. This refuses arbitrary directories, other repos'
+		// worktrees, and the primary working tree - cleanup must never be
+		// an unrestricted delete primitive.
+		const resolved = resolve(worktreePath);
+		const storageBase = resolve(getWorktreeStorageDir(root));
+		if (resolved !== storageBase && !resolved.startsWith(storageBase + sep)) {
+			return {
+				success: false,
+				error: `Refusing to clean up '${worktreePath}': path is outside the worktree storage directory (${storageBase}).`,
+			};
+		}
+		const registered = registeredWorktreePaths(root);
+		if (!registered) {
+			return { success: false, error: "Failed to list registered worktrees - aborting cleanup." };
+		}
+		const resolvedRegistered = registered.map((path) => resolve(path));
+		if (!resolvedRegistered.includes(resolved)) {
+			return {
+				success: false,
+				error: `Refusing to clean up '${worktreePath}': not a registered worktree of this repository.`,
+			};
+		}
+		if (resolvedRegistered[0] === resolved) {
+			return { success: false, error: "Refusing to remove the primary working tree." };
+		}
+
+		// Snapshot: stage and commit remaining changes. If the snapshot
+		// cannot be established (hook failure, missing identity, lock
+		// error, timeout), abort - never destroy uncommitted work.
+		const addArgs = ["add", "-A", "--", "."];
+		try {
+			// Exclude the plugin-created node_modules symlink so repos that
+			// do not ignore it never commit a machine-local link.
+			if (lstatSync(join(resolved, "node_modules")).isSymbolicLink()) {
+				addArgs.push(":(exclude)node_modules");
+			}
+		} catch {}
+		const addRes = spawnSync("git", addArgs, {
 			cwd: worktreePath,
 			env: getCleanGitEnv(),
+			encoding: "utf8",
 			timeout: 5_000,
 		});
+		if (addRes.status !== 0) {
+			return {
+				success: false,
+				error: `Snapshot failed (git add: ${(addRes.stderr ?? "").trim()}) - worktree left intact.`,
+			};
+		}
+		const commitRes = spawnSync(
+			"git",
+			["commit", "-m", "chore(worktree): auto-snapshot before cleanup", "--allow-empty"],
+			{ cwd: worktreePath, env: getCleanGitEnv(), encoding: "utf8", timeout: 5_000 },
+		);
+		if (commitRes.status !== 0) {
+			return {
+				success: false,
+				error: `Snapshot failed (git commit: ${(commitRes.stderr ?? "").trim().split("\n").pop()?.trim() ?? "unknown error"}) - worktree left intact.`,
+			};
+		}
 
 		const res = spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
 			cwd: root,
@@ -1640,15 +1781,10 @@ export function cleanupGitWorktree(
 			encoding: "utf8",
 			timeout: 10_000,
 		});
-
 		if (res.status !== 0) {
-			try {
-				rmSync(worktreePath, { recursive: true, force: true });
-				spawnSync("git", ["worktree", "prune"], { cwd: root, env: getCleanGitEnv(), timeout: 5_000 });
-				return { success: true };
-			} catch (err: any) {
-				return { success: false, error: res.stderr.trim() || err?.message };
-			}
+			// A failed git removal is an error - never authorization for a
+			// raw recursive delete of the directory.
+			return { success: false, error: res.stderr.trim() || "git worktree remove failed." };
 		}
 
 		return { success: true };
@@ -1794,6 +1930,7 @@ let lastVerify: {
 	durationMs?: number;
 	commitHash?: string;
 	gitStatus?: string;
+	workspaceRoot?: string;
 } | undefined;
 const sessionVerifyResults = new Map<string, NonNullable<typeof lastVerify>>();
 
@@ -2088,6 +2225,7 @@ export function recordVerifyResult(
 		timestamp: Date.now(),
 		durationMs: result.durationMs,
 		commitHash,
+		workspaceRoot: resolve(root),
 		gitStatus,
 	};
 	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
@@ -2269,13 +2407,21 @@ async function guardToolCallImpl(
 						? sessionVerifyResults.get(sessionID)
 						: lastVerify;
 
-					// If in-memory cache is missing, attempt to recover from durable disk cache
-					if (!verifyResult) {
-						const diskCached = loadVerifyCache();
-						if (diskCached && diskCached.passed && diskCached.command === command) {
-							verifyResult = diskCached;
-						}
+				// If in-memory cache is missing, attempt to recover from durable disk cache.
+				// Durable evidence is bound to the workspace that produced it: without
+				// this check a passing run from a different project (identical verify
+				// command, non-git state) could satisfy finalization here.
+				if (!verifyResult) {
+					const diskCached = loadVerifyCache();
+					if (
+						diskCached &&
+						diskCached.passed &&
+						diskCached.command === command &&
+						diskCached.workspaceRoot === resolve(workspaceRoot)
+					) {
+						verifyResult = diskCached;
 					}
+				}
 
 					const mutationTimestamp = sessionID
 						? (sessionMutationTimestamps.get(sessionID) ?? 0)
@@ -2521,7 +2667,6 @@ async function guardToolCallImpl(
 			const normalizedInvocation = `git ${invocation.rest}`;
 			if (
 				isPathOutsideWorkspace(invocation.repoDir, workspaceRoot) &&
-				!allowLive &&
 				(GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))
 			) {
 				logBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
@@ -2633,6 +2778,22 @@ async function guardToolCallImpl(
 				"Create a feature branch and open a PR instead."
 			);
 		}
+		// Policy 2 (cont.): configured protected branches receive the same
+		// destination-side push protection as main/master.
+		for (const invocation of gitInvocations) {
+			const pushText = `git ${invocation.rest}`;
+			if (!/\bgit\s+push\b/.test(pushText)) continue;
+			const pushedBranch = pushedProtectedBranchIn(pushText, invocation.repoDir);
+			if (pushedBranch) {
+				logBlock(
+					`[workflow-guard] blocked push to protected branch '${pushedBranch}': ${command}`,
+				);
+				return (
+					`Blocked: direct pushes to protected branch '${pushedBranch}' are not allowed. ` +
+					"Create a feature branch and open a PR instead."
+				);
+			}
+		}
 		// ── Policy 20: block push from protected or already-merged branches ──
 		for (const invocation of gitInvocations) {
 			if (!/\bgit\s+push\b/.test(`git ${invocation.rest}`)) continue;
@@ -2659,7 +2820,6 @@ async function guardToolCallImpl(
 		if (hasPrCreateInvocation(raw)) {
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
-			const descFlag = isAz ? "--description" : "--body";
 
 			// Policy 19: Conflict-free mergeability gate before opening PR
 			const conflictCheck = checkMergeConflicts(workspaceRoot);
@@ -2948,11 +3108,19 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						.describe("Base branch to branch off of (defaults to HEAD)"),
 				},
 				execute: async (args, toolContext) => {
+					const todos = await effectiveTodos(toolContext.sessionID);
+					if (todos !== undefined && !hasActiveTodo(todos)) {
+						return (
+							"[workflow-guard] Blocked: worktree creation with no active todo item. " +
+							"Break the request down with todowrite first, then create worktrees."
+						);
+					}
 					const effectiveRoot = toolContext.worktree || toolContext.directory || workspaceRoot;
 					const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", effectiveRoot);
 					if (!res.success) {
 						return `[workflow-guard] Failed to create worktree: ${res.error}`;
 					}
+					recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID);
 					return (
 						`[workflow-guard] Worktree created successfully at: ${res.worktreePath}\n` +
 						`Run subagent tasks or pass worktree directory context to isolate file mutations.`
@@ -2968,11 +3136,19 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						.describe("Path of the worktree directory to clean up"),
 				},
 				execute: async (args, toolContext) => {
+					const todos = await effectiveTodos(toolContext.sessionID);
+					if (todos !== undefined && !hasActiveTodo(todos)) {
+						return (
+							"[workflow-guard] Blocked: worktree cleanup with no active todo item. " +
+							"Break the request down with todowrite first, then clean up worktrees."
+						);
+					}
 					const effectiveRoot = toolContext.worktree || toolContext.directory || workspaceRoot;
 					const res = cleanupGitWorktree(args.worktreePath, effectiveRoot);
 					if (!res.success) {
 						return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
 					}
+					recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID);
 					return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
 				},
 			}),
@@ -2996,13 +3172,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			}
 		},
 
-		// Post-edit verification: run the verify command when the agent
-		// attempts to finalize the todo list (all tasks completed), not on
-		// every edit. This avoids running tests on intermediate broken states
-		// and reduces performance overhead.
-		"tool.execute.after": async (input) => {
-			return;
-		},
+		// Post-edit verification runs when the agent attempts to finalize
+		// the todo list (all tasks completed) - enforced in the
+		// tool.execute.before todowrite branch above. This avoids running
+		// tests on intermediate broken states and reduces overhead.
 
 		// Focus preservation across context compaction (documented in
 		// https://opencode.ai/docs/plugins/#compaction-hooks).
