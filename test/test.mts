@@ -42,6 +42,10 @@ import {
 	checkInteractiveTtyCommand,
 	checkPackageHygiene,
 	sendDesktopNotification,
+	createGitWorktree,
+	cleanupGitWorktree,
+	getWorktreeStorageDir,
+	getCleanGitEnv,
 	default as defaultExport,
 } from "../src/workflow-guard.ts";
 import { WorkflowGuardTui } from "../src/workflow-guard-ui.ts";
@@ -1103,6 +1107,54 @@ check("shell tool blocks npm audit fix --force", blocked(await shell("npm audit 
 check("shell tool blocks global npm install", blocked(await shell("npm i -g tsx")));
 check("shell tool blocks direct npm publish", blocked(await shell("npm publish --access public")));
 check("shell tool allows regular npm install", !(await shell("npm install lodash")));
+
+// 18. Native Git Worktree Lifecycle Tools
+console.log("- Native Git Worktree Lifecycle Tools -");
+const worktreeStorage = mkdtempSync(join(tmpdir(), "wg-wt-storage-"));
+process.env.WORKFLOW_GUARD_WORKTREE_DIR = worktreeStorage;
+const worktreeBaseRepo = mkdtempSync(join(tmpdir(), "wg-wt-base-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: worktreeBaseRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: worktreeBaseRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: worktreeBaseRepo });
+writeFileSync(join(worktreeBaseRepo, "README.md"), "# Main Base\n");
+spawnSync("git", ["add", "-A"], { cwd: worktreeBaseRepo });
+spawnSync("git", ["commit", "-m", "init base"], { cwd: worktreeBaseRepo });
+
+check("getWorktreeStorageDir returns valid path", typeof getWorktreeStorageDir(worktreeBaseRepo) === "string");
+check("createGitWorktree rejects invalid branch names", !createGitWorktree("-bad-branch", "HEAD", worktreeBaseRepo).success);
+check("createGitWorktree rejects protected branch", !createGitWorktree("main", "HEAD", worktreeBaseRepo).success);
+
+const prevRoot = root;
+setWorkspaceRoot(worktreeBaseRepo);
+const wtCreateRes = createGitWorktree("feat/isolated-subagent", "HEAD", worktreeBaseRepo);
+check("createGitWorktree creates physical worktree on disk", wtCreateRes.success && typeof wtCreateRes.worktreePath === "string" && existsSync(wtCreateRes.worktreePath));
+
+if (wtCreateRes.worktreePath) {
+	// Modify file in worktree
+	writeFileSync(join(wtCreateRes.worktreePath, "worktree.txt"), "isolated edit\n");
+	const wtCleanupRes = cleanupGitWorktree(wtCreateRes.worktreePath, worktreeBaseRepo);
+	check("cleanupGitWorktree commits snapshot and removes worktree directory", wtCleanupRes.success && !existsSync(wtCreateRes.worktreePath));
+}
+
+// Regression: git context env (e.g. GIT_INDEX_FILE exported by git hooks) must not
+// leak into spawned worktree git commands, where the new worktree's `.git` is a file.
+process.env.GIT_INDEX_FILE = ".git/index";
+process.env.GIT_DIR = worktreeBaseRepo;
+const hookEnvCreate = createGitWorktree("feat/hook-context", "HEAD", worktreeBaseRepo);
+check("createGitWorktree succeeds with git hook env (GIT_INDEX_FILE leak)", hookEnvCreate.success);
+if (hookEnvCreate.worktreePath) {
+	writeFileSync(join(hookEnvCreate.worktreePath, "hook.txt"), "hook edit\n");
+	const hookEnvCleanup = cleanupGitWorktree(hookEnvCreate.worktreePath, worktreeBaseRepo);
+	check("cleanupGitWorktree succeeds with git hook env", hookEnvCleanup.success && !existsSync(hookEnvCreate.worktreePath));
+}
+delete process.env.GIT_INDEX_FILE;
+delete process.env.GIT_DIR;
+check("getCleanGitEnv strips git context variables", typeof getCleanGitEnv().GIT_INDEX_FILE === "undefined");
+
+rmSync(worktreeBaseRepo, { recursive: true, force: true });
+delete process.env.WORKFLOW_GUARD_WORKTREE_DIR;
+rmSync(worktreeStorage, { recursive: true, force: true });
+setWorkspaceRoot(prevRoot);
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);
