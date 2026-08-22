@@ -2837,6 +2837,14 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					const s = String(t.status ?? "");
 					return s === "pending" || s === "in_progress";
 				});
+				const branch = currentGitBranch(workspaceRoot) ?? "unknown";
+				const isProtected = onProtectedBranch(workspaceRoot);
+				const lastV = sessionID ? sessionVerifyResults.get(sessionID) ?? lastVerify : lastVerify;
+				const lastR = getLastReviewResult();
+				const mutationCountVal = getMutationCount(sessionID);
+
+				const contextBlocks: string[] = [];
+
 				if (active && active.length > 0) {
 					const lines = active.map(
 						(t) =>
@@ -2847,13 +2855,33 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						: sessionID
 							? ` (Session: ${sessionID})`
 							: "";
-					const contextPrompt =
+					contextBlocks.push(
 						`## Active Tasks${attribution}\n` +
 						lines.join("\n") +
-						"\nComplete tasks efficiently — mark finished items as completed and address remaining ones.";
-					if (Array.isArray(output?.context)) {
-						output.context.push(contextPrompt);
-					}
+						"\nComplete tasks efficiently — mark finished items as completed and address remaining ones.",
+					);
+				}
+
+				// Inject operational guard state to keep the model grounded after compaction
+				const stateLines: string[] = [
+					`## Operational Guard State`,
+					`- Git Branch: ${branch}${isProtected ? " (PROTECTED BRANCH - edits/commits require feature branch)" : " (feature branch - edits allowed)"}`,
+					`- Uncommitted Mutations: ${mutationCountVal} recorded in current session`,
+				];
+				if (lastV) {
+					stateLines.push(
+						`- Test Verification: ${lastV.passed ? "PASSED" : "FAILED"} (${lastV.command})${lastV.commitHash ? ` at commit ${lastV.commitHash.slice(0, 7)}` : ""}`,
+					);
+				}
+				if (lastR) {
+					stateLines.push(
+						`- Secondary Review: ${lastR.passed ? "APPROVED" : "CHANGES REQUESTED"} by ${lastR.reviewer}`,
+					);
+				}
+				contextBlocks.push(stateLines.join("\n"));
+
+				if (Array.isArray(output?.context)) {
+					output.context.push(contextBlocks.join("\n\n"));
 				}
 			} catch {}
 		},
