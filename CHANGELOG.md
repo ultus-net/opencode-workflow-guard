@@ -4,6 +4,9 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 
 ## Unreleased
 
+### Changed
+- Removed single-task focus rule (Policy 1). Multiple tasks may now be `in_progress` simultaneously, enabling concurrent subagent work on different tasks. Only "no silent deletion" and "all-done verification" remain enforced.
+
 ### Security & Correctness
 - Hardened PR detection for normal `gh` global-option forms and require an actual `Changelog:`/Changelog heading instead of accepting any mention of the word.
 - Made configured project `verifyCommand` effective and scoped verification freshness to the session that produced the mutation.

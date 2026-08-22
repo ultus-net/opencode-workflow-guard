@@ -2,7 +2,7 @@
 
 The purpose of this plugin is to hold AI agents accountable and maximize developer experience (DX) as OpenCode acts as your pair programmer. It enforces workflow discipline, agent focus, and safety boundaries through **deterministic hooks** - not prompt rules that LLMs can ignore.
 
-This plugin integrates with **OpenCode's native todo system** (`todowrite` / `GET /session/:id/todo`), enforces single-task focus, requires verification evidence before completion, and provides workspace boundary protection.
+This plugin integrates with **OpenCode's native todo system** (`todowrite` / `GET /session/:id/todo`), enforces structured task lifecycle, requires verification evidence before completion, and provides workspace boundary protection.
 
 ---
 
@@ -29,7 +29,7 @@ opencode-workflow-guard/
 
 | # | Policy | Summary |
 |---|---|---|
-| **1** | **Task Gate & Lifecycle** | File mutations (`edit`, `write`, `apply_patch`, shell redirects/copy/in-place edits) are blocked until an active todo item exists via `todowrite`. Enforces single-task `in_progress` focus, flexible task completion without artificial blockers, and prevents silent task deletion. |
+| **1** | **Task Gate & Lifecycle** | File mutations (`edit`, `write`, `apply_patch`, shell redirects/copy/in-place edits) are blocked until an active todo item exists via `todowrite`. Enforces structured task lifecycle (no silent deletion) and requires all tasks to be completed before finalization, with flexible task ordering.
 | **2** | **No Pushes to Main** | `git push ... main/master` is hard-blocked, including refspecs (`HEAD:main`, `feature:main`, `:main`) and forced refspecs (`+main`). Git global flags (`-C`, `--git-dir`) are parsed before matching. |
 | **3** | **PR Changelog** | `gh pr create` and `az repos pr create` require a `Changelog:` section in the PR description or a CHANGELOG file in the diff. |
 | **4** | **Destructive CLI Guard** | Blocks destructive operations (`kubectl delete`, `terraform destroy`, `helm uninstall`, `az/aws/gcloud delete`, `docker rm/prune`, database `drop/truncate`, `rm -rf`, `git clean`, `gh repo delete`, `curl DELETE`, `git push --force`, `prisma migrate reset`). Override requires explicit user environment flag (`WORKFLOW_GUARD_ALLOW_LIVE=1`). |
