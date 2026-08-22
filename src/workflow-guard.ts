@@ -548,12 +548,26 @@ async function guardShellMutation(
 	command: string,
 	sessionID: string | undefined,
 ): Promise<string | undefined> {
-	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	let hasMutation = false;
 	for (const segment of command.split(/[\n|;&]+/)) {
 		const secretSource = secretSourceInFilesystemCommand(segment);
 		if (secretSource) {
 			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;
+		}
+		// mv mutates its SOURCES too (they are removed from their origin), so
+		// sources must respect the same boundaries as mutation targets: no
+		// moving files in from outside the workspace, no moving protected
+		// (settings/plugin) files to innocuous names.
+		const transfer = filesystemTransferInfo(segment);
+		if (transfer && shellWords(unwrapShellCommand(segment))[0] === "mv") {
+			for (const source of transfer.sources) {
+				if (isProtectedPath(source)) {
+					return PROTECTED_PATH_REASON;
+				}
+				if (isPathOutsideWorkspace(source, workspaceRoot)) {
+					return `Blocked: mv would remove source '${source}' from outside the workspace root (${workspaceRoot}). File mutations must stay within the workspace.`;
+				}
+			}
 		}
 		const simpleMutations = simpleFilesystemMutations(segment);
 		const fallbackMutation = shellMutationIn(segment.trim());
@@ -575,11 +589,10 @@ async function guardShellMutation(
 				return PROTECTED_PATH_REASON;
 			}
 			if (target && isPathOutsideWorkspace(target, workspaceRoot)) {
-				// A redirect OUT of the workspace is also a live-system write.
-				if (!allowLive) {
-					return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
-				}
-				continue;
+				// The workspace boundary has no override: a write outside the
+				// workspace is out of bounds even with WORKFLOW_GUARD_ALLOW_LIVE
+				// (that override covers live-system commands, not the boundary).
+				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
 			}
 			if (onProtectedBranch(workspaceRoot)) {
 				return branchGuardReason();
@@ -1124,7 +1137,11 @@ export function isProtectedPath(targetPath: string): boolean {
 		/^opencode\.jsonc?$/i.test(base) ||
 		// workflow-guard.json / workflow-guard.jsonc anywhere
 		/^workflow-guard\.jsonc?$/i.test(base) ||
-		// anything under a .opencode directory (project plugins, agents)
+		// the .opencode directory itself and anything under it (project
+		// plugins, agents) - including the exact directory, not just paths
+		// nested inside it
+		lower === ".opencode" ||
+		lower.endsWith("/.opencode") ||
 		lower.includes(`${"/"}.opencode/`) ||
 		// anything under ~/.config/opencode (global config, plugins, ui)
 		lower.includes("/.config/opencode/") ||
@@ -1382,6 +1399,19 @@ function branchHasChangelogChange(root: string): boolean {
 
 // ── Documentation review & synchronization check (Policy 21) ─────────────────
 
+/**
+ * True for user-facing documentation files: README.md (root or package
+ * level) and anything under a docs/ directory. Deliberately excludes
+ * arbitrary markdown (e.g. .changeset/*.md, CHANGELOG.md) so the
+ * documentation gate cannot be satisfied by a changeset fragment.
+ */
+function isDocumentationFile(filePath: string): boolean {
+	const lower = filePath.toLowerCase();
+	if (lower === "readme.md" || lower.endsWith("/readme.md")) return true;
+	if (lower === "docs" || lower.startsWith("docs/") || lower.includes("/docs/")) return true;
+	return false;
+}
+
 export function branchHasDocumentationChange(root: string): boolean {
 	try {
 		const baseCandidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
@@ -1399,14 +1429,7 @@ export function branchHasDocumentationChange(root: string): boolean {
 			);
 			if (diff.status !== 0) continue;
 			const files = diff.stdout.split("\n").filter(Boolean);
-			if (
-				files.some(
-					(f) =>
-						/\.md$/i.test(f) ||
-						f.startsWith("docs/") ||
-						f.toLowerCase() === "readme.md",
-				)
-			) {
+			if (files.some((f) => isDocumentationFile(f))) {
 				return true;
 			}
 		}
@@ -1417,12 +1440,7 @@ export function branchHasDocumentationChange(root: string): boolean {
 		});
 		if (last.status === 0) {
 			const files = last.stdout.split("\n").filter(Boolean);
-			return files.some(
-				(f) =>
-					/\.md$/i.test(f) ||
-					f.startsWith("docs/") ||
-					f.toLowerCase() === "readme.md",
-			);
+			return files.some((f) => isDocumentationFile(f));
 		}
 		return false;
 	} catch {
@@ -1912,6 +1930,7 @@ let lastVerify: {
 	durationMs?: number;
 	commitHash?: string;
 	gitStatus?: string;
+	workspaceRoot?: string;
 } | undefined;
 const sessionVerifyResults = new Map<string, NonNullable<typeof lastVerify>>();
 
@@ -2206,6 +2225,7 @@ export function recordVerifyResult(
 		timestamp: Date.now(),
 		durationMs: result.durationMs,
 		commitHash,
+		workspaceRoot: resolve(root),
 		gitStatus,
 	};
 	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
@@ -2387,13 +2407,21 @@ async function guardToolCallImpl(
 						? sessionVerifyResults.get(sessionID)
 						: lastVerify;
 
-					// If in-memory cache is missing, attempt to recover from durable disk cache
-					if (!verifyResult) {
-						const diskCached = loadVerifyCache();
-						if (diskCached && diskCached.passed && diskCached.command === command) {
-							verifyResult = diskCached;
-						}
+				// If in-memory cache is missing, attempt to recover from durable disk cache.
+				// Durable evidence is bound to the workspace that produced it: without
+				// this check a passing run from a different project (identical verify
+				// command, non-git state) could satisfy finalization here.
+				if (!verifyResult) {
+					const diskCached = loadVerifyCache();
+					if (
+						diskCached &&
+						diskCached.passed &&
+						diskCached.command === command &&
+						diskCached.workspaceRoot === resolve(workspaceRoot)
+					) {
+						verifyResult = diskCached;
 					}
+				}
 
 					const mutationTimestamp = sessionID
 						? (sessionMutationTimestamps.get(sessionID) ?? 0)
@@ -2639,7 +2667,6 @@ async function guardToolCallImpl(
 			const normalizedInvocation = `git ${invocation.rest}`;
 			if (
 				isPathOutsideWorkspace(invocation.repoDir, workspaceRoot) &&
-				!allowLive &&
 				(GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))
 			) {
 				logBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
@@ -2793,7 +2820,6 @@ async function guardToolCallImpl(
 		if (hasPrCreateInvocation(raw)) {
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
-			const descFlag = isAz ? "--description" : "--body";
 
 			// Policy 19: Conflict-free mergeability gate before opening PR
 			const conflictCheck = checkMergeConflicts(workspaceRoot);
@@ -3146,13 +3172,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			}
 		},
 
-		// Post-edit verification: run the verify command when the agent
-		// attempts to finalize the todo list (all tasks completed), not on
-		// every edit. This avoids running tests on intermediate broken states
-		// and reduces performance overhead.
-		"tool.execute.after": async (input) => {
-			return;
-		},
+		// Post-edit verification runs when the agent attempts to finalize
+		// the todo list (all tasks completed) - enforced in the
+		// tool.execute.before todowrite branch above. This avoids running
+		// tests on intermediate broken states and reduces overhead.
 
 		// Focus preservation across context compaction (documented in
 		// https://opencode.ai/docs/plugins/#compaction-hooks).

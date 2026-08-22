@@ -31,6 +31,7 @@ import {
 	getLastReviewResult,
 	resetReviewState,
 	isSecretPath,
+	isProtectedPath,
 	loadProjectConfig,
 	reloadProjectConfig,
 	extractInterpreterPayload,
@@ -341,6 +342,22 @@ check("touch checks every target for workspace escape", blocked(await call("bash
 check("mkdir checks every target for workspace escape", blocked(await call("bash", { command: "mkdir /tmp/wg-outside-dir local-dir" }, { sessionID: "s-active" })));
 check("rm checks every target for workspace escape", blocked(await call("bash", { command: "rm /tmp/wg-outside-file local-file" }, { sessionID: "s-active" })));
 
+// mv mutates its sources: sources outside the workspace or protected paths
+// must block even when the destination is inside the workspace.
+check("mv source outside workspace is blocked", blocked(await call("bash", { command: "mv /tmp/valuable-file ./valuable-file" }, { sessionID: "s-active" })));
+const protectedConfigName = "opencode" + ".json";
+check("mv of protected config to innocuous name is blocked", blocked(await call("bash", { command: `mv ${protectedConfigName} disabled.json` }, { sessionID: "s-active" })));
+check("mv within workspace is allowed with todos", !(await call("bash", { command: "mv src-file.ts dst-file.ts" }, { sessionID: "s-active" })));
+// The workspace boundary has no override: WORKFLOW_GUARD_ALLOW_LIVE covers
+// live-system commands only, not the Policy 8 filesystem boundary.
+process.env.WORKFLOW_GUARD_ALLOW_LIVE = "1";
+check("redirect outside workspace stays blocked under allow-live", blocked(await call("bash", { command: "echo x > /etc/a.ts" }, { sessionID: "s-active" })));
+check("mv source outside workspace stays blocked under allow-live", blocked(await call("bash", { command: "mv /tmp/valuable-file ./valuable-file" }, { sessionID: "s-active" })));
+delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
+// The exact .opencode directory (not just paths under it) is protected.
+check("rm of exact .opencode directory is blocked", blocked(await call("bash", { command: "rm -rf .opencode" }, { sessionID: "s-active" })));
+check("isProtectedPath detects exact .opencode directory", isProtectedPath(".opencode"));
+
 console.log("- Policy 8: workspace boundary guard -");
 check("allow edit within workspace", !(await call("edit", { filePath: join(root, "src", "index.ts"), content: "x" }, { sessionID: "s-active" })));
 check("allow write relative path within workspace", !(await call("write", { filePath: "src/a.ts", content: "x" }, { sessionID: "s-active" })));
@@ -453,13 +470,15 @@ check("event hook emits no intrusive startup toast", toasts.length === 0);
 
 // ── New: audit trail ──
 console.log("- Audit trail -");
+const auditPath = getAuditFilePath();
+const auditSizeBefore = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
 await shell("git push origin main"); // block
 await shell("ls -la");                // allow
-// The log file is only opened when needed; the implementation writes
-// synchronously. We can't assert file existence deterministically here
-// without fs access to the audit dir, but the decision writer should
-// not throw, and the public wrapper should return normally.
-check("audit writes do not throw", true);
+const auditSizeAfter = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
+check(
+	"audit trail records shell decisions",
+	auditSizeAfter > auditSizeBefore,
+);
 
 // ── New: secret-content scan ──
 console.log("- Secret-content scan -");
@@ -482,11 +501,12 @@ check("normal key preserved", envObj.NORMAL === "keep");
 // ── New: command.executed channel ──
 console.log("- command.executed guard -");
 const cmdEvt = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
-let blockedEvt: string | undefined;
+const evtAuditBefore = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
 if (typeof cmdEvt.event === "function") {
 	await cmdEvt.event({ event: { type: "command.executed", properties: { command: "git push origin main", sessionID: "s-active" } } } as any);
 }
-check("command.executed does not throw on blocked command", true);
+const evtAuditAfter = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
+check("command.executed event is audited", evtAuditAfter > evtAuditBefore);
 
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
@@ -1010,6 +1030,19 @@ check(
 );
 delete process.env.WORKFLOW_GUARD_REQUIRE_DOCS;
 
+// Arbitrary markdown (e.g. a changeset fragment) must NOT satisfy the
+// documentation gate - only README.md and docs/ files count.
+spawnSync("git", ["switch", "-c", "feat/changeset-only", "main"], { cwd: docRepo });
+mkdirSync(join(docRepo, ".changeset"), { recursive: true });
+writeFileSync(join(docRepo, ".changeset", "some-change.md"), "---\n\"opencode-workflow-guard\": minor\n---\n- change\n");
+spawnSync("git", ["add", "-A"], { cwd: docRepo });
+spawnSync("git", ["commit", "-m", "changeset only"], { cwd: docRepo });
+check(
+	"changeset-only change does not satisfy documentation gate",
+	!branchHasDocumentationChange(docRepo),
+);
+setWorkspaceRoot(root);
+
 // 15. New Ecosystem DX & Safety Features (Features 1 - 6)
 console.log("- Ecosystem Features: Safe .env Masking, Output Snip, Git Snapshot, Durable Cache -");
 
@@ -1072,6 +1105,42 @@ const testVerifyCache = {
 persistVerifyCache(testVerifyCache);
 const loadedCache = loadVerifyCache();
 check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
+
+// Durable verification evidence is workspace-bound: a passing run from
+// workspace A must never satisfy finalization in workspace B, even when
+// the verify command is identical (critical for non-git workspaces where
+// commit/status provide no distinguishing state).
+const vcWsA = mkdtempSync(join(tmpdir(), "wg-vc-a-"));
+const vcWsB = mkdtempSync(join(tmpdir(), "wg-vc-b-"));
+for (const ws of [vcWsA, vcWsB]) {
+	writeFileSync(join(ws, "package.json"), JSON.stringify({ scripts: { test: "node probe.js" } }));
+}
+writeFileSync(join(vcWsA, "probe.js"), "process.exit(0);\n");
+writeFileSync(join(vcWsB, "probe.js"), "process.exit(1);\n");
+setWorkspaceRoot(vcWsA);
+resetVerifyState();
+recordVerifyResult("node probe.js", { passed: true, output: "ok" }, undefined, vcWsA);
+check(
+	"recordVerifyResult stamps durable cache with workspace identity",
+	loadVerifyCache()?.workspaceRoot === resolve(vcWsA),
+);
+
+setWorkspaceRoot(vcWsB);
+resetVerifyState();
+todo("s-vc-b", item("vc work", "in_progress"));
+await call("edit", { filePath: join(vcWsB, "code.ts"), content: "x" }, { sessionID: "s-vc-b" });
+const vcFinalRes = await call(
+	"todowrite",
+	{ todos: [item("vc work", "completed")] },
+	{ sessionID: "s-vc-b" },
+);
+check(
+	"durable verify cache is workspace-bound (foreign evidence rejected)",
+	blocked(vcFinalRes),
+);
+rmSync(vcWsA, { recursive: true, force: true });
+rmSync(vcWsB, { recursive: true, force: true });
+setWorkspaceRoot(root);
 
 // 16. Policy 22: Non-Interactive Shell & TTY Hang Guard
 console.log("- Policy 22: Non-Interactive Shell & TTY Hang Guard -");
