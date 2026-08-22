@@ -55,7 +55,7 @@
 - The agent is prompted to create a feature branch first (`git switch -c feat/my-feature`).
 
 ### 8. Workspace Boundary Guard
-- File modification tools (`edit`, `write`, `apply_patch`) and shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`, `git apply`/`git am`) are validated to ensure targets cannot escape the current workspace root via `../` traversal, symlinks, or absolute paths.
+- File modification tools (`edit`, `write`, `apply_patch`) and common shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`/`ln`, `touch`, `mkdir`, `rm`, `git apply`/`git am`) are validated to ensure targets cannot escape the current workspace root via `../` traversal, symlinks, or absolute paths.
 - External repository git writes (`git -C /other-repo commit`) are also confined to the workspace.
 
 ### 9. Script-Laundering Guard
@@ -64,13 +64,13 @@
 
 ### 10. Evidence-Based Verification
 - When the agent attempts to mark **every** task completed (finalizing the request), the guard requires passing verification evidence.
-- Verification (`WORKFLOW_GUARD_VERIFY` env, or auto-detected `npm test` from `package.json`) executes in an isolated environment with scrubbed credentials, output caps, and strict timeout protection.
+- Verification (`WORKFLOW_GUARD_VERIFY` env, project `verifyCommand`, or auto-detected `npm test` from `package.json`) executes in an isolated environment with scrubbed credentials, output caps, and strict timeout protection. Environment configuration takes precedence over project configuration.
 - If edits occurred after the previous verification run, fresh verification is executed. If verification fails, finalization is blocked with the error output tail.
 - The verify command is **disabled** when `WORKFLOW_GUARD_VERIFY` is empty (`""`).
 
 ### 11. Secret-Content Scan
-- File payloads are scanned for common credential material (AWS keys, private key headers, GitHub tokens, OpenAI/LLM keys, Google API keys, Slack tokens, explicit env-style assignments).
-- Flagged content is blocked at the write/edit step with an actionable message.
+- File payloads and recognized shell file-mutation commands are scanned for common credential material (AWS keys, private key headers, GitHub tokens, OpenAI/LLM keys, Google API keys, Slack tokens, explicit env-style assignments).
+- Flagged content is blocked before the write with an actionable message. Secret-file reads also resolve existing symlink aliases, and copying/moving/linking a known secret path under another name is blocked.
 
 ### 12. Shell Environment Scrub
 - Sensitive environment variables (`AWS_*`, `KUBE*`, `OPENAI*`, `ANTHROPIC*`, `GH_/GITHUB_*`, `GOOGLE_/GCP_`, `AZURE_`, `SLACK_`, `NPM_`, `DOCKER_`, `KUBECONFIG`, and fixed names like `GITHUB_TOKEN`, `OPENAI_API_KEY`, `KUBECONFIG`, `NPM_TOKEN`) are **emptied** in agent shells by the `shell.env` hook.
