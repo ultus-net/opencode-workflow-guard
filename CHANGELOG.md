@@ -2,6 +2,19 @@
 
 All notable changes to `opencode-workflow-guard` will be documented in this file.
 
+## Unreleased
+
+### Security & Correctness
+- Hardened PR detection for normal `gh` global-option forms and require an actual `Changelog:`/Changelog heading instead of accepting any mention of the word.
+- Made configured project `verifyCommand` effective and scoped verification freshness to the session that produced the mutation.
+- Invalidated review approval after new mutations, scoped tool-recorded reviews to their parent session/workspace, and rejected `record_review` self-approval from non-subagent sessions.
+- Resolved existing symlink aliases when checking secret/protected paths and blocked copying, moving, or linking recognized secret files under benign names.
+- Expanded shell workspace confinement to common `touch`, `mkdir`, `rm`, `unlink`, `rmdir`, and `ln` mutations; direct download-to-shell pipelines are blocked.
+- Hardened chained `git -C` repository checks and recognized additional Git global pathspec options so they cannot hide guarded subcommands.
+- Fixed Slack `xox*` token detection and shell secret-content scanning, while excluding `/dev/null` and standard device sinks from file-mutation gating.
+- Fixed duplicate todo lifecycle accounting so one of two identically named active tasks cannot silently disappear.
+- Corrected troubleshooting documentation: `WORKFLOW_GUARD_ALLOW_LIVE=1` is the only live-system override.
+
 ## [1.2.0] - 2026-08-22
 
 ### Security & Invariant Hardening

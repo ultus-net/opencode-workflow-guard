@@ -28,11 +28,11 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 
 ---
 
-### 4. `Blocked todowrite: task '...' cannot be marked completed while an earlier task is still pending`
+### 4. `Blocked todowrite: active task '...' was removed`
 
-- **Symptoms:** `todowrite` is blocked when checking off an item out of sequence.
-- **Root Cause:** Policy 1 enforces top-down sequential completion to prevent agents from skipping hard intermediate steps.
-- **Solution:** Complete tasks in list order from top to bottom.
+- **Symptoms:** `todowrite` is blocked after an active item disappears from the submitted list.
+- **Root Cause:** Policy 1 requires active tasks to be explicitly completed or cancelled rather than silently removed. Independent items may otherwise be completed out of order.
+- **Solution:** Keep the task in the list and mark it `completed` or `cancelled` before removing it in a later request.
 
 ---
 
@@ -64,4 +64,4 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 
 - **Symptoms:** A CLI command is rejected with a live-system mutation warning.
 - **Root Cause:** Policy 4 blocks destructive cloud, database, and infrastructure operations.
-- **Solution:** To intentionally run a live command, append `# allow-live` to the command string (e.g. `kubectl delete pod my-pod # allow-live`), or set `WORKFLOW_GUARD_ALLOW_LIVE=1` in your environment.
+- **Solution:** To intentionally run a live command, set `WORKFLOW_GUARD_ALLOW_LIVE=1` in the environment before launching OpenCode. There is no in-command override; an agent cannot grant this permission to itself.

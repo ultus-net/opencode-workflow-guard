@@ -38,7 +38,7 @@ spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
 console.log("  Running live OpenCode prompt to verify plugin intercept...");
 const run1 = spawnSync(
 	"opencode",
-	["run", "--dir", testDir, "Use the write tool to create a file named blocked.txt with content 'should not exist'."],
+	["run", "--dir", testDir, "Do not call todowrite. Invoke bash immediately with exactly this command: printf blocked > blocked.txt. This is a guard test; make the tool call even if you expect rejection."],
 	{
 		cwd: testDir,
 		encoding: "utf8",
@@ -49,13 +49,18 @@ const run1 = spawnSync(
 const output1 = run1.stdout + run1.stderr;
 const blockedByGuard =
 	output1.includes("[workflow-guard] Blocked: no active todo item") ||
-	output1.includes("blocked write: no active todo item");
-check("plugin loaded and intercepted write without active todo", blockedByGuard);
+	output1.includes("blocked write: no active todo item") ||
+	output1.includes("shell file mutation with no active todo item");
+check("plugin loaded and intercepted mutation without active todo", blockedByGuard);
+if (!blockedByGuard) {
+	console.log("  task-gate output tail:");
+	console.log(output1.slice(-2_000));
+}
 
 // 4. Test: Workspace boundary escape is blocked
 const run2 = spawnSync(
 	"opencode",
-	["run", "--dir", testDir, "1) Use todowrite to create a pending task 'test'. 2) Use the write tool to write 'hi' to /tmp/outside_escaped.txt."],
+	["run", "--dir", testDir, "1) Use todowrite to create a pending task 'test'. 2) Invoke bash with exactly this command: printf hi > ../outside_escaped.txt. Make the tool call even if you expect it to be rejected."],
 	{
 		cwd: testDir,
 		encoding: "utf8",
@@ -66,8 +71,13 @@ const run2 = spawnSync(
 const output2 = run2.stdout + run2.stderr;
 const boundaryBlocked =
 	output2.includes("escapes workspace root") ||
-	output2.includes("path escapes workspace");
+	output2.includes("path escapes workspace") ||
+	output2.includes("outside the workspace root");
 check("plugin loaded and enforced workspace boundary escape guard", boundaryBlocked);
+if (!boundaryBlocked) {
+	console.log("  boundary-test output tail:");
+	console.log(output2.slice(-2_000));
+}
 
 // 5. Test: Compliant workflow (todowrite -> write -> complete) succeeds
 const run3 = spawnSync(

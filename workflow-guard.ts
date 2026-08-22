@@ -49,7 +49,7 @@
 import { spawnSync, spawn } from "node:child_process";
 import { mkdirSync, realpathSync, readFileSync, appendFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
 
 // OpenCode built-in tools (https://opencode.ai/docs/tools/): bash is the
@@ -95,6 +95,91 @@ function normalize(cmd: string): string {
 	return cmd.replace(/\s+/g, " ");
 }
 
+function shellWords(command: string): string[] {
+	return (command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map((word) =>
+		word.replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2"),
+	);
+}
+
+function splitShellSegments(command: string): string[] {
+	const segments: string[] = [];
+	let current = "";
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (const char of command) {
+		if (escaped) {
+			current += char;
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			current += char;
+			escaped = true;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			if (!quote) quote = char;
+			else if (quote === char) quote = undefined;
+			current += char;
+			continue;
+		}
+		if (!quote && /[\n|;&]/.test(char)) {
+			if (current.trim()) segments.push(current.trim());
+			current = "";
+			continue;
+		}
+		current += char;
+	}
+	if (current.trim()) segments.push(current.trim());
+	return segments;
+}
+
+/** Remove common command wrappers while preserving the underlying invocation. */
+function unwrapShellWords(command: string): string[] {
+	const words = shellWords(command.trim());
+	let i = 0;
+	while (i < words.length) {
+		if (words[i] === "command") {
+			i++;
+			continue;
+		}
+		if (words[i] === "sudo") {
+			i++;
+			const valueOptions = new Set(["-u", "--user", "-g", "--group", "-h", "--host", "-p", "--prompt", "-C", "--close-from", "-R", "--chroot", "-D", "--chdir"]);
+			while (i < words.length && words[i]!.startsWith("-")) {
+				const option = words[i++]!;
+				if (valueOptions.has(option) && i < words.length) i++;
+			}
+			continue;
+		}
+		if (words[i] === "env") {
+			i++;
+			const valueOptions = new Set(["-u", "--unset", "-C", "--chdir", "-S", "--split-string"]);
+			while (i < words.length) {
+				const word = words[i]!;
+				if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+					i++;
+					continue;
+				}
+				if (!word.startsWith("-")) break;
+				i++;
+				if (valueOptions.has(word) && i < words.length) i++;
+			}
+			continue;
+		}
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) {
+			i++;
+			continue;
+		}
+		break;
+	}
+	return words.slice(i);
+}
+
+function unwrapShellCommand(command: string): string {
+	return unwrapShellWords(command).join(" ");
+}
+
 // Matches a direct push of main|master: "git push origin main",
 // "git push main", "git push origin local:main" (refspec), "git push
 // origin :main" (branch deletion), "git push origin +HEAD:master" (forced
@@ -102,13 +187,17 @@ function normalize(cmd: string): string {
 // feature/main-fix or HEAD:main-backup are fine.
 const PUSH_TO_MAIN_RE =
 	/\bgit\s+push\b[^|;&]*(?:^|\s)\+?[\w./-]*:(?:main|master)(?![\w./-])|\bgit\s+push\b[^|;&]*(?:\s|\/)(?:main|master)(?![\w./-])/;
-const PR_CREATE_INVOCATION_RE = /^(?:gh\s+pr\s+create|az\s+repos\s+pr\s+create)\b/;
-const CHANGELOG_SECTION_RE = /changelog/i;
+const CHANGELOG_SECTION_RE = /^\s*(?:#{1,6}\s*)?changelog\s*(?::|$)/im;
 
 function hasPrCreateInvocation(command: string): boolean {
-	return command
-		.split(/[\n|;&]+/)
-		.some((seg) => PR_CREATE_INVOCATION_RE.test(seg.trim()));
+	return splitShellSegments(command)
+		.some((seg) => {
+			const trimmed = unwrapShellCommand(seg);
+			return (
+				/^gh\b[^|;&]*\bpr\s+create\b/.test(trimmed) ||
+				/^az\b[^|;&]*\brepos\s+pr\s+create\b/.test(trimmed)
+			);
+		});
 }
 
 // ── Task gate (native session todos) ─────────────────────────────────────────
@@ -203,6 +292,22 @@ async function effectiveTodos(
 	return [];
 }
 
+async function effectiveTodoOwnerSessionID(
+	sessionID: string | undefined,
+): Promise<string | undefined> {
+	if (!sessionID) return undefined;
+	const seen = new Set<string>();
+	let current: string | undefined = sessionID;
+	while (current && !seen.has(current)) {
+		seen.add(current);
+		const todos = await fetchSessionTodos(current);
+		if (todos === undefined) return sessionID;
+		if (todos.length > 0) return current;
+		current = await fetchParentSessionID(current);
+	}
+	return sessionID;
+}
+
 function hasActiveTodo(todos: TodoItem[]): boolean {
 	return todos.some((todo) => ACTIVE_TODO_STATUSES.has(String(todo.status ?? "")));
 }
@@ -233,10 +338,18 @@ export function validateTodoLifecycle(
 			return s === "pending" || s === "in_progress";
 		});
 		if (activeExisting.length > 0) {
-			const newContents = new Set(newTodos.map((t) => String(t.content ?? "").trim()));
-			const missing = activeExisting.find(
-				(t) => !newContents.has(String(t.content ?? "").trim()),
-			);
+			const newContentCounts = new Map<string, number>();
+			for (const todo of newTodos) {
+				const content = String(todo.content ?? "").trim();
+				newContentCounts.set(content, (newContentCounts.get(content) ?? 0) + 1);
+			}
+			const missing = activeExisting.find((todo) => {
+				const content = String(todo.content ?? "").trim();
+				const remaining = newContentCounts.get(content) ?? 0;
+				if (remaining === 0) return true;
+				newContentCounts.set(content, remaining - 1);
+				return false;
+			});
 			if (missing) {
 				return (
 					`Blocked todowrite: active task '${String(missing.content ?? "")}' was removed ` +
@@ -320,6 +433,9 @@ function shellMutationIn(segment: string): ShellMutation | undefined {
 		/(?:^|\s|>)(?:[0-9]*>>?)\s*["']?([^\s>&|;"']+)/,
 	);
 	if (redirectMatch?.[1]) {
+		if (/^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(redirectMatch[1])) {
+			return undefined;
+		}
 		return {
 			kind: "redirect",
 			target: redirectMatch[1],
@@ -343,6 +459,26 @@ function shellMutationIn(segment: string): ShellMutation | undefined {
 		const target = tokens[tokens.length - 1];
 		return { kind: "command", target, what: `sed -i on '${target}'` };
 	}
+	const transfer = filesystemTransferInfo(segment);
+	if (transfer?.destination) {
+		return {
+			kind: "command",
+			target: transfer.destination,
+			what: `copy/move/link to '${transfer.destination}'`,
+		};
+	}
+	// Common single-target filesystem mutations. Flags are tolerated; the
+	// final operand is the target for these forms.
+	const fsMutationMatch = segment.match(
+		/\b(?:touch|mkdir|rm|unlink|rmdir|ln)\b[^|;&]*\s+["']?([^\s;&|"']+)["']?\s*$/,
+	);
+	if (fsMutationMatch?.[1] && !fsMutationMatch[1].startsWith("-")) {
+		return {
+			kind: "command",
+			target: fsMutationMatch[1],
+			what: `filesystem mutation of '${fsMutationMatch[1]}'`,
+		};
+	}
 	// Copy/move into the workspace: cp/mv/rsync … dest
 	const copyMatch = segment.match(
 		/\b(?:cp|mv|rsync|install|cpio|scp|wget|curl)\b[^|;&]*?(-o\s+)?(["']?)([^\s;&|"']+)\2?\s*$/,
@@ -361,6 +497,58 @@ function shellMutationIn(segment: string): ShellMutation | undefined {
 	return undefined;
 }
 
+function simpleFilesystemMutations(segment: string): ShellMutation[] {
+	const words = shellWords(unwrapShellCommand(segment));
+	const command = words[0];
+	if (!command || !new Set(["touch", "mkdir", "rm", "unlink", "rmdir"]).has(command)) {
+		return [];
+	}
+	return words
+		.slice(1)
+		.filter((word) => !word.startsWith("-"))
+		.map((target) => ({
+			kind: "command" as const,
+			target,
+			what: `filesystem mutation of '${target}'`,
+		}));
+}
+
+function filesystemTransferInfo(
+	segment: string,
+): { sources: string[]; destination?: string } | undefined {
+	const words = shellWords(unwrapShellCommand(segment));
+	if (!words[0] || !new Set(["cp", "mv", "ln"]).has(words[0])) return undefined;
+	const operands: string[] = [];
+	let targetDirectory: string | undefined;
+	for (let i = 1; i < words.length; i++) {
+		const word = words[i]!;
+		if (word === "-t" || word === "--target-directory") {
+			targetDirectory = words[++i];
+			continue;
+		}
+		if (word.startsWith("--target-directory=")) {
+			targetDirectory = word.slice("--target-directory=".length);
+			continue;
+		}
+		if (word.startsWith("-")) continue;
+		operands.push(word);
+	}
+	if (targetDirectory) return { sources: operands, destination: targetDirectory };
+	return {
+		sources: operands.slice(0, -1),
+		destination: operands.at(-1),
+	};
+}
+
+function secretSourceInFilesystemCommand(segment: string): string | undefined {
+	const transfer = filesystemTransferInfo(segment);
+	if (!transfer) return undefined;
+	for (const source of transfer.sources) {
+		if (isSecretPath(source)) return source;
+	}
+	return undefined;
+}
+
 /**
  * Mutations via the shell are subject to the same gates as direct edits:
  * todo activity, branch protection (targets inside the workspace) and the
@@ -373,37 +561,52 @@ async function guardShellMutation(
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	let hasMutation = false;
 	for (const segment of command.split(/[\n|;&]+/)) {
-		const mutation = shellMutationIn(segment.trim());
-		if (!mutation) continue;
-		hasMutation = true;
-		const target = mutation.target ?? "";
-		// git apply/am has no explicit filename target - treat as workspace
-		// mutation: subject to todo + branch gates, boundary implicit.
-		if (target && isProtectedPath(target)) {
-			return PROTECTED_PATH_REASON;
+		const secretSource = secretSourceInFilesystemCommand(segment);
+		if (secretSource) {
+			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;
 		}
-		if (target && isPathOutsideWorkspace(target, workspaceRoot)) {
-			// A redirect OUT of the workspace is also a live-system write.
-			if (!allowLive) {
-				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
+		const simpleMutations = simpleFilesystemMutations(segment);
+		const fallbackMutation = shellMutationIn(segment.trim());
+		const mutations = simpleMutations.length > 0
+			? simpleMutations
+			: fallbackMutation
+				? [fallbackMutation]
+				: [];
+		for (const mutation of mutations) {
+			hasMutation = true;
+			const secret = secretIn(segment);
+			if (secret) {
+				return `Blocked: shell file mutation payload appears to contain a ${secret}. Secrets must not be written to disk from agent commands.`;
 			}
-			continue;
-		}
-		if (onProtectedBranch(workspaceRoot)) {
-			return branchGuardReason();
-		}
-		const todos = await effectiveTodos(sessionID);
-		if (todos !== undefined && !hasActiveTodo(todos)) {
-			return (
-				"Blocked: shell file mutation with no active todo item. " +
-				"Break the request down with todowrite first, then apply " +
-				"changes (the same gates apply to shell redirects, tee, " +
-				"sed -i, cp/mv and git apply as to the edit tools)."
-			);
+			const target = mutation.target ?? "";
+			// git apply/am has no explicit filename target - treat as workspace
+			// mutation: subject to todo + branch gates, boundary implicit.
+			if (target && isProtectedPath(target)) {
+				return PROTECTED_PATH_REASON;
+			}
+			if (target && isPathOutsideWorkspace(target, workspaceRoot)) {
+				// A redirect OUT of the workspace is also a live-system write.
+				if (!allowLive) {
+					return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
+				}
+				continue;
+			}
+			if (onProtectedBranch(workspaceRoot)) {
+				return branchGuardReason();
+			}
+			const todos = await effectiveTodos(sessionID);
+			if (todos !== undefined && !hasActiveTodo(todos)) {
+				return (
+					"Blocked: shell file mutation with no active todo item. " +
+					"Break the request down with todowrite first, then apply " +
+					"changes (the same gates apply to shell redirects, tee, " +
+					"sed -i, cp/mv and git apply as to the edit tools)."
+				);
+			}
 		}
 	}
 	if (hasMutation) {
-		recordMutation();
+		recordMutation(await effectiveTodoOwnerSessionID(sessionID));
 	}
 	return undefined;
 }
@@ -423,6 +626,20 @@ const GIT_DIR_OPTION_TAKES_VALUE = new Set([
 ]);
 const GIT_DIR_OPTION_PREFIXED =
 	/^(--git-dir=|--work-tree=|--namespace=|-c\S|--config-env=)/;
+const GIT_GLOBAL_BOOLEAN_OPTIONS = new Set([
+	"--version",
+	"--help",
+	"--no-pager",
+	"-p",
+	"--paginate",
+	"--bare",
+	"--literal-pathspecs",
+	"--glob-pathspecs",
+	"--noglob-pathspecs",
+	"--icase-pathspecs",
+	"--no-optional-locks",
+	"--exec-path",
+]);
 
 interface GitInvocation {
 	repoDir: string;
@@ -436,8 +653,8 @@ interface GitInvocation {
  * global flags cannot smuggle a guarded subcommand past the regexes.
  */
 function parseGitInvocation(command: string): GitInvocation | undefined {
-	if (!/^\s*git\s/.test(command)) return undefined;
-	const tokens = command.split(/\s+/);
+	const tokens = unwrapShellWords(command);
+	if (tokens[0] !== "git") return undefined;
 	let i = 1;
 	let repoDir = workspaceRoot;
 	let sawDirOption = false;
@@ -462,7 +679,7 @@ function parseGitInvocation(command: string): GitInvocation | undefined {
 			continue;
 		}
 		// Bare global flags that take no value.
-		if (/^(--version|--help|--no-pager|-p|--paginate|--bare|--literal-pathspecs|--no-optional-locks|--exec-path)$/.test(tok)) {
+		if (GIT_GLOBAL_BOOLEAN_OPTIONS.has(tok)) {
 			i += 1;
 			continue;
 		}
@@ -478,18 +695,12 @@ function parseGitInvocation(command: string): GitInvocation | undefined {
  * global flags. Non-git segments pass through unchanged.
  */
 function normalizeGitCommands(command: string): string {
-	return command
-		.split(/([\n|;&]+)/)
+	return splitShellSegments(command)
 		.map((segment) => {
-			const parsed = parseGitInvocation(segment.trim());
-			if (parsed) {
-				const leading = segment.match(/^\s*/)?.[0] ?? "";
-				const trailing = segment.match(/\s*$/)?.[0] ?? "";
-				return `${leading}git ${parsed.rest}${trailing}`;
-			}
-			return segment;
+			const parsed = parseGitInvocation(segment);
+			return parsed ? `git ${parsed.rest}` : segment;
 		})
-		.join("");
+		.join(" ; ");
 }
 
 const GIT_WRITE_RE =
@@ -754,6 +965,7 @@ const LIVE_MUTATION_PATTERNS: LivePattern[] = [
 	{ re: /\bprisma\s+migrate\s+reset\b/, what: "prisma migrate reset (database wipe)" },
 	// Destructive remote HTTP calls (DELETE only; POST/PUT/PATCH are normal API work)
 	{ re: /\bcurl\b(?=[^|;&]*(?:(?<!\S)(?:-X|--request)\s*=?\s*DELETE))(?=[^|;&]*https?:\/\/(?!localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]))/, what: "remote HTTP DELETE" },
+	{ re: /\b(?:curl|wget)\b[^;&]*\|\s*(?:bash|sh|zsh)\b/, what: "remote download piped directly to a shell" },
 	// Destructive git operations
 	{ re: /\bgit\s+push\b[^|;&]*(?:--force\b|--force-with-lease\b|\s-f\b)/, what: "force push" },
 ];
@@ -791,8 +1003,7 @@ const SECRET_PATTERNS: SecretPattern[] = [
 	{ re: /\bsk-[A-Za-z0-9]{20,}\b/, what: "OpenAI-style API key" },
 	{ re: /\bog-[A-Za-z0-9]{20,}\b/, what: "OpenCode/legacy API key" },
 	{ re: /\bAIza[0-9A-Za-z_-]{35}\b/, what: "Google API key" },
-	{ re: /\bywq[A-Za-z0-9_-]{44,}\b/, what: "Slack token (xoxp/xoxb/xoxa family)" },
-	{ re: /\bywq[A-Za-z0-9_-]{10,}\b/, what: "Slack-style token" },
+	{ re: /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, what: "Slack token (xox family)" },
 	// Explicit env-style assignments are a common accident in .env files.
 	{ re: /(?:^|\s)(?:AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN)\s*=\s*\S+/, what: "AWS credential assignment" },
 	{ re: /(?:^|\s)(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|OPENAI_KEY)\s*=\s*\S+/, what: "LLM API key assignment" },
@@ -877,9 +1088,10 @@ function mcpMutationTool(toolName: string): string | undefined {
 export function isProtectedPath(targetPath: string): boolean {
 	if (!targetPath) return false;
 	const resolved = resolve(workspaceRoot, targetPath);
-	const base = basename(resolved);
-	const lower = resolved.toLowerCase();
-	return (
+	const matches = (path: string): boolean => {
+		const base = basename(path);
+		const lower = path.toLowerCase();
+		return (
 		// opencode.json / opencode.jsonc anywhere (project config)
 		/^opencode\.jsonc?$/i.test(base) ||
 		// workflow-guard.json / workflow-guard.jsonc anywhere
@@ -889,7 +1101,23 @@ export function isProtectedPath(targetPath: string): boolean {
 		// anything under ~/.config/opencode (global config, plugins, ui)
 		lower.includes("/.config/opencode/") ||
 		lower.includes("/.config/opencode.json")
-	);
+		);
+	};
+	if (matches(resolved)) return true;
+	try {
+		return matches(realpathSync(resolved));
+	} catch {
+		let ancestor = resolve(resolved, "..");
+		while (ancestor !== resolve(ancestor, "..")) {
+			try {
+				const realAncestor = realpathSync(ancestor);
+				return matches(resolve(realAncestor, relative(ancestor, resolved)));
+			} catch {
+				ancestor = resolve(ancestor, "..");
+			}
+		}
+		return false;
+	}
 }
 
 // ── Sensitive file READ guard (.env*, keys, credentials, kubeconfig) ─────────
@@ -902,8 +1130,9 @@ const SAFE_ENV_FIXTURE_RE =
 export function isSecretPath(targetPath: string): boolean {
 	if (!targetPath) return false;
 	const resolved = resolve(workspaceRoot, targetPath);
-	const base = basename(resolved).toLowerCase();
-	const full = resolved.toLowerCase();
+	const matches = (path: string): boolean => {
+	const base = basename(path).toLowerCase();
+	const full = path.toLowerCase();
 
 	// Safe fixtures
 	if (SAFE_ENV_FIXTURE_RE.test(base)) {
@@ -938,16 +1167,27 @@ export function isSecretPath(targetPath: string): boolean {
 	}
 
 	return false;
+	};
+	if (matches(resolved)) return true;
+	try {
+		return matches(realpathSync(resolved));
+	} catch {
+		return false;
+	}
 }
 
 const SECRET_READ_COMMAND_RE =
 	/(?:^|\s)(?:cat|head|tail|less|more|grep|awk|sed|od|hexdump|strings|base64|xxd|nl|sort|uniq|view|nano|vim?)\s+[^|;&]*?(?:["']?)([\w\/.~-]*\.(?:pem|key|pfx|p12)|[\w\/.~-]*\.env(?:\.[\w-]+)*|[\w\/.~-]*id_(?:rsa|dsa|ecdsa|ed25519)[\w.-]*|[\w\/.~-]*kubeconfig[\w.-]*|[\w\/.~-]*(?:service[-_]?account|credentials|client[-_]?secret)[\w.-]*\.json)(?:["']?)/i;
+const SIMPLE_FILE_READ_COMMAND_RE =
+	/(?:^|\s)(?:cat|head|tail|less|more|od|hexdump|strings|base64|xxd|nl|view|nano|vim?)\s+(?:-\S+\s+)*["']?([^\s|;&"']+)/i;
 
 function secretFileReadIn(segment: string): string | undefined {
 	const match = segment.match(SECRET_READ_COMMAND_RE);
 	if (match?.[1] && isSecretPath(match[1])) {
 		return match[1];
 	}
+	const simpleMatch = segment.match(SIMPLE_FILE_READ_COMMAND_RE);
+	if (simpleMatch?.[1] && isSecretPath(simpleMatch[1])) return simpleMatch[1];
 	return undefined;
 }
 
@@ -1139,15 +1379,15 @@ export function isDocumentationRequired(root: string): boolean {
 function prBodyIncludesChangelog(command: string): boolean {
 	// Handle inline --body / --description / -d / -b "..." with a Changelog section.
 	const bodyMatch = command.match(
-		/(?:--body|--description|-d|-b)\s+(?:"([^"]*)"|'([^']*)')/,
+		/(?:--body|--description|-d|-b)(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s|;&]+))/,
 	);
-	const body = bodyMatch?.[1] ?? bodyMatch?.[2] ?? "";
+	const body = bodyMatch?.[1] ?? bodyMatch?.[2] ?? bodyMatch?.[3] ?? "";
 	if (CHANGELOG_SECTION_RE.test(body)) {
 		return true;
 	}
 	// Handle --body-file <path> / --description-file <path> / -F <path>: read the referenced file.
 	const bodyFileMatch = command.match(
-		/(?:--body-file|--description-file|-F)\s+(?:"([^"]*)"|'([^']*)'|(\S+))/,
+		/(?:--body-file|--description-file|-F)(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s|;&]+))/,
 	);
 	const bodyFile =
 		bodyFileMatch?.[1] ?? bodyFileMatch?.[2] ?? bodyFileMatch?.[3];
@@ -1174,20 +1414,28 @@ let lastReview:
 			reviewer: string;
 			summary: string;
 			timestamp: number;
+			targetSessionID?: string;
+			workspace?: string;
 	  }
 	| undefined;
+const sessionReviews = new Map<string, NonNullable<typeof lastReview>>();
 
 export function recordReviewResult(
 	reviewer: string,
 	summary: string,
 	passed: boolean,
+	targetSessionID?: string,
+	workspace?: string,
 ): void {
 	lastReview = {
 		reviewer,
 		summary: summary.slice(-4000),
 		passed,
 		timestamp: Date.now(),
+		targetSessionID,
+		workspace,
 	};
+	if (targetSessionID) sessionReviews.set(targetSessionID, lastReview);
 }
 
 export function getLastReviewResult(): typeof lastReview {
@@ -1196,6 +1444,7 @@ export function getLastReviewResult(): typeof lastReview {
 
 export function resetReviewState(): void {
 	lastReview = undefined;
+	sessionReviews.clear();
 }
 
 /**
@@ -1247,6 +1496,7 @@ export function buildReviewRubric(diffText: string, taskPrompt?: string): string
 // the guard ensures fresh verification has passed since the most recent mutation.
 
 let lastMutationTimestamp = 0;
+const sessionMutationTimestamps = new Map<string, number>();
 let lastVerify: {
 	passed: boolean;
 	command: string;
@@ -1254,9 +1504,18 @@ let lastVerify: {
 	timestamp: number;
 	durationMs?: number;
 } | undefined;
+const sessionVerifyResults = new Map<string, NonNullable<typeof lastVerify>>();
 
-export function recordMutation(): void {
+export function recordMutation(sessionID?: string): void {
 	lastMutationTimestamp = Date.now();
+	if (sessionID) {
+		sessionMutationTimestamps.set(sessionID, lastMutationTimestamp);
+		sessionVerifyResults.delete(sessionID);
+	}
+	if (sessionID) sessionReviews.delete(sessionID);
+	if (!lastReview?.targetSessionID || lastReview.targetSessionID === sessionID) {
+		lastReview = undefined;
+	}
 }
 
 export function getLastMutationTimestamp(): number {
@@ -1270,6 +1529,8 @@ export function getLastVerifyResult(): typeof lastVerify {
 export function resetVerifyState(): void {
 	lastMutationTimestamp = 0;
 	lastVerify = undefined;
+	sessionMutationTimestamps.clear();
+	sessionVerifyResults.clear();
 }
 
 // Sensitive environment variables scrubbed from agent shells by the
@@ -1308,6 +1569,11 @@ function detectVerifyCommand(root: string): string | undefined {
 	if (process.env.WORKFLOW_GUARD_VERIFY !== undefined) {
 		const cmd = process.env.WORKFLOW_GUARD_VERIFY.trim();
 		return cmd || undefined; // empty string = "disabled"
+	}
+	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
+	if (typeof cfg.verifyCommand === "string") {
+		const cmd = cfg.verifyCommand.trim();
+		return cmd || undefined;
 	}
 	try {
 		const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
@@ -1398,6 +1664,7 @@ export async function runVerify(
 export function recordVerifyResult(
 	command: string,
 	result: { passed: boolean; output: string; durationMs?: number },
+	sessionID?: string,
 ): void {
 	lastVerify = {
 		command,
@@ -1406,6 +1673,7 @@ export function recordVerifyResult(
 		timestamp: Date.now(),
 		durationMs: result.durationMs,
 	};
+	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
 }
 
 // Every block/allow decision is appended as a JSON line to a durable file so
@@ -1576,15 +1844,22 @@ async function guardToolCallImpl(
 
 				const command = detectVerifyCommand(workspaceRoot);
 				if (command) {
+					const sessionID = context?.sessionID;
+					const verifyResult = sessionID
+						? sessionVerifyResults.get(sessionID)
+						: lastVerify;
+					const mutationTimestamp = sessionID
+						? (sessionMutationTimestamps.get(sessionID) ?? 0)
+						: lastMutationTimestamp;
 					const isFresh =
-						lastVerify !== undefined &&
-						lastVerify.passed &&
-						lastVerify.command === command &&
-						lastVerify.timestamp >= lastMutationTimestamp;
+						verifyResult !== undefined &&
+						verifyResult.passed &&
+						verifyResult.command === command &&
+						verifyResult.timestamp >= mutationTimestamp;
 
 					if (!isFresh) {
 						const result = await runVerify(command, workspaceRoot);
-						recordVerifyResult(command, result);
+						recordVerifyResult(command, result, sessionID);
 						if (!result.passed) {
 							const tail = result.output.slice(-500);
 							const reason =
@@ -1737,7 +2012,7 @@ async function guardToolCallImpl(
 				"starting new work."
 			);
 		}
-		recordMutation();
+		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
 		return undefined;
 	}
 
@@ -1771,23 +2046,32 @@ async function guardToolCallImpl(
 		// Rewrite `git [global-opts] <sub>` to `git <sub>` so global flags
 		// cannot smuggle a guarded subcommand past the regexes.
 		const normalizedCommand = normalizeGitCommands(command);
-		const gitInvocation = parseGitInvocation(command);
-		const effectiveRoot = gitInvocation?.repoDir ?? workspaceRoot;
+		const gitInvocations = splitShellSegments(command)
+			.map((segment) => parseGitInvocation(segment.trim()))
+			.filter((invocation): invocation is GitInvocation => invocation !== undefined);
+		const effectiveRoot = gitInvocations[0]?.repoDir ?? workspaceRoot;
 
 		// Workspace boundary check for external git repo targets
-		if (isPathOutsideWorkspace(effectiveRoot, workspaceRoot) && !allowLive) {
-			if (GIT_WRITE_RE.test(normalizedCommand) || /\bgit\s+push\b/.test(normalizedCommand)) {
-				logBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${effectiveRoot}`);
-				return `Blocked: git command targets repository '${effectiveRoot}' outside workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
+		for (const invocation of gitInvocations) {
+			const normalizedInvocation = `git ${invocation.rest}`;
+			if (
+				isPathOutsideWorkspace(invocation.repoDir, workspaceRoot) &&
+				!allowLive &&
+				(GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))
+			) {
+				logBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
+				return `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
 			}
 		}
 
 		// ── Policy 7: changes only on feature branches ───────────
-		if (GIT_WRITE_RE.test(normalizedCommand) && onProtectedBranch(effectiveRoot)) {
-			logBlock(
-				`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`,
-			);
-			return branchGuardReason();
+		for (const invocation of gitInvocations) {
+			if (GIT_WRITE_RE.test(`git ${invocation.rest}`) && onProtectedBranch(invocation.repoDir)) {
+				logBlock(
+					`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`,
+				);
+				return branchGuardReason();
+			}
 		}
 
 		// Check if creating a fresh branch while local base is behind remote
@@ -1859,7 +2143,7 @@ async function guardToolCallImpl(
 
 		// ── Policy 4: live-system mutations (env var is the ONLY override) ──
 		if (!allowLive) {
-			const what = liveMutationIn(normalizedCommand);
+			const what = liveMutationIn(normalizedCommand) ?? liveMutationIn(command);
 			if (what) {
 				logBlock(
 					`[workflow-guard] blocked ${what}: ${command.slice(0, 120)}`,
@@ -1884,13 +2168,17 @@ async function guardToolCallImpl(
 				"Create a feature branch and open a PR instead."
 			);
 		}
-
-		// ── Policy 20: block push to already merged / closed PR branches ──
-		if (/\bgit\s+push\b/.test(normalizedCommand)) {
-			const branch = currentGitBranch(effectiveRoot);
+		// ── Policy 20: block push from protected or already-merged branches ──
+		for (const invocation of gitInvocations) {
+			if (!/\bgit\s+push\b/.test(`git ${invocation.rest}`)) continue;
+			if (onProtectedBranch(invocation.repoDir)) {
+				logBlock(`[workflow-guard] blocked push from protected branch: ${command}`);
+				return branchGuardReason();
+			}
+			const branch = currentGitBranch(invocation.repoDir);
 			if (branch) {
 				const mergedStatus = isBranchAlreadyMergedOrClosed(
-					effectiveRoot,
+					invocation.repoDir,
 					branch,
 				);
 				if (mergedStatus.merged) {
@@ -1903,7 +2191,7 @@ async function guardToolCallImpl(
 		}
 
 		// ── Policy 3: PRs must include a changelog (GitHub & Azure DevOps) ──
-		if (hasPrCreateInvocation(normalizedCommand)) {
+		if (hasPrCreateInvocation(raw)) {
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
 			const descFlag = isAz ? "--description" : "--body";
@@ -1931,8 +2219,14 @@ async function guardToolCallImpl(
 			}
 
 			if (isReviewRequired(workspaceRoot)) {
-				const review = getLastReviewResult();
-				if (!review || !review.passed) {
+				const review = context?.sessionID
+					? (sessionReviews.get(context.sessionID) ?? getLastReviewResult())
+					: getLastReviewResult();
+				const reviewMatchesContext =
+					review?.passed === true &&
+					(!review.workspace || review.workspace === workspaceRoot) &&
+					(!review.targetSessionID || review.targetSessionID === context?.sessionID);
+				if (!reviewMatchesContext) {
 					logBlock(`[workflow-guard] blocked ${prTool}: review approval required`);
 					return (
 						`Blocked: PR creation requires a passing review approval. ` +
@@ -1953,9 +2247,12 @@ async function guardToolCallImpl(
 				}
 			}
 
+			const branchChangelog = branchHasChangelogChange(workspaceRoot);
+			const prSegments = splitShellSegments(raw)
+				.filter((segment) => hasPrCreateInvocation(segment));
 			const hasChangelog =
-				prBodyIncludesChangelog(command) ||
-				branchHasChangelogChange(workspaceRoot);
+				branchChangelog ||
+				prSegments.every((segment) => prBodyIncludesChangelog(segment));
 			if (!hasChangelog) {
 				const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 				const prTool = isAz ? "az repos pr create" : "gh pr create";
@@ -1969,6 +2266,17 @@ async function guardToolCallImpl(
 					`'Changelog:' section in the PR description (${descFlag}).`
 				);
 			}
+		}
+
+		const hasGitMutation = gitInvocations.some((invocation) => {
+			const normalizedInvocation = `git ${invocation.rest}`;
+			return (
+				GIT_WRITE_RE.test(normalizedInvocation) ||
+				/\bgit\s+(?:switch|checkout)\b/.test(normalizedInvocation)
+			);
+		});
+		if (hasGitMutation) {
+			recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
 		}
 	}
 
@@ -2144,8 +2452,18 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						.boolean()
 						.describe("True if change is approved, false if changes requested"),
 				},
-				execute: async (args) => {
-					recordReviewResult(args.reviewer, args.summary, args.passed);
+				execute: async (args, toolContext) => {
+					const parentSessionID = await fetchParentSessionID(toolContext.sessionID);
+					if (!parentSessionID) {
+						return "[workflow-guard] Review rejected: record_review must be called from a secondary/subagent session.";
+					}
+					recordReviewResult(
+						args.reviewer,
+						args.summary,
+						args.passed,
+						parentSessionID,
+						toolContext.worktree || toolContext.directory,
+					);
 					return args.passed
 						? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.`
 						: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
