@@ -47,9 +47,9 @@
  */
 
 import { spawnSync, spawn } from "node:child_process";
-import { mkdirSync, realpathSync, readFileSync, writeFileSync, appendFileSync, existsSync, symlinkSync, rmSync } from "node:fs";
+import { mkdirSync, realpathSync, readFileSync, writeFileSync, appendFileSync, existsSync, symlinkSync, rmSync, lstatSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, join, relative, resolve } from "node:path";
+import { basename, join, relative, resolve, sep } from "node:path";
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
 
 // OpenCode built-in tools (https://opencode.ai/docs/tools/): bash is the
@@ -754,15 +754,24 @@ export function isReviewRequired(root: string): boolean {
 	return cfg.requireReview === true;
 }
 
-function onProtectedBranch(root: string): boolean {
-	const branch = currentGitBranch(root);
+/**
+ * True when `branch` is protected for this repository: the built-in
+ * main/master set plus any branches configured in
+ * `.opencode/workflow-guard.json` (`protectedBranches`). Shared by the
+ * branch guard, the push guard and the native worktree tools so every
+ * path enforces the same set.
+ */
+export function isProtectedBranchName(branch: string, root = workspaceRoot): boolean {
 	if (!branch) return false;
 	const cfg = cachedProjectConfig ?? loadProjectConfig(root);
 	const customBranches = Array.isArray(cfg.protectedBranches)
 		? cfg.protectedBranches
 		: [];
-	const allProtected = new Set([...PROTECTED_BRANCHES, ...customBranches]);
-	return allProtected.has(branch);
+	return new Set([...PROTECTED_BRANCHES, ...customBranches]).has(branch);
+}
+
+function onProtectedBranch(root: string): boolean {
+	return isProtectedBranchName(currentGitBranch(root) ?? "", root);
 }
 
 function branchGuardReason(): string {
@@ -1551,16 +1560,32 @@ export function getCleanGitEnv(): Record<string, string> {
 	return env;
 }
 
+/**
+ * Validates a branch name using git itself (`git check-ref-format
+ * --branch`), with fast local pre-filters for names that must never be
+ * passed as arguments at all (leading dash would be parsed as an option).
+ */
 export function isValidBranchName(name: string): boolean {
 	if (!name || name.length > 255) return false;
-	for (let i = 0; i < name.length; i++) {
-		const code = name.charCodeAt(i);
-		if (code <= 0x1f || code === 0x7f) return false;
-	}
-	if (/[~^:?*[\]\\;&|`$()]/.test(name)) return false;
 	if (name.startsWith("-") || name.startsWith(".") || name.endsWith(".") || name.endsWith(".lock")) return false;
-	if (name.startsWith("/") || name.endsWith("/") || name.includes("//") || name.includes("..") || name.includes("@{")) return false;
-	return true;
+	if (name.includes("..") || name.includes("@{") || name.includes("//")) return false;
+	const res = spawnSync("git", ["check-ref-format", "--branch", name], {
+		encoding: "utf8",
+		timeout: 5_000,
+		env: getCleanGitEnv(),
+	});
+	return res.status === 0;
+}
+
+/** True when `refs/heads/<branch>` exists in the repository at `root`. */
+function localBranchExists(branch: string, root: string): boolean {
+	const res = spawnSync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+		env: getCleanGitEnv(),
+	});
+	return res.status === 0;
 }
 
 export function createGitWorktree(
@@ -1568,10 +1593,10 @@ export function createGitWorktree(
 	baseBranch = "HEAD",
 	root = workspaceRoot,
 ): { success: boolean; worktreePath?: string; error?: string } {
-	if (!branch || !isValidBranchName(branch) || branch.startsWith("-") || branch.includes("..")) {
+	if (!branch || !isValidBranchName(branch)) {
 		return { success: false, error: `Invalid branch name '${branch}' for worktree creation.` };
 	}
-	if (PROTECTED_BRANCHES.has(branch.toLowerCase())) {
+	if (isProtectedBranchName(branch, root)) {
 		return { success: false, error: `Cannot create worktree on protected branch '${branch}'.` };
 	}
 
@@ -1581,13 +1606,7 @@ export function createGitWorktree(
 	try {
 		mkdirSync(storageBase, { recursive: true });
 
-		const branchCheck = spawnSync("git", ["rev-parse", "--verify", branch], {
-			cwd: root,
-			env: getCleanGitEnv(),
-			encoding: "utf8",
-			timeout: 5_000,
-		});
-		const exists = branchCheck.status === 0;
+		const exists = localBranchExists(branch, root);
 
 		const gitArgs = exists
 			? ["worktree", "add", targetPath, branch]
@@ -1618,6 +1637,25 @@ export function createGitWorktree(
 	}
 }
 
+/**
+ * Lists the worktree paths registered for the repository at `root`
+ * (primary worktree first), or undefined when git cannot be consulted.
+ */
+function registeredWorktreePaths(root: string): string[] | undefined {
+	const res = spawnSync("git", ["worktree", "list", "--porcelain"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+		env: getCleanGitEnv(),
+	});
+	if (res.status !== 0) return undefined;
+	return res.stdout
+		.split("\n")
+		.filter((line) => line.startsWith("worktree "))
+		.map((line) => line.slice("worktree ".length))
+		.filter((path) => path.length > 0);
+}
+
 export function cleanupGitWorktree(
 	worktreePath: string,
 	root = workspaceRoot,
@@ -1627,12 +1665,68 @@ export function cleanupGitWorktree(
 			return { success: false, error: `Worktree path '${worktreePath}' does not exist.` };
 		}
 
-		spawnSync("git", ["add", "-A"], { cwd: worktreePath, env: getCleanGitEnv(), timeout: 5_000 });
-		spawnSync("git", ["commit", "-m", "chore(worktree): auto-snapshot before cleanup", "--allow-empty"], {
+		// Ownership validation: the path must live under the configured
+		// worktree storage directory AND be a registered worktree of this
+		// repository. This refuses arbitrary directories, other repos'
+		// worktrees, and the primary working tree - cleanup must never be
+		// an unrestricted delete primitive.
+		const resolved = resolve(worktreePath);
+		const storageBase = resolve(getWorktreeStorageDir(root));
+		if (resolved !== storageBase && !resolved.startsWith(storageBase + sep)) {
+			return {
+				success: false,
+				error: `Refusing to clean up '${worktreePath}': path is outside the worktree storage directory (${storageBase}).`,
+			};
+		}
+		const registered = registeredWorktreePaths(root);
+		if (!registered) {
+			return { success: false, error: "Failed to list registered worktrees - aborting cleanup." };
+		}
+		const resolvedRegistered = registered.map((path) => resolve(path));
+		if (!resolvedRegistered.includes(resolved)) {
+			return {
+				success: false,
+				error: `Refusing to clean up '${worktreePath}': not a registered worktree of this repository.`,
+			};
+		}
+		if (resolvedRegistered[0] === resolved) {
+			return { success: false, error: "Refusing to remove the primary working tree." };
+		}
+
+		// Snapshot: stage and commit remaining changes. If the snapshot
+		// cannot be established (hook failure, missing identity, lock
+		// error, timeout), abort - never destroy uncommitted work.
+		const addArgs = ["add", "-A", "--", "."];
+		try {
+			// Exclude the plugin-created node_modules symlink so repos that
+			// do not ignore it never commit a machine-local link.
+			if (lstatSync(join(resolved, "node_modules")).isSymbolicLink()) {
+				addArgs.push(":(exclude)node_modules");
+			}
+		} catch {}
+		const addRes = spawnSync("git", addArgs, {
 			cwd: worktreePath,
 			env: getCleanGitEnv(),
+			encoding: "utf8",
 			timeout: 5_000,
 		});
+		if (addRes.status !== 0) {
+			return {
+				success: false,
+				error: `Snapshot failed (git add: ${(addRes.stderr ?? "").trim()}) - worktree left intact.`,
+			};
+		}
+		const commitRes = spawnSync(
+			"git",
+			["commit", "-m", "chore(worktree): auto-snapshot before cleanup", "--allow-empty"],
+			{ cwd: worktreePath, env: getCleanGitEnv(), encoding: "utf8", timeout: 5_000 },
+		);
+		if (commitRes.status !== 0) {
+			return {
+				success: false,
+				error: `Snapshot failed (git commit: ${(commitRes.stderr ?? "").trim().split("\n").pop()?.trim() ?? "unknown error"}) - worktree left intact.`,
+			};
+		}
 
 		const res = spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
 			cwd: root,
@@ -1640,15 +1734,10 @@ export function cleanupGitWorktree(
 			encoding: "utf8",
 			timeout: 10_000,
 		});
-
 		if (res.status !== 0) {
-			try {
-				rmSync(worktreePath, { recursive: true, force: true });
-				spawnSync("git", ["worktree", "prune"], { cwd: root, env: getCleanGitEnv(), timeout: 5_000 });
-				return { success: true };
-			} catch (err: any) {
-				return { success: false, error: res.stderr.trim() || err?.message };
-			}
+			// A failed git removal is an error - never authorization for a
+			// raw recursive delete of the directory.
+			return { success: false, error: res.stderr.trim() || "git worktree remove failed." };
 		}
 
 		return { success: true };
@@ -2948,11 +3037,19 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						.describe("Base branch to branch off of (defaults to HEAD)"),
 				},
 				execute: async (args, toolContext) => {
+					const todos = await effectiveTodos(toolContext.sessionID);
+					if (todos !== undefined && !hasActiveTodo(todos)) {
+						return (
+							"[workflow-guard] Blocked: worktree creation with no active todo item. " +
+							"Break the request down with todowrite first, then create worktrees."
+						);
+					}
 					const effectiveRoot = toolContext.worktree || toolContext.directory || workspaceRoot;
 					const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", effectiveRoot);
 					if (!res.success) {
 						return `[workflow-guard] Failed to create worktree: ${res.error}`;
 					}
+					recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID);
 					return (
 						`[workflow-guard] Worktree created successfully at: ${res.worktreePath}\n` +
 						`Run subagent tasks or pass worktree directory context to isolate file mutations.`
@@ -2968,11 +3065,19 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						.describe("Path of the worktree directory to clean up"),
 				},
 				execute: async (args, toolContext) => {
+					const todos = await effectiveTodos(toolContext.sessionID);
+					if (todos !== undefined && !hasActiveTodo(todos)) {
+						return (
+							"[workflow-guard] Blocked: worktree cleanup with no active todo item. " +
+							"Break the request down with todowrite first, then clean up worktrees."
+						);
+					}
 					const effectiveRoot = toolContext.worktree || toolContext.directory || workspaceRoot;
 					const res = cleanupGitWorktree(args.worktreePath, effectiveRoot);
 					if (!res.success) {
 						return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
 					}
+					recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID);
 					return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
 				},
 			}),

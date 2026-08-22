@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -1135,6 +1135,105 @@ if (wtCreateRes.worktreePath) {
 	const wtCleanupRes = cleanupGitWorktree(wtCreateRes.worktreePath, worktreeBaseRepo);
 	check("cleanupGitWorktree commits snapshot and removes worktree directory", wtCleanupRes.success && !existsSync(wtCreateRes.worktreePath));
 }
+
+// Cleanup safety: arbitrary directories must never be treated as worktrees.
+const arbitraryDir = mkdtempSync(join(tmpdir(), "wg-wt-arbitrary-"));
+writeFileSync(join(arbitraryDir, "keep.txt"), "valuable data\n");
+const arbCleanup = cleanupGitWorktree(arbitraryDir, worktreeBaseRepo);
+check(
+	"cleanupGitWorktree refuses arbitrary directories (no destructive fallback)",
+	!arbCleanup.success && existsSync(join(arbitraryDir, "keep.txt")),
+);
+rmSync(arbitraryDir, { recursive: true, force: true });
+
+// Cleanup safety: unregistered paths under the storage dir are refused too.
+const storageBase = getWorktreeStorageDir(worktreeBaseRepo);
+const roguePath = join(storageBase, "rogue-dir");
+mkdirSync(roguePath, { recursive: true });
+writeFileSync(join(roguePath, "keep.txt"), "valuable data\n");
+const rogueCleanup = cleanupGitWorktree(roguePath, worktreeBaseRepo);
+check(
+	"cleanupGitWorktree refuses unregistered paths under the storage dir",
+	!rogueCleanup.success && existsSync(join(roguePath, "keep.txt")),
+);
+
+// Snapshot integrity: when the snapshot commit cannot be established (e.g. a
+// failing pre-commit hook), cleanup must abort and preserve the worktree.
+const failingHooks = mkdtempSync(join(tmpdir(), "wg-wt-hooks-"));
+writeFileSync(join(failingHooks, "pre-commit"), "#!/bin/sh\nexit 1\n");
+chmodSync(join(failingHooks, "pre-commit"), 0o755);
+spawnSync("git", ["config", "core.hooksPath", failingHooks], { cwd: worktreeBaseRepo });
+const snapFailCreate = createGitWorktree("feat/snapshot-fail", "HEAD", worktreeBaseRepo);
+if (snapFailCreate.worktreePath) {
+	writeFileSync(join(snapFailCreate.worktreePath, "precious.txt"), "do not lose me\n");
+	const snapFailCleanup = cleanupGitWorktree(snapFailCreate.worktreePath, worktreeBaseRepo);
+	check(
+		"cleanupGitWorktree aborts when snapshot commit fails (worktree preserved)",
+		!snapFailCleanup.success && existsSync(join(snapFailCreate.worktreePath, "precious.txt")),
+	);
+} else {
+	check("cleanupGitWorktree aborts when snapshot commit fails (worktree preserved)", false);
+}
+spawnSync("git", ["config", "--unset", "core.hooksPath"], { cwd: worktreeBaseRepo });
+
+// The plugin-created node_modules symlink must never enter the snapshot commit.
+mkdirSync(join(worktreeBaseRepo, "node_modules"), { recursive: true });
+writeFileSync(join(worktreeBaseRepo, "node_modules", "marker.json"), "{}\n");
+const nmCreate = createGitWorktree("feat/nm-share", "HEAD", worktreeBaseRepo);
+if (nmCreate.worktreePath) {
+	check(
+		"createGitWorktree symlinks parent node_modules",
+		lstatSync(join(nmCreate.worktreePath, "node_modules")).isSymbolicLink(),
+	);
+	writeFileSync(join(nmCreate.worktreePath, "nm-file.txt"), "snapshot me\n");
+	const nmCleanup = cleanupGitWorktree(nmCreate.worktreePath, worktreeBaseRepo);
+	const tree = spawnSync("git", ["ls-tree", "-r", "--name-only", "feat/nm-share"], {
+		cwd: worktreeBaseRepo,
+		encoding: "utf8",
+	});
+	check(
+		"cleanupGitWorktree snapshot excludes the node_modules symlink",
+		nmCleanup.success && tree.status === 0 && tree.stdout.includes("nm-file.txt") && !tree.stdout.split("\n").includes("node_modules"),
+	);
+} else {
+	check("cleanupGitWorktree snapshot excludes the node_modules symlink", false);
+}
+
+// Config-aware protection: custom protectedBranches apply to worktree creation.
+mkdirSync(join(worktreeBaseRepo, ".opencode"), { recursive: true });
+writeFileSync(
+	join(worktreeBaseRepo, ".opencode", "workflow-guard.json"),
+	JSON.stringify({ protectedBranches: ["release/prod"] }),
+);
+reloadProjectConfig(worktreeBaseRepo);
+check(
+	"createGitWorktree rejects custom protected branch from config",
+	!createGitWorktree("release/prod", "HEAD", worktreeBaseRepo).success,
+);
+rmSync(join(worktreeBaseRepo, ".opencode"), { recursive: true, force: true });
+reloadProjectConfig(prevRoot);
+
+// Tool-level checks: registration, todo gate, protected-branch rejection.
+check("plugin registers guard_worktree_create tool", typeof customPlugin.tool?.guard_worktree_create?.execute === "function");
+check("plugin registers guard_worktree_cleanup tool", typeof customPlugin.tool?.guard_worktree_cleanup?.execute === "function");
+
+todo("s-wt-done", item("worktree task", "completed"));
+const wtToolBlocked = await customPlugin.tool?.guard_worktree_create?.execute(
+	{ branch: "feat/tool-gate" },
+	{ sessionID: "s-wt-done", worktree: worktreeBaseRepo, directory: worktreeBaseRepo } as any,
+);
+check(
+	"guard_worktree_create blocks with no active todo",
+	typeof wtToolBlocked === "string" && wtToolBlocked.includes("no active todo"),
+);
+const wtToolProtected = await customPlugin.tool?.guard_worktree_create?.execute(
+	{ branch: "main" },
+	{ sessionID: "s-active", worktree: worktreeBaseRepo, directory: worktreeBaseRepo } as any,
+);
+check(
+	"guard_worktree_create rejects protected branch via tool",
+	typeof wtToolProtected === "string" && wtToolProtected.includes("protected"),
+);
 
 // Regression: git context env (e.g. GIT_INDEX_FILE exported by git hooks) must not
 // leak into spawned worktree git commands, where the new worktree's `.git` is a file.

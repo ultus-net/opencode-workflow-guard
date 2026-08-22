@@ -137,12 +137,15 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 
 ### `guard_worktree_create`
 - Creates an isolated git worktree for concurrent subagent execution: `guard_worktree_create(branch, baseBranch?)`.
-- Branch names are validated against git ref rules (control characters, shell metacharacters, `..`, leading `-`/`.` are rejected) and protected branches (`main`/`master`) are refused.
+- Branch names are validated with `git check-ref-format --branch`; protected branches — the built-in `main`/`master` plus any configured via `protectedBranches` in `.opencode/workflow-guard.json` — are refused.
 - Worktrees are stored outside the repository under `~/.local/share/opencode/worktrees/<repo-name>/` (override with `WORKFLOW_GUARD_WORKTREE_DIR`), and the parent's `node_modules` is symlinked into the new worktree so tooling works without a fresh install.
-- If the branch already exists, the worktree is checked out on it; otherwise it is created from `baseBranch` (default `HEAD`).
+- If the branch already exists (as a local branch), the worktree is checked out on it; otherwise it is created from `baseBranch` (default `HEAD`).
+- Subject to the same todo gate as other mutations, and successful worktree mutations invalidate stale verification/review evidence.
 
 ### `guard_worktree_cleanup`
-- Commits a final snapshot of any remaining changes (`chore(worktree): auto-snapshot before cleanup`) and then removes the worktree directory with `git worktree remove --force`, pruning stale worktree metadata if needed.
+- Commits a final snapshot of any remaining changes (`chore(worktree): auto-snapshot before cleanup`, excluding the plugin-created `node_modules` symlink) and then removes the worktree directory with `git worktree remove --force`.
+- **Ownership validation:** only registered worktrees of the current repository under the configured worktree storage directory can be cleaned up — arbitrary directories, other repositories' worktrees, and the primary working tree are refused. A failed `git worktree remove` is an error, never a fallback to raw directory deletion.
+- **Lossless by construction:** if the snapshot commit cannot be established (failing hook, missing identity, lock error), cleanup aborts and the worktree is left fully intact.
 
 ### Hook-Context Safety
 - All spawned git commands run with a sanitized environment: inherited git context variables (`GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`, ...) are stripped so the tools resolve the repository from their working directory alone. This makes them safe to invoke from inside git hooks, which export those variables.
