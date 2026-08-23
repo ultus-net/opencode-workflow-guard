@@ -37,7 +37,7 @@ npm run test:all
 | Test Group | Checks |
 |---|---|
 | **Policy 1: Native Todo Gate** | Verifies edits are blocked when todos are missing, completed, or cancelled, and allowed when `pending` or `in_progress` todos exist. |
-| **Policy 1: Lifecycle & Focus** | Verifies the single `in_progress` focus rule, flexible task execution, and silent deletion prevention. |
+| **Policy 1: Lifecycle** | Verifies flexible task completion, concurrent `in_progress` tasks (single-focus rule removed), and silent deletion prevention. |
 | **Policy 1: Subagent Inheritance** | Verifies subagents walk up the `parentID` hierarchy to inherit parent/grandparent todos, and handles cycle termination. |
 | **Policies 2 & 7: Git Branches** | Verifies push blocking on `main`/`master`, feature-branch editing allowances, and git commit gates. |
 | **Policy 3: PR Changelog** | Verifies `gh pr create` requires a changelog in body or diff. |

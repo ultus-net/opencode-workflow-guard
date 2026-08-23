@@ -115,38 +115,6 @@
 
 All notable changes to `opencode-workflow-guard` will be documented in this file.
 
-## Unreleased
-
-### Changed
-
-- Removed single-task focus rule (Policy 1). Multiple tasks may now be `in_progress` simultaneously, enabling concurrent subagent work on different tasks. Only "no silent deletion" and "all-done verification" remain enforced.
-
-### Developer Experience
-
-- Added `.editorconfig` and `.prettierrc` for editor and formatting consistency.
-- Added `.githooks/pre-commit` hook that runs typecheck + unit tests before every commit (activate with `git config core.hooksPath .githooks`).
-- Added `CONTRIBUTING.md` with contributor guide covering test patterns, policy additions, and PR requirements.
-- Added `SECURITY.md` with vulnerability disclosure process for bypass reports.
-- Added `Makefile` with `make test`, `make typecheck`, `make audit` shortcuts.
-- Added `.vscode/launch.json` for debugging unit tests in VSCode.
-- Added GitHub issue templates (`bug_report.yml`, `feature_request.yml`) and `PULL_REQUEST_TEMPLATE.md`.
-- Added `.opencode/opencode.json` for dogfooding — the guard is now self-hosted during development.
-- Added `.opencode/.gitignore` matching upstream OpenCode patterns.
-- Added `dogfood` CI job that loads the guard in a live OpenCode session and verifies `guard_status` responds.
-- Updated `ci.yml` `status` job to depend on the new `dogfood` check.
-
-### Security & Correctness
-
-- Hardened PR detection for normal `gh` global-option forms and require an actual `Changelog:`/Changelog heading instead of accepting any mention of the word.
-- Made configured project `verifyCommand` effective and scoped verification freshness to the session that produced the mutation.
-- Invalidated review approval after new mutations, scoped tool-recorded reviews to their parent session/workspace, and rejected `record_review` self-approval from non-subagent sessions.
-- Resolved existing symlink aliases when checking secret/protected paths and blocked copying, moving, or linking recognized secret files under benign names.
-- Expanded shell workspace confinement to common `touch`, `mkdir`, `rm`, `unlink`, `rmdir`, and `ln` mutations; direct download-to-shell pipelines are blocked.
-- Hardened chained `git -C` repository checks and recognized additional Git global pathspec options so they cannot hide guarded subcommands.
-- Fixed Slack `xox*` token detection and shell secret-content scanning, while excluding `/dev/null` and standard device sinks from file-mutation gating.
-- Fixed duplicate todo lifecycle accounting so one of two identically named active tasks cannot silently disappear.
-- Corrected troubleshooting documentation: `WORKFLOW_GUARD_ALLOW_LIVE=1` is the only live-system override.
-
 ## [1.2.0] - 2026-08-22
 
 ### Security & Invariant Hardening

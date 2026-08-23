@@ -9,6 +9,7 @@
  */
 
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
+import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -547,9 +548,11 @@ async function guardToolCallImpl(
 		// Workspace boundary check for external git repo targets
 		for (const invocation of gitInvocations) {
 			const normalizedInvocation = `git ${invocation.rest}`;
+			// The workspace boundary has no allow-live override (same invariant as
+			// file redirects/mv): an external repository write is out of bounds even
+			// with WORKFLOW_GUARD_ALLOW_LIVE=1.
 			if (
 				isPathOutsideWorkspace(invocation.repoDir, currentRoot) &&
-				!allowLive &&
 				(GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))
 			) {
 				logBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
@@ -929,7 +932,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			}),
 			record_review: tool({
 				description:
-					"Record a secondary reviewer agent's approval or critique of the current changes.",
+					"Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric.",
 				args: {
 					reviewer: tool.schema
 						.string()
@@ -946,6 +949,24 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					if (!parentSessionID) {
 						return "[workflow-guard] Review rejected: record_review must be called from a secondary/subagent session.";
 					}
+					// The rubric is the contract: a recorded review must demonstrate it
+					// was evaluated against the 5 axes, not just assert a verdict.
+					const axesRefs = [
+						"test integrity",
+						"task completeness",
+						"cleanliness",
+						"security",
+						"platform",
+					];
+					const summaryLower = args.summary.toLowerCase();
+					const referenced = axesRefs.filter((axis) => summaryLower.includes(axis));
+					if (referenced.length < 3) {
+						return (
+							`[workflow-guard] Review rejected: summary must reference the review axes ` +
+							`(found ${referenced.length}/5). Call guard_review_rubric to get the rubric, ` +
+							`evaluate each axis, and include findings per axis in the summary.`
+						);
+					}
 					recordReviewResult(
 						args.reviewer,
 						args.summary,
@@ -956,6 +977,42 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					return args.passed
 						? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.`
 						: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
+				},
+			}),
+			guard_review_rubric: tool({
+				description:
+					"Get the secondary-review rubric for the current branch diff. The orchestrator calls this, spawns a reviewer subagent with the rubric as the prompt, then the reviewer records its verdict via record_review.",
+				args: {
+					base: tool.schema
+						.string()
+						.optional()
+						.describe("Base ref to diff against (default: origin/main, origin/master, main)"),
+				},
+				execute: async (args) => {
+					const bases = args.base
+						? [args.base]
+						: ["origin/main", "origin/master", "main", "master"];
+					let diffText = "";
+					for (const base of bases) {
+						const res = spawnSync(
+							"git",
+							["diff", `${base}...HEAD`],
+							{ cwd: getWorkspaceRoot(), encoding: "utf8", timeout: 10_000 },
+						);
+						if (res.status === 0 && res.stdout.trim()) {
+							diffText = res.stdout;
+							break;
+						}
+					}
+					if (!diffText) {
+						const last = spawnSync("git", ["diff", "HEAD~1"], {
+							cwd: getWorkspaceRoot(),
+							encoding: "utf8",
+							timeout: 10_000,
+						});
+						diffText = last.status === 0 ? last.stdout : "(no diff available)";
+					}
+					return buildReviewRubric(diffText);
 				},
 			}),
 			guard_worktree_create: tool({

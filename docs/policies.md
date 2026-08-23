@@ -1,6 +1,6 @@
 # Enforced Policies & Guardrails
 
-`opencode-workflow-guard` enforces workflow discipline through **deterministic TypeScript hooks** (`tool.execute.before` and `experimental.session.compacting`) - not prompt rules that LLMs can ignore.
+`opencode-workflow-guard` enforces workflow discipline through **deterministic TypeScript hooks** (`tool.execute.before`, `experimental.session.compacting`, `shell.env`, `permission.ask`, and `event` journaling) - not prompt rules that LLMs can ignore.
 
 ---
 
