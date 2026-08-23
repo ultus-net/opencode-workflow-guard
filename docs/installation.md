@@ -13,7 +13,24 @@
 
 ## Installation Methods
 
-### 1. Server Plugin (Tool Gates, Task Lifecycle & Security)
+### 1. From npm (Recommended)
+
+Add the package to your project's `opencode.json` (or global `~/.config/opencode/opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-workflow-guard"
+  ]
+}
+```
+
+OpenCode automatically installs the plugin and its dependencies with Bun at startup (cached in `~/.cache/opencode/node_modules/`). No manual file copies needed.
+
+---
+
+### 2. Manual File Copy (Server Plugin)
 
 Install the core server plugin into your plugin directory:
 
@@ -31,7 +48,7 @@ Files in `.opencode/plugins/` and `~/.config/opencode/plugins/` are automaticall
 
 ---
 
-### 2. TUI Visual Indicator (Prompt Box Badge)
+### 3. TUI Visual Indicator (Prompt Box Badge)
 
 To enable the persistent `🛡️ [Workflow Guard: Active]` badge inside the prompt input bar:
 

@@ -4,6 +4,10 @@
   "description": "OpenCode plugin enforcing workflow discipline through deterministic tool.execute.before hooks",
   "license": "MIT",
   "type": "module",
+  "main": "src/workflow-guard.ts",
+  "publishConfig": {
+    "access": "public"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/ultus-net/opencode-workflow-guard.git"
@@ -27,14 +31,16 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc --noEmit -p tsconfig.json",
     "changeset": "changeset",
-    "version-packages": "changeset version"
+    "version-packages": "changeset version",
+    "prepublishOnly": "npm run typecheck"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.21"
   },
   "devDependencies": {
     "@changesets/cli": "^3.0.1",
-    "@opencode-ai/plugin": "*",
     "@opentui/solid": "^0.5.6",
     "@types/node": "^26.2.0",
     "typescript": "^7.0.2"
-  },
-  "devDependenciesMeta_comment": "only needed for type-checking; opencode resolves this itself at runtime"
+  }
 }
