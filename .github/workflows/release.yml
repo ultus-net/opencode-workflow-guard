@@ -32,6 +32,23 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+      # Fail fast before the registry does: OIDC trusted publishing requires
+      # repository.url to match the sigstore provenance claim, and npm pack is
+      # the last cheap point to catch a malformed or missing field.
+      - name: Verify publish-critical package metadata
+        run: |
+          node -e \
+            "const p=require('./package.json');
+            if (p.repository?.url !== 'git+https://github.com/ultus-net/opencode-workflow-guard.git') {
+              console.error('repository.url mismatch:', JSON.stringify(p.repository));
+              process.exit(1);
+            }
+            if (!p.main || !p.files?.length) {
+              console.error('main/files missing');
+              process.exit(1);
+            }"
+      - run: npm pack --dry-run
+
       - name: Create Release Pull Request or Publish to npm
         id: changesets
         uses: changesets/action@v1
