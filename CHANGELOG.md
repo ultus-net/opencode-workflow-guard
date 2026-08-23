@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.5
+
+### Patch Changes
+
+- d65e5eb: Use `changeset publish` in release workflow to ensure git tags and GitHub Releases are created automatically upon publish.
+
 ## 1.1.4
 
 ### Patch Changes
