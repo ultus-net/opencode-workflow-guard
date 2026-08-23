@@ -18,7 +18,7 @@ export const SETTINGS_TAMPER_PATTERNS: RegExp[] = [
 	new RegExp(`${GT}\\s*["']?[\\w\\/.~-]*(?:${C_LIST})`, "i"),
 	new RegExp(`(?:^|\\s)(?:${V_LIST})\\s+[^|;&]*?[\\w\\/.~-]*(?:${U_LIST})`, "i"),
 	new RegExp(`${GT}\\s*["']?[\\w\\/.~-]*(?:${U_LIST})`, "i"),
-	new RegExp("(?:" + "^|\\s)(?:op" + "encode)\\s+(?:auth|config|permission)\\b", "i"),
+	new RegExp("(?:" + "^|\\s)(?:op" + "encode)\\s+(?:-[^|;&]*\\s+)*(?:auth|config|permission)\\b", "i"),
 	new RegExp("(?:" + "^|\\s)(?:op" + "encode)\\s+(?:run\\s+)?--auto\\b", "i"),
 ];
 

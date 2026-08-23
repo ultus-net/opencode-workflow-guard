@@ -49,25 +49,25 @@ export function secretPathInPayload(payload: string): string | undefined {
 	return undefined;
 }
 
-const WRITE_VERB_RE =
-	/\b(?:write|writeFile|writeFileSync|write_text|writeTextFile|appendFile|appendFileSync|createWriteStream|unlink|unlinkSync|rm|rmSync|rmdir|rmdirSync|mkdir|mkdirSync|rename|renameSync|copy|cp|cpSync|truncate|move|shutil|remove|delete)\b|\bopen\s*\(\s*["'][^"']*["']\s*,\s*["'][wa]/i;
+const FUNCTION_TARGET_PATTERNS: RegExp[] = [
+	/\b(?:writeFileSync|writeFile|appendFile|appendFileSync|createWriteStream|unlink|unlinkSync|rmSync|rmdirSync|mkdirSync|renameSync|copyFileSync|cpSync|truncateSync)\s*\(\s*["']([^"']+)["']/g,
+	/\b(?:open|os\.remove|os\.unlink|os\.rmdir|os\.mkdir|os\.makedirs|os\.rename|shutil\.rmtree|shutil\.copy|shutil\.copy2|shutil\.move|Path)\s*\(\s*["']([^"']+)["']/g,
+	/[>]{1,2}\s*["']?([^\s;&"'|)]+)/g,
+];
 
 /**
  * Detects workspace boundary escapes (writes/redirects to paths outside the
- * workspace root) initiated from inline interpreter payloads.
+ * workspace root) initiated from inline interpreter payloads. Extracts destination
+ * file arguments from file-writing APIs and shell redirects.
  */
 export function outsideWritePathInPayload(payload: string, root: string): string | undefined {
-	const hasWrite = WRITE_VERB_RE.test(payload) || /[>]{1,2}\s*\S/.test(payload);
-	if (!hasWrite) return undefined;
-
 	const candidates = new Set<string>();
-	const redirectMatches = payload.matchAll(/[>]{1,2}\s*["']?([^\s;&"'|)]+)/g);
-	for (const m of redirectMatches) {
-		if (m[1]) candidates.add(m[1]);
-	}
-	const literalMatches = payload.matchAll(/["']([^"']{2,})["']/g);
-	for (const m of literalMatches) {
-		if (m[1]) candidates.add(m[1]);
+
+	for (const pattern of FUNCTION_TARGET_PATTERNS) {
+		const matches = payload.matchAll(pattern);
+		for (const m of matches) {
+			if (m[1]) candidates.add(m[1]);
+		}
 	}
 
 	for (const candidate of candidates) {
