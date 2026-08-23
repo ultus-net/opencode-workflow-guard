@@ -5,6 +5,10 @@
   "license": "MIT",
   "type": "module",
   "main": "src/workflow-guard.ts",
+  "exports": {
+    ".": "./src/workflow-guard.ts",
+    "./ui": "./src/workflow-guard-ui.ts"
+  },
   "publishConfig": {
     "access": "public"
   },
