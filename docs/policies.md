@@ -58,9 +58,10 @@
 - The agent is prompted to create a feature branch first (`git switch -c feat/my-feature`).
 
 ### 8. Workspace Boundary Guard
-- File modification tools (`edit`, `write`, `apply_patch`) and common shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`/`ln`, `touch`, `mkdir`, `rm`, `git apply`/`git am`) are validated to ensure targets cannot escape the current workspace root via `../` traversal, symlinks, or absolute paths.
+- File modification tools (`edit`, `write`, `apply_patch`) and common shell mutations (redirection `>`, `>>`, `&>`, `>&`, `tee`, `sed -i`, `cp`/`mv`/`ln`, `touch`, `mkdir`, `rm`, `git apply`/`git am`) are validated to ensure targets cannot escape the current workspace root via `../` traversal, symlinks, absolute paths, or shell expansions (`~`, `~user`, `$HOME`). Unresolvable `$VARIABLE` references fail closed.
+- `tee` flag parsing generically skips option flags (`-a`, `--append`, `-ai`, `--`) and validates all specified target files against the boundary.
 - `mv` sources are validated too: moving a file from outside the workspace (or a protected settings/plugin file to an innocuous name) is blocked, since `mv` mutates the source.
-- External repository git writes (`git -C /other-repo commit`) are also confined to the workspace.
+- External repository git writes (`git -C /other-repo commit`, `git --git-dir=/other-repo/.git push`, `GIT_DIR=/other-repo/.git git push`, `GIT_WORK_TREE=...`) are also confined to the workspace.
 - The boundary has **no override**: `WORKFLOW_GUARD_ALLOW_LIVE=1` covers live-system commands only and never weakens the workspace confinement.
 
 ### 9. Script-Laundering Guard
@@ -106,12 +107,12 @@
 - The companion TUI plugin (`workflow-guard-ui.ts`) dynamically reflects the latest guard state in the prompt bar, displaying `🛡️ [Workflow Guard: Active]` during normal operation and `🛡️ [Workflow Guard: Blocked: <reason>]` when an action is intercepted. Blocked state is scoped to the session that triggered it and sourced only from guard-originated toasts.
 
 ### 17. Secret-File READ Block & Safe Schema Masking
-- Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool or shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`).
+- Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool, shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`), or inline interpreter payloads (`python3 -c "open('.env')"`, `bash -c 'cat id_rsa'`).
 - **Safe Schema Masking:** On `.env*` reads via the `read` tool, the guard parses the variable names and comments, and returns a safe redacted schema mask with secret values masked as `********`, enabling agents to inspect variable existence without leaking secrets into model context.
 - Standard non-secret fixtures (`.env.example`, `.env.sample`, `.env.template`) remain readable.
 
 ### 18. Interpreter Inline Evasion Scanner
-- Decodes and inspects inline interpreter payloads (`python -c`, `node -e`, `perl -e`, `ruby -e`, `osascript -e`, `powershell -enc`, `echo <base64> | base64 -d | sh`) to prevent smuggling live destructive commands or settings tampering past shell pattern checks.
+- Decodes and inspects inline interpreter payloads (`python -c`, `node -e`, `perl -e`, `ruby -e`, `osascript -e`, `bash -c`, `sh -c`, `zsh -c`, `powershell -enc`, `echo <base64> | base64 -d | sh`) to prevent smuggling live destructive commands, settings tampering, secret reads, or out-of-workspace writes past shell pattern checks.
 
 ### 19. Conflict-Free Pre-Flight Guard
 - Evaluates `git merge-tree` against the base branch (`origin/main`, `origin/master`, `main`) before PR creation or final task handoff, ensuring changes can be merged cleanly without conflicts.

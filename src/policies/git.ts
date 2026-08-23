@@ -44,6 +44,9 @@ const GIT_GLOBAL_BOOLEAN_OPTIONS = new Set([
 	"--exec-path",
 ]);
 
+const GIT_ENV_DIR_RE =
+	/(?:^|\s)(?:env\s+(?:-\S+\s+)*)?(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=(?:"([^"]*)"|'([^']*)'|(\S+))/;
+
 export function parseGitInvocation(command: string): GitInvocation | undefined {
 	const root = getWorkspaceRoot();
 	const tokens = unwrapShellWords(command);
@@ -51,12 +54,22 @@ export function parseGitInvocation(command: string): GitInvocation | undefined {
 	let i = 1;
 	let repoDir = root;
 	let sawDirOption = false;
+
+	const envDirMatch = command.match(GIT_ENV_DIR_RE);
+	if (envDirMatch) {
+		const envVal = envDirMatch[1] ?? envDirMatch[2] ?? envDirMatch[3];
+		if (envVal) {
+			repoDir = resolve(root, envVal);
+			sawDirOption = true;
+		}
+	}
+
 	while (i < tokens.length) {
 		const tok = tokens[i]!;
 		if (GIT_DIR_OPTION_TAKES_VALUE.has(tok)) {
 			const value = tokens[i + 1];
 			if (value === undefined) return { repoDir, rest: "" };
-			if (tok === "-C" || tok === "--git-dir") {
+			if (tok === "-C" || tok === "--git-dir" || tok === "--work-tree") {
 				repoDir = resolve(root, value);
 				sawDirOption = true;
 			}
@@ -66,6 +79,9 @@ export function parseGitInvocation(command: string): GitInvocation | undefined {
 		if (GIT_DIR_OPTION_PREFIXED.test(tok)) {
 			if (tok.startsWith("--git-dir=")) {
 				repoDir = resolve(root, tok.slice("--git-dir=".length));
+				sawDirOption = true;
+			} else if (tok.startsWith("--work-tree=")) {
+				repoDir = resolve(root, tok.slice("--work-tree=".length));
 				sawDirOption = true;
 			}
 			i += 1;

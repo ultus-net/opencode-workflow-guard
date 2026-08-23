@@ -27,7 +27,7 @@ Add to your project's `opencode.json` or global `~/.config/opencode/opencode.jso
 
 ```bash
 npm run typecheck    # Strict TypeScript check (0 errors)
-npm test             # Run 320+ unit and adversarial tests
+npm test             # Run 400+ unit and adversarial tests
 npm run test:all     # Run full verification suite (typecheck + unit + live e2e)
 ```
 
@@ -43,11 +43,11 @@ opencode-workflow-guard/
 │   ├── policies/              # Per-policy implementations (task gate, git, secrets, shell-safety, ...)
 │   └── lib/                   # Engine services (state, verify, audit, review, worktree, utils, types)
 ├── test/                      # Test suites
-│   ├── test.mts               # 320+ in-memory unit & adversarial tests
+│   ├── test.mts               # 400+ in-memory unit & adversarial tests
 │   └── test-e2e.mts           # npm tarball resolution + live runtime OpenCode loader tests
 ├── docs/                      # In-depth documentation & guides
 │   ├── installation.md        # Full setup options, worktrees & permissions
-│   ├── policies.md            # Detailed 23-policy reference & overrides
+│   ├── policies.md            # Detailed 24-policy reference & overrides
 │   ├── troubleshooting.md     # Error diagnosis & bypass explanations
 │   └── testing.md             # Test architecture & coverage matrix
 ├── .changeset/                # Fragment-based versioning & release changelogs

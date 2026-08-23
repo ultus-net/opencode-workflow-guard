@@ -1,5 +1,6 @@
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import type { ShellMutation } from "../lib/types.ts";
 import {
 	getWorkspaceRoot,
@@ -16,9 +17,47 @@ import {
 	hasActiveTodo,
 } from "./todo.ts";
 
+/**
+ * Expands leading `~`, `~user`, `$HOME`, and `${HOME}` in candidate targets so
+ * shell-level expansion cannot evade workspace boundary checks. Paths that
+ * contain unresolvable `$VARIABLE` references return `null` so callers treat
+ * indeterminate destinations as outside-workspace (fail-closed).
+ */
+export function expandShellTargetPath(targetPath: string): string | null {
+	if (!targetPath) return targetPath;
+	const trimmed = targetPath.trim().replace(/^["']|["']$/g, "");
+	if (!trimmed) return trimmed;
+
+	const home = process.env.HOME || homedir();
+
+	if (trimmed === "~") return home;
+	if (trimmed.startsWith("~/") || trimmed.startsWith("~\\")) {
+		return join(home, trimmed.slice(2));
+	}
+	if (/^~[A-Za-z0-9_.-]+(?:\/|\\|$)/.test(trimmed)) {
+		const parts = trimmed.slice(1).split(/[/\\]/);
+		const user = parts[0]!;
+		const rest = parts.slice(1);
+		return join(dirname(home), user, ...rest);
+	}
+
+	let out = trimmed;
+	if (/^\$(?:HOME|\{HOME\})(?=$|[/\\])/.test(out)) {
+		out = out.replace(/^\$(?:HOME|\{HOME\})/, home);
+	}
+
+	if (out.includes("$")) {
+		return null;
+	}
+
+	return out;
+}
+
 export function isPathOutsideWorkspace(targetPath: string, root: string): boolean {
 	if (!targetPath) return false;
-	const resolved = resolve(root, targetPath);
+	const expanded = expandShellTargetPath(targetPath);
+	if (expanded === null) return true;
+	const resolved = resolve(root, expanded);
 	const normalizedRoot = root.endsWith("/") ? root : root + "/";
 	if (resolved !== root && !resolved.startsWith(normalizedRoot)) {
 		return true;
@@ -64,26 +103,53 @@ export function extractPatchPaths(patchText: string): string[] {
 	return paths;
 }
 
+export function teeTargetsIn(segment: string): string[] {
+	const words = shellWords(unwrapShellCommand(segment));
+	if (words[0] !== "tee") {
+		const teeIdx = words.indexOf("tee");
+		if (teeIdx === -1) return [];
+	}
+	const startIdx = words[0] === "tee" ? 1 : words.indexOf("tee") + 1;
+	const targets: string[] = [];
+	let stopFlags = false;
+	for (let i = startIdx; i < words.length; i++) {
+		const w = words[i]!;
+		if (/^[|;&<>]/.test(w)) break;
+		if (!stopFlags) {
+			if (w === "--") {
+				stopFlags = true;
+				continue;
+			}
+			if (w.startsWith("-")) continue;
+		}
+		targets.push(w);
+	}
+	return targets;
+}
+
 export function shellMutationIn(segment: string): ShellMutation | undefined {
 	const redirectMatch = segment.match(
-		/(?:^|\s|>)(?:[0-9]*>>?)\s*["']?([^\s>&|;"']+)/,
+		/(?:^|[\s>]|(?<=[^\s"']))([0-9]*&?>>?&?)\s*["']?([^\s>&|;"']+)/,
 	);
-	if (redirectMatch?.[1]) {
-		if (/^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(redirectMatch[1])) {
-			return undefined;
+	if (redirectMatch?.[1] && redirectMatch?.[2]) {
+		const op = redirectMatch[1];
+		const target = redirectMatch[2];
+		// Filter fd duplication (e.g. 2>&1, >&2) where target is purely an fd number
+		const isFdDup = op.endsWith("&") && /^\d+$/.test(target);
+		if (!isFdDup && !/^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(target)) {
+			return {
+				kind: "redirect",
+				target,
+				what: `file redirect to '${target}'`,
+			};
 		}
-		return {
-			kind: "redirect",
-			target: redirectMatch[1],
-			what: `file redirect to '${redirectMatch[1]}'`,
-		};
 	}
-	const teeMatch = segment.match(/\btee\s+(?:-a\s+)?["']?([^\s;&|"']+)/);
-	if (teeMatch?.[1]) {
+	const teeTargets = teeTargetsIn(segment);
+	if (teeTargets.length > 0) {
 		return {
 			kind: "command",
-			target: teeMatch[1],
-			what: `tee to '${teeMatch[1]}'`,
+			target: teeTargets[0]!,
+			what: `tee to '${teeTargets[0]!}'`,
 		};
 	}
 	const sedMatch = segment.match(/\bsed\s+(?:-(?:[a-zA-Z]*i[a-zA-Z]*|i\S*)\s+)+[^\s;&|]+/);
@@ -205,12 +271,20 @@ export async function guardShellMutation(
 			}
 		}
 		const simpleMutations = simpleFilesystemMutations(segment);
+		const teeTargets = teeTargetsIn(segment);
+		const teeMutations: ShellMutation[] = teeTargets.map((target) => ({
+			kind: "command" as const,
+			target,
+			what: `tee to '${target}'`,
+		}));
 		const fallbackMutation = shellMutationIn(segment.trim());
 		const mutations = simpleMutations.length > 0
 			? simpleMutations
-			: fallbackMutation
-				? [fallbackMutation]
-				: [];
+			: teeMutations.length > 0
+				? teeMutations
+				: fallbackMutation
+					? [fallbackMutation]
+					: [];
 		for (const mutation of mutations) {
 			hasMutation = true;
 			const secret = secretIn(segment);
