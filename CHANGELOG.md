@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.5
+
+### Patch Changes
+
+- 3584fc9: Add exports map to package.json for seamless plugin + TUI loading
+
 ## 1.3.4
 
 ### Patch Changes
