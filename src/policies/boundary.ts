@@ -183,12 +183,26 @@ export async function guardShellMutation(
 	sessionID: string | undefined,
 ): Promise<string | undefined> {
 	const root = getWorkspaceRoot();
-	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	let hasMutation = false;
 	for (const segment of command.split(/[\n|;&]+/)) {
 		const secretSource = secretSourceInFilesystemCommand(segment);
 		if (secretSource) {
 			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;
+		}
+		// mv mutates its SOURCES too (they are removed from their origin), so
+		// sources must respect the same boundaries as mutation targets: no
+		// moving files in from outside the workspace, no moving protected
+		// (settings/plugin) files to innocuous names.
+		const transfer = filesystemTransferInfo(segment);
+		if (transfer && shellWords(unwrapShellCommand(segment))[0] === "mv") {
+			for (const source of transfer.sources) {
+				if (isProtectedPath(source)) {
+					return PROTECTED_PATH_REASON;
+				}
+				if (isPathOutsideWorkspace(source, root)) {
+					return `Blocked: mv would remove source '${source}' from outside the workspace root (${root}). File mutations must stay within the workspace.`;
+				}
+			}
 		}
 		const simpleMutations = simpleFilesystemMutations(segment);
 		const fallbackMutation = shellMutationIn(segment.trim());
@@ -208,10 +222,10 @@ export async function guardShellMutation(
 				return PROTECTED_PATH_REASON;
 			}
 			if (target && isPathOutsideWorkspace(target, root)) {
-				if (!allowLive) {
-					return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${root}). All changes must stay within the workspace.`;
-				}
-				continue;
+				// The workspace boundary has no override: a write outside the
+				// workspace is out of bounds even with WORKFLOW_GUARD_ALLOW_LIVE
+				// (that override covers live-system commands, not the boundary).
+				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${root}). All changes must stay within the workspace.`;
 			}
 			if (onProtectedBranch(root)) {
 				return branchGuardReason();

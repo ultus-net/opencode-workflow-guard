@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -12,9 +12,18 @@ import {
 	getCleanEnv,
 	resetVerifyState,
 	recordMutation,
+	getMutationCount,
 	getLastMutationTimestamp,
 	getLastVerifyResult,
 	recordVerifyResult,
+	snipVerifyOutput,
+	getCurrentGitCommitHash,
+	getGitStatusSummary,
+	getVerifyCacheFilePath,
+	persistVerifyCache,
+	loadVerifyCache,
+	isEnvFilePath,
+	generateMaskedEnvSchema,
 	getAuditFilePath,
 	getRecentAuditEntries,
 	buildReviewRubric,
@@ -22,6 +31,7 @@ import {
 	getLastReviewResult,
 	resetReviewState,
 	isSecretPath,
+	isProtectedPath,
 	loadProjectConfig,
 	reloadProjectConfig,
 	extractInterpreterPayload,
@@ -30,9 +40,16 @@ import {
 	checkBranchBaseIsUpToDate,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
+	checkInteractiveTtyCommand,
+	checkPackageHygiene,
+	sendDesktopNotification,
+	createGitWorktree,
+	cleanupGitWorktree,
+	getWorktreeStorageDir,
+	getCleanGitEnv,
 	default as defaultExport,
-} from "./workflow-guard.ts";
-import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "./workflow-guard-ui.ts";
+} from "../src/workflow-guard.ts";
+import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
 let fail = 0;
@@ -98,10 +115,9 @@ check("edit allowed with in_progress todo", !(await call("edit", { filePath: joi
 check("edit allowed with mixed pending/completed", !(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-mixed" })));
 check("task gate is per session (other session's todos don't help)", blocked(await call("edit", { filePath: join(root, "a.ts"), content: "x" }, { sessionID: "s-empty" })));
 
-console.log("- Policy 1: todowrite focus & lifecycle validation -");
-// Focus rule: only 1 in_progress
-check("todowrite allows 1 in_progress", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "pending")] }, { sessionID: "s-empty" })));
-check("todowrite blocks >1 in_progress (focus rule)", blocked(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
+console.log("- Policy 1: todowrite lifecycle validation -");
+// Multiple in_progress allowed (no single-task focus rule)
+check("todowrite allows multiple in_progress tasks", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
 // Flexible out-of-order completion allows finishing independent items without artificial sequential blockers
 check("todowrite allows flexible out-of-order completion", !(await call("todowrite", { todos: [item("a", "pending"), item("b", "completed")] }, { sessionID: "s-empty" })));
 // No silent deletion: active task cannot silently vanish
@@ -163,6 +179,25 @@ check("env option cannot hide gh pr create", blocked(await shell("env -u GH_TOKE
 check("gh pr create accepts --body= changelog form", !(await shell("gh pr create --title t --body='Changelog: fixed'")));
 check("gh pr create preserves multiline Changelog section", !(await shell("gh pr create --title t --body 'Summary\n\nChangelog:\n- fixed'")));
 check("each chained PR create requires its own changelog", blocked(await shell("gh pr create --title one --body 'Changelog: first' && gh pr create --title two --body 'no release notes'")));
+
+// Changeset support: branches modifying .changeset/*.md satisfy Policy 3
+const changesetRepo = mkdtempSync(join(tmpdir(), "wg-changeset-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: changesetRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: changesetRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: changesetRepo });
+writeFileSync(join(changesetRepo, "code.ts"), "export const a = 1;\n");
+spawnSync("git", ["add", "-A"], { cwd: changesetRepo });
+spawnSync("git", ["commit", "-m", "init"], { cwd: changesetRepo });
+spawnSync("git", ["switch", "-c", "feat/with-changeset"], { cwd: changesetRepo });
+mkdirSync(join(changesetRepo, ".changeset"), { recursive: true });
+writeFileSync(join(changesetRepo, ".changeset", "my-change.md"), "---\n\"pkg\": patch\n---\nFixed bug\n");
+spawnSync("git", ["add", "-A"], { cwd: changesetRepo });
+spawnSync("git", ["commit", "-m", "add changeset"], { cwd: changesetRepo });
+setWorkspaceRoot(changesetRepo);
+check("branch with .changeset/*.md satisfies PR changelog check (no body needed)", !(await shell("gh pr create --title t --body 'clean pr description'")));
+rmSync(changesetRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
 console.log("- Policy 4: destructive commands -");
 check("block kubectl delete", blocked(await shell("kubectl delete pod foo")));
 check("block helm uninstall", blocked(await shell("helm uninstall my-release")));
@@ -307,6 +342,22 @@ check("touch checks every target for workspace escape", blocked(await call("bash
 check("mkdir checks every target for workspace escape", blocked(await call("bash", { command: "mkdir /tmp/wg-outside-dir local-dir" }, { sessionID: "s-active" })));
 check("rm checks every target for workspace escape", blocked(await call("bash", { command: "rm /tmp/wg-outside-file local-file" }, { sessionID: "s-active" })));
 
+// mv mutates its sources: sources outside the workspace or protected paths
+// must block even when the destination is inside the workspace.
+check("mv source outside workspace is blocked", blocked(await call("bash", { command: "mv /tmp/valuable-file ./valuable-file" }, { sessionID: "s-active" })));
+const protectedConfigName = "opencode" + ".json";
+check("mv of protected config to innocuous name is blocked", blocked(await call("bash", { command: `mv ${protectedConfigName} disabled.json` }, { sessionID: "s-active" })));
+check("mv within workspace is allowed with todos", !(await call("bash", { command: "mv src-file.ts dst-file.ts" }, { sessionID: "s-active" })));
+// The workspace boundary has no override: WORKFLOW_GUARD_ALLOW_LIVE covers
+// live-system commands only, not the Policy 8 filesystem boundary.
+process.env.WORKFLOW_GUARD_ALLOW_LIVE = "1";
+check("redirect outside workspace stays blocked under allow-live", blocked(await call("bash", { command: "echo x > /etc/a.ts" }, { sessionID: "s-active" })));
+check("mv source outside workspace stays blocked under allow-live", blocked(await call("bash", { command: "mv /tmp/valuable-file ./valuable-file" }, { sessionID: "s-active" })));
+delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
+// The exact .opencode directory (not just paths under it) is protected.
+check("rm of exact .opencode directory is blocked", blocked(await call("bash", { command: "rm -rf .opencode" }, { sessionID: "s-active" })));
+check("isProtectedPath detects exact .opencode directory", isProtectedPath(".opencode"));
+
 console.log("- Policy 8: workspace boundary guard -");
 check("allow edit within workspace", !(await call("edit", { filePath: join(root, "src", "index.ts"), content: "x" }, { sessionID: "s-active" })));
 check("allow write relative path within workspace", !(await call("write", { filePath: "src/a.ts", content: "x" }, { sessionID: "s-active" })));
@@ -419,13 +470,15 @@ check("event hook emits no intrusive startup toast", toasts.length === 0);
 
 // ── New: audit trail ──
 console.log("- Audit trail -");
+const auditPath = getAuditFilePath();
+const auditSizeBefore = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
 await shell("git push origin main"); // block
 await shell("ls -la");                // allow
-// The log file is only opened when needed; the implementation writes
-// synchronously. We can't assert file existence deterministically here
-// without fs access to the audit dir, but the decision writer should
-// not throw, and the public wrapper should return normally.
-check("audit writes do not throw", true);
+const auditSizeAfter = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
+check(
+	"audit trail records shell decisions",
+	auditSizeAfter > auditSizeBefore,
+);
 
 // ── New: secret-content scan ──
 console.log("- Secret-content scan -");
@@ -448,11 +501,12 @@ check("normal key preserved", envObj.NORMAL === "keep");
 // ── New: command.executed channel ──
 console.log("- command.executed guard -");
 const cmdEvt = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
-let blockedEvt: string | undefined;
+const evtAuditBefore = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
 if (typeof cmdEvt.event === "function") {
 	await cmdEvt.event({ event: { type: "command.executed", properties: { command: "git push origin main", sessionID: "s-active" } } } as any);
 }
-check("command.executed does not throw on blocked command", true);
+const evtAuditAfter = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
+check("command.executed event is audited", evtAuditAfter > evtAuditBefore);
 
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
@@ -808,6 +862,18 @@ check(
 );
 check("custom protected branch release/prod blocks pushes", blocked(await shell("git push origin release/prod")));
 
+// Destination-side protection: pushing a feature branch refspec INTO a
+// configured protected branch is blocked even from a feature branch.
+spawnSync("git", ["switch", "-c", "feat/from-prod"], { cwd: projectConfigDir });
+check(
+	"custom protected branch blocks destination refspec push (feat:release/prod)",
+	blocked(await shell("git push origin feat/from-prod:release/prod")),
+);
+check(
+	"custom protected branch blocks bare destination push from feature branch",
+	blocked(await shell("git push origin staging")),
+);
+
 // Review Requirement gating on PR creation
 resetReviewState();
 check(
@@ -964,19 +1030,329 @@ check(
 );
 delete process.env.WORKFLOW_GUARD_REQUIRE_DOCS;
 
+// Arbitrary markdown (e.g. a changeset fragment) must NOT satisfy the
+// documentation gate - only README.md and docs/ files count.
+spawnSync("git", ["switch", "-c", "feat/changeset-only", "main"], { cwd: docRepo });
+mkdirSync(join(docRepo, ".changeset"), { recursive: true });
+writeFileSync(join(docRepo, ".changeset", "some-change.md"), "---\n\"opencode-workflow-guard\": minor\n---\n- change\n");
+spawnSync("git", ["add", "-A"], { cwd: docRepo });
+spawnSync("git", ["commit", "-m", "changeset only"], { cwd: docRepo });
+check(
+	"changeset-only change does not satisfy documentation gate",
+	!branchHasDocumentationChange(docRepo),
+);
+setWorkspaceRoot(root);
+
+// 15. New Ecosystem DX & Safety Features (Features 1 - 6)
+console.log("- Ecosystem Features: Safe .env Masking, Output Snip, Git Snapshot, Durable Cache -");
+
+// Feature 1: Safe .env schema inspection
+check("isEnvFilePath identifies .env", isEnvFilePath(".env"));
+check("isEnvFilePath identifies .env.local", isEnvFilePath(".env.local"));
+check("isEnvFilePath rejects .env.example (safe fixture)", !isEnvFilePath(".env.example"));
+check("isEnvFilePath rejects id_rsa", !isEnvFilePath("id_rsa"));
+
+const sampleEnv = "# Database credentials\nDATABASE_URL=postgres://user:secret@localhost:5432/db\nAPI_KEY=sk_live_123456789\nPORT=3000\n";
+const maskedSchema = generateMaskedEnvSchema(sampleEnv);
+check("generateMaskedEnvSchema preserves keys and comments but redacts values", maskedSchema.includes("DATABASE_URL=********") && maskedSchema.includes("API_KEY=********") && !maskedSchema.includes("sk_live_123456789"));
+
+const envTestFile = join(root, ".env.production");
+writeFileSync(envTestFile, "STRIPE_SECRET=sk_live_99999\nPUBLIC_APP=myapp\n");
+const envReadBlock = await call("read", { filePath: envTestFile });
+check("read on .env file returns blocked message with masked variable schema hint", blocked(envReadBlock) && (envReadBlock as string).includes("STRIPE_SECRET=********") && !(envReadBlock as string).includes("sk_live_99999"));
+
+// Feature 2: Verification output snipping
+const verbosePassingLogs = Array.from({ length: 100 }, (_, i) => `PASS: test #${i} passed successfully`).join("\n");
+const snippedPass = snipVerifyOutput(verbosePassingLogs, true, 20);
+check("snipVerifyOutput truncates verbose passing logs", snippedPass.includes("lines omitted") && snippedPass.split("\n").length < 30);
+
+const verboseFailingLogs = Array.from({ length: 80 }, (_, i) => i === 40 ? "FAIL: AssertionError: expected true to be false\n    at Object.<anonymous> (test.ts:42:1)" : `info log line ${i}`).join("\n");
+const snippedFail = snipVerifyOutput(verboseFailingLogs, false, 20);
+check("snipVerifyOutput preserves failure keywords on fail", snippedFail.includes("AssertionError") || snippedFail.includes("FAIL:"));
+
+// Feature 3: Git snapshot & mutation counts
+check("getCurrentGitCommitHash returns commit string in git repo", typeof getCurrentGitCommitHash(conflictRepo) === "string");
+check("getGitStatusSummary returns status string in git repo", typeof getGitStatusSummary(conflictRepo) === "string");
+
+resetVerifyState();
+check("initial mutation count is 0", getMutationCount() === 0);
+recordMutation("s-mut-test");
+check("mutation count increments after recordMutation", getMutationCount() === 1 && getMutationCount("s-mut-test") === 1);
+
+// Feature 4: Subagent role attribution & operational state in compaction hook
+const subagentCompactingContext: { context: string[] } = { context: [] };
+fakeParents.set("s-sub-agent-child", "s-active");
+recordVerifyResult("npm test", { passed: true, output: "ok" }, "s-active");
+recordReviewResult("senior-reviewer", "LGTM - 5 axes approved", true, "s-active");
+const compactSubagentFn = pluginWithToast["experimental.session.compacting"];
+if (typeof compactSubagentFn === "function") {
+	await compactSubagentFn({ sessionID: "s-sub-agent-child" } as any, subagentCompactingContext as any);
+}
+const compactText = subagentCompactingContext.context[0] ?? "";
+check("compaction context includes subagent session & parent attribution", compactText.includes("Subagent session: s-sub-agent-child"));
+check("compaction context includes Operational Guard State header", compactText.includes("Operational Guard State"));
+check("compaction context includes Git Branch status", compactText.includes("Git Branch:"));
+check("compaction context includes Test Verification status", compactText.includes("Test Verification:"));
+check("compaction context includes Secondary Review status", compactText.includes("Secondary Review:"));
+
+// Feature 5: Durable verification cache
+const testVerifyCache = {
+	command: "npm test",
+	passed: true,
+	output: "All 10 tests passed.",
+	timestamp: Date.now(),
+};
+persistVerifyCache(testVerifyCache);
+const loadedCache = loadVerifyCache();
+check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
+
+// Durable verification evidence is workspace-bound: a passing run from
+// workspace A must never satisfy finalization in workspace B, even when
+// the verify command is identical (critical for non-git workspaces where
+// commit/status provide no distinguishing state).
+const vcWsA = mkdtempSync(join(tmpdir(), "wg-vc-a-"));
+const vcWsB = mkdtempSync(join(tmpdir(), "wg-vc-b-"));
+for (const ws of [vcWsA, vcWsB]) {
+	writeFileSync(join(ws, "package.json"), JSON.stringify({ scripts: { test: "node probe.js" } }));
+}
+writeFileSync(join(vcWsA, "probe.js"), "process.exit(0);\n");
+writeFileSync(join(vcWsB, "probe.js"), "process.exit(1);\n");
+setWorkspaceRoot(vcWsA);
+resetVerifyState();
+recordVerifyResult("node probe.js", { passed: true, output: "ok" }, undefined, vcWsA);
+check(
+	"recordVerifyResult stamps durable cache with workspace identity",
+	loadVerifyCache()?.workspaceRoot === resolve(vcWsA),
+);
+
+setWorkspaceRoot(vcWsB);
+resetVerifyState();
+todo("s-vc-b", item("vc work", "in_progress"));
+await call("edit", { filePath: join(vcWsB, "code.ts"), content: "x" }, { sessionID: "s-vc-b" });
+const vcFinalRes = await call(
+	"todowrite",
+	{ todos: [item("vc work", "completed")] },
+	{ sessionID: "s-vc-b" },
+);
+check(
+	"durable verify cache is workspace-bound (foreign evidence rejected)",
+	blocked(vcFinalRes),
+);
+rmSync(vcWsA, { recursive: true, force: true });
+rmSync(vcWsB, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
+// 16. Policy 22: Non-Interactive Shell & TTY Hang Guard
+console.log("- Policy 22: Non-Interactive Shell & TTY Hang Guard -");
+check("checkInteractiveTtyCommand detects vim", checkInteractiveTtyCommand("vim file.txt").isInteractive);
+check("checkInteractiveTtyCommand detects nano", checkInteractiveTtyCommand("nano /tmp/foo").isInteractive);
+check("checkInteractiveTtyCommand detects less", checkInteractiveTtyCommand("less file.txt").isInteractive);
+check("checkInteractiveTtyCommand detects top", checkInteractiveTtyCommand("top").isInteractive);
+check("checkInteractiveTtyCommand detects sudo", checkInteractiveTtyCommand("sudo apt-get update").isInteractive);
+check("checkInteractiveTtyCommand detects git rebase -i", checkInteractiveTtyCommand("git rebase -i HEAD~2").isInteractive);
+check("checkInteractiveTtyCommand detects npm init without -y", checkInteractiveTtyCommand("npm init").isInteractive);
+check("checkInteractiveTtyCommand permits npm init -y", !checkInteractiveTtyCommand("npm init -y").isInteractive);
+check("checkInteractiveTtyCommand permits npm init --yes", !checkInteractiveTtyCommand("npm init --yes").isInteractive);
+check("checkInteractiveTtyCommand detects apt-get install without -y", checkInteractiveTtyCommand("apt-get install curl").isInteractive);
+check("checkInteractiveTtyCommand permits apt-get install -y", !checkInteractiveTtyCommand("apt-get install -y curl").isInteractive);
+check("checkInteractiveTtyCommand permits regular non-interactive command", !checkInteractiveTtyCommand("ls -la && git status").isInteractive);
+
+check("shell tool blocks nano", blocked(await shell("nano README.md")));
+check("shell tool blocks less", blocked(await shell("less package.json")));
+check("shell tool blocks top", blocked(await shell("top")));
+check("shell tool blocks npm init without flag", blocked(await shell("npm init")));
+check("shell tool allows npm init -y", !(await shell("npm init -y")));
+
+// Desktop notifications dispatch test
+check("sendDesktopNotification runs without throwing", (() => {
+	try {
+		sendDesktopNotification("Test Title", "Test Message");
+		return true;
+	} catch {
+		return false;
+	}
+})());
+
+// 17. Policy 23: Package Supply-Chain & Dependency Hygiene Guard
+console.log("- Policy 23: Package Supply-Chain & Dependency Hygiene Guard -");
+check("checkPackageHygiene detects npm audit fix --force", checkPackageHygiene("npm audit fix --force").isViolating);
+check("checkPackageHygiene detects global npm install", checkPackageHygiene("npm install -g typescript").isViolating);
+check("checkPackageHygiene detects global pnpm add", checkPackageHygiene("pnpm add -g turbo").isViolating);
+check("checkPackageHygiene detects pip force-reinstall", checkPackageHygiene("pip install --force-reinstall requests").isViolating);
+check("checkPackageHygiene detects direct npm publish", checkPackageHygiene("npm publish").isViolating);
+check("checkPackageHygiene permits regular npm install", !checkPackageHygiene("npm install --save-dev typescript").isViolating);
+check("checkPackageHygiene permits regular npm audit", !checkPackageHygiene("npm audit").isViolating);
+check("checkPackageHygiene permits regular npm audit fix", !checkPackageHygiene("npm audit fix").isViolating);
+
+check("shell tool blocks npm audit fix --force", blocked(await shell("npm audit fix --force")));
+check("shell tool blocks global npm install", blocked(await shell("npm i -g tsx")));
+check("shell tool blocks direct npm publish", blocked(await shell("npm publish --access public")));
+check("shell tool allows regular npm install", !(await shell("npm install lodash")));
+
+// 18. Native Git Worktree Lifecycle Tools
+console.log("- Native Git Worktree Lifecycle Tools -");
+const worktreeStorage = mkdtempSync(join(tmpdir(), "wg-wt-storage-"));
+process.env.WORKFLOW_GUARD_WORKTREE_DIR = worktreeStorage;
+const worktreeBaseRepo = mkdtempSync(join(tmpdir(), "wg-wt-base-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: worktreeBaseRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: worktreeBaseRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: worktreeBaseRepo });
+writeFileSync(join(worktreeBaseRepo, "README.md"), "# Main Base\n");
+spawnSync("git", ["add", "-A"], { cwd: worktreeBaseRepo });
+spawnSync("git", ["commit", "-m", "init base"], { cwd: worktreeBaseRepo });
+
+check("getWorktreeStorageDir returns valid path", typeof getWorktreeStorageDir(worktreeBaseRepo) === "string");
+check("createGitWorktree rejects invalid branch names", !createGitWorktree("-bad-branch", "HEAD", worktreeBaseRepo).success);
+check("createGitWorktree rejects protected branch", !createGitWorktree("main", "HEAD", worktreeBaseRepo).success);
+
+const prevRoot = root;
+setWorkspaceRoot(worktreeBaseRepo);
+const wtCreateRes = createGitWorktree("feat/isolated-subagent", "HEAD", worktreeBaseRepo);
+check("createGitWorktree creates physical worktree on disk", wtCreateRes.success && typeof wtCreateRes.worktreePath === "string" && existsSync(wtCreateRes.worktreePath));
+
+if (wtCreateRes.worktreePath) {
+	// Modify file in worktree
+	writeFileSync(join(wtCreateRes.worktreePath, "worktree.txt"), "isolated edit\n");
+	const wtCleanupRes = cleanupGitWorktree(wtCreateRes.worktreePath, worktreeBaseRepo);
+	check("cleanupGitWorktree commits snapshot and removes worktree directory", wtCleanupRes.success && !existsSync(wtCreateRes.worktreePath));
+}
+
+// Cleanup safety: arbitrary directories must never be treated as worktrees.
+const arbitraryDir = mkdtempSync(join(tmpdir(), "wg-wt-arbitrary-"));
+writeFileSync(join(arbitraryDir, "keep.txt"), "valuable data\n");
+const arbCleanup = cleanupGitWorktree(arbitraryDir, worktreeBaseRepo);
+check(
+	"cleanupGitWorktree refuses arbitrary directories (no destructive fallback)",
+	!arbCleanup.success && existsSync(join(arbitraryDir, "keep.txt")),
+);
+rmSync(arbitraryDir, { recursive: true, force: true });
+
+// Cleanup safety: unregistered paths under the storage dir are refused too.
+const storageBase = getWorktreeStorageDir(worktreeBaseRepo);
+const roguePath = join(storageBase, "rogue-dir");
+mkdirSync(roguePath, { recursive: true });
+writeFileSync(join(roguePath, "keep.txt"), "valuable data\n");
+const rogueCleanup = cleanupGitWorktree(roguePath, worktreeBaseRepo);
+check(
+	"cleanupGitWorktree refuses unregistered paths under the storage dir",
+	!rogueCleanup.success && existsSync(join(roguePath, "keep.txt")),
+);
+
+// Snapshot integrity: when the snapshot commit cannot be established (e.g. a
+// failing pre-commit hook), cleanup must abort and preserve the worktree.
+const failingHooks = mkdtempSync(join(tmpdir(), "wg-wt-hooks-"));
+writeFileSync(join(failingHooks, "pre-commit"), "#!/bin/sh\nexit 1\n");
+chmodSync(join(failingHooks, "pre-commit"), 0o755);
+spawnSync("git", ["config", "core.hooksPath", failingHooks], { cwd: worktreeBaseRepo });
+const snapFailCreate = createGitWorktree("feat/snapshot-fail", "HEAD", worktreeBaseRepo);
+if (snapFailCreate.worktreePath) {
+	writeFileSync(join(snapFailCreate.worktreePath, "precious.txt"), "do not lose me\n");
+	const snapFailCleanup = cleanupGitWorktree(snapFailCreate.worktreePath, worktreeBaseRepo);
+	check(
+		"cleanupGitWorktree aborts when snapshot commit fails (worktree preserved)",
+		!snapFailCleanup.success && existsSync(join(snapFailCreate.worktreePath, "precious.txt")),
+	);
+} else {
+	check("cleanupGitWorktree aborts when snapshot commit fails (worktree preserved)", false);
+}
+spawnSync("git", ["config", "--unset", "core.hooksPath"], { cwd: worktreeBaseRepo });
+
+// The plugin-created node_modules symlink must never enter the snapshot commit.
+mkdirSync(join(worktreeBaseRepo, "node_modules"), { recursive: true });
+writeFileSync(join(worktreeBaseRepo, "node_modules", "marker.json"), "{}\n");
+const nmCreate = createGitWorktree("feat/nm-share", "HEAD", worktreeBaseRepo);
+if (nmCreate.worktreePath) {
+	check(
+		"createGitWorktree symlinks parent node_modules",
+		lstatSync(join(nmCreate.worktreePath, "node_modules")).isSymbolicLink(),
+	);
+	writeFileSync(join(nmCreate.worktreePath, "nm-file.txt"), "snapshot me\n");
+	const nmCleanup = cleanupGitWorktree(nmCreate.worktreePath, worktreeBaseRepo);
+	const tree = spawnSync("git", ["ls-tree", "-r", "--name-only", "feat/nm-share"], {
+		cwd: worktreeBaseRepo,
+		encoding: "utf8",
+	});
+	check(
+		"cleanupGitWorktree snapshot excludes the node_modules symlink",
+		nmCleanup.success && tree.status === 0 && tree.stdout.includes("nm-file.txt") && !tree.stdout.split("\n").includes("node_modules"),
+	);
+} else {
+	check("cleanupGitWorktree snapshot excludes the node_modules symlink", false);
+}
+
+// Config-aware protection: custom protectedBranches apply to worktree creation.
+mkdirSync(join(worktreeBaseRepo, ".opencode"), { recursive: true });
+writeFileSync(
+	join(worktreeBaseRepo, ".opencode", "workflow-guard.json"),
+	JSON.stringify({ protectedBranches: ["release/prod"] }),
+);
+reloadProjectConfig(worktreeBaseRepo);
+check(
+	"createGitWorktree rejects custom protected branch from config",
+	!createGitWorktree("release/prod", "HEAD", worktreeBaseRepo).success,
+);
+rmSync(join(worktreeBaseRepo, ".opencode"), { recursive: true, force: true });
+reloadProjectConfig(prevRoot);
+
+// Tool-level checks: registration, todo gate, protected-branch rejection.
+check("plugin registers guard_worktree_create tool", typeof customPlugin.tool?.guard_worktree_create?.execute === "function");
+check("plugin registers guard_worktree_cleanup tool", typeof customPlugin.tool?.guard_worktree_cleanup?.execute === "function");
+
+todo("s-wt-done", item("worktree task", "completed"));
+const wtToolBlocked = await customPlugin.tool?.guard_worktree_create?.execute(
+	{ branch: "feat/tool-gate" },
+	{ sessionID: "s-wt-done", worktree: worktreeBaseRepo, directory: worktreeBaseRepo } as any,
+);
+check(
+	"guard_worktree_create blocks with no active todo",
+	typeof wtToolBlocked === "string" && wtToolBlocked.includes("no active todo"),
+);
+const wtToolProtected = await customPlugin.tool?.guard_worktree_create?.execute(
+	{ branch: "main" },
+	{ sessionID: "s-active", worktree: worktreeBaseRepo, directory: worktreeBaseRepo } as any,
+);
+check(
+	"guard_worktree_create rejects protected branch via tool",
+	typeof wtToolProtected === "string" && wtToolProtected.includes("protected"),
+);
+
+// Regression: git context env (e.g. GIT_INDEX_FILE exported by git hooks) must not
+// leak into spawned worktree git commands, where the new worktree's `.git` is a file.
+process.env.GIT_INDEX_FILE = ".git/index";
+process.env.GIT_DIR = worktreeBaseRepo;
+const hookEnvCreate = createGitWorktree("feat/hook-context", "HEAD", worktreeBaseRepo);
+check("createGitWorktree succeeds with git hook env (GIT_INDEX_FILE leak)", hookEnvCreate.success);
+if (hookEnvCreate.worktreePath) {
+	writeFileSync(join(hookEnvCreate.worktreePath, "hook.txt"), "hook edit\n");
+	const hookEnvCleanup = cleanupGitWorktree(hookEnvCreate.worktreePath, worktreeBaseRepo);
+	check("cleanupGitWorktree succeeds with git hook env", hookEnvCleanup.success && !existsSync(hookEnvCreate.worktreePath));
+}
+delete process.env.GIT_INDEX_FILE;
+delete process.env.GIT_DIR;
+check("getCleanGitEnv strips git context variables", typeof getCleanGitEnv().GIT_INDEX_FILE === "undefined");
+
+rmSync(worktreeBaseRepo, { recursive: true, force: true });
+delete process.env.WORKFLOW_GUARD_WORKTREE_DIR;
+rmSync(worktreeStorage, { recursive: true, force: true });
+setWorkspaceRoot(prevRoot);
+
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);
 
-// 15. Permission Hook Auditing
-console.log("- Permission Hook Auditing -");
-const pluginInst = await WorkflowGuard({
+rmSync(conflictRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
+// ── Modularization regression tests (permission hook, block logging,
+//    runtime instance isolation, TUI session scoping) ──
+console.log("- Permission Hook Auditing & Modular Invariants -");
+const permPlugin = await WorkflowGuard({
 	directory: root,
 	worktree: root,
 	client: fakeClient as any,
 } as any);
 
-check("plugin registers typed permission.ask hook", typeof pluginInst["permission.ask"] === "function");
-await pluginInst["permission.ask"]?.(
+check("plugin registers typed permission.ask hook", typeof permPlugin["permission.ask"] === "function");
+await permPlugin["permission.ask"]?.(
 	{
 		id: "perm-1",
 		sessionID: "s-perm-test",
@@ -988,13 +1364,11 @@ await pluginInst["permission.ask"]?.(
 	} as any,
 	{ status: "ask" },
 );
-
-const auditEntries = getRecentAuditEntries(5);
-const askedEntry = auditEntries.find((e) => e.tool === "permission.ask");
+const askedEntry = getRecentAuditEntries(5).find((e) => e.tool === "permission.ask");
 check("permission.ask hook is journaled to audit log", askedEntry !== undefined);
 check("permission.ask audit preserves ask status", (askedEntry?.input as any)?.status === "ask");
 
-await pluginInst.event?.({
+await permPlugin.event?.({
 	event: {
 		type: "permission.replied",
 		properties: { sessionID: "s-perm-test", permissionID: "perm-1", response: "reject" },
@@ -1025,6 +1399,7 @@ check(
 	appLogs.some((entry) => entry?.body?.level === "warn" && String(entry?.body?.message).includes("blocked write")),
 );
 
+// Concurrent plugin instances keep SDK client state isolated (AsyncLocalStorage).
 const activeClient = {
 	session: {
 		todo: async () => ({ data: [item("isolated", "pending")] }),
@@ -1059,9 +1434,8 @@ try {
 }
 check("plugin instances keep SDK client state isolated", !activeInstanceBlocked && emptyInstanceBlocked);
 
-// 16. TUI Status Badge with Dynamic Last-Block Feedback
+// TUI badge: session-scoped, guard-originated toast sourcing.
 console.log("- TUI Companion Status Badge -");
-let tuiSlots: Record<string, () => any> | undefined;
 let toastHandler: ((event: any) => void) | undefined;
 const fakeTuiBadgeApi = {
 	theme: { current: { success: "green", warning: "yellow", error: "red" } },
@@ -1072,14 +1446,9 @@ const fakeTuiBadgeApi = {
 			return () => {};
 		},
 	},
-	slots: {
-		register(cfg: any) {
-			tuiSlots = cfg.slots;
-		},
-	},
+	slots: { register() {} },
 };
 await WorkflowGuardTui(fakeTuiBadgeApi as any, undefined, {} as any);
-check("tui registers slots with dynamic badge handlers", typeof tuiSlots?.home_prompt_right === "function");
 
 setLastBlockedReasonForTesting(undefined);
 const activeBadge = formatBadge();
@@ -1089,6 +1458,7 @@ setLastBlockedReasonForTesting("[workflow-guard] blocked edit: on protected bran
 const blockedBadge = formatBadge();
 check("TUI badge renders Blocked status when block occurs", blockedBadge.text.includes("Workflow Guard: Blocked:") && blockedBadge.isBlocked);
 setLastBlockedReasonForTesting(undefined);
+
 toastHandler?.({ properties: { title: "Other Plugin", message: "Blocked: unrelated" } });
 check("TUI ignores unrelated blocked toasts", !formatBadge("s-badge").isBlocked);
 toastHandler?.({ properties: { title: "Workflow Guard Blocked", message: "Blocked: protected branch" } });
@@ -1096,8 +1466,6 @@ check("TUI associates guard toast with current session", formatBadge("s-badge").
 check("TUI does not leak session block to another session", !formatBadge("s-other").isBlocked);
 setLastBlockedReasonForTesting(undefined);
 
-rmSync(conflictRepo, { recursive: true, force: true });
-setWorkspaceRoot(root);
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
 console.log(`\n${pass} passed, ${fail} failed`);

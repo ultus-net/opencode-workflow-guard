@@ -10,11 +10,7 @@
     "types": ["node"]
   },
   "include": [
-    "workflow-guard.ts",
-    "workflow-guard-ui.ts",
-    "lib/**/*.ts",
-    "policies/**/*.ts",
-    "test.mts",
-    "test-e2e.mts"
+    "src/**/*.ts",
+    "test/**/*.mts"
   ]
 }

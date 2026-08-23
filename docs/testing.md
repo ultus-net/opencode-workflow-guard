@@ -19,7 +19,7 @@ npm test            # runs node test.mts (Node >= 22.18) or bun test.mts
 ```
 
 ### 3. Live OpenCode Runtime & Install Tests
-Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies `workflow-guard.ts` plus `lib/` and `policies/` into `.opencode/plugins/` and runs live `opencode run` sessions to verify that OpenCode's real runtime loader discovers, loads, and executes the plugin hooks:
+Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies `src/workflow-guard.ts` plus `src/lib/` and `src/policies/` into `.opencode/plugins/` and runs live `opencode run` sessions to verify that OpenCode's real runtime loader discovers, loads, and executes the plugin hooks:
 ```bash
 npm run test:install # runs node test-e2e.mts
 ```

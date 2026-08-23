@@ -29,6 +29,9 @@ export interface VerifyResult {
 	output: string;
 	timestamp: number;
 	durationMs?: number;
+	commitHash?: string;
+	gitStatus?: string;
+	workspaceRoot?: string;
 }
 
 export interface ReviewResult {

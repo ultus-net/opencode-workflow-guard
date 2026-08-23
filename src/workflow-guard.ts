@@ -3,11 +3,16 @@
  *
  * Deterministic enforcement via the tool.execute.before plugin hook.
  * Throwing from the hook blocks the tool call outright.
+ *
+ * Orchestrator: imports policy modules from ./policies/ and engine services
+ * from ./lib/, and re-exports the public helper surface for tests.
  */
 
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
+import { existsSync, readFileSync } from "node:fs";
+import { resolve } from "node:path";
 
-// Re-export types
+// ── Types ────────────────────────────────────────────────────────────────────
 export type {
 	TodoItem,
 	TodoSdkClient,
@@ -19,7 +24,7 @@ export type {
 	ShellMutation,
 } from "./lib/types.ts";
 
-// Re-export state & utils
+// ── State & runtime context ──────────────────────────────────────────────────
 import {
 	setWorkspaceRoot,
 	getWorkspaceRoot,
@@ -28,6 +33,7 @@ import {
 	runWithRuntimeState,
 	lastMutationTimestamp,
 	getLastMutationTimestamp,
+	getMutationCount,
 	lastVerify,
 	getLastVerifyResult,
 	recordMutation,
@@ -50,6 +56,7 @@ export {
 	getWorkspaceRoot,
 	setSdkClient,
 	getLastMutationTimestamp,
+	getMutationCount,
 	getLastVerifyResult,
 	recordMutation,
 	recordVerifyResult,
@@ -63,12 +70,12 @@ export {
 	resetReviewState,
 };
 
+// ── Shared shell/env utilities ───────────────────────────────────────────────
 import {
 	asRecord,
 	extractCommands,
 	normalize,
 	splitShellSegments,
-	unwrapShellCommand,
 	getCleanEnv,
 	showBlockToast,
 	SENSITIVE_ENV_KEYS,
@@ -77,23 +84,59 @@ import {
 
 export { getCleanEnv };
 
+// ── Audit & durable verification cache ───────────────────────────────────────
 import {
 	getAuditFilePath,
+	getVerifyCacheFilePath,
+	persistVerifyCache,
+	loadVerifyCache,
 	getRecentAuditEntries,
 	audit,
 	logDecision,
 	summarizeInput,
 } from "./lib/audit.ts";
 
-export { getAuditFilePath, getRecentAuditEntries };
+export { getAuditFilePath, getVerifyCacheFilePath, persistVerifyCache, loadVerifyCache, getRecentAuditEntries };
 
-import { detectVerifyCommand, runVerify } from "./lib/verify.ts";
-export { detectVerifyCommand, runVerify };
+// ── Verification engine ──────────────────────────────────────────────────────
+import {
+	detectVerifyCommand,
+	runVerify,
+	snipVerifyOutput,
+	getCurrentGitCommitHash,
+	getGitStatusSummary,
+} from "./lib/verify.ts";
 
+export {
+	detectVerifyCommand,
+	runVerify,
+	snipVerifyOutput,
+	getCurrentGitCommitHash,
+	getGitStatusSummary,
+};
+
+// ── Secondary review rubric ──────────────────────────────────────────────────
 import { buildReviewRubric } from "./lib/review.ts";
 export { buildReviewRubric };
 
-// Re-export policies
+// ── Git worktree lifecycle ───────────────────────────────────────────────────
+import {
+	getWorktreeStorageDir,
+	getCleanGitEnv,
+	isValidBranchName,
+	createGitWorktree,
+	cleanupGitWorktree,
+} from "./lib/worktree.ts";
+
+export {
+	getWorktreeStorageDir,
+	getCleanGitEnv,
+	isValidBranchName,
+	createGitWorktree,
+	cleanupGitWorktree,
+};
+
+// ── Policy modules ───────────────────────────────────────────────────────────
 import {
 	EDIT_TOOL_NAMES,
 	validateTodoLifecycle,
@@ -107,12 +150,13 @@ import {
 export { validateTodoLifecycle };
 
 import {
-	PROTECTED_BRANCHES,
 	PUSH_TO_MAIN_RE,
 	GIT_WRITE_RE,
 	GIT_BRANCH_CREATE_RE,
 	currentGitBranch,
 	onProtectedBranch,
+	isProtectedBranchName,
+	pushedProtectedBranchIn,
 	branchGuardReason,
 	parseGitInvocation,
 	normalizeGitCommands,
@@ -122,6 +166,7 @@ import {
 } from "./policies/git.ts";
 
 export {
+	isProtectedBranchName,
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
@@ -133,10 +178,7 @@ import {
 	prBodyIncludesChangelog,
 } from "./policies/changelog.ts";
 
-import {
-	liveMutationIn,
-	extractEditContent,
-} from "./policies/destructive.ts";
+import { liveMutationIn, extractEditContent } from "./policies/destructive.ts";
 
 import { mcpMutationTool } from "./policies/mcp.ts";
 
@@ -154,19 +196,23 @@ import {
 	guardShellMutation,
 } from "./policies/boundary.ts";
 
-import {
-	isSecretPath,
-	secretIn,
-	secretFileReadIn,
-} from "./policies/secrets.ts";
+import { isSecretPath, secretIn, secretFileReadIn, isEnvFilePath, generateMaskedEnvSchema } from "./policies/secrets.ts";
 
-export { isSecretPath };
+export { isSecretPath, isEnvFilePath, generateMaskedEnvSchema };
 
 import { extractInterpreterPayload } from "./policies/interpreter.ts";
 export { extractInterpreterPayload };
 
 import { branchHasDocumentationChange } from "./policies/docs.ts";
 export { branchHasDocumentationChange };
+
+import {
+	checkInteractiveTtyCommand,
+	checkPackageHygiene,
+	sendDesktopNotification,
+} from "./policies/shell-safety.ts";
+
+export { checkInteractiveTtyCommand, checkPackageHygiene, sendDesktopNotification };
 
 const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
@@ -189,6 +235,7 @@ async function guardToolCallImpl(
 ): Promise<string | undefined> {
 	const currentRoot = getWorkspaceRoot();
 
+	// ── Policy 17: secret file read block via read tool ──
 	if (toolName === "read" || toolName === "read_file") {
 		const record = asRecord(input);
 		const target =
@@ -201,6 +248,21 @@ async function guardToolCallImpl(
 						: "";
 		if (target && isSecretPath(target)) {
 			logBlock(`[workflow-guard] blocked read: secret file ${target}`);
+			if (isEnvFilePath(target)) {
+				let schemaHint = "";
+				try {
+					const resolvedTarget = resolve(currentRoot, target);
+					if (existsSync(resolvedTarget)) {
+						const raw = readFileSync(resolvedTarget, "utf8");
+						const masked = generateMaskedEnvSchema(raw);
+						schemaHint = `\n\nSafe variable schema mask:\n\`\`\`\n${masked.slice(0, 800)}\n\`\`\``;
+					}
+				} catch {}
+				return (
+					`Blocked: reading sensitive credential file '${target}' directly is not permitted. ` +
+					`Use environment variables or reference safe templates.${schemaHint}`
+				);
+			}
 			return (
 				`Blocked: reading sensitive credential/secret file '${target}' is not permitted. ` +
 				"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
@@ -209,6 +271,7 @@ async function guardToolCallImpl(
 		return undefined;
 	}
 
+	// ── Policy 1: todowrite lifecycle validation & finalization gates ──
 	if (toolName === "todowrite") {
 		const record = asRecord(input);
 		const rawTodos = record?.todos;
@@ -230,6 +293,7 @@ async function guardToolCallImpl(
 					return s === "completed" || s === "cancelled";
 				});
 			if (allDone) {
+				// Policy 19: conflict-free mergeability gate before task completion/handoff
 				const conflictCheck = checkMergeConflicts(currentRoot);
 				if (conflictCheck.hasConflicts) {
 					const reason = `Blocked todowrite: ${conflictCheck.reason}`;
@@ -237,26 +301,54 @@ async function guardToolCallImpl(
 					return reason;
 				}
 
+				// Policy 10: evidence-based verification
 				const command = detectVerifyCommand(currentRoot);
 				if (command) {
 					const sessionID = context?.sessionID;
-					const verifyResult = sessionID
+					let verifyResult = sessionID
 						? sessionVerifyResults.get(sessionID)
 						: lastVerify;
+
+					// Recover durable evidence from disk when in-memory state is missing.
+					// Durable evidence is bound to the workspace that produced it: without
+					// this check a passing run from a different project (identical verify
+					// command, non-git state) could satisfy finalization here.
+					if (!verifyResult) {
+						const diskCached = loadVerifyCache();
+						if (
+							diskCached &&
+							diskCached.passed &&
+							diskCached.command === command &&
+							diskCached.workspaceRoot === resolve(currentRoot)
+						) {
+							verifyResult = diskCached;
+						}
+					}
+
 					const mutationTimestamp = sessionID
 						? (sessionMutationTimestamps.get(sessionID) ?? 0)
 						: lastMutationTimestamp;
+
+					const currentCommit = getCurrentGitCommitHash(currentRoot);
+					const currentGitStatus = getGitStatusSummary(currentRoot);
+
+					const gitStateMatches =
+						!verifyResult?.commitHash ||
+						(verifyResult.commitHash === currentCommit &&
+							verifyResult.gitStatus === currentGitStatus);
+
 					const isFresh =
 						verifyResult !== undefined &&
 						verifyResult.passed &&
 						verifyResult.command === command &&
-						verifyResult.timestamp >= mutationTimestamp;
+						verifyResult.timestamp >= mutationTimestamp &&
+						gitStateMatches;
 
 					if (!isFresh) {
 						const result = await runVerify(command, currentRoot);
-						recordVerifyResult(command, result, sessionID);
+						recordVerifyResult(command, result, sessionID, currentRoot);
 						if (!result.passed) {
-							const tail = result.output.slice(-500);
+							const tail = snipVerifyOutput(result.output, result.passed).slice(-500);
 							const reason =
 								`Blocked todowrite: all tasks marked done but verification is failing ` +
 								`(${command}). Fix the failure before finishing; ` +
@@ -271,6 +363,7 @@ async function guardToolCallImpl(
 		return undefined;
 	}
 
+	// ── Policies 1, 6, 7, 8 & 9: edit/write/patch gates ──
 	if (EDIT_TOOL_NAMES.has(toolName)) {
 		const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 		const record = asRecord(input);
@@ -388,7 +481,7 @@ async function guardToolCallImpl(
 			return (
 				"Blocked: no active todo item. First break the request down " +
 				"with the todowrite tool (create items with status 'pending' " +
-				"or 'in_progress'), then work them top to bottom, marking " +
+				"or 'in_progress'), then work them through, marking " +
 				"each completed via todowrite as you finish it. When every " +
 				"item is completed, create a fresh todo list before " +
 				"starting new work."
@@ -400,6 +493,7 @@ async function guardToolCallImpl(
 
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 
+	// ── Policy 5: MCP tools that mutate GitHub / Azure / DevOps ──
 	if (!allowLive) {
 		const mcpWhat = mcpMutationTool(toolName);
 		if (mcpWhat) {
@@ -423,12 +517,34 @@ async function guardToolCallImpl(
 	const commands = extractCommands(input);
 	for (const raw of commands) {
 		const command = normalize(raw);
+
+		// ── Policy 22: non-interactive shell & TTY hang guard ──
+		const ttyCheck = checkInteractiveTtyCommand(command);
+		if (ttyCheck.isInteractive) {
+			logBlock(`[workflow-guard] blocked interactive TTY command: ${command.slice(0, 100)}`);
+			return (
+				`Blocked: '${command.slice(0, 60)}' is an ${ttyCheck.name} and will hang non-interactive agent execution. ` +
+				`${ttyCheck.advice}`
+			);
+		}
+
+		// ── Policy 23: package supply-chain & dependency hygiene guard ──
+		const packageCheck = checkPackageHygiene(command);
+		if (packageCheck.isViolating && !allowLive) {
+			logBlock(`[workflow-guard] blocked package supply-chain violation: ${command.slice(0, 100)}`);
+			return (
+				`Blocked: '${command.slice(0, 60)}' is a ${packageCheck.name}. ` +
+				`${packageCheck.advice}`
+			);
+		}
+
 		const normalizedCommand = normalizeGitCommands(command);
 		const gitInvocations = splitShellSegments(command)
 			.map((segment) => parseGitInvocation(segment.trim()))
 			.filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
 		const effectiveRoot = gitInvocations[0]?.repoDir ?? currentRoot;
 
+		// Workspace boundary check for external git repo targets
 		for (const invocation of gitInvocations) {
 			const normalizedInvocation = `git ${invocation.rest}`;
 			if (
@@ -441,6 +557,7 @@ async function guardToolCallImpl(
 			}
 		}
 
+		// ── Policy 7: changes only on feature branches ──
 		for (const invocation of gitInvocations) {
 			if (GIT_WRITE_RE.test(`git ${invocation.rest}`) && onProtectedBranch(invocation.repoDir)) {
 				logBlock(
@@ -450,6 +567,7 @@ async function guardToolCallImpl(
 			}
 		}
 
+		// Policy 20: base freshness when creating a fresh branch
 		if (GIT_BRANCH_CREATE_RE.test(normalizedCommand)) {
 			const behindCheck = checkBranchBaseIsUpToDate(effectiveRoot);
 			if (behindCheck.isBehind) {
@@ -460,6 +578,7 @@ async function guardToolCallImpl(
 			}
 		}
 
+		// ── Policy 6: block self-modification of approval gates ──
 		if (isSettingsTamper(command)) {
 			logBlock(
 				`[workflow-guard] blocked settings tamper: ${command.slice(0, 120)}`,
@@ -467,6 +586,7 @@ async function guardToolCallImpl(
 			return PROTECTED_PATH_REASON;
 		}
 
+		// ── Policy 17: secret file reads via shell ──
 		if (!allowLive) {
 			for (const segment of command.split(/[\n|;&]+/)) {
 				const secretFile = secretFileReadIn(segment.trim());
@@ -482,6 +602,7 @@ async function guardToolCallImpl(
 			}
 		}
 
+		// ── Policy 18: interpreter inline evasion scanner ──
 		if (!allowLive) {
 			for (const payload of extractInterpreterPayload(command)) {
 				const normPayload = normalizeGitCommands(normalize(payload));
@@ -501,6 +622,7 @@ async function guardToolCallImpl(
 			}
 		}
 
+		// ── Policies 1, 7 & 8: shell file mutations get the same gates as edits ──
 		const shellMutationReason = await guardShellMutation(
 			command,
 			context?.sessionID,
@@ -512,6 +634,7 @@ async function guardToolCallImpl(
 			return shellMutationReason;
 		}
 
+		// ── Policy 4: live-system mutations (env var is the ONLY override) ──
 		if (!allowLive) {
 			const what = liveMutationIn(normalizedCommand) ?? liveMutationIn(command);
 			if (what) {
@@ -528,6 +651,7 @@ async function guardToolCallImpl(
 			}
 		}
 
+		// ── Policy 2: block git push to main/master ──
 		if (PUSH_TO_MAIN_RE.test(normalizedCommand)) {
 			logBlock(
 				`[workflow-guard] blocked push to main/master: ${command}`,
@@ -537,6 +661,24 @@ async function guardToolCallImpl(
 				"Create a feature branch and open a PR instead."
 			);
 		}
+		// Policy 2 (cont.): configured protected branches receive the same
+		// destination-side push protection as main/master.
+		for (const invocation of gitInvocations) {
+			const pushText = `git ${invocation.rest}`;
+			if (!/\bgit\s+push\b/.test(pushText)) continue;
+			const pushedBranch = pushedProtectedBranchIn(pushText, invocation.repoDir);
+			if (pushedBranch) {
+				logBlock(
+					`[workflow-guard] blocked push to protected branch '${pushedBranch}': ${command}`,
+				);
+				return (
+					`Blocked: direct pushes to protected branch '${pushedBranch}' are not allowed. ` +
+					"Create a feature branch and open a PR instead."
+				);
+			}
+		}
+
+		// ── Policy 20: block push from protected or already-merged branches ──
 		for (const invocation of gitInvocations) {
 			if (!/\bgit\s+push\b/.test(`git ${invocation.rest}`)) continue;
 			if (onProtectedBranch(invocation.repoDir)) {
@@ -558,23 +700,23 @@ async function guardToolCallImpl(
 			}
 		}
 
+		// ── Policy 3: PRs must include a changelog (GitHub & Azure DevOps) ──
 		if (hasPrCreateInvocation(raw)) {
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
 			const descFlag = isAz ? "--description" : "--body";
 
+			// Policy 19: conflict-free mergeability gate before opening PR
 			const conflictCheck = checkMergeConflicts(currentRoot);
 			if (conflictCheck.hasConflicts) {
 				logBlock(`[workflow-guard] blocked ${prTool}: merge conflicts detected`);
 				return `Blocked: ${conflictCheck.reason}`;
 			}
 
+			// Policy 20: branch already merged/closed
 			const branch = currentGitBranch(currentRoot);
 			if (branch) {
-				const mergedStatus = isBranchAlreadyMergedOrClosed(
-					currentRoot,
-					branch,
-				);
+				const mergedStatus = isBranchAlreadyMergedOrClosed(currentRoot, branch);
 				if (mergedStatus.merged) {
 					logBlock(
 						`[workflow-guard] blocked ${prTool}: branch already merged/closed`,
@@ -600,6 +742,7 @@ async function guardToolCallImpl(
 				}
 			}
 
+			// Policy 21: documentation review & update check
 			if (isDocumentationRequired(currentRoot)) {
 				const hasDocChange = branchHasDocumentationChange(currentRoot);
 				if (!hasDocChange) {
@@ -618,12 +761,7 @@ async function guardToolCallImpl(
 				branchChangelog ||
 				prSegments.every((segment) => prBodyIncludesChangelog(segment));
 			if (!hasChangelog) {
-				const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
-				const prTool = isAz ? "az repos pr create" : "gh pr create";
-				const descFlag = isAz ? "--description" : "--body";
-				logBlock(
-					`[workflow-guard] blocked ${prTool}: no changelog found`,
-				);
+				logBlock(`[workflow-guard] blocked ${prTool}: no changelog found`);
 				return (
 					`Blocked: PR must include a changelog. Either update a ` +
 					`CHANGELOG file in this branch's diff, or include a ` +
@@ -647,6 +785,10 @@ async function guardToolCallImpl(
 	return undefined;
 }
 
+/**
+ * Public guard entry point. Audits every decision (block or allow) to a
+ * durable JSONL file before returning.
+ */
 export async function guardToolCall(
 	toolName: string,
 	input: unknown,
@@ -678,7 +820,16 @@ export async function guardToolCall(
 	return reason;
 }
 
+async function emitBlockFeedback(message: string): Promise<void> {
+	try {
+		sendDesktopNotification("Workflow Guard Blocked", message);
+	} catch {}
+	await showBlockToast(message);
+}
+
 export const WorkflowGuard: Plugin = async (ctx) => {
+	// Honor worktree if present (e.g. opencode worktrees or devcontainers)
+	// so worktree plugins cannot punch through boundary gates.
 	const effectiveRoot = ctx.worktree || ctx.directory || process.cwd();
 	setWorkspaceRoot(effectiveRoot);
 	setSdkClient(ctx.client);
@@ -714,11 +865,13 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 							branch,
 							onProtectedBranch: isProtected,
 							lastMutationTimestamp: lastMut,
+							mutationCount: getMutationCount(),
 							lastVerify: lastV
 								? {
 										command: lastV.command,
 										passed: lastV.passed,
 										fresh: lastV.timestamp >= lastMut,
+										commitHash: lastV.commitHash,
 									}
 								: null,
 							lastReview: lastR
@@ -805,6 +958,67 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
 				},
 			}),
+			guard_worktree_create: tool({
+				description:
+					"Create an isolated git worktree directory for concurrent subagent execution.",
+				args: {
+					branch: tool.schema
+						.string()
+						.describe("Branch name for the isolated worktree (e.g. 'feat/subagent-task')"),
+					baseBranch: tool.schema
+						.string()
+						.optional()
+						.describe("Base branch to branch off of (defaults to HEAD)"),
+				},
+				execute: async (args, toolContext) => {
+					const todos = await effectiveTodos(toolContext.sessionID);
+					if (todos !== undefined && !hasActiveTodo(todos)) {
+						return (
+							"[workflow-guard] Blocked: worktree creation with no active todo item. " +
+							"Break the request down with todowrite first, then create worktrees."
+						);
+					}
+					const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot;
+					const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", toolRoot);
+					if (!res.success) {
+						return `[workflow-guard] Failed to create worktree: ${res.error}`;
+					}
+					recordMutation(
+						(await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID,
+					);
+					return (
+						`[workflow-guard] Worktree created successfully at: ${res.worktreePath}\n` +
+						`Run subagent tasks or pass worktree directory context to isolate file mutations.`
+					);
+				},
+			}),
+			guard_worktree_cleanup: tool({
+				description:
+					"Commit a final snapshot and remove an isolated git worktree directory.",
+				args: {
+					worktreePath: tool.schema
+						.string()
+						.describe("Path of the worktree directory to clean up"),
+				},
+				execute: async (args, toolContext) => {
+					const todos = await effectiveTodos(toolContext.sessionID);
+					if (todos !== undefined && !hasActiveTodo(todos)) {
+						return (
+							"[workflow-guard] Blocked: worktree cleanup with no active todo item. " +
+							"Break the request down with todowrite first, then clean up worktrees."
+						);
+					}
+					const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot;
+					const res = cleanupGitWorktree(args.worktreePath, toolRoot);
+					if (!res.success) {
+						return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
+					}
+					recordMutation(
+						(await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID,
+					);
+					return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
+				},
+			}),
 		},
 
 		"tool.execute.before": async (input, output) => {
@@ -816,36 +1030,67 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					sessionID: input.sessionID,
 				});
 				if (reason !== undefined) {
-					await showBlockToast(reason);
+					await emitBlockFeedback(reason);
 					throw new Error(`[workflow-guard] ${reason}`);
 				}
 			});
 		},
 
-		"tool.execute.after": async (input) => {
-			return;
-		},
-
 		"experimental.session.compacting": async (input, output) => {
 			try {
 				const sessionID = (input as { sessionID?: string })?.sessionID;
+				const parentID = sessionID ? await fetchParentSessionID(sessionID) : undefined;
 				const todos = await effectiveTodos(sessionID);
 				const active = todos?.filter((t) => {
 					const s = String(t.status ?? "");
 					return s === "pending" || s === "in_progress";
 				});
+				const branch = currentGitBranch(effectiveRoot) ?? "unknown";
+				const isProtected = onProtectedBranch(effectiveRoot);
+				const lastV = sessionID
+					? (sessionVerifyResults.get(sessionID) ?? lastVerify)
+					: lastVerify;
+				const lastR = getLastReviewResult();
+				const mutationCountVal = getMutationCount(sessionID);
+
+				const contextBlocks: string[] = [];
+
 				if (active && active.length > 0) {
 					const lines = active.map(
 						(t) =>
 							`- [${String(t.status) === "in_progress" ? "IN PROGRESS" : "PENDING"}] ${String(t.content ?? "")}`,
 					);
-					const contextPrompt =
-						"## Active Tasks (Sequential Order Required)\n" +
-						lines.join("\n") +
-						"\nStrict focus rule: complete the in-progress task before starting another.";
-					if (Array.isArray(output?.context)) {
-						output.context.push(contextPrompt);
-					}
+					const attribution = parentID
+						? ` (Subagent session: ${sessionID}, Parent: ${parentID})`
+						: sessionID
+							? ` (Session: ${sessionID})`
+							: "";
+					contextBlocks.push(
+						`## Active Tasks${attribution}\n` +
+							lines.join("\n") +
+							"\nComplete tasks efficiently - mark finished items as completed and address remaining ones.",
+					);
+				}
+
+				const stateLines: string[] = [
+					`## Operational Guard State`,
+					`- Git Branch: ${branch}${isProtected ? " (PROTECTED BRANCH - edits/commits require feature branch)" : " (feature branch - edits allowed)"}`,
+					`- Uncommitted Mutations: ${mutationCountVal} recorded in current session`,
+				];
+				if (lastV) {
+					stateLines.push(
+						`- Test Verification: ${lastV.passed ? "PASSED" : "FAILED"} (${lastV.command})${lastV.commitHash ? ` at commit ${lastV.commitHash.slice(0, 7)}` : ""}`,
+					);
+				}
+				if (lastR) {
+					stateLines.push(
+						`- Secondary Review: ${lastR.passed ? "APPROVED" : "CHANGES REQUESTED"} by ${lastR.reviewer}`,
+					);
+				}
+				contextBlocks.push(stateLines.join("\n"));
+
+				if (Array.isArray(output?.context)) {
+					output.context.push(contextBlocks.join("\n\n"));
 				}
 			} catch {}
 		},
@@ -869,8 +1114,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					}
 					if (scrubbed.length > 0) {
 						try {
-							const client = getSdkClient();
-							await (client as any)?.app?.log?.({
+							await (getSdkClient() as any)?.app?.log?.({
 								body: {
 									service: "workflow-guard",
 									level: "warn",
@@ -925,6 +1169,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	};
 };
 
+// Default export MUST be a V1 PluginModule record.
 export default {
 	id: "workflow-guard",
 	server: WorkflowGuard,

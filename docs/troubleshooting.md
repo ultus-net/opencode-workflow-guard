@@ -8,7 +8,7 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 
 - **Symptoms:** OpenCode crashes or reports `Unexpected server error` when starting a session, with logs showing `TypeError: undefined is not an object (evaluating '...event')`.
 - **Root Cause:** OpenCode 1.18+'s legacy loader treats *every exported function* in a plugin module as a separate plugin instance. If a plugin exports helper functions (like `guardToolCall` or `setWorkspaceRoot`) alongside a default function, OpenCode calls them as plugins, pushes `undefined` into the hook registry, and crashes event dispatch on `session.created`.
-- **Solution:** Ensure `workflow-guard.ts` uses the V1 `PluginModule` export format (`export default { id: "workflow-guard", server: WorkflowGuard } satisfies PluginModule`). File plugins require an explicit `id` string.
+- **Solution:** Ensure `src/workflow-guard.ts` uses the V1 `PluginModule` export format (`export default { id: "workflow-guard", server: WorkflowGuard } satisfies PluginModule`). File plugins require an explicit `id` string.
 
 ---
 

@@ -58,7 +58,12 @@ export function isProtectedPath(targetPath: string): boolean {
 		return (
 			/^opencode\.jsonc?$/i.test(base) ||
 			/^workflow-guard\.jsonc?$/i.test(base) ||
-			lower.includes("/" + dotOc) ||
+			// the .opencode directory itself and anything under it (project
+		// plugins, agents) - including the exact directory, not just paths
+		// nested inside it
+		lower === ".opencode" ||
+		lower.endsWith("/.opencode") ||
+		lower.includes("/" + dotOc) ||
 			lower.includes(cfgOc) ||
 			lower.includes(cfgOcJson)
 		);

@@ -77,32 +77,52 @@ jobs:
       - run: npm audit --audit-level=high
 
   # ───── PR etiquette ─────
-  # Every PR must update CHANGELOG.md - matches the plugin's own Policy 3.
+  # Every PR must update CHANGELOG.md or add a .changeset/*.md fragment (Policy 3).
   changelog:
-    name: Changelog updated
+    name: Changelog / Changeset updated
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
     steps:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Verify CHANGELOG modified
+      - name: Verify CHANGELOG or Changeset modified
         run: |
           BASE="origin/${{ github.base_ref }}"
-          if git diff --name-only "${BASE}...HEAD" | grep -qi '^CHANGELOG\.md$'; then
-            echo "CHANGELOG.md updated relative to base branch - good."
-          elif git diff --name-only HEAD~1...HEAD | grep -qi '^CHANGELOG\.md$'; then
-            echo "CHANGELOG.md updated in latest commit - good."
+          DIFF_FILES=$(git diff --name-only "${BASE}...HEAD" || git diff --name-only HEAD~1...HEAD)
+          if echo "$DIFF_FILES" | grep -qiE '^(CHANGELOG\.md|\.changeset\/[^\/]+\.md)$'; then
+            echo "CHANGELOG.md or .changeset/*.md updated relative to base branch - good."
           else
-            echo "::error::PR diff must include changes to CHANGELOG.md (Policy 3)"
+            echo "::error::PR diff must include changes to CHANGELOG.md or a .changeset/*.md file (Policy 3)"
             exit 1
           fi
+
+  # ───── Dogfood self-load test ─────
+  dogfood:
+    name: Dogfood (guard self-load)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci
+      - name: Smoke test guard loading
+        run: |
+          if ! command -v opencode &>/dev/null; then echo "SKIP"; exit 0; fi
+          TMP=$(mktemp -d)
+          mkdir -p "$TMP/.opencode/plugins"
+          cp src/workflow-guard.ts "$TMP/.opencode/plugins/"
+          cd "$TMP"
+          echo '{"plugin":["file://./.opencode/plugins/workflow-guard.ts"]}' > opencode.json
+          opencode run --no-tui "guard_status" 2>&1 | grep -q "workspaceRoot"
 
   # ───── Human-readable summary ─────
   status:
     name: Status
     runs-on: ubuntu-latest
-    needs: [typecheck, test, e2e, audit, changelog]
+    needs: [typecheck, test, e2e, audit, changelog, dogfood]
     if: always()
     steps:
       - name: Report gates

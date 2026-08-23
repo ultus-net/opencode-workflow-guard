@@ -13,9 +13,9 @@
 
 ## Installation Methods
 
-### Option A: npm Package (Recommended)
+### 1. From npm (Recommended)
 
-Add `opencode-workflow-guard` directly to your project or global OpenCode configuration:
+Add the package to your project's `opencode.json` (or global `~/.config/opencode/opencode.json`):
 
 ```json
 {
@@ -26,31 +26,30 @@ Add `opencode-workflow-guard` directly to your project or global OpenCode config
 }
 ```
 
-OpenCode automatically resolves the plugin package and all internal policy modules.
+OpenCode automatically installs the plugin and its dependencies with Bun at startup (cached in `~/.cache/opencode/node_modules/`). No manual file copies needed.
 
 ---
 
-### Option B: Local Plugin Copy
+### 2. Manual File Copy (Server Plugin)
 
-Place `workflow-guard.ts`, `lib/`, and `policies/` into your OpenCode plugins folder:
+The server plugin is modular - copy the entrypoint **plus** its `lib/` and `policies/` directories into your OpenCode plugins folder (global `~/.config/opencode/plugins/` or project-level `.opencode/plugins/`):
 
 ```bash
-# Copy into your plugins directory (e.g. ./opencode-plugins/ or your configured plugin path)
-cp -r workflow-guard.ts lib policies /path/to/opencode-plugins/
+cp -r src/workflow-guard.ts src/lib src/policies /path/to/opencode-plugins/
 ```
 
 Files in your plugin directory are automatically loaded by the OpenCode server process at startup.
 
 ---
 
-### 2. TUI Visual Indicator (Prompt Box Badge)
+### 3. TUI Visual Indicator (Prompt Box Badge)
 
 To enable the dynamic prompt-bar badge - `🛡️ [Workflow Guard: Active]` during normal operation, switching to `🛡️ [Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
 1. Place `workflow-guard-ui.tsx` in your config directory (outside `plugins/`):
 ```bash
 mkdir -p ~/.config/opencode/ui
-cp workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
+cp src/workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
 ```
 
 2. Reference it in your `~/.config/opencode/tui.json`:

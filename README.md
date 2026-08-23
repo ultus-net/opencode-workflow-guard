@@ -1,65 +1,14 @@
 # opencode-workflow-guard
 
-The purpose of this plugin is to hold AI agents accountable and maximize developer experience (DX) as OpenCode acts as your pair programmer. It enforces workflow discipline, agent focus, and safety boundaries through **deterministic hooks** - not prompt rules that LLMs can ignore.
+OpenCode plugin enforcing workflow discipline, agent focus, and deterministic safety boundaries through **hard plugin hooks** — not prompt instructions that LLMs can ignore.
 
-This plugin integrates with **OpenCode's native todo system** (`todowrite` / `GET /session/:id/todo`), enforces single-task focus, requires verification evidence before completion, and provides workspace boundary protection.
-
----
-
-## Documentation Tree
-
-```
-opencode-workflow-guard/
-├── workflow-guard.ts          # Core server plugin (tool hooks, orchestrator)
-├── workflow-guard-ui.ts       # Visual TUI companion (dynamic status badge & toasts)
-├── lib/                       # Core engine services (state, verify, review, audit)
-├── policies/                  # Modular policy implementations (1–21)
-├── package.json               # Package configuration & test scripts
-├── tsconfig.json              # Strict TypeScript configuration
-├── test.mts                   # In-memory unit & adversarial tests
-├── test-e2e.mts               # Live OpenCode runtime & install tests
-└── docs/                      # Detailed documentation
-    ├── installation.md        # Complete install options & companion permissions
-    ├── policies.md            # In-depth policy reference, lifecycle rules & overrides
-    ├── troubleshooting.md     # 8-point error diagnosis and resolution guide
-    └── testing.md             # Test suite architecture and execution guide
-```
+Integrates with OpenCode's native todo system (`todowrite`), prevents accidental destructive actions, gates protected branches, enforces testing evidence before task finalization, and stops secret leakage.
 
 ---
 
-## Summary of Enforced Policies
+## Quick Start
 
-| # | Policy | Summary |
-|---|---|---|
-| **1** | **Task Gate & Lifecycle** | File mutations (`edit`, `write`, `apply_patch`, shell redirects/copy/in-place edits) are blocked until an active todo item exists via `todowrite`. Enforces single-task `in_progress` focus, flexible task completion without artificial blockers, and prevents silent task deletion. |
-| **2** | **No Pushes to Main** | `git push ... main/master` is hard-blocked, including refspecs (`HEAD:main`, `feature:main`, `:main`) and forced refspecs (`+main`). Git global flags (`-C`, `--git-dir`) are parsed before matching. |
-| **3** | **PR Changelog** | `gh pr create` and `az repos pr create` require a `Changelog:` section in the PR description or a CHANGELOG file in the diff. |
-| **4** | **Destructive CLI Guard** | Blocks destructive operations (`kubectl delete`, `terraform destroy`, `helm uninstall`, `az/aws/gcloud delete`, `docker rm/prune`, database `drop/truncate`, `rm -rf`, `git clean`, `gh repo delete`, `curl DELETE`, `git push --force`, `prisma migrate reset`). Override requires explicit user environment flag (`WORKFLOW_GUARD_ALLOW_LIVE=1`). |
-| **5** | **MCP Mutation Guard** | Mutating GitHub & Azure DevOps MCP tools (`create`, `delete`, `merge`, ...) are blocked; read-only tools pass. Server-name tokens are split on all non-alphanumerics (`azure-devops`, `gh` aliases match). |
-| **6** | **Settings Tamper Guard** | Prevents the agent from editing `opencode.json[c]`, `~/.config/opencode/*`, `.opencode/*`, or the guard's own plugin files via shell **or** the edit tools. Quote-concatenation and glob evasion are normalized before matching. Read-only access (`cat`, `grep`) is allowed; only modifications trigger. |
-| **7** | **Feature-Branch Workflow** | On `main`/`master`, edits and history-changing git commands (`commit`, `merge`, `rebase`, `update-ref`, `filter-branch`, `branch -D`, ...) are blocked until a feature branch is created. Git `-C`/`--git-dir` are parsed so the correct repo's branch is checked. |
-| **8** | **Workspace Boundary Guard** | Blocks file tools (`edit`, `write`, `apply_patch`) **and** common shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`, `touch`, `mkdir`, `rm`, `ln`, `git apply`) from escaping the workspace root via `../` path traversal or symlinks. External repository git writes are also confined. |
-| **9** | **Script-Laundering Guard** | Content written via `edit`/`write`/`apply_patch` is scanned for destructive patterns, so `write deploy.sh` -> `bash deploy.sh` cannot smuggle blocked commands. |
-| **10** | **Evidence-Based Verification** | Runs `WORKFLOW_GUARD_VERIFY`, project `verifyCommand`, or auto-detected `npm test` in an isolated, scrubbed environment with timeout controls. Blocks final "all done" completion until fresh passing verification evidence is recorded. |
-| **11** | **Secret-Content Scan** | Blocks edit payloads and recognized shell file mutations containing AWS keys, private keys, GitHub tokens, LLM keys, Google/Slack tokens, or env-style assignments. |
-| **12** | **Shell Env Scrub** | Sensitive vars (`AWS_*`, `OPENAI*`, `KUBE*`, `GH_/GITHUB_*`, etc.) are emptied in agent shells via `shell.env`; the agent cannot carry live credentials by default. |
-| **13** | **Command-Channel Audit** | Slash commands (`command.executed`) are journaled to the audit file so agents cannot run hidden work through user-facing channels. |
-| **14** | **Audit Trail & Permission Journal** | Every block/allow decision plus permission requests/replies (`permission.ask`, `permission.updated`, `permission.replied`) is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (durable). |
-| **15** | **Compaction Focus Hook** | Injects the active sequential task list into `experimental.session.compacting` context. |
-| **16** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers dynamic status indicator feedback in the OpenCode interface (`Active` / `Blocked: <reason>`) and emits toasts on blocked actions. |
-| **17** | **Secret-File Read Block** | Blocks reading `.env*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`, `kubeconfig`, `credentials.json`, or service account keys via the `read` tool or shell commands (`cat`, `less`, `grep`). Safe templates (`.env.example`) remain readable. |
-| **18** | **Interpreter Inline Evasion** | Decodes and scans inline interpreter scripts (`python -c`, `node -e`, `perl -e`, `ruby -e`, `powershell -enc`, `base64 | sh`) for destructive commands or settings tampering. |
-| **19** | **Conflict-Free Pre-Flight** | Verifies via `git merge-tree` that the branch has zero merge conflicts with the base branch (`origin/main`) before allowing PR creation or final task handoff. |
-| **20** | **Merged Branch & Freshness** | Blocks pushing to branches already merged or associated with closed PRs (GitHub & Azure DevOps), and blocks creating fresh branches when the local base is behind remote. |
-| **21** | **Documentation Synchronization** | Verifies that relevant documentation (`README.md` or `docs/`) is reviewed and updated when introducing new features, tools, or policy changes before opening a PR. |
-
-For detailed rule descriptions and overrides, see [docs/policies.md](docs/policies.md).
-
----
-
-## Quick Install
-
-### Option A: npm Package Configuration (Recommended)
+### 1. Installation
 
 Add to your project's `opencode.json` or global `~/.config/opencode/opencode.json`:
 
@@ -72,69 +21,92 @@ Add to your project's `opencode.json` or global `~/.config/opencode/opencode.jso
 }
 ```
 
-### Option B: Local Plugin Copy
+*Requires OpenCode >= 1.18.* See [docs/installation.md](docs/installation.md) for local manual installation and TUI companion badge setup.
 
-The server plugin is modular - copy the entrypoint **plus** its `lib/` and `policies/` directories into your OpenCode plugins folder (global or project-level):
-
-```bash
-# Server plugin (plugins folder is auto-loaded at startup)
-cp -r workflow-guard.ts lib policies /path/to/opencode-plugins/
-
-# Optional TUI badge (do NOT put this in the server plugins folder)
-cp workflow-guard-ui.ts /path/to/opencode-ui/workflow-guard-ui.tsx
-```
-
-Then reference the badge in `~/.config/opencode/tui.json`:
-
-```json
-{
-  "$schema": "https://opencode.ai/tui.json",
-  "plugin": [
-    "file:///absolute/path/to/.config/opencode/ui/workflow-guard-ui.tsx"
-  ]
-}
-```
-
-*Requires OpenCode >= 1.18.* See [docs/installation.md](docs/installation.md) for full configuration options.
-
----
-
-## Custom Tools
-
-The plugin registers custom tools available in OpenCode sessions:
-- `guard_status`: Inspect active guardrails, current branch protection, verification status, and review approval.
-- `guard_audit`: View recent audit log entries recorded in `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl`.
-- `guard_why`: Simulate and explain whether a specific tool call or command would be blocked.
-- `record_review`: Record a secondary reviewer subagent's approval or critique across the 5 core review axes.
-
----
-
-## Quick Verification
+### 2. Verification
 
 ```bash
 npm run typecheck    # Strict TypeScript check (0 errors)
-npm test             # Run unit tests (node test.mts)
-npm run test:install # Run live OpenCode runtime install test (node test-e2e.mts)
-npm run test:all     # Run full verification suite
+npm test             # Run 320+ unit and adversarial tests
+npm run test:all     # Run full verification suite (typecheck + unit + live e2e)
 ```
-
-See [docs/testing.md](docs/testing.md) for test details.
 
 ---
 
-## CI / CD
+## Repository Structure
 
-GitHub Actions enforces the same gates the plugin enforces on contributors:
+```
+opencode-workflow-guard/
+├── src/                       # Production plugin sources
+│   ├── workflow-guard.ts      # Server plugin entrypoint (hook orchestrator & public exports)
+│   ├── workflow-guard-ui.ts   # TUI companion prompt badge
+│   ├── policies/              # Per-policy implementations (task gate, git, secrets, shell-safety, ...)
+│   └── lib/                   # Engine services (state, verify, audit, review, worktree, utils, types)
+├── test/                      # Test suites
+│   ├── test.mts               # 320+ in-memory unit & adversarial tests
+│   └── test-e2e.mts           # npm tarball resolution + live runtime OpenCode loader tests
+├── docs/                      # In-depth documentation & guides
+│   ├── installation.md        # Full setup options, worktrees & permissions
+│   ├── policies.md            # Detailed 23-policy reference & overrides
+│   ├── troubleshooting.md     # Error diagnosis & bypass explanations
+│   └── testing.md             # Test architecture & coverage matrix
+├── .changeset/                # Fragment-based versioning & release changelogs
+├── ACKNOWLEDGEMENTS.md        # Open-source community credits & inspirations
+├── CONTRIBUTING.md            # Development guide, test patterns & PR rules
+├── CHANGELOG.md               # Version history
+└── SECURITY.md                # Vulnerability disclosure policy
+```
 
-| Workflow | Trigger | What runs |
+---
+
+## Summary of Enforced Policies
+
+| # | Policy Group | Summary |
 |---|---|---|
-| **CI** | PR + push to `main` | Typecheck -> unit tests (Node 20/22/24) -> e2e plugin-load -> `npm audit` -> CHANGELOG-updated gate |
-| **Release** | push `v*` tag | Re-verify -> tag/version match -> `npm publish --provenance` -> GitHub release |
+| **1** | **Task Gate & Lifecycle** | Gates file mutations on active `todowrite` tasks. Prevents silent task deletion; allows flexible completion order. |
+| **2 & 7** | **Branch Protection** | Blocks direct edits & commits on `main`/`master`. Hard-blocks `git push ... main` and forced refspecs. |
+| **3** | **PR Changelog & Changesets** | Requires PRs to include changesets (`.changeset/*.md`), `CHANGELOG.md` updates, or a `Changelog:` body section. |
+| **4 & 9** | **Destructive CLI & Laundering** | Blocks destructive infrastructure, database, and system mutations unless overridden by user environment (`WORKFLOW_GUARD_ALLOW_LIVE=1`). Scans script payloads for smuggled commands. |
+| **5** | **MCP Mutation Guard** | Blocks mutating GitHub & Azure DevOps MCP tools while allowing read-only inspection tools. |
+| **6** | **Settings Tamper Guard** | Blocks agent modification of `opencode.json`, `.opencode/*`, or the guard's own plugin files. |
+| **8** | **Workspace Boundary Guard** | Confines file mutations and shell redirects strictly within the project workspace root (symlink & `../` escape safe). |
+| **10** | **Evidence-Based Verification** | Runs test verification before final task completion. Binds freshness to git state with token-efficient output snipping. |
+| **11, 12, 17** | **Secret Protection & Masking** | Scans file payloads for API keys, scrubs sensitive env vars in agent subshells, and provides safe redacted `.env` variable schema masks (`KEY=********`). |
+| **13 & 14** | **Audit Trail & Attribution** | Durable JSONL audit logging (`~/.local/state/opencode/workflow-guard/workflow-guard.jsonl`) with subagent hierarchy breadcrumbs. |
+| **15 & 16** | **Compaction & TUI Feedback** | Preserves active task plans across context compactions; emits real-time TUI warning toasts and native desktop alerts. |
+| **18** | **Interpreter Inline Evasion** | Scans inline scripts (`python -c`, `node -e`, `base64 | sh`) for smuggled live commands or config tampering. |
+| **19 & 20** | **Pre-Flight Conflicts & Freshness** | Verifies clean `git merge-tree` mergeability and checks local base branch freshness before opening PRs. |
+| **21** | **Documentation Synchronization** | Verifies documentation is updated when introducing new public features or policies. |
+| **22** | **TTY Hang Guard** | Blocks interactive editors (`vim`, `nano`), pagers (`less`), and commands missing non-interactive flags (`npm init` without `-y`). |
+| **23** | **Package Supply-Chain Hygiene** | Blocks destructive `npm audit fix --force`, global unversioned installs (`npm i -g`), and direct CLI `npm publish`. |
 
-Branch protection on `main` should require the `Typecheck`, `Unit tests`, `E2E`, `npm audit`, and (for PRs) `Changelog updated` checks. The `e2e` job gracefully skips when no `opencode` binary is present, so it never blocks merge.
+👉 **For complete policy specifications and override rules, see [docs/policies.md](docs/policies.md).**
+
+---
+
+## Custom Tools Registered in OpenCode
+
+* `guard_status`: Inspect active guardrails, current branch protection, and verification/review status.
+* `guard_audit`: View recent audit log entries recorded in `workflow-guard.jsonl`.
+* `guard_why`: Simulate and explain whether a specific tool call or command would be blocked.
+* `record_review`: Record secondary reviewer subagent approval or critique across the 5 core review axes.
+* `guard_worktree_create`: Create an isolated git worktree (with shared `node_modules` symlink) for concurrent subagent execution; rejects invalid and protected branch names.
+* `guard_worktree_cleanup`: Snapshot-commit remaining changes and remove an isolated worktree directory.
+
+---
+
+## Documentation & Community
+
+* [Installation Guide](docs/installation.md)
+* [Policies & Overrides Reference](docs/policies.md)
+* [Troubleshooting Guide](docs/troubleshooting.md)
+* [Testing Guide](docs/testing.md)
+* [Contributing Guide](CONTRIBUTING.md)
+* [Acknowledgements & Ecosystem Credits](ACKNOWLEDGEMENTS.md)
+* [Security Policy](SECURITY.md)
 
 ---
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -111,15 +111,44 @@ export function currentGitBranch(root: string): string | undefined {
 	return undefined;
 }
 
-export function onProtectedBranch(root: string): boolean {
-	const branch = currentGitBranch(root);
-	if (!branch) return false;
+export function getProtectedBranches(root: string): Set<string> {
 	const cfg = getProjectConfig(root);
 	const customBranches = Array.isArray(cfg.protectedBranches)
 		? cfg.protectedBranches
 		: [];
-	const allProtected = new Set([...PROTECTED_BRANCHES, ...customBranches]);
-	return allProtected.has(branch);
+	return new Set([...PROTECTED_BRANCHES, ...customBranches]);
+}
+
+/** True when `branch` is protected for the repository at `root`. */
+export function isProtectedBranchName(branch: string, root: string): boolean {
+	if (!branch) return false;
+	return getProtectedBranches(root).has(branch);
+}
+
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Returns the protected branch a `git push` command targets as its destination,
+ * if any. Covers bare refspecs (`git push origin <branch>`) and colon forms
+ * (`git push origin HEAD:<branch>`, `:<branch>` deletion, `+<branch>` forced),
+ * for every protected branch - built-in and configured - of the repository.
+ */
+export function pushedProtectedBranchIn(pushCommand: string, root: string): string | undefined {
+	for (const branch of getProtectedBranches(root)) {
+		const escaped = escapeRegExp(branch);
+		const re = new RegExp(
+			`(?:^|\\s)\\+?[\\w./-]*:${escaped}(?![\\w./-])` +
+				`|(?:\\s|\\/)${escaped}(?![\\w./-])`,
+		);
+		if (re.test(pushCommand)) return branch;
+	}
+	return undefined;
+}
+
+export function onProtectedBranch(root: string): boolean {
+	return isProtectedBranchName(currentGitBranch(root) ?? "", root);
 }
 
 export function branchGuardReason(): string {

@@ -86,6 +86,37 @@ export function isSecretPath(targetPath: string): boolean {
 	}
 }
 
+/**
+ * Returns true specifically for environment variable files (.env, .env.local,
+ * etc.) that can safely present their schema (masked keys) to agents without
+ * exposing secret values.
+ */
+export function isEnvFilePath(targetPath: string): boolean {
+	if (!targetPath) return false;
+	const base = basename(targetPath).toLowerCase();
+	if (SAFE_ENV_FIXTURE_RE.test(base)) return false;
+	return /^\.env(?:\.|$)/i.test(base);
+}
+
+/**
+ * Parses a raw .env file and returns a sanitized schema mask where variable
+ * names and comment structures are preserved, but sensitive values are
+ * redacted to '********'.
+ */
+export function generateMaskedEnvSchema(content: string): string {
+	const lines = content.split("\n");
+	return lines
+		.map((line) => {
+			const trimmed = line.trim();
+			if (!trimmed || trimmed.startsWith("#")) return line;
+			const eqIdx = line.indexOf("=");
+			if (eqIdx === -1) return line;
+			const key = line.slice(0, eqIdx);
+			return `${key}=********`;
+		})
+		.join("\n");
+}
+
 export const SECRET_READ_COMMAND_RE =
 	/(?:^|\s)(?:cat|head|tail|less|more|grep|awk|sed|od|hexdump|strings|base64|xxd|nl|sort|uniq|view|nano|vim?)\s+[^|;&]*?(?:["']?)([\w\/.~-]*\.(?:pem|key|pfx|p12)|[\w\/.~-]*\.env(?:\.[\w-]+)*|[\w\/.~-]*id_(?:rsa|dsa|ecdsa|ed25519)[\w.-]*|[\w\/.~-]*kubeconfig[\w.-]*|[\w\/.~-]*(?:service[-_]?account|credentials|client[-_]?secret)[\w.-]*\.json)(?:["']?)/i;
 export const SIMPLE_FILE_READ_COMMAND_RE =

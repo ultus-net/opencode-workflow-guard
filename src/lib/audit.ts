@@ -1,7 +1,7 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import type { AuditEntry } from "./types.ts";
+import type { AuditEntry, VerifyResult } from "./types.ts";
 import { asRecord } from "./utils.ts";
 
 const AUDIT_DIR = join(
@@ -10,9 +10,40 @@ const AUDIT_DIR = join(
 	"workflow-guard",
 );
 const AUDIT_FILE = join(AUDIT_DIR, "workflow-guard.jsonl");
+const VERIFY_CACHE_FILE = join(AUDIT_DIR, "last-verify.json");
 
 export function getAuditFilePath(): string {
 	return AUDIT_FILE;
+}
+
+export function getVerifyCacheFilePath(): string {
+	return VERIFY_CACHE_FILE;
+}
+
+/**
+ * Persists passing verification evidence to disk so session restarts
+ * or multi-agent handoffs retain valid verification state.
+ */
+export function persistVerifyCache(verifyData: NonNullable<VerifyResult>): void {
+	try {
+		mkdirSync(AUDIT_DIR, { recursive: true });
+		writeFileSync(VERIFY_CACHE_FILE, JSON.stringify(verifyData, null, 2), "utf8");
+	} catch {}
+}
+
+/**
+ * Loads durable verification evidence from disk if present and fresh.
+ */
+export function loadVerifyCache(): VerifyResult | undefined {
+	try {
+		if (!existsSync(VERIFY_CACHE_FILE)) return undefined;
+		const raw = readFileSync(VERIFY_CACHE_FILE, "utf8");
+		const data = JSON.parse(raw);
+		if (data && typeof data.command === "string" && typeof data.timestamp === "number") {
+			return data;
+		}
+	} catch {}
+	return undefined;
 }
 
 export function getRecentAuditEntries(limit = 10): AuditEntry[] {

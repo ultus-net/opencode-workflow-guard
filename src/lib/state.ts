@@ -1,6 +1,8 @@
 import { realpathSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { persistVerifyCache } from "./audit.ts";
+import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary } from "./verify.ts";
 import type {
 	TodoSdkClient,
 	ProjectConfig,
@@ -66,24 +68,35 @@ export function runWithRuntimeState<T>(root: string, client: unknown, fn: () => 
 }
 
 export let lastMutationTimestamp = 0;
+export let mutationCount = 0;
 export const sessionMutationTimestamps = new Map<string, number>();
+export const sessionMutationCounts = new Map<string, number>();
 
 export let lastVerify: VerifyResult | undefined;
-export const sessionVerifyResults = new Map<string, VerifyResult>();
+export const sessionVerifyResults = new Map<string, NonNullable<VerifyResult>>();
 
 export let lastReview: ReviewResult | undefined;
 export const sessionReviews = new Map<string, ReviewResult>();
 
 export function recordMutation(sessionID?: string): void {
 	lastMutationTimestamp = Date.now();
+	mutationCount++;
 	if (sessionID) {
 		sessionMutationTimestamps.set(sessionID, lastMutationTimestamp);
+		sessionMutationCounts.set(sessionID, (sessionMutationCounts.get(sessionID) ?? 0) + 1);
 		sessionVerifyResults.delete(sessionID);
 	}
 	if (sessionID) sessionReviews.delete(sessionID);
 	if (!lastReview?.targetSessionID || lastReview.targetSessionID === sessionID) {
 		lastReview = undefined;
 	}
+}
+
+export function getMutationCount(sessionID?: string): number {
+	if (sessionID && sessionMutationCounts.has(sessionID)) {
+		return sessionMutationCounts.get(sessionID) ?? 0;
+	}
+	return mutationCount;
 }
 
 export function getLastMutationTimestamp(): number {
@@ -98,21 +111,34 @@ export function recordVerifyResult(
 	command: string,
 	result: { passed: boolean; output: string; durationMs?: number },
 	sessionID?: string,
+	root = getWorkspaceRoot(),
 ): void {
 	lastVerify = {
 		command,
 		passed: result.passed,
-		output: result.output.slice(-4000),
+		output: snipVerifyOutput(result.output, result.passed),
 		timestamp: Date.now(),
 		durationMs: result.durationMs,
+		commitHash: getCurrentGitCommitHash(root),
+		gitStatus: getGitStatusSummary(root),
+		workspaceRoot: resolve(root),
 	};
 	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
+	if (lastVerify.passed) {
+		persistVerifyCache(lastVerify);
+	}
+}
+
+export function setLastVerifyResult(result: NonNullable<VerifyResult>): void {
+	lastVerify = result;
 }
 
 export function resetVerifyState(): void {
 	lastMutationTimestamp = 0;
+	mutationCount = 0;
 	lastVerify = undefined;
 	sessionMutationTimestamps.clear();
+	sessionMutationCounts.clear();
 	sessionVerifyResults.clear();
 }
 

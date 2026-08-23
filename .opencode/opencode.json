@@ -1,0 +1,17 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-workflow-guard"],
+  "lsp": true,
+  "permission": {
+    "bash": {
+      "git push *main*": "deny",
+      "git push *master*": "deny"
+    }
+  },
+  "instructions": [
+    "CONTRIBUTING.md",
+    "AGENTS.md",
+    "docs/policies.md",
+    "docs/testing.md"
+  ]
+}

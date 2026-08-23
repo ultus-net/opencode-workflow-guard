@@ -72,16 +72,9 @@ export function validateTodoLifecycle(
 	newTodos: TodoItem[],
 	existingTodos: TodoItem[] | undefined,
 ): string | undefined {
-	// Rule 1: Single in_progress task (focus)
-	const inProgress = newTodos.filter((t) => String(t.status) === "in_progress");
-	if (inProgress.length > 1) {
-		return (
-			`Blocked todowrite: only one task may be 'in_progress' at a time (found ${inProgress.length}). ` +
-			"Maintain narrow focus: finish or pause the current in-progress task before starting another."
-		);
-	}
-
-	// Rule 2: No silent task deletion while active work remains
+	// Rule: No silent task deletion while active work remains
+	// (single-focus rule removed: multiple tasks may be in_progress to allow
+	// concurrent subagent work on different tasks)
 	if (existingTodos && existingTodos.length > 0) {
 		const activeExisting = existingTodos.filter((t) => {
 			const s = String(t.status ?? "");
