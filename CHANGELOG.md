@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.7
+
+### Patch Changes
+
+- b8f9d32: Fix TUI plugin failing to load when installed via npm: move `@opentui/solid` from devDependencies to dependencies so it is installed automatically alongside the package. OpenCode resolves the `./ui` entrypoint's imports from the config directory's `node_modules`, not its own runtime, so the package must declare the dependency itself.
+
 ## 1.3.6
 
 ### Patch Changes
