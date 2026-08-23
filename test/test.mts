@@ -364,8 +364,27 @@ check("allow edit within workspace", !(await call("edit", { filePath: join(root,
 check("allow write relative path within workspace", !(await call("write", { filePath: "src/a.ts", content: "x" }, { sessionID: "s-active" })));
 check("block edit traversing outside workspace (../)", blocked(await call("edit", { filePath: join(root, "..", "outside.ts"), content: "x" }, { sessionID: "s-active" })));
 check("block write to /etc/passwd", blocked(await call("write", { filePath: "/etc/passwd", content: "x" }, { sessionID: "s-active" })));
+check("block write to ~ path", blocked(await call("write", { filePath: "~/.bashrc", content: "x" }, { sessionID: "s-active" })));
+check("block write to $HOME path", blocked(await call("write", { filePath: "$HOME/.profile", content: "x" }, { sessionID: "s-active" })));
+check("block write to unresolvable $VAR path", blocked(await call("write", { filePath: "$UNKNOWN_DIR/file.txt", content: "x" }, { sessionID: "s-active" })));
 check("allow apply_patch within workspace", !(await call("apply_patch", { patchText: "*** Update File: src/app.ts\n" }, { sessionID: "s-active" })));
 check("block apply_patch escaping workspace", blocked(await call("apply_patch", { patchText: "*** Update File: ../../secret.env\n" }, { sessionID: "s-active" })));
+
+// Regression checks: tilde expansion and advanced redirect/tee operators
+check("shell redirect with tilde path (~/.bashrc) is blocked", blocked(await call("bash", { command: "echo pwned > ~/.bashrc" }, { sessionID: "s-active" })));
+check("shell cp to ~ path (~/.ssh/notes.md) is blocked", blocked(await call("bash", { command: "cp notes.md ~/.ssh/notes.md" }, { sessionID: "s-active" })));
+check("ampersand redirect &> needs active todos", blocked(await call("bash", { command: "echo x &> src/a.ts" }, { sessionID: "s-empty" })));
+check("ampersand redirect &> allowed with active todos", !(await call("bash", { command: "echo x &> src/a.ts" }, { sessionID: "s-active" })));
+check("ampersand redirect &> outside workspace is blocked", blocked(await call("bash", { command: "echo x &> /etc/outside.ts" }, { sessionID: "s-active" })));
+check("ampersand redirect &> with tilde (~/.bashrc) is blocked", blocked(await call("bash", { command: "echo x &> ~/.bashrc" }, { sessionID: "s-active" })));
+check("fd duplication 2>&1 is not treated as a file mutation", !(await call("bash", { command: "ls missing 2>&1" }, { sessionID: "s-empty" })));
+check("fd duplication >&2 is not treated as a file mutation", !(await call("bash", { command: "echo err >&2" }, { sessionID: "s-empty" })));
+check("attached redirect x>file is detected as mutation", blocked(await call("bash", { command: "printf hi>src/b.ts" }, { sessionID: "s-empty" })));
+check("tee --append outside workspace is blocked", blocked(await call("bash", { command: "echo x | tee --append /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
+check("tee -ai outside workspace is blocked", blocked(await call("bash", { command: "echo x | tee -ai /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
+check("tee -- flag separator outside workspace is blocked", blocked(await call("bash", { command: "echo x | tee -- /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
+check("multi-target tee with an outside path is blocked", blocked(await call("bash", { command: "echo x | tee in.txt /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
+check("tee --append within workspace is allowed with todos", !(await call("bash", { command: "echo x | tee --append src/a.ts" }, { sessionID: "s-active" })));
 
 console.log("- Compaction focus preservation & TUI toast -");
 let toasts: unknown[] = [];
@@ -610,6 +629,12 @@ mkdirSync(externalRepoWithMeta);
 spawnSync("git", ["init", "-b", "feat/external"], { cwd: externalRepoWithMeta });
 check("quoted git -C path with shell separator cannot hide external write", blocked(await shell(`git -C "${externalRepoWithMeta}" commit -m test`)));
 rmSync(resolve(externalRepoWithMeta, ".."), { recursive: true, force: true });
+
+// GIT_DIR / GIT_WORK_TREE env assignment cannot escape the workspace boundary
+check("GIT_DIR prefix to external repository is blocked for writes", blocked(await shell(`GIT_DIR=${externalRepo}/.git git commit -m test`)));
+check("env GIT_DIR prefix to external repository is blocked for writes", blocked(await shell(`env GIT_DIR=${externalRepo}/.git git commit -m test`)));
+check("GIT_DIR prefix push to external repository is blocked", blocked(await shell(`GIT_DIR=${externalRepo}/.git git push origin feat/external`)));
+
 rmSync(externalRepo, { recursive: true, force: true });
 
 // 5. Verification isolation and privilege checks
@@ -829,6 +854,16 @@ check("python -c destructive command is blocked", blocked(await shell('python3 -
 check("python -c rm -rf / is blocked", blocked(await shell('python -c "import os; os.system(\'rm -rf /\')"' )));
 check("node -e destructive command is blocked", blocked(await shell('node -e "require(\'child_process\').execSync(\'terraform destroy\')"' )));
 check("python -c benign script is allowed", !(await shell('python3 -c "print(\'hello world\')"' )));
+
+// Policy 18 secret-read and boundary-escape regression checks
+check("extractInterpreterPayload extracts bash -c", extractInterpreterPayload('bash -c "echo hi"').length > 0);
+check("python -c reading .env is blocked", blocked(await shell('python3 -c "print(open(\'.env\').read())"')));
+check("python -c reading .env.example (safe fixture) is allowed", !(await shell('python3 -c "print(open(\'.env.example\').read())"')));
+check("bash -c reading id_rsa is blocked", blocked(await shell("bash -c 'cat ~/.ssh/id_rsa'")));
+check("bash -c benign cat is allowed", !(await shell("bash -c 'cat src/index.ts'")));
+check("node -e writeFileSync outside workspace is blocked", blocked(await shell('node -e "require(\'fs\').writeFileSync(\'/tmp/wg-outside-interp\', \'x\')"' )));
+check("node -e writeFileSync within workspace is allowed", !(await shell('node -e "require(\'fs\').writeFileSync(\'src/local.txt\', \'x\')"' )));
+check("bash -c redirect outside workspace is blocked", blocked(await shell("bash -c 'echo pwned > /tmp/wg-outside-interp'")));
 
 const b64Destructive = Buffer.from("kubectl delete pod foo").toString("base64");
 check("base64 pipe destructive command is blocked", blocked(await shell(`echo "${b64Destructive}" | base64 -d | sh`)));

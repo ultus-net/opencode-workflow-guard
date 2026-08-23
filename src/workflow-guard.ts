@@ -201,8 +201,12 @@ import { isSecretPath, secretIn, secretFileReadIn, isEnvFilePath, generateMasked
 
 export { isSecretPath, isEnvFilePath, generateMaskedEnvSchema };
 
-import { extractInterpreterPayload } from "./policies/interpreter.ts";
-export { extractInterpreterPayload };
+import {
+	extractInterpreterPayload,
+	secretPathInPayload,
+	outsideWritePathInPayload,
+} from "./policies/interpreter.ts";
+export { extractInterpreterPayload, secretPathInPayload, outsideWritePathInPayload };
 
 import { branchHasDocumentationChange } from "./policies/docs.ts";
 export { branchHasDocumentationChange };
@@ -610,8 +614,18 @@ async function guardToolCallImpl(
 		}
 
 		// ── Policy 18: interpreter inline evasion scanner ──
-		if (!allowLive) {
-			for (const payload of extractInterpreterPayload(command)) {
+		for (const payload of extractInterpreterPayload(command)) {
+			// Workspace boundary check inside inline interpreter payloads has no
+			// allow-live override (same invariant as file redirects).
+			const outsidePath = outsideWritePathInPayload(payload, currentRoot);
+			if (outsidePath) {
+				logBlock(
+					`[workflow-guard] blocked interpreter payload writing outside workspace: ${outsidePath}`,
+				);
+				return `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`;
+			}
+
+			if (!allowLive) {
 				const normPayload = normalizeGitCommands(normalize(payload));
 				const liveCheck = liveMutationIn(normPayload);
 				if (liveCheck) {
@@ -625,6 +639,16 @@ async function guardToolCallImpl(
 						`[workflow-guard] blocked interpreter payload with settings tamper`,
 					);
 					return PROTECTED_PATH_REASON;
+				}
+				const secretPath = secretPathInPayload(payload);
+				if (secretPath) {
+					logBlock(
+						`[workflow-guard] blocked interpreter payload accessing secret file: ${secretPath}`,
+					);
+					return (
+						`Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted. ` +
+						"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
+					);
 				}
 			}
 		}
