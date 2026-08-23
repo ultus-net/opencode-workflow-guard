@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.3.3
+
+### Patch Changes
+
+- 6e7373f: Fix release workflow git tag push & GitHub Releases generation, and exempt automated changeset release PRs from changelog gate.
+- 7c4cfe6: Security hardening and parser fixes:
+    - Catch global option flags before subcommands in `SETTINGS_TAMPER_PATTERNS` (`opencode --dir . auth ...`)
+    - Target-specific destination extraction in `outsideWritePathInPayload` avoiding false positives on data payloads containing path strings
+    - Strip comments and trailing commas in `loadProjectConfig` so `.jsonc` configuration files parse reliably
+
 ## 1.3.2
 
 ### Patch Changes
