@@ -19,7 +19,7 @@ npm test            # runs node test.mts (Node >= 22.18) or bun test.mts
 ```
 
 ### 3. Live OpenCode Runtime & Install Tests
-Spawns an isolated temporary workspace, copies `workflow-guard.ts` into `.opencode/plugins/`, and runs live `opencode run` sessions to verify that OpenCode's real runtime loader discovers, loads, and executes the plugin hooks:
+Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies `workflow-guard.ts` plus `lib/` and `policies/` into `.opencode/plugins/` and runs live `opencode run` sessions to verify that OpenCode's real runtime loader discovers, loads, and executes the plugin hooks:
 ```bash
 npm run test:install # runs node test-e2e.mts
 ```
@@ -47,5 +47,7 @@ npm run test:all
 | **Policy 8: Workspace Boundary** | Verifies path traversal (`../`), symlinks, and absolute path escape protection in `edit`, `write`, `apply_patch`, and shell mutations. |
 | **Policy 10: Evidence Verification** | Verifies isolated verification execution, timeout handling, scrubbed environment, and finalization gating on fresh passing tests. |
 | **Adversarial Invariants** | Verifies defense against compound shell mutations, symlink escapes, chained git normalization, verify script abuse, and external repo mutations. |
-| **Compaction & TUI Feedback** | Verifies active task injection in `experimental.session.compacting` and clean error propagation. |
-| **Export Shape & Loader Contract** | Verifies V1 `PluginModule` `{ id, server }` structure and `output.args` hook contract. |
+| **Audit & Permission Events** | Verifies the typed `permission.ask` hook, permission replies, and command journaling in the audit trail. |
+| **Compaction & TUI Feedback** | Verifies active task injection in `experimental.session.compacting`, session-scoped dynamic last-block badge state, guard-only toast sourcing, and clean error propagation. |
+| **Runtime Instance Isolation** | Verifies concurrent plugin instances keep workspace root and SDK client state isolated via `runWithRuntimeState`. |
+| **Modular Exports & Shape** | Verifies V1 `PluginModule` `{ id, server }` structure, modular policy imports, and `output.args` hook contract. |

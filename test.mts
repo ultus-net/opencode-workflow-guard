@@ -32,7 +32,7 @@ import {
 	isDocumentationRequired,
 	default as defaultExport,
 } from "./workflow-guard.ts";
-import { WorkflowGuardTui } from "./workflow-guard-ui.ts";
+import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "./workflow-guard-ui.ts";
 
 let pass = 0;
 let fail = 0;
@@ -966,6 +966,135 @@ delete process.env.WORKFLOW_GUARD_REQUIRE_DOCS;
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);
+
+// 15. Permission Hook Auditing
+console.log("- Permission Hook Auditing -");
+const pluginInst = await WorkflowGuard({
+	directory: root,
+	worktree: root,
+	client: fakeClient as any,
+} as any);
+
+check("plugin registers typed permission.ask hook", typeof pluginInst["permission.ask"] === "function");
+await pluginInst["permission.ask"]?.(
+	{
+		id: "perm-1",
+		sessionID: "s-perm-test",
+		type: "bash",
+		pattern: "ls *",
+		title: "Run shell command",
+		metadata: {},
+		time: { created: Date.now() },
+	} as any,
+	{ status: "ask" },
+);
+
+const auditEntries = getRecentAuditEntries(5);
+const askedEntry = auditEntries.find((e) => e.tool === "permission.ask");
+check("permission.ask hook is journaled to audit log", askedEntry !== undefined);
+check("permission.ask audit preserves ask status", (askedEntry?.input as any)?.status === "ask");
+
+await pluginInst.event?.({
+	event: {
+		type: "permission.replied",
+		properties: { sessionID: "s-perm-test", permissionID: "perm-1", response: "reject" },
+	},
+} as any);
+const repliedEntry = getRecentAuditEntries(5).find((e) => e.tool === "permission.replied");
+check("permission reply audit preserves rejection", (repliedEntry?.input as any)?.response === "reject");
+
+// Block logging must survive the modularization refactor.
+const appLogs: any[] = [];
+const loggingPlugin = await WorkflowGuard({
+	directory: root,
+	worktree: root,
+	client: {
+		...fakeClient,
+		app: { log: async (entry: any) => appLogs.push(entry) },
+	} as any,
+} as any);
+todo("s-log-block");
+try {
+	await loggingPlugin["tool.execute.before"]?.(
+		{ tool: "write", sessionID: "s-log-block", callID: "call-log" } as any,
+		{ args: { filePath: join(root, "blocked.ts"), content: "x" } } as any,
+	);
+} catch {}
+check(
+	"blocked tool call writes warning to app log",
+	appLogs.some((entry) => entry?.body?.level === "warn" && String(entry?.body?.message).includes("blocked write")),
+);
+
+const activeClient = {
+	session: {
+		todo: async () => ({ data: [item("isolated", "pending")] }),
+		get: async () => ({ data: {} }),
+	},
+};
+const emptyClient = {
+	session: {
+		todo: async () => ({ data: [] }),
+		get: async () => ({ data: {} }),
+	},
+};
+const activeInstance = await WorkflowGuard({ directory: root, worktree: root, client: activeClient as any } as any);
+const emptyInstance = await WorkflowGuard({ directory: root, worktree: root, client: emptyClient as any } as any);
+let activeInstanceBlocked = false;
+try {
+	await activeInstance["tool.execute.before"]?.(
+		{ tool: "write", sessionID: "same-session", callID: "active" } as any,
+		{ args: { filePath: join(root, "isolated-a.ts"), content: "x" } } as any,
+	);
+} catch {
+	activeInstanceBlocked = true;
+}
+let emptyInstanceBlocked = false;
+try {
+	await emptyInstance["tool.execute.before"]?.(
+		{ tool: "write", sessionID: "same-session", callID: "empty" } as any,
+		{ args: { filePath: join(root, "isolated-b.ts"), content: "x" } } as any,
+	);
+} catch {
+	emptyInstanceBlocked = true;
+}
+check("plugin instances keep SDK client state isolated", !activeInstanceBlocked && emptyInstanceBlocked);
+
+// 16. TUI Status Badge with Dynamic Last-Block Feedback
+console.log("- TUI Companion Status Badge -");
+let tuiSlots: Record<string, () => any> | undefined;
+let toastHandler: ((event: any) => void) | undefined;
+const fakeTuiBadgeApi = {
+	theme: { current: { success: "green", warning: "yellow", error: "red" } },
+	route: { current: { name: "session", params: { sessionID: "s-badge" } } },
+	event: {
+		on(type: string, handler: (event: any) => void) {
+			if (type === "tui.toast.show") toastHandler = handler;
+			return () => {};
+		},
+	},
+	slots: {
+		register(cfg: any) {
+			tuiSlots = cfg.slots;
+		},
+	},
+};
+await WorkflowGuardTui(fakeTuiBadgeApi as any, undefined, {} as any);
+check("tui registers slots with dynamic badge handlers", typeof tuiSlots?.home_prompt_right === "function");
+
+setLastBlockedReasonForTesting(undefined);
+const activeBadge = formatBadge();
+check("TUI badge renders Active text when no block", activeBadge.text.includes("Workflow Guard: Active") && !activeBadge.isBlocked);
+
+setLastBlockedReasonForTesting("[workflow-guard] blocked edit: on protected branch main");
+const blockedBadge = formatBadge();
+check("TUI badge renders Blocked status when block occurs", blockedBadge.text.includes("Workflow Guard: Blocked:") && blockedBadge.isBlocked);
+setLastBlockedReasonForTesting(undefined);
+toastHandler?.({ properties: { title: "Other Plugin", message: "Blocked: unrelated" } });
+check("TUI ignores unrelated blocked toasts", !formatBadge("s-badge").isBlocked);
+toastHandler?.({ properties: { title: "Workflow Guard Blocked", message: "Blocked: protected branch" } });
+check("TUI associates guard toast with current session", formatBadge("s-badge").isBlocked);
+check("TUI does not leak session block to another session", !formatBadge("s-other").isBlocked);
+setLastBlockedReasonForTesting(undefined);
 
 rmSync(conflictRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);

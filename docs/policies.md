@@ -65,7 +65,8 @@
 ### 10. Evidence-Based Verification
 - When the agent attempts to mark **every** task completed (finalizing the request), the guard requires passing verification evidence.
 - Verification (`WORKFLOW_GUARD_VERIFY` env, project `verifyCommand`, or auto-detected `npm test` from `package.json`) executes in an isolated environment with scrubbed credentials, output caps, and strict timeout protection. Environment configuration takes precedence over project configuration.
-- If edits occurred after the previous verification run, fresh verification is executed. If verification fails, finalization is blocked with the error output tail.
+- If edits occurred after the previous verification run, fresh verification is executed. If verification fails, finalization is blocked with detailed error output.
+- OpenCode's current `lsp.client.diagnostics` event identifies the server and path but does not expose the diagnostics themselves, so the guard deliberately does not claim an LSP-clean finalization gate until the SDK provides a supported diagnostics source.
 - The verify command is **disabled** when `WORKFLOW_GUARD_VERIFY` is empty (`""`).
 
 ### 11. Secret-Content Scan
@@ -79,15 +80,16 @@
 ### 13. Command-Channel Audit
 - User-triggered slash commands (`command.executed` events) are journaled to the audit trail so agents cannot perform hidden work through a user-facing side channel.
 
-### 14. Audit Trail
-- Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with a timestamp, session id, tool name, decision, and reason - a durable record.
+### 14. Audit Trail & Permission Journaling
+- Every block/allow decision and permission lifecycle observation (`permission.ask` hook, `permission.updated`, `permission.replied`, `command.executed`, `session.created`) is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with timestamp, session ID, tool name, decision, and payload summary - a durable record.
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
 ### 15. Compaction Focus Preservation
 - Integrates with OpenCode's `experimental.session.compacting` hook to inject the active sequential task list into `output.context` before context summarization, ensuring the model retains its plan across long sessions.
 
-### 16. TUI Visual Feedback
+### 16. TUI Visual Feedback & Dynamic Last-Block Status
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.
+- The companion TUI plugin (`workflow-guard-ui.ts`) dynamically reflects the latest guard state in the prompt bar, displaying `🛡️ [Workflow Guard: Active]` during normal operation and `🛡️ [Workflow Guard: Blocked: <reason>]` when an action is intercepted. Blocked state is scoped to the session that triggered it and sourced only from guard-originated toasts.
 
 ### 17. Secret-File READ Block
 - Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool or shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`).
@@ -124,7 +126,7 @@ There is **deliberately no in-command override** (no `# allow-live` marker): an 
 
 ## Known Limits (Defense in Depth)
 
-These guards match on command and file strings. An agent that base64-encodes a payload, invokes an interpreter directly (`python3 -c ...`), or uses exotic shell redirection can evade pattern matching. This plugin is a **deterrent against forgetful or complacent agents**, not a sandbox. Pair it with:
+These guards match on command strings, file structures, and interpreter payloads (including base64 pipeline decoding and inline eval scans under Policy 18). While inline scripts are decoded and analyzed, compiled binaries or multi-stage external downloads require OS-level sandboxing. This plugin is a **hardened deterrent against forgetful, complacent, or prompt-injected agents**, not an OS kernel sandbox. Pair it with:
 - GitHub branch protection/rulesets server-side
 - OS-level workspace isolation (containers, read-only mounts)
 

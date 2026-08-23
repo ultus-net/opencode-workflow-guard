@@ -13,27 +13,39 @@
 
 ## Installation Methods
 
-### 1. Server Plugin (Tool Gates, Task Lifecycle & Security)
+### Option A: npm Package (Recommended)
 
-Install the core server plugin into your plugin directory:
+Add `opencode-workflow-guard` directly to your project or global OpenCode configuration:
 
-```bash
-# Global (all projects)
-mkdir -p ~/.config/opencode/plugins
-cp workflow-guard.ts ~/.config/opencode/plugins/
-
-# Project-level (per repo)
-mkdir -p .opencode/plugins
-cp workflow-guard.ts .opencode/plugins/
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "opencode-workflow-guard"
+  ]
+}
 ```
 
-Files in `.opencode/plugins/` and `~/.config/opencode/plugins/` are automatically loaded by the OpenCode server process at startup.
+OpenCode automatically resolves the plugin package and all internal policy modules.
+
+---
+
+### Option B: Local Plugin Copy
+
+Place `workflow-guard.ts`, `lib/`, and `policies/` into your OpenCode plugins folder:
+
+```bash
+# Copy into your plugins directory (e.g. ./opencode-plugins/ or your configured plugin path)
+cp -r workflow-guard.ts lib policies /path/to/opencode-plugins/
+```
+
+Files in your plugin directory are automatically loaded by the OpenCode server process at startup.
 
 ---
 
 ### 2. TUI Visual Indicator (Prompt Box Badge)
 
-To enable the persistent `🛡️ [Workflow Guard: Active]` badge inside the prompt input bar:
+To enable the dynamic prompt-bar badge - `🛡️ [Workflow Guard: Active]` during normal operation, switching to `🛡️ [Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
 1. Place `workflow-guard-ui.tsx` in your config directory (outside `plugins/`):
 ```bash

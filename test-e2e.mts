@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync, existsSync, readFileSync, copyFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, copyFileSync, cpSync, mkdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,12 +21,33 @@ console.log(`  Found OpenCode version: ${opencodeCheck.stdout.trim()}`);
 
 // 2. Set up a fresh isolated project with plugin installed
 const testDir = mkdtempSync(join(tmpdir(), "wg-install-test-"));
+
+// Verify the publish artifact resolves its modular entrypoint, not only the
+// checkout/local-copy layout used by the live plugin test below.
+const packResult = spawnSync("npm", ["pack", "--pack-destination", testDir], {
+	cwd: import.meta.dirname,
+	encoding: "utf8",
+});
+const tarballName = packResult.stdout.trim().split("\n").at(-1) ?? "";
+const tarballPath = join(testDir, tarballName);
+const installResult = spawnSync("npm", ["install", "--ignore-scripts", tarballPath], {
+	cwd: testDir,
+	encoding: "utf8",
+});
+const packageEntry = join(testDir, "node_modules", "opencode-workflow-guard", "workflow-guard.ts");
+check(
+	"npm tarball installs modular plugin entrypoint",
+	packResult.status === 0 && installResult.status === 0 && existsSync(packageEntry),
+);
+
 const pluginsDir = join(testDir, ".opencode", "plugins");
 mkdirSync(pluginsDir, { recursive: true });
 
 const sourcePlugin = join(import.meta.dirname, "workflow-guard.ts");
 const targetPlugin = join(pluginsDir, "workflow-guard.ts");
 copyFileSync(sourcePlugin, targetPlugin);
+cpSync(join(import.meta.dirname, "lib"), join(pluginsDir, "lib"), { recursive: true });
+cpSync(join(import.meta.dirname, "policies"), join(pluginsDir, "policies"), { recursive: true });
 check("plugin copied to .opencode/plugins/ successfully", existsSync(targetPlugin));
 
 // Initialize git repository on a feature branch

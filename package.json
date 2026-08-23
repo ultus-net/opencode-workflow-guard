@@ -8,9 +8,12 @@
     "type": "git",
     "url": "https://github.com/ultus-net/opencode-workflow-guard.git"
   },
+  "main": "workflow-guard.ts",
   "files": [
     "workflow-guard.ts",
     "workflow-guard-ui.ts",
+    "lib",
+    "policies",
     "README.md",
     "LICENSE"
   ],

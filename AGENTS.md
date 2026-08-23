@@ -1,10 +1,12 @@
 # Repository Guide
 
 ## Where Behavior Lives
-- `workflow-guard.ts` is the server plugin and policy implementation. Keep its default export in V1 `PluginModule` form: `{ id: "workflow-guard", server: WorkflowGuard }`. OpenCode 1.18+ can misinterpret a bare default plugin function when named helper exports are present.
+- `workflow-guard.ts` is the server plugin entrypoint and orchestrator: it imports policy modules from `policies/` and engine services from `lib/`, then re-exports the public helper surface for tests. Keep its default export in V1 `PluginModule` form: `{ id: "workflow-guard", server: WorkflowGuard }`. OpenCode 1.18+ can misinterpret a bare default plugin function when named helper exports are present.
+- `policies/` holds the per-policy implementations (`todo`, `git`, `changelog`, `destructive`, `mcp`, `tamper`, `boundary`, `secrets`, `interpreter`, `docs`). Add new policies as new modules here, not inline in `workflow-guard.ts`.
+- `lib/` holds shared engine services: `state` (runtime state + AsyncLocalStorage), `utils`, `audit`, `verify`, `review`, `types`. Policy modules must read runtime context via these getters, never module-level captures.
 - `workflow-guard-ui.ts` is the optional TUI companion; it is installed separately from the server plugin.
 - `test.mts` is an executable in-memory/adversarial harness, not a framework suite. It has no per-test CLI filter; add a focused regression check and run `npm test`.
-- `test-e2e.mts` launches real `opencode run` sessions in a temporary project. It skips successfully when `opencode` is absent from `PATH`, so a CI-green E2E job does not prove the live loader ran unless the binary was present.
+- `test-e2e.mts` packs the npm tarball, installs it into an isolated project, copies the plugin (with `lib/` and `policies/`) into `.opencode/plugins/`, and launches real `opencode run` sessions. It skips successfully when `opencode` is absent from `PATH`, so a CI-green E2E job does not prove the live loader ran unless the binary was present.
 
 ## Verification
 - Use Node 22+ locally. CI runs unit tests on Node 22 and 24; `docs/testing.md` documents Node >=22.18 for `test.mts`.
@@ -19,6 +21,10 @@
 - Existing secret/protected-path checks are symlink-aware. Preserve ancestor resolution for new files through symlinked directories; checking only the lexical or final existing path reopens bypasses.
 - `WORKFLOW_GUARD_ALLOW_LIVE=1`, set before OpenCode starts, is the only live-system override. Do not reintroduce an in-command `# allow-live` escape.
 - Project `.opencode/workflow-guard.json[c]` may configure `protectedBranches`, `verifyCommand`, `requireReview`, and `requireDocumentation`; behavior changes must honor these in addition to environment overrides/defaults.
+- Per-invocation runtime context (workspace root, SDK client, project config) flows through `runWithRuntimeState` (AsyncLocalStorage) in `lib/state.ts`. Verification/review evidence maps in `lib/state.ts` are process-global by design so subagent sessions share freshness with parents; do not "fix" that without a dedicated design discussion.
+- Permission prompts must be journaled via the typed `"permission.ask"` plugin hook. There is no `permission.asked` event in the V1 SDK `Event` union (only `permission.updated`/`permission.replied`); tests must not fabricate unsupported event types with `as any`.
+- There is deliberately no LSP-diagnostics finalization gate: the V1 `lsp.client.diagnostics` event carries only `{serverID, path}` metadata, not diagnostics. Do not reintroduce the gate until the SDK exposes a supported diagnostics source.
+- Block reasons must keep flowing to `client.app.log()` at warn level via `logBlock` (the modularization accidentally no-op'd it once); toasts via `tui.showToast` are for the TUI, app logs are for the durable in-app trail.
 
 ## PR And Release Gates
 - Every non-Dependabot PR must modify `CHANGELOG.md`; CI checks this independently of the plugin's PR-body `Changelog:` policy.

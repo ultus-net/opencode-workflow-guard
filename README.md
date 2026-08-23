@@ -10,11 +10,13 @@ This plugin integrates with **OpenCode's native todo system** (`todowrite` / `GE
 
 ```
 opencode-workflow-guard/
-├── workflow-guard.ts          # Core server plugin (tool hooks, task gate, guardrails)
-├── workflow-guard-ui.ts       # Visual TUI companion (registers status indicator)
+├── workflow-guard.ts          # Core server plugin (tool hooks, orchestrator)
+├── workflow-guard-ui.ts       # Visual TUI companion (dynamic status badge & toasts)
+├── lib/                       # Core engine services (state, verify, review, audit)
+├── policies/                  # Modular policy implementations (1–21)
 ├── package.json               # Package configuration & test scripts
 ├── tsconfig.json              # Strict TypeScript configuration
-├── test.mts                   # In-memory unit tests
+├── test.mts                   # In-memory unit & adversarial tests
 ├── test-e2e.mts               # Live OpenCode runtime & install tests
 └── docs/                      # Detailed documentation
     ├── installation.md        # Complete install options & companion permissions
@@ -38,13 +40,13 @@ opencode-workflow-guard/
 | **7** | **Feature-Branch Workflow** | On `main`/`master`, edits and history-changing git commands (`commit`, `merge`, `rebase`, `update-ref`, `filter-branch`, `branch -D`, ...) are blocked until a feature branch is created. Git `-C`/`--git-dir` are parsed so the correct repo's branch is checked. |
 | **8** | **Workspace Boundary Guard** | Blocks file tools (`edit`, `write`, `apply_patch`) **and** common shell mutations (redirection `>`, `tee`, `sed -i`, `cp`/`mv`, `touch`, `mkdir`, `rm`, `ln`, `git apply`) from escaping the workspace root via `../` path traversal or symlinks. External repository git writes are also confined. |
 | **9** | **Script-Laundering Guard** | Content written via `edit`/`write`/`apply_patch` is scanned for destructive patterns, so `write deploy.sh` -> `bash deploy.sh` cannot smuggle blocked commands. |
-| **10** | **Evidence-Based Verification** | Runs `WORKFLOW_GUARD_VERIFY`, project `verifyCommand`, or auto-detected `npm test` in an isolated, scrubbed environment with timeout controls. Blocks final "all done" completion until fresh passing verification evidence is recorded after the latest mutation in that session. |
+| **10** | **Evidence-Based Verification** | Runs `WORKFLOW_GUARD_VERIFY`, project `verifyCommand`, or auto-detected `npm test` in an isolated, scrubbed environment with timeout controls. Blocks final "all done" completion until fresh passing verification evidence is recorded. |
 | **11** | **Secret-Content Scan** | Blocks edit payloads and recognized shell file mutations containing AWS keys, private keys, GitHub tokens, LLM keys, Google/Slack tokens, or env-style assignments. |
 | **12** | **Shell Env Scrub** | Sensitive vars (`AWS_*`, `OPENAI*`, `KUBE*`, `GH_/GITHUB_*`, etc.) are emptied in agent shells via `shell.env`; the agent cannot carry live credentials by default. |
 | **13** | **Command-Channel Audit** | Slash commands (`command.executed`) are journaled to the audit file so agents cannot run hidden work through user-facing channels. |
-| **14** | **Audit Trail** | Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (durable). |
+| **14** | **Audit Trail & Permission Journal** | Every block/allow decision plus permission requests/replies (`permission.ask`, `permission.updated`, `permission.replied`) is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (durable). |
 | **15** | **Compaction Focus Hook** | Injects the active sequential task list into `experimental.session.compacting` context. |
-| **16** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers status indicator feedback in the OpenCode interface and emits toasts on blocked actions. |
+| **16** | **TUI Visual Feedback** | Companion TUI plugin (`workflow-guard-ui.ts`) registers dynamic status indicator feedback in the OpenCode interface (`Active` / `Blocked: <reason>`) and emits toasts on blocked actions. |
 | **17** | **Secret-File Read Block** | Blocks reading `.env*`, `*.pem`, `*.key`, `id_rsa`, `id_ed25519`, `kubeconfig`, `credentials.json`, or service account keys via the `read` tool or shell commands (`cat`, `less`, `grep`). Safe templates (`.env.example`) remain readable. |
 | **18** | **Interpreter Inline Evasion** | Decodes and scans inline interpreter scripts (`python -c`, `node -e`, `perl -e`, `ruby -e`, `powershell -enc`, `base64 | sh`) for destructive commands or settings tampering. |
 | **19** | **Conflict-Free Pre-Flight** | Verifies via `git merge-tree` that the branch has zero merge conflicts with the base branch (`origin/main`) before allowing PR creation or final task handoff. |
@@ -72,17 +74,17 @@ Add to your project's `opencode.json` or global `~/.config/opencode/opencode.jso
 
 ### Option B: Local Plugin Copy
 
-```bash
-# Server plugin - global example
-mkdir -p ~/.config/opencode/plugins
-cp workflow-guard.ts ~/.config/opencode/plugins/
+The server plugin is modular - copy the entrypoint **plus** its `lib/` and `policies/` directories into your OpenCode plugins folder (global or project-level):
 
-# Optional TUI badge (do NOT put this in plugins/)
-mkdir -p ~/.config/opencode/ui
-cp workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
+```bash
+# Server plugin (plugins folder is auto-loaded at startup)
+cp -r workflow-guard.ts lib policies /path/to/opencode-plugins/
+
+# Optional TUI badge (do NOT put this in the server plugins folder)
+cp workflow-guard-ui.ts /path/to/opencode-ui/workflow-guard-ui.tsx
 ```
 
-Then add `~/.config/opencode/tui.json`:
+Then reference the badge in `~/.config/opencode/tui.json`:
 
 ```json
 {

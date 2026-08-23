@@ -1,0 +1,234 @@
+import { realpathSync } from "node:fs";
+import { resolve } from "node:path";
+import type { ShellMutation } from "../lib/types.ts";
+import {
+	getWorkspaceRoot,
+	getWorkspaceRootReal,
+	recordMutation,
+} from "../lib/state.ts";
+import { shellWords, unwrapShellCommand } from "../lib/utils.ts";
+import { isProtectedPath, PROTECTED_PATH_REASON } from "./tamper.ts";
+import { isSecretPath, secretIn } from "./secrets.ts";
+import { onProtectedBranch, branchGuardReason } from "./git.ts";
+import {
+	effectiveTodos,
+	effectiveTodoOwnerSessionID,
+	hasActiveTodo,
+} from "./todo.ts";
+
+export function isPathOutsideWorkspace(targetPath: string, root: string): boolean {
+	if (!targetPath) return false;
+	const resolved = resolve(root, targetPath);
+	const normalizedRoot = root.endsWith("/") ? root : root + "/";
+	if (resolved !== root && !resolved.startsWith(normalizedRoot)) {
+		return true;
+	}
+	const realRootVal = getWorkspaceRootReal();
+	try {
+		const real = realpathSync(resolved);
+		const realRoot = realRootVal.endsWith("/") ? realRootVal : realRootVal + "/";
+		if (real !== realRootVal && !real.startsWith(realRoot)) {
+			return true;
+		}
+	} catch {
+		let curr = resolved;
+		while (curr && curr !== "/" && curr !== ".") {
+			const parent = resolve(curr, "..");
+			if (parent === curr) break;
+			curr = parent;
+			try {
+				const realParent = realpathSync(curr);
+				const realRoot = realRootVal.endsWith("/") ? realRootVal : realRootVal + "/";
+				if (realParent !== realRootVal && !realParent.startsWith(realRoot)) {
+					return true;
+				}
+				break;
+			} catch {}
+		}
+	}
+	return false;
+}
+
+export function extractPatchPaths(patchText: string): string[] {
+	const paths: string[] = [];
+	const markerRe =
+		/^\*\*\*\s+(?:Add File|Update File|Delete File|Move to|Move from):\s*(\S+)/gm;
+	let match: RegExpExecArray | null;
+	while ((match = markerRe.exec(patchText)) !== null) {
+		if (match[1]) paths.push(match[1]);
+	}
+	const diffRe = /^(?:---|\+\+\+)\s+(?:[ab]\/)?(\S+)/gm;
+	while ((match = diffRe.exec(patchText)) !== null) {
+		if (match[1] && match[1] !== "/dev/null") paths.push(match[1]);
+	}
+	return paths;
+}
+
+export function shellMutationIn(segment: string): ShellMutation | undefined {
+	const redirectMatch = segment.match(
+		/(?:^|\s|>)(?:[0-9]*>>?)\s*["']?([^\s>&|;"']+)/,
+	);
+	if (redirectMatch?.[1]) {
+		if (/^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(redirectMatch[1])) {
+			return undefined;
+		}
+		return {
+			kind: "redirect",
+			target: redirectMatch[1],
+			what: `file redirect to '${redirectMatch[1]}'`,
+		};
+	}
+	const teeMatch = segment.match(/\btee\s+(?:-a\s+)?["']?([^\s;&|"']+)/);
+	if (teeMatch?.[1]) {
+		return {
+			kind: "command",
+			target: teeMatch[1],
+			what: `tee to '${teeMatch[1]}'`,
+		};
+	}
+	const sedMatch = segment.match(/\bsed\s+(?:-(?:[a-zA-Z]*i[a-zA-Z]*|i\S*)\s+)+[^\s;&|]+/);
+	if (sedMatch) {
+		const tokens = sedMatch[0]!.split(/\s+/);
+		const target = tokens[tokens.length - 1];
+		return { kind: "command", target, what: `sed -i on '${target}'` };
+	}
+	const transfer = filesystemTransferInfo(segment);
+	if (transfer?.destination) {
+		return {
+			kind: "command",
+			target: transfer.destination,
+			what: `copy/move/link to '${transfer.destination}'`,
+		};
+	}
+	const fsMutationMatch = segment.match(
+		/\b(?:touch|mkdir|rm|unlink|rmdir|ln)\b[^|;&]*\s+["']?([^\s;&|"']+)["']?\s*$/,
+	);
+	if (fsMutationMatch?.[1] && !fsMutationMatch[1].startsWith("-")) {
+		return {
+			kind: "command",
+			target: fsMutationMatch[1],
+			what: `filesystem mutation of '${fsMutationMatch[1]}'`,
+		};
+	}
+	const copyMatch = segment.match(
+		/\b(?:cp|mv|rsync|install|cpio|scp|wget|curl)\b[^|;&]*?(-o\s+)?(["']?)([^\s;&|"']+)\2?\s*$/,
+	);
+	if (copyMatch?.[3] && /\b(?:cp|mv|rsync|install)\b/.test(segment)) {
+		return {
+			kind: "command",
+			target: copyMatch[3],
+			what: `copy/move to '${copyMatch[3]}'`,
+		};
+	}
+	if (/\bgit\s+(?:apply|am)\b/.test(segment)) {
+		return { kind: "command", what: "git apply/am (patch via shell)" };
+	}
+	return undefined;
+}
+
+export function simpleFilesystemMutations(segment: string): ShellMutation[] {
+	const words = shellWords(unwrapShellCommand(segment));
+	const command = words[0];
+	if (!command || !new Set(["touch", "mkdir", "rm", "unlink", "rmdir"]).has(command)) {
+		return [];
+	}
+	return words
+		.slice(1)
+		.filter((word) => !word.startsWith("-"))
+		.map((target) => ({
+			kind: "command" as const,
+			target,
+			what: `filesystem mutation of '${target}'`,
+		}));
+}
+
+export function filesystemTransferInfo(
+	segment: string,
+): { sources: string[]; destination?: string } | undefined {
+	const words = shellWords(unwrapShellCommand(segment));
+	if (!words[0] || !new Set(["cp", "mv", "ln"]).has(words[0])) return undefined;
+	const operands: string[] = [];
+	let targetDirectory: string | undefined;
+	for (let i = 1; i < words.length; i++) {
+		const word = words[i]!;
+		if (word === "-t" || word === "--target-directory") {
+			targetDirectory = words[++i];
+			continue;
+		}
+		if (word.startsWith("--target-directory=")) {
+			targetDirectory = word.slice("--target-directory=".length);
+			continue;
+		}
+		if (word.startsWith("-")) continue;
+		operands.push(word);
+	}
+	if (targetDirectory) return { sources: operands, destination: targetDirectory };
+	return {
+		sources: operands.slice(0, -1),
+		destination: operands.at(-1),
+	};
+}
+
+export function secretSourceInFilesystemCommand(segment: string): string | undefined {
+	const transfer = filesystemTransferInfo(segment);
+	if (!transfer) return undefined;
+	for (const source of transfer.sources) {
+		if (isSecretPath(source)) return source;
+	}
+	return undefined;
+}
+
+export async function guardShellMutation(
+	command: string,
+	sessionID: string | undefined,
+): Promise<string | undefined> {
+	const root = getWorkspaceRoot();
+	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
+	let hasMutation = false;
+	for (const segment of command.split(/[\n|;&]+/)) {
+		const secretSource = secretSourceInFilesystemCommand(segment);
+		if (secretSource) {
+			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;
+		}
+		const simpleMutations = simpleFilesystemMutations(segment);
+		const fallbackMutation = shellMutationIn(segment.trim());
+		const mutations = simpleMutations.length > 0
+			? simpleMutations
+			: fallbackMutation
+				? [fallbackMutation]
+				: [];
+		for (const mutation of mutations) {
+			hasMutation = true;
+			const secret = secretIn(segment);
+			if (secret) {
+				return `Blocked: shell file mutation payload appears to contain a ${secret}. Secrets must not be written to disk from agent commands.`;
+			}
+			const target = mutation.target ?? "";
+			if (target && isProtectedPath(target)) {
+				return PROTECTED_PATH_REASON;
+			}
+			if (target && isPathOutsideWorkspace(target, root)) {
+				if (!allowLive) {
+					return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${root}). All changes must stay within the workspace.`;
+				}
+				continue;
+			}
+			if (onProtectedBranch(root)) {
+				return branchGuardReason();
+			}
+			const todos = await effectiveTodos(sessionID);
+			if (todos !== undefined && !hasActiveTodo(todos)) {
+				return (
+					"Blocked: shell file mutation with no active todo item. " +
+					"Break the request down with todowrite first, then apply " +
+					"changes (the same gates apply to shell redirects, tee, " +
+					"sed -i, cp/mv and git apply as to the edit tools)."
+				);
+			}
+		}
+	}
+	if (hasMutation) {
+		recordMutation(await effectiveTodoOwnerSessionID(sessionID));
+	}
+	return undefined;
+}

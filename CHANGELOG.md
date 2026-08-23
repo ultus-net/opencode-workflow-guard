@@ -5,6 +5,16 @@ All notable changes to `opencode-workflow-guard` will be documented in this file
 ## Unreleased
 
 ### Security & Correctness
+- **Permission Ask Hook Journaling (Policy 14).** Captures the typed `permission.ask` hook before a reply and preserves reply outcomes (including rejections) in the audit trail instead of labeling every permission event as allowed.
+- **LSP Contract Correction.** Removed the proposed LSP-clean finalization gate after verifying that OpenCode's current `lsp.client.diagnostics` event exposes only server/path metadata, not diagnostic errors. The plugin no longer makes an unenforceable LSP-clean claim.
+- **Block Logging Restoration.** Restored warning-level `client.app.log()` entries that were accidentally dropped during modularization.
+- **Runtime Instance Isolation.** Per-invocation workspace root, SDK client, and project config now flow through `runWithRuntimeState` (AsyncLocalStorage), so co-hosted plugin instances cannot read each other's runtime context.
+- **Audit Evidence Hygiene.** Removed the unused LSP evidence field from `AuditEntry` after dropping the unenforceable LSP gate.
+
+### Developer Experience
+- **Dynamic TUI Companion Status Badge (Policy 16).** `workflow-guard-ui.ts` now dynamically reflects the latest guard state (`Active` vs `Blocked: <reason>`) in prompt bar slots. Blocked state is session-scoped and sourced only from guard-originated toasts, so unrelated plugins cannot paint the badge.
+- **Modular Codebase Architecture.** Extracted monolithic guard policies into structured modules under `policies/` and engine services under `lib/`, cleanly imported into `workflow-guard.ts` with complete backward compatibility.
+- **npm Tarball E2E Coverage.** `test-e2e.mts` now packs and installs the publish artifact and verifies the modular entrypoint resolves, in addition to the existing live local-copy plugin-load checks.
 - Hardened PR detection for normal `gh` global-option forms and require an actual `Changelog:`/Changelog heading instead of accepting any mention of the word.
 - Made configured project `verifyCommand` effective and scoped verification freshness to the session that produced the mutation.
 - Invalidated review approval after new mutations, scoped tool-recorded reviews to their parent session/workspace, and rejected `record_review` self-approval from non-subagent sessions.
