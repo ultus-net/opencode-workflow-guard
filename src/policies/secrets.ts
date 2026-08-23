@@ -100,18 +100,43 @@ export function isEnvFilePath(targetPath: string): boolean {
 
 /**
  * Parses a raw .env file and returns a sanitized schema mask where variable
- * names and comment structures are preserved, but sensitive values are
- * redacted to '********'.
+ * names and comment structures are preserved, but sensitive values (including
+ * multiline secret continuations) are redacted to '********'.
  */
 export function generateMaskedEnvSchema(content: string): string {
 	const lines = content.split("\n");
+	let inMultilineQuote: string | null = null;
+
 	return lines
 		.map((line) => {
 			const trimmed = line.trim();
-			if (!trimmed || trimmed.startsWith("#")) return line;
+			if (!trimmed || trimmed.startsWith("#")) {
+				inMultilineQuote = null;
+				return line;
+			}
+
+			if (inMultilineQuote) {
+				if (trimmed.endsWith(inMultilineQuote) || trimmed.includes(inMultilineQuote)) {
+					inMultilineQuote = null;
+				}
+				return "********";
+			}
+
 			const eqIdx = line.indexOf("=");
-			if (eqIdx === -1) return line;
+			if (eqIdx === -1) {
+				return "********";
+			}
+
 			const key = line.slice(0, eqIdx);
+			const val = line.slice(eqIdx + 1).trim();
+
+			if (
+				(val.startsWith('"') && !val.slice(1).includes('"')) ||
+				(val.startsWith("'") && !val.slice(1).includes("'"))
+			) {
+				inMultilineQuote = val[0]!;
+			}
+
 			return `${key}=********`;
 		})
 		.join("\n");

@@ -215,13 +215,14 @@ import {
 	checkInteractiveTtyCommand,
 	checkPackageHygiene,
 	sendDesktopNotification,
+	escapeAppleScriptString,
 } from "./policies/shell-safety.ts";
 
 import { checkCompletionClaims } from "./policies/completion.ts";
 
 export { checkCompletionClaims };
 
-export { checkInteractiveTtyCommand, checkPackageHygiene, sendDesktopNotification };
+export { checkInteractiveTtyCommand, checkPackageHygiene, sendDesktopNotification, escapeAppleScriptString };
 
 const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
@@ -1017,14 +1018,20 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						.describe("Base ref to diff against (default: origin/main, origin/master, main)"),
 				},
 				execute: async (args) => {
-					const bases = args.base
-						? [args.base]
+					const sanitizedBase =
+						typeof args.base === "string" &&
+						!args.base.startsWith("-") &&
+						!/[\s;'"\0]/.test(args.base)
+							? args.base
+							: undefined;
+					const bases = sanitizedBase
+						? [sanitizedBase]
 						: ["origin/main", "origin/master", "main", "master"];
 					let diffText = "";
 					for (const base of bases) {
 						const res = spawnSync(
 							"git",
-							["diff", `${base}...HEAD`],
+							["diff", "--", `${base}...HEAD`],
 							{ cwd: getWorkspaceRoot(), encoding: "utf8", timeout: 10_000 },
 						);
 						if (res.status === 0 && res.stdout.trim()) {
@@ -1033,7 +1040,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						}
 					}
 					if (!diffText) {
-						const last = spawnSync("git", ["diff", "HEAD~1"], {
+						const last = spawnSync("git", ["diff", "--", "HEAD~1"], {
 							cwd: getWorkspaceRoot(),
 							encoding: "utf8",
 							timeout: 10_000,

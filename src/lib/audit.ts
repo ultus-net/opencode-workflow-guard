@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readSync, closeSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AuditEntry, VerifyResult } from "./types.ts";
@@ -46,13 +46,32 @@ export function loadVerifyCache(): VerifyResult | undefined {
 	return undefined;
 }
 
+/**
+ * Reads recent audit entries from the end of the JSONL audit log with a bounded
+ * buffer window to prevent memory spikes on long-lived installations.
+ */
 export function getRecentAuditEntries(limit = 10): AuditEntry[] {
 	try {
 		if (!existsSync(AUDIT_FILE)) return [];
-		const lines = readFileSync(AUDIT_FILE, "utf8").trim().split("\n");
+		const stat = statSync(AUDIT_FILE);
+		if (stat.size === 0) return [];
+
+		const maxBytesToRead = Math.min(stat.size, 65_536);
+		const buffer = Buffer.alloc(maxBytesToRead);
+		const fd = openSync(AUDIT_FILE, "r");
+		try {
+			readSync(fd, buffer, 0, maxBytesToRead, stat.size - maxBytesToRead);
+		} finally {
+			closeSync(fd);
+		}
+
+		const text = buffer.toString("utf8");
+		const lines = text.trim().split("\n");
+		const completeLines = maxBytesToRead < stat.size ? lines.slice(1) : lines;
+
 		const entries: AuditEntry[] = [];
-		for (let i = lines.length - 1; i >= 0 && entries.length < limit; i--) {
-			const line = lines[i]?.trim();
+		for (let i = completeLines.length - 1; i >= 0 && entries.length < limit; i--) {
+			const line = completeLines[i]?.trim();
 			if (line) {
 				try {
 					entries.push(JSON.parse(line));
