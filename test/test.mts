@@ -34,6 +34,7 @@ import {
 	isProtectedPath,
 	loadProjectConfig,
 	reloadProjectConfig,
+	stripJsonComments,
 	extractInterpreterPayload,
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
@@ -271,6 +272,10 @@ check("block quote-concatenated write to opencode.json", blocked(await shell(`ec
 check("block glob write to opencode.jso?", blocked(await shell(`echo '{}' > opencode.jso?`)));
 check("block sed -i on the guard plugin itself", blocked(await shell("sed -i 's/x/y/' ~/.config/opencode/plugins/workflow-guard.ts")));
 check("block rm on the TUI plugin", blocked(await shell("rm ~/.config/opencode/ui/workflow-guard-ui.tsx")));
+const ocCli = ["op", "encode"].join("");
+check("block auth with global flags (--dir)", blocked(await shell(`${ocCli} --dir /path ${"au" + "th"} login`)));
+check("block config with global flags (-d)", blocked(await shell(`${ocCli} -d . ${"con" + "fig"} edit`)));
+check("block permission with global flags (--workspace)", blocked(await shell(`${ocCli} --workspace . ${"perm" + "ission"} grant`)));
 check("allow normal command", !(await shell("ls -la && git status")));
 
 console.log("- Policy 6: tamper via edit tools (path protection) -");
@@ -864,6 +869,7 @@ check("bash -c reading id_rsa is blocked", blocked(await shell("bash -c 'cat ~/.
 check("bash -c benign cat is allowed", !(await shell("bash -c 'cat src/index.ts'")));
 check("node -e writeFileSync outside workspace is blocked", blocked(await shell('node -e "require(\'fs\').writeFileSync(\'/tmp/wg-outside-interp\', \'x\')"' )));
 check("node -e writeFileSync within workspace is allowed", !(await shell('node -e "require(\'fs\').writeFileSync(\'src/local.txt\', \'x\')"' )));
+check("node -e writeFileSync with path data content is allowed", !(await shell('node -e "require(\'fs\').writeFileSync(\'src/config.json\', JSON.stringify({ temp: \'/tmp/dir\' }))"')));
 check("bash -c redirect outside workspace is blocked", blocked(await shell("bash -c 'echo pwned > /tmp/wg-outside-interp'")));
 
 const b64Destructive = Buffer.from("kubectl delete pod foo").toString("base64");
@@ -889,6 +895,17 @@ const loadedCfg = loadProjectConfig(projectConfigDir);
 check("project config loads protectedBranches", loadedCfg.protectedBranches?.includes("release/prod") ?? false);
 check("project config loads verifyCommand", loadedCfg.verifyCommand === "node -e 'process.exit(0)'");
 check("project config loads requireReview", loadedCfg.requireReview === true);
+
+// JSONC with comments and trailing commas
+const jsoncDir = mkdtempSync(join(tmpdir(), "wg-cfg-jsonc-"));
+mkdirSync(join(jsoncDir, ".opencode"), { recursive: true });
+writeFileSync(
+	join(jsoncDir, ".opencode", "workflow-guard.jsonc"),
+	`{\n  // Line comment\n  "protectedBranches": ["prod-jsonc"],\n  /* Block comment */\n  "requireReview": true,\n}`,
+);
+const loadedJsonc = loadProjectConfig(jsoncDir);
+check("project config parses .jsonc with comments and trailing commas", loadedJsonc.protectedBranches?.includes("prod-jsonc") && loadedJsonc.requireReview === true);
+rmSync(jsoncDir, { recursive: true, force: true });
 
 resetVerifyState();
 todo("s-config-verify", item("verify config", "in_progress"));
