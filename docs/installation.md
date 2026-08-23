@@ -62,7 +62,7 @@ cp src/workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
 }
 ```
 
-The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). OpenCode resolves that package from its own runtime; no extra install is required when running inside OpenCode. For local typecheck of this repo, `@opentui/solid` is a devDependency.
+The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime `dependency` of this package, so npm installs it automatically alongside `opencode-workflow-guard` — no extra install is needed. Imports resolve from the config directory's `node_modules`, not OpenCode's own runtime: for the manual file-copy install above, ensure `@opentui/solid` is reachable from that directory tree (e.g. install it in the same parent directory where OpenCode's config lives).
 
 ---
 
