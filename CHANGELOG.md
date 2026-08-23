@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.6
+
+### Patch Changes
+
+- 63338ad: Stop stripping GITHUB_TOKEN/GH_TOKEN from shell env to prevent gh CLI login prompts
+
 ## 1.3.5
 
 ### Patch Changes
