@@ -78,10 +78,11 @@ jobs:
 
   # ───── PR etiquette ─────
   # Every PR must update CHANGELOG.md or add a .changeset/*.md fragment (Policy 3).
+  # Automated Changeset version release PRs are exempted.
   changelog:
     name: Changelog / Changeset updated
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]'
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.head_ref != 'changeset-release/main' && !startsWith(github.head_ref, 'changeset-release/')
     steps:
       - uses: actions/checkout@v7
         with:
