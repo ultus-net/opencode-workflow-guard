@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.3
+
+### Patch Changes
+
+- 1c515ae: Align repository.url format with npm git+https convention for Trusted Publishing OIDC claim validation.
+
 ## 1.1.2
 
 ### Patch Changes
