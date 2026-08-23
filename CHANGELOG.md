@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.3.2
+
+### Patch Changes
+
+- 7c5df68: Harden workspace boundary and secret-read policies against shell evasion patterns:
+    - Expand `~`, `~user`, `$HOME`, and fail closed on indeterminate `$VARIABLE` references in boundary targets
+    - Support `&>`, `&>>`, `>&`, `>>&`, and attached redirects in shell mutation parsing while filtering fd duplication (`2>&1`, `>&2`)
+    - Generic `tee` flag skipping (`-a`, `--append`, `-ai`, `--`) and multi-target boundary validation
+    - Enforce external-repository confinement on `GIT_DIR=` and `GIT_WORK_TREE=` environment assignments
+    - Scan inline interpreter payloads (`python -c`, `node -e`, `bash -c`, `sh -c`, `zsh -c`) for secret-file reads and out-of-workspace writes
+- 591959b: Security hardening and operational optimizations:
+    - Sanitize desktop notifications against AppleScript command injection on macOS
+    - Redact multiline secret value continuations completely in `.env` schema masking
+    - Bounded tail buffering in `getRecentAuditEntries` to prevent memory spikes on long-lived logs
+    - Sanitize base reference inputs in `guard_review_rubric`
+
 ## 1.3.1
 
 ### Patch Changes
