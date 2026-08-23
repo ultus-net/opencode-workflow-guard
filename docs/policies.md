@@ -104,7 +104,7 @@
 
 ### 16. TUI Visual Feedback & Dynamic Last-Block Status
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.
-- The companion TUI plugin (`workflow-guard-ui.ts`) dynamically reflects the latest guard state in the prompt bar, displaying `🛡️ [Workflow Guard: Active]` during normal operation and `🛡️ [Workflow Guard: Blocked: <reason>]` when an action is intercepted. Blocked state is scoped to the session that triggered it and sourced only from guard-originated toasts.
+- The companion TUI plugin (`workflow-guard-ui.ts`) dynamically reflects the latest guard state in the prompt bar, displaying `[Workflow Guard: Active]` during normal operation and `[Workflow Guard: Blocked: <reason>]` when an action is intercepted. Blocked state is scoped to the session that triggered it and sourced only from guard-originated toasts.
 
 ### 17. Secret-File READ Block & Safe Schema Masking
 - Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool, shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`), or inline interpreter payloads (`python3 -c "open('.env')"`, `bash -c 'cat id_rsa'`).
@@ -139,7 +139,7 @@
 
 ### 24. Completion Claims vs Evidence (Observability)
 - When the assistant's final response text asserts completion or passing verification ("all tests pass", "work is done", "verified"), the guard compares the claim against recorded verification evidence for that session.
-- Mismatches — failing verification, stale evidence (mutations after the verify run), or no evidence at all — are journaled to the audit trail and logged at warn level. This is **observability, not gating**: the response is never blocked, but a confident wrap-up cannot silently contradict a failing or absent verification state.
+- Mismatches (failing verification, stale evidence due to mutations after the verify run, or no evidence at all) are journaled to the audit trail and logged at warn level. This is **observability, not gating**: the response is never blocked, but a confident wrap-up cannot silently contradict a failing or absent verification state.
 - Uses the `experimental.text.complete` hook; claim detection is a conservative phrase heuristic to avoid false positives on casual wording.
 
 ### Tool Description Honesty
@@ -153,14 +153,14 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 
 ### `guard_worktree_create`
 - Creates an isolated git worktree for concurrent subagent execution: `guard_worktree_create(branch, baseBranch?)`.
-- Branch names are validated with `git check-ref-format --branch`; protected branches — the built-in `main`/`master` plus any configured via `protectedBranches` in `.opencode/workflow-guard.json` — are refused.
+- Branch names are validated with `git check-ref-format --branch`; protected branches (the built-in `main`/`master` plus any configured via `protectedBranches` in `.opencode/workflow-guard.json`) are refused.
 - Worktrees are stored outside the repository under `~/.local/share/opencode/worktrees/<repo-name>/` (override with `WORKFLOW_GUARD_WORKTREE_DIR`), and the parent's `node_modules` is symlinked into the new worktree so tooling works without a fresh install.
 - If the branch already exists (as a local branch), the worktree is checked out on it; otherwise it is created from `baseBranch` (default `HEAD`).
 - Subject to the same todo gate as other mutations, and successful worktree mutations invalidate stale verification/review evidence.
 
 ### `guard_worktree_cleanup`
 - Commits a final snapshot of any remaining changes (`chore(worktree): auto-snapshot before cleanup`, excluding the plugin-created `node_modules` symlink) and then removes the worktree directory with `git worktree remove --force`.
-- **Ownership validation:** only registered worktrees of the current repository under the configured worktree storage directory can be cleaned up — arbitrary directories, other repositories' worktrees, and the primary working tree are refused. A failed `git worktree remove` is an error, never a fallback to raw directory deletion.
+- **Ownership validation:** only registered worktrees of the current repository under the configured worktree storage directory can be cleaned up; arbitrary directories, other repositories' worktrees, and the primary working tree are refused. A failed `git worktree remove` is an error, never a fallback to raw directory deletion.
 - **Lossless by construction:** if the snapshot commit cannot be established (failing hook, missing identity, lock error), cleanup aborts and the worktree is left fully intact.
 
 ### Hook-Context Safety

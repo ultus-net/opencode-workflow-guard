@@ -24,7 +24,7 @@ function text(props: Record<string, unknown>, children: Child[]) {
 	return element("text", props, children);
 }
 
-const BADGE_ACTIVE = "🛡️ [Workflow Guard: Active]";
+const BADGE_ACTIVE = "[Workflow Guard: Active]";
 let lastBlockedReason: string | undefined;
 const sessionBlockedReasons = new Map<string, string>();
 const badgeNodes = new Map<string, unknown>();
@@ -45,7 +45,7 @@ export function formatBadge(sessionID?: string): { text: string; isBlocked: bool
 	}
 	const cleanReason = reason.replace(/^\[workflow-guard\]\s*/, "").replace(/^Blocked:\s*/, "");
 	const shortReason = cleanReason.length > 30 ? cleanReason.slice(0, 27) + "..." : cleanReason;
-	return { text: `🛡️ [Workflow Guard: Blocked: ${shortReason}]`, isBlocked: true };
+	return { text: `[Workflow Guard: Blocked: ${shortReason}]`, isBlocked: true };
 }
 
 export const WorkflowGuardTui: TuiPlugin = async (api) => {

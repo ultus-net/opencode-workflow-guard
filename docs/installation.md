@@ -44,7 +44,7 @@ Files in your plugin directory are automatically loaded by the OpenCode server p
 
 ### 3. TUI Visual Indicator (Prompt Box Badge)
 
-To enable the dynamic prompt-bar badge - `🛡️ [Workflow Guard: Active]` during normal operation, switching to `🛡️ [Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
+To enable the dynamic prompt-bar badge - `[Workflow Guard: Active]` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
 1. Place `workflow-guard-ui.tsx` in your config directory (outside `plugins/`):
 ```bash
