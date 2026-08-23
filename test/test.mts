@@ -43,6 +43,7 @@ import {
 	checkInteractiveTtyCommand,
 	checkPackageHygiene,
 	sendDesktopNotification,
+	escapeAppleScriptString,
 	createGitWorktree,
 	cleanupGitWorktree,
 	getWorktreeStorageDir,
@@ -993,6 +994,8 @@ check(
 	"guard_review_rubric returns the rubric with axes",
 	typeof rubricOut === "string" && rubricOut.includes("Test Integrity") && rubricOut.includes("Code Diff Under Review"),
 );
+const rubricOptionFlag = await customPlugin.tool?.guard_review_rubric?.execute({ base: "--output=injected" }, {} as any);
+check("guard_review_rubric sanitizes option flags in base ref", typeof rubricOptionFlag === "string" && !existsSync(join(root, "injected")));
 
 const mainReviewToolResult = await customPlugin.tool?.record_review?.execute(
 	{ reviewer: "self", summary: "self approval", passed: true },
@@ -1121,6 +1124,10 @@ const sampleEnv = "# Database credentials\nDATABASE_URL=postgres://user:secret@l
 const maskedSchema = generateMaskedEnvSchema(sampleEnv);
 check("generateMaskedEnvSchema preserves keys and comments but redacts values", maskedSchema.includes("DATABASE_URL=********") && maskedSchema.includes("API_KEY=********") && !maskedSchema.includes("sk_live_123456789"));
 
+const multilineEnv = 'CERT="-----BEGIN CERTIFICATE-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA\n-----END CERTIFICATE-----"\nPUBLIC_VAR=123\n';
+const maskedMultiline = generateMaskedEnvSchema(multilineEnv);
+check("generateMaskedEnvSchema redacts multiline secret continuations completely", maskedMultiline.includes("CERT=********") && !maskedMultiline.includes("MIIBIjANBgkq") && maskedMultiline.includes("PUBLIC_VAR=********"));
+
 const envTestFile = join(root, ".env.production");
 writeFileSync(envTestFile, "STRIPE_SECRET=sk_live_99999\nPUBLIC_APP=myapp\n");
 const envReadBlock = await call("read", { filePath: envTestFile });
@@ -1229,6 +1236,10 @@ check("shell tool blocks npm init without flag", blocked(await shell("npm init")
 check("shell tool allows npm init -y", !(await shell("npm init -y")));
 
 // Desktop notifications dispatch test
+check("escapeAppleScriptString escapes quotes, backslashes, and newlines safely", (() => {
+	const escaped = escapeAppleScriptString('test\\" do shell script "pwn"\nline2');
+	return !escaped.includes("\n") && escaped.includes('\\\\\\"') && escaped.includes('\\"pwn\\"');
+})());
 check("sendDesktopNotification runs without throwing", (() => {
 	try {
 		sendDesktopNotification("Test Title", "Test Message");

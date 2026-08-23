@@ -98,17 +98,28 @@ export function checkInteractiveTtyCommand(command: string): { isInteractive: bo
 }
 
 /**
+ * Escapes strings safely for interpolation into AppleScript string literals.
+ * Replaces newlines/CRs with spaces, escapes backslashes first, then double quotes.
+ */
+export function escapeAppleScriptString(str: string): string {
+	return str
+		.replace(/[\r\n]+/g, " ")
+		.replace(/\\/g, "\\\\")
+		.replace(/"/g, '\\"');
+}
+
+/**
  * Dispatches a native OS desktop notification (macOS osascript or Linux notify-send)
  * on important guard events (policy blocks, verification completion).
  * Non-blocking, fails gracefully.
  */
 export function sendDesktopNotification(title: string, message: string): void {
 	if (process.env.WORKFLOW_GUARD_NOTIFY === "0") return;
-	const safeTitle = title.replace(/"/g, '\\"');
-	const safeMsg = message.slice(0, 150).replace(/"/g, '\\"');
 
 	try {
 		if (process.platform === "darwin") {
+			const safeTitle = escapeAppleScriptString(title);
+			const safeMsg = escapeAppleScriptString(message.slice(0, 150));
 			const child = spawn(
 				"osascript",
 				["-e", `display notification "${safeMsg}" with title "${safeTitle}"`],
@@ -117,6 +128,8 @@ export function sendDesktopNotification(title: string, message: string): void {
 			child.on("error", () => {});
 			child.unref();
 		} else if (process.platform === "linux") {
+			const safeTitle = title.replace(/[\r\n\0]/g, " ");
+			const safeMsg = message.slice(0, 150).replace(/[\0]/g, "");
 			const child = spawn("notify-send", [safeTitle, safeMsg], {
 				stdio: "ignore",
 				detached: true,
