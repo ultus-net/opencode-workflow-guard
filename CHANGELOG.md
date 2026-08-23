@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.3.4
+
+### Patch Changes
+
+- 2e0f0be: Streamline README with punchy 4-pillar summary, documentation index table, and clean repository tree.
+
 ## 1.3.3
 
 ### Patch Changes
