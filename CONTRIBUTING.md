@@ -1,7 +1,7 @@
 # Contributing to opencode-workflow-guard
 
 Thanks for your interest! This plugin enforces workflow discipline through
-**deterministic hooks** — every contribution should maintain that standard.
+**deterministic hooks**; every contribution should maintain that standard.
 
 ## Quick Start
 
@@ -22,7 +22,7 @@ git config core.hooksPath .githooks
 Always run before pushing:
 
 ```bash
-npm run typecheck   # strict TS — 0 errors required
+npm run typecheck   # strict TS: 0 errors required
 npm test            # in-memory unit + adversarial tests
 npm run test:all    # optional: full suite incl. live opencode load
 ```
@@ -57,7 +57,7 @@ See `docs/testing.md` for the full coverage matrix.
   - **Preferred:** Add a changeset file with `npx changeset` (creates `.changeset/<name>.md`), avoiding merge conflicts with parallel PRs.
   - Add a `Changelog:` section in the PR description.
   - Update `CHANGELOG.md` directly.
-- Keep documentation synchronized — if you change behavior, update README,
+- Keep documentation synchronized: if you change behavior, update README,
   policy docs, and troubleshooting guide.
 - The `record_review` custom tool should be used for secondary review
   verification when policy correctness matters (it usually does).
