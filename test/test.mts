@@ -591,6 +591,15 @@ check(
 );
 check("env wrapper cannot hide external git write", blocked(await shell(`env git -C ${externalRepo} commit -m test`)));
 check("command wrapper cannot hide external git write", blocked(await shell(`command git -C ${externalRepo} commit -m test`)));
+
+// Policy 8 invariant: the workspace boundary has NO allow-live override,
+// including for git -C writes to external repositories.
+process.env.WORKFLOW_GUARD_ALLOW_LIVE = "1";
+check(
+	"git -C to external repository stays blocked under allow-live",
+	blocked(await shell(`git -C ${externalRepo} commit -m test`)),
+);
+delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 const externalRepoWithSpaces = join(mkdtempSync(join(tmpdir(), "wg-external-parent-")), "repo with spaces");
 mkdirSync(externalRepoWithSpaces);
 spawnSync("git", ["init", "-b", "feat/external"], { cwd: externalRepoWithSpaces });
@@ -926,10 +935,30 @@ check("guard_why confirms allowed command", typeof whyResultAllowed === "string"
 
 fakeParents.set("s-reviewer-tool", "s-active");
 const reviewToolResult = await customPlugin.tool?.record_review?.execute(
-	{ reviewer: "subagent-1", summary: "Real tests pass, zero stubs.", passed: true },
+	{ reviewer: "subagent-1", summary: "Test integrity: real assertions. Task completeness: done. Cleanliness: no stubs. Security: clean. Platform fit: ok.", passed: true },
 	{ sessionID: "s-reviewer-tool", agent: "reviewer", worktree: root, directory: root } as any,
 );
 check("record_review tool execution succeeds", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+
+// Rubric enforcement: summaries that skip the axes are rejected
+fakeParents.set("s-reviewer-thin", "s-active");
+const thinReviewResult = await customPlugin.tool?.record_review?.execute(
+	{ reviewer: "subagent-2", summary: "looks good to me", passed: true },
+	{ sessionID: "s-reviewer-thin", agent: "reviewer", worktree: root, directory: root } as any,
+);
+check(
+	"record_review rejects summaries missing review axes",
+	typeof thinReviewResult === "string" && thinReviewResult.includes("guard_review_rubric"),
+);
+
+// The rubric tool emits a real prompt with the current diff
+check("plugin registers guard_review_rubric tool", typeof customPlugin.tool?.guard_review_rubric?.execute === "function");
+const rubricOut = await customPlugin.tool?.guard_review_rubric?.execute({}, {} as any);
+check(
+	"guard_review_rubric returns the rubric with axes",
+	typeof rubricOut === "string" && rubricOut.includes("Test Integrity") && rubricOut.includes("Code Diff Under Review"),
+);
+
 const mainReviewToolResult = await customPlugin.tool?.record_review?.execute(
 	{ reviewer: "self", summary: "self approval", passed: true },
 	{ sessionID: "s-active", agent: "main", worktree: root, directory: root } as any,
