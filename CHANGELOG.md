@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.2
+
+### Patch Changes
+
+- 2644db7: Switch npm release workflow from legacy token to OIDC Trusted Publishing.
+
 ## 1.1.1
 
 ### Patch Changes
