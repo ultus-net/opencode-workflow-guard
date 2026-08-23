@@ -136,8 +136,6 @@ export function unwrapShellCommand(command: string): string {
 }
 
 export const SENSITIVE_ENV_KEYS = [
-	"GITHUB_TOKEN",
-	"GH_TOKEN",
 	"OPENAI_API_KEY",
 	"ANTHROPIC_API_KEY",
 	"OPENAI_KEY",
@@ -150,7 +148,7 @@ export const SENSITIVE_ENV_KEYS = [
 	"SLACK_TOKEN",
 ];
 export const SENSITIVE_ENV_RE =
-	/^(AWS_|KUBE|OPENAI|ANTHROPIC|GH_|GITHUB_|GOOGLE_|GCP_|AZURE_|SLACK_|NPM_|DOCKER_|KUBECONFIG)/;
+	/^(AWS_|KUBE|OPENAI|ANTHROPIC|GH_TOKEN|GITHUB_TOKEN|GOOGLE_|GCP_|AZURE_|SLACK_|NPM_|DOCKER_|KUBECONFIG)/;
 
 export function getCleanEnv(): Record<string, string> {
 	const env: Record<string, string> = { ...(process.env as Record<string, string>) };
