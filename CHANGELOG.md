@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.4
+
+### Patch Changes
+
+- bdb0796: Upgrade Release workflow to Node.js 24 (npm >= 11.5.1) required for npm OIDC Trusted Publishing.
+
 ## 1.1.3
 
 ### Patch Changes
