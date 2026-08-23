@@ -26,6 +26,8 @@
 - There is deliberately no LSP-diagnostics finalization gate: the V1 `lsp.client.diagnostics` event carries only `{serverID, path}` metadata, not diagnostics. Do not reintroduce the gate until the SDK exposes a supported diagnostics source.
 - Block reasons must keep flowing to `client.app.log()` at warn level via `logBlock` (the modularization accidentally no-op'd it once); toasts via `tui.showToast` are for the TUI, app logs are for the durable in-app trail.
 - The single-task focus rule was intentionally removed from Policy 1: multiple tasks may be `in_progress` concurrently so subagents can parallelize. Only "no silent deletion" and the all-done verification gate remain.
+- Policy 24 (claims-vs-evidence) lives in `src/policies/completion.ts` and is observability-only: the `experimental.text.complete` hook journals mismatches between completion claims and verification evidence; it must never block or mutate `output.text`.
+- The `tool.definition` hook is used only to keep tool descriptions honest (currently: `todowrite`'s finalization-gate note). Do not use it to inject instructions — that would reintroduce prompt rules.
 
 ## PR And Release Gates
 - Releases are managed by Changesets: add a `.changeset/*.md` entry (run `npm run changeset`) for user-facing changes. `@changesets/action` opens/updates the version PR, and merging it publishes to npm with OIDC Trusted Publishing and creates the GitHub Release.

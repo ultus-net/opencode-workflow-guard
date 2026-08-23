@@ -47,6 +47,7 @@ import {
 	cleanupGitWorktree,
 	getWorktreeStorageDir,
 	getCleanGitEnv,
+	checkCompletionClaims,
 	default as defaultExport,
 } from "../src/workflow-guard.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
@@ -1465,6 +1466,70 @@ toastHandler?.({ properties: { title: "Workflow Guard Blocked", message: "Blocke
 check("TUI associates guard toast with current session", formatBadge("s-badge").isBlocked);
 check("TUI does not leak session block to another session", !formatBadge("s-other").isBlocked);
 setLastBlockedReasonForTesting(undefined);
+
+// ── Policy 24: Completion claims vs evidence (observability) ──
+console.log("- Policy 24: Completion Claims vs Evidence -");
+
+// The instance-isolation test above leaves an empty global client behind;
+// restore the fake client so todo-gated calls resolve against fakeTodos.
+setSdkClient(fakeClient);
+setWorkspaceRoot(root);
+
+// Pure function checks (unscoped calls fall back to global state, so isolate them)
+resetVerifyState();
+check("benign text does not trigger a claim", !checkCompletionClaims("I refactored the module.").claimsCompletion);
+check("explicit completion claim is detected", checkCompletionClaims("All tasks are complete and the work is done.").claimsCompletion);
+check("test-pass claim is detected", checkCompletionClaims("All tests pass now.").claimsCompletion);
+check("claim with no evidence is flagged missing", checkCompletionClaims("All tests pass.", { sessionID: "s-no-evidence" }).evidenceState === "missing");
+
+// Fresh passing verification -> no mismatch
+resetVerifyState();
+todo("s-claim-fresh", item("verify task", "in_progress"));
+writeFileSync(join(root, "package.json"), JSON.stringify({ scripts: { test: "node -e 'process.exit(0)'" } }));
+await call("edit", { filePath: join(root, "claim.ts"), content: "x" }, { sessionID: "s-claim-fresh" });
+await call("todowrite", { todos: [item("verify task", "completed")] }, { sessionID: "s-claim-fresh" });
+const freshCheck = checkCompletionClaims("All tests pass.", { sessionID: "s-claim-fresh" });
+check("fresh passing evidence satisfies the claim", freshCheck.evidenceState === "fresh-pass");
+
+// Failing evidence -> flagged
+resetVerifyState();
+recordVerifyResult("npm test", { passed: false, output: "1 failed" }, "s-claim-fail");
+const failCheck = checkCompletionClaims("All tests pass.", { sessionID: "s-claim-fail" });
+check("failing verification contradicts the claim", failCheck.evidenceState === "failing" && typeof failCheck.reason === "string");
+
+// Stale evidence: passing verification, then a mutation, then claim -> stale-pass
+resetVerifyState();
+recordVerifyResult("npm test", { passed: true, output: "ok" }, "s-claim-stale");
+todo("s-claim-stale", item("stale task", "in_progress"));
+await new Promise((r) => setTimeout(r, 5)); // ensure mutation timestamp is strictly newer
+await call("edit", { filePath: join(root, "claim3.ts"), content: "z2" }, { sessionID: "s-claim-stale" });
+const staleCheck = checkCompletionClaims("All tests pass.", { sessionID: "s-claim-stale" });
+check("post-verify mutation makes evidence stale-pass", staleCheck.evidenceState === "stale-pass");
+
+// Hook integration: mismatch is journaled, not blocked
+recordVerifyResult("npm test", { passed: false, output: "1 failed" }, "s-claim-hook");
+const claimAuditBefore = getRecentAuditEntries(50).filter((e) => e.tool === "experimental.text.complete").length;
+await (defaultExport as any).server?.({ directory: root, worktree: root, client: fakeClient as any }).then(async (plugin: any) => {
+	await plugin["experimental.text.complete"]?.(
+		{ sessionID: "s-claim-hook", messageID: "m1", partID: "p1" },
+		{ text: "All tests pass." },
+	);
+});
+const claimAuditAfter = getRecentAuditEntries(50).filter((e) => e.tool === "experimental.text.complete").length;
+check("claims-vs-evidence mismatch is journaled via the hook", claimAuditAfter > claimAuditBefore);
+
+// tool.definition enriches todowrite's description with the gate note
+const defPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
+const todoDef = { description: "Write the todo list.", parameters: {} };
+await defPlugin["tool.definition"]?.({ toolID: "todowrite" } as any, todoDef);
+check("tool.definition adds finalization gate note to todowrite", todoDef.description.includes("verification evidence"));
+const otherDef = { description: "Read a file.", parameters: {} };
+await defPlugin["tool.definition"]?.({ toolID: "read" } as any, otherDef);
+check("tool.definition leaves other tools untouched", otherDef.description === "Read a file.");
+// Idempotent: re-running does not double-append
+const idemDef = { description: todoDef.description, parameters: {} };
+await defPlugin["tool.definition"]?.({ toolID: "todowrite" } as any, idemDef);
+check("tool.definition enrichment is idempotent", idemDef.description === todoDef.description);
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;

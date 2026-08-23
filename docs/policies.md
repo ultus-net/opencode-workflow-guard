@@ -136,6 +136,14 @@
   - Direct agent publishing (`npm publish`, `pnpm publish`): Enforces automated CI/CD release pipelines.
   - `pip install --force-reinstall`: Enforces pinned requirements.
 
+### 24. Completion Claims vs Evidence (Observability)
+- When the assistant's final response text asserts completion or passing verification ("all tests pass", "work is done", "verified"), the guard compares the claim against recorded verification evidence for that session.
+- Mismatches — failing verification, stale evidence (mutations after the verify run), or no evidence at all — are journaled to the audit trail and logged at warn level. This is **observability, not gating**: the response is never blocked, but a confident wrap-up cannot silently contradict a failing or absent verification state.
+- Uses the `experimental.text.complete` hook; claim detection is a conservative phrase heuristic to avoid false positives on casual wording.
+
+### Tool Description Honesty
+- Via the `tool.definition` hook, the guard enriches the `todowrite` tool's description with the finalization-gate note (verification evidence required after the last mutation), so the model is not surprised by blocks at completion time. Other tools are untouched, and the enrichment is idempotent.
+
 ---
 
 ## Custom Tools

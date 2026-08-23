@@ -212,6 +212,10 @@ import {
 	sendDesktopNotification,
 } from "./policies/shell-safety.ts";
 
+import { checkCompletionClaims } from "./policies/completion.ts";
+
+export { checkCompletionClaims };
+
 export { checkInteractiveTtyCommand, checkPackageHygiene, sendDesktopNotification };
 
 const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
@@ -1140,6 +1144,40 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					status: output.status,
 				},
 			});
+		},
+
+		// Policy 24 (observability): claims-vs-evidence. When the assistant's final
+		// text asserts completion or passing verification, compare the claim against
+		// recorded verification evidence. A mismatch is journaled (not blocked) so
+		// confident wrap-ups cannot silently contradict failing or stale state.
+		"experimental.text.complete": async (input, output) => {
+			try {
+				const sessionID = input.sessionID;
+				const text = typeof output.text === "string" ? output.text : "";
+				const check = checkCompletionClaims(text, { sessionID });
+				if (check.claimsCompletion && check.evidenceState && check.evidenceState !== "fresh-pass") {
+					logBlock(`[workflow-guard] completion claim mismatch: ${check.reason}`);
+					audit({
+						ts: new Date().toISOString(),
+						sessionID,
+						tool: "experimental.text.complete",
+						decision: "allow",
+						reason: `Completion claim '${check.claim}' has ${check.evidenceState} verification evidence`,
+						input: { claim: check.claim, evidenceState: check.evidenceState },
+					});
+				}
+			} catch {}
+		},
+
+		// Keep tool descriptions honest: todowrite's description reflects the
+		// finalization gates so the model is not surprised by verification blocks.
+		"tool.definition": async (input, output) => {
+			if (input.toolID !== "todowrite") return;
+			const description = typeof output.description === "string" ? output.description : "";
+			if (description.includes("verification evidence")) return;
+			output.description =
+				description +
+				"\n\nNote: marking every task completed triggers the workflow guard's finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply.";
 		},
 
 		event: async ({
