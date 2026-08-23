@@ -79,6 +79,7 @@ opencode-workflow-guard/
 | **21** | **Documentation Synchronization** | Verifies documentation is updated when introducing new public features or policies. |
 | **22** | **TTY Hang Guard** | Blocks interactive editors (`vim`, `nano`), pagers (`less`), and commands missing non-interactive flags (`npm init` without `-y`). |
 | **23** | **Package Supply-Chain Hygiene** | Blocks destructive `npm audit fix --force`, global unversioned installs (`npm i -g`), and direct CLI `npm publish`. |
+| **24** | **Completion Claims vs Evidence** | When the final response asserts completion/passing tests, the claim is compared against recorded verification evidence; failing, stale, or missing evidence is journaled (observability, never blocks). Also enriches `todowrite`'s tool description with the finalization-gate note via `tool.definition`. |
 
 👉 **For complete policy specifications and override rules, see [docs/policies.md](docs/policies.md).**
 
