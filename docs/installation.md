@@ -32,30 +32,24 @@ OpenCode automatically installs the plugin and its dependencies with Bun at star
 
 ### 2. Manual File Copy (Server Plugin)
 
-Install the core server plugin into your plugin directory:
+The server plugin is modular - copy the entrypoint **plus** its `lib/` and `policies/` directories into your OpenCode plugins folder (global `~/.config/opencode/plugins/` or project-level `.opencode/plugins/`):
 
 ```bash
-# Global (all projects)
-mkdir -p ~/.config/opencode/plugins
-cp workflow-guard.ts ~/.config/opencode/plugins/
-
-# Project-level (per repo)
-mkdir -p .opencode/plugins
-cp workflow-guard.ts .opencode/plugins/
+cp -r src/workflow-guard.ts src/lib src/policies /path/to/opencode-plugins/
 ```
 
-Files in `.opencode/plugins/` and `~/.config/opencode/plugins/` are automatically loaded by the OpenCode server process at startup.
+Files in your plugin directory are automatically loaded by the OpenCode server process at startup.
 
 ---
 
 ### 3. TUI Visual Indicator (Prompt Box Badge)
 
-To enable the persistent `🛡️ [Workflow Guard: Active]` badge inside the prompt input bar:
+To enable the dynamic prompt-bar badge - `🛡️ [Workflow Guard: Active]` during normal operation, switching to `🛡️ [Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
 1. Place `workflow-guard-ui.tsx` in your config directory (outside `plugins/`):
 ```bash
 mkdir -p ~/.config/opencode/ui
-cp workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
+cp src/workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
 ```
 
 2. Reference it in your `~/.config/opencode/tui.json`:

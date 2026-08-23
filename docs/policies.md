@@ -73,6 +73,7 @@
 - **Git State & Snapshot Binding:** Verification evidence records the current git commit hash (`git rev-parse HEAD`) and working tree status. If unverified edits or index modifications occur after verification, fresh verification is enforced.
 - **Durable Disk Cache:** Passing verification results are cached to `~/.local/state/opencode/workflow-guard/last-verify.json`, allowing session restarts and multi-agent handoffs to retain valid verification evidence without redundant test runs. Durable evidence is **workspace-bound**: a cached result is only accepted for the workspace that produced it, so a passing run in one project can never satisfy finalization in another.
 - If verification fails, finalization is blocked with a structured summary of error markers, stack traces, and failure output.
+- OpenCode's current `lsp.client.diagnostics` event identifies the server and path but does not expose the diagnostics themselves, so the guard deliberately does not claim an LSP-clean finalization gate until the SDK provides a supported diagnostics source.
 - The verify command is **disabled** when `WORKFLOW_GUARD_VERIFY` is empty (`""`).
 
 ### 11. Secret-Content Scan
@@ -86,8 +87,9 @@
 ### 13. Command-Channel Audit
 - User-triggered slash commands (`command.executed` events) are journaled to the audit trail so agents cannot perform hidden work through a user-facing side channel.
 
-### 14. Audit Trail
+### 14. Audit Trail & Permission Journaling
 - Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with a timestamp, session id, tool name, decision, subagent/parent session attribution, and reason - a durable record.
+- Permission prompts are journaled at request time via the typed `permission.ask` plugin hook, and `permission.replied` outcomes (including rejections) are preserved instead of being labeled as allows.
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
 ### 15. Compaction State & Focus Preservation
@@ -99,8 +101,9 @@
   - Uncommitted mutation counts.
 - Ensures the model retains its operational context, security posture, and task roadmap across session compactions without hallucinations.
 
-### 16. TUI Visual Feedback
+### 16. TUI Visual Feedback & Dynamic Last-Block Status
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.
+- The companion TUI plugin (`workflow-guard-ui.ts`) dynamically reflects the latest guard state in the prompt bar, displaying `🛡️ [Workflow Guard: Active]` during normal operation and `🛡️ [Workflow Guard: Blocked: <reason>]` when an action is intercepted. Blocked state is scoped to the session that triggered it and sourced only from guard-originated toasts.
 
 ### 17. Secret-File READ Block & Safe Schema Masking
 - Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool or shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`).
@@ -176,7 +179,7 @@ There is **deliberately no in-command override** (no `# allow-live` marker): an 
 
 ## Known Limits (Defense in Depth)
 
-These guards match on command and file strings. An agent that base64-encodes a payload, invokes an interpreter directly (`python3 -c ...`), or uses exotic shell redirection can evade pattern matching. This plugin is a **deterrent against forgetful or complacent agents**, not a sandbox. Pair it with:
+These guards match on command strings, file structures, and interpreter payloads (including base64 pipeline decoding and inline eval scans under Policy 18). While inline scripts are decoded and analyzed, compiled binaries or multi-stage external downloads require OS-level sandboxing. This plugin is a **hardened deterrent against forgetful, complacent, or prompt-injected agents**, not an OS kernel sandbox. Pair it with:
 - GitHub branch protection/rulesets server-side
 - OS-level workspace isolation (containers, read-only mounts)
 

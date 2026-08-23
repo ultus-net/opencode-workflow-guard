@@ -38,11 +38,13 @@ npm run test:all     # Run full verification suite (typecheck + unit + live e2e)
 ```
 opencode-workflow-guard/
 ├── src/                       # Production plugin sources
-│   ├── workflow-guard.ts      # Core server hooks & 23 deterministic policies
-│   └── workflow-guard-ui.ts   # TUI companion prompt badge
+│   ├── workflow-guard.ts      # Server plugin entrypoint (hook orchestrator & public exports)
+│   ├── workflow-guard-ui.ts   # TUI companion prompt badge
+│   ├── policies/              # Per-policy implementations (task gate, git, secrets, shell-safety, ...)
+│   └── lib/                   # Engine services (state, verify, audit, review, worktree, utils, types)
 ├── test/                      # Test suites
 │   ├── test.mts               # 320+ in-memory unit & adversarial tests
-│   └── test-e2e.mts           # Live runtime OpenCode loader tests
+│   └── test-e2e.mts           # npm tarball resolution + live runtime OpenCode loader tests
 ├── docs/                      # In-depth documentation & guides
 │   ├── installation.md        # Full setup options, worktrees & permissions
 │   ├── policies.md            # Detailed 23-policy reference & overrides

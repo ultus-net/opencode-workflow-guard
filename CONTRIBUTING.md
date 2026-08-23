@@ -29,7 +29,7 @@ npm run test:all    # optional: full suite incl. live opencode load
 
 ## Test Patterns
 
-The test suite in `test.mts` is an in-memory adversarial harness, not a
+The test suite in `test/test.mts` is an in-memory adversarial harness, not a
 framework suite. New policies or evasions need regression cases for:
 
 - Normal CLI variants (options, wrappers, chained commands)
@@ -41,14 +41,15 @@ See `docs/testing.md` for the full coverage matrix.
 
 ## Adding a Guard Policy
 
-1. Add the check logic in `workflow-guard.ts` (the `guardToolCall` function
-   or `tool.execute.before` hook).
-2. Add regression tests in `test.mts` (look for existing policy blocks).
+1. Add the check logic as a new module in `src/policies/` (or extend the
+   matching existing policy module), then wire it into the orchestrator's
+   `guardToolCallImpl` in `src/workflow-guard.ts`.
+2. Add regression tests in `test/test.mts` (look for existing policy blocks).
 3. Document the policy in `docs/policies.md` and update the policy table in
    `README.md`.
 4. If the policy deserves a troubleshooting entry, add it to
    `docs/troubleshooting.md`.
-5. Update `CHANGELOG.md` (required for every non-Dependabot PR).
+5. Add a changeset (`npx changeset`) for release notes.
 
 ## PR Requirements
 

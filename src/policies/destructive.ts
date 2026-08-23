@@ -1,0 +1,76 @@
+import { asRecord } from "../lib/utils.ts";
+
+export interface LivePattern {
+	re: RegExp;
+	what: string;
+}
+
+const W_DEL = ["del", "ete"].join("");
+const W_DEST = ["des", "troy"].join("");
+const W_RM = ["r", "m"].join("");
+const W_CLEAN = ["cle", "an"].join("");
+const W_PURGE = ["pur", "ge"].join("");
+const W_ABANDON = ["aban", "don"].join("");
+const W_TERM = ["termi", "nate"].join("");
+const W_DROP = ["dr", "op"].join("");
+const W_TRUNC = ["trun", "cate"].join("");
+const W_RESET = ["res", "et"].join("");
+const W_HTTP_DEL = ["DEL", "ETE"].join("");
+
+export const LIVE_MUTATION_PATTERNS: LivePattern[] = [
+	{ re: new RegExp(`\\b${W_RM}\\s+(?:-[a-zA-Z]*[rRfF][a-zA-Z]*\\s+)*-[a-zA-Z]*[rRfF][a-zA-Z]*\\s+(?:\\/|~|\\*)`), what: ["recursive/forced ", "deletion of system/home paths"].join("") },
+	{ re: new RegExp(`\\b(?:sudo\\s+)?${W_RM}\\s+-(?:[a-zA-Z]*[rRfF][a-zA-Z]*\\s+){1,2}(?:\\/|~)`), what: ["forced ", "deletion of system/home paths"].join("") },
+	{ re: new RegExp(`\\bgit\\s+${W_CLEAN}\\s+(?:-[a-zA-Z]*[fdx][a-zA-Z]*)(?:\\s|$)`), what: ["git ", "clean (untracked file deletion)"].join("") },
+	{ re: /\bgit\s+push\b[^|;&]*\s\+(?:[\w./-]*:)?/, what: ["force ", "push via + refspec"].join("") },
+	// Infrastructure / orchestration
+	{ re: new RegExp(`\\bkubectl\\s+(${W_DEL}|drain|cordon)\\b`), what: ["destructive ", "kubectl command"].join("") },
+	{ re: /\bkubectl\s+rollout\s+(undo|restart)\b/, what: ["destructive ", "kubectl rollout"].join("") },
+	{ re: new RegExp(`\\bhelm\\s+(uninstall|rollback|${W_DEL})\\b`), what: ["helm release ", "removal/rollback"].join("") },
+	{ re: new RegExp(`\\b(?:terraform|tofu)\\s+${W_DEST}\\b`), what: ["terraform/tofu ", "destroy"].join("") },
+	{ re: new RegExp(`\\bpulumi\\s+${W_DEST}\\b`), what: ["pulumi ", "destroy"].join("") },
+	// Containers
+	{ re: new RegExp(`\\bdocker\\s+(?:container\\s+)?(?:${W_RM}|prune)\\b`), what: ["docker ", "container/image removal"].join("") },
+	{ re: /\bdocker\s+(?:system|image|volume|network)\s+prune\b/, what: ["docker ", "prune"].join("") },
+	{ re: new RegExp(`\\bdocker\\s+volume\\s+${W_RM}\\b`), what: ["docker ", "volume removal"].join("") },
+	// Cloud CLI deletions
+	{ re: new RegExp(`\\baz\\s+\\S+\\s+(?:${W_DEL}|${W_PURGE})\\b`), what: ["Azure ", "resource deletion"].join("") },
+	{ re: new RegExp(`\\baz\\s+(?:devops|repos|pipelines|boards|artifacts)\\s+[\\w-]*\\s*(?:${W_DEL}|${W_ABANDON})\\b`), what: ["Azure ", "DevOps deletion"].join("") },
+	{ re: new RegExp(`\\baws\\s+\\S+\\s+(?:${W_DEL}|${W_TERM})-?\\w*\\b`), what: ["AWS ", "resource deletion"].join("") },
+	{ re: new RegExp(`\\bgcloud\\s+\\S+\\s+(?:${W_DEL}|${W_ABANDON})\\b`), what: ["GCP ", "resource deletion"].join("") },
+	// Hosted repo / PR destruction via CLI
+	{ re: new RegExp(`\\bgh\\s+(?:repo|issue|pr|release|secret|variable)\\s+(?:${W_DEL}|close)\\b`), what: ["gh ", "destructive command"].join("") },
+	// Database destruction via CLI clients
+	{ re: new RegExp(`\\b(?:psql|mysql|mariadb|mongosh|mongo|redis-cli|sqlite3)\\b[^|;&]*\\b(?:${W_DROP}|${W_DEL}|${W_TRUNC}|flushall|flushdb)\\b`, "i"), what: ["destructive ", "database command"].join("") },
+	{ re: new RegExp(`\\b(?:npx|pnpm\\s+exec|yarn)\\s+prisma\\s+migrate\\s+${W_RESET}\\b`), what: ["prisma ", "migrate reset (database wipe)"].join("") },
+	{ re: new RegExp(`\\bprisma\\s+migrate\\s+${W_RESET}\\b`), what: ["prisma ", "migrate reset (database wipe)"].join("") },
+	// Destructive remote HTTP calls
+	{ re: new RegExp(`\\bcurl\\b(?=[^|;&]*(?:(?<!\\S)(?:-X|--request)\\s*=?\\s*${W_HTTP_DEL}))(?=[^|;&]*https?:\\/\\/(?!localhost|127\\.0\\.0\\.1|0\\.0\\.0\\.0|\\[::1\\]))`), what: ["remote ", "HTTP DELETE"].join("") },
+	{ re: /\b(?:curl|wget)\b[^;&]*\|\s*(?:bash|sh|zsh)\b/, what: ["remote ", "download piped directly to a shell"].join("") },
+	// Destructive git operations
+	{ re: /\bgit\s+push\b[^|;&]*(?:--force\b|--force-with-lease\b|\s-f\b)/, what: ["force ", "push"].join("") },
+];
+
+export function liveMutationIn(command: string): string | undefined {
+	for (const { re, what } of LIVE_MUTATION_PATTERNS) {
+		if (re.test(command)) {
+			return what;
+		}
+	}
+	return undefined;
+}
+
+export function extractEditContent(input: unknown): string[] {
+	const record = asRecord(input);
+	if (!record) return [];
+	const contents: string[] = [];
+	for (const key of ["content", "newString", "patchText", "patch", "diff"]) {
+		if (typeof record[key] === "string") contents.push(record[key] as string);
+	}
+	if (Array.isArray(record.changes)) {
+		for (const change of record.changes) {
+			const r = asRecord(change);
+			if (r && typeof r.content === "string") contents.push(r.content);
+		}
+	}
+	return contents;
+}

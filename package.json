@@ -5,13 +5,6 @@
   "license": "MIT",
   "type": "module",
   "main": "src/workflow-guard.ts",
-  "publishConfig": {
-    "access": "public"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/ultus-net/opencode-workflow-guard.git"
-  },
   "files": [
     "src/",
     "README.md",
