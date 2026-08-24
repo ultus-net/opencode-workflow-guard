@@ -37,15 +37,19 @@ check("npm package exposes OpenCode server entrypoint", installedPackageJson.exp
 check("npm package exposes OpenCode TUI entrypoint", installedPackageJson.exports?.["./tui"] === "./src/workflow-guard-ui.ts");
 check("npm package does not expose ambiguous /ui entrypoint", installedPackageJson.exports?.["./ui"] === undefined);
 
+// Verify the export map resolves both entrypoints. OpenCode loads the package's
+// raw TypeScript entrypoints with its own module loader at runtime, while plain
+// Node will not type-strip .ts files under node_modules; resolution (not direct
+// import) is therefore the correct invariant to assert here.
 const serverImport = spawnSync("node", ["--input-type=module", "-e", `
 	const serverUrl = import.meta.resolve('opencode-workflow-guard/server', 'file://' + process.cwd() + '/dummy.js');
 	const tuiUrl = import.meta.resolve('opencode-workflow-guard/tui', 'file://' + process.cwd() + '/dummy.js');
 	if (!serverUrl.endsWith('/src/workflow-guard.ts') || !tuiUrl.endsWith('/src/workflow-guard-ui.ts')) process.exit(2);
-`], {
-	cwd: testDir,
-	encoding: "utf8",
-});
-check("packed server entrypoint resolves correctly", serverImport.status === 0);
+	`], {
+		cwd: testDir,
+		encoding: "utf8",
+	});
+check("packed server and TUI entrypoints resolve correctly", serverImport.status === 0);
 
 // 2. Verify opencode binary is available for live runtime tests.
 const opencodeCheck = spawnSync("opencode", ["--version"], { encoding: "utf8" });

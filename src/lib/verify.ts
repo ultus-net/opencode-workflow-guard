@@ -119,7 +119,17 @@ export function getGitStatusSummary(root: string): string | undefined {
 
 export function getGitWorktreeFingerprint(root: string): string | undefined {
 	try {
-		const diff = spawnSync("git", ["diff", "--no-ext-diff", "HEAD", "--"], {
+		// Index listing captures the exact staged/tracked content (blob hashes);
+		// a worktree-vs-index diff captures unstaged edits; untracked file
+		// contents cover files git does not yet track. Together these bind the
+		// fingerprint to file contents regardless of whether HEAD exists, so
+		// freshly initialized (commitless) repositories are covered too.
+		const staged = spawnSync("git", ["ls-files", "--stage", "-z"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		const unstaged = spawnSync("git", ["diff", "--no-ext-diff", "--"], {
 			cwd: root,
 			encoding: "utf8",
 			timeout: 5_000,
@@ -129,8 +139,8 @@ export function getGitWorktreeFingerprint(root: string): string | undefined {
 			encoding: "utf8",
 			timeout: 5_000,
 		});
-		if (diff.status !== 0 || untracked.status !== 0) return undefined;
-		const hash = createHash("sha256").update(diff.stdout);
+		if (staged.status !== 0 || unstaged.status !== 0 || untracked.status !== 0) return undefined;
+		const hash = createHash("sha256").update(staged.stdout).update(unstaged.stdout);
 		for (const file of untracked.stdout.split("\0").filter(Boolean).sort()) {
 			hash.update("\0" + file + "\0");
 			try {

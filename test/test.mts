@@ -871,6 +871,13 @@ const fingerprintBeforeContentChange = getGitWorktreeFingerprint(fingerprintRepo
 writeFileSync(join(fingerprintRepo, "reviewed.txt"), "second revision\n");
 check("dirty tracked content change keeps porcelain status", getGitStatusSummary(fingerprintRepo) === statusBeforeContentChange);
 check("dirty tracked content change updates review fingerprint", getGitWorktreeFingerprint(fingerprintRepo) !== fingerprintBeforeContentChange);
+const commitlessRepo = mkdtempSync(join(tmpdir(), "wg-review-commitless-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: commitlessRepo });
+writeFileSync(join(commitlessRepo, "seed.txt"), "v1\n");
+const commitlessBefore = getGitWorktreeFingerprint(commitlessRepo);
+writeFileSync(join(commitlessRepo, "seed.txt"), "v2\n");
+check("commitless repo content change updates review fingerprint", getGitWorktreeFingerprint(commitlessRepo) !== commitlessBefore);
+rmSync(commitlessRepo, { recursive: true, force: true });
 rmSync(fingerprintRepo, { recursive: true, force: true });
 
 // 9. Secret-File READ Blocks (Policy 17)
@@ -1377,6 +1384,8 @@ check("checkInteractiveTtyCommand detects nano", checkInteractiveTtyCommand("nan
 check("checkInteractiveTtyCommand detects less", checkInteractiveTtyCommand("less file.txt").isInteractive);
 check("checkInteractiveTtyCommand detects top", checkInteractiveTtyCommand("top").isInteractive);
 check("checkInteractiveTtyCommand permits top batch mode", !checkInteractiveTtyCommand("top -b -n 1").isInteractive);
+check("checkInteractiveTtyCommand permits top long-form batch flag", !checkInteractiveTtyCommand("top --batch -n 1").isInteractive);
+check("checkInteractiveTtyCommand permits hyphenated top-like filename", !checkInteractiveTtyCommand("ls top-level-dir").isInteractive);
 check("top batch mode does not hide another interactive monitor", checkInteractiveTtyCommand("top -b -n 1; htop").isInteractive);
 check("top batch mode does not hide a later interactive top", checkInteractiveTtyCommand("top -b -n 1; top").isInteractive);
 check("checkInteractiveTtyCommand detects sudo", checkInteractiveTtyCommand("sudo apt-get update").isInteractive);
@@ -1392,6 +1401,7 @@ check("shell tool blocks nano", blocked(await shell("nano README.md")));
 check("shell tool blocks less", blocked(await shell("less package.json")));
 check("shell tool blocks top", blocked(await shell("top")));
 check("shell tool allows top batch mode", !(await shell("top -b -n 1")));
+check("shell tool allows top long-form batch flag", !(await shell("top --batch -n 1")));
 check("shell tool blocks npm init without flag", blocked(await shell("npm init")));
 check("shell tool allows npm init -y", !(await shell("npm init -y")));
 
