@@ -23,6 +23,7 @@ Packs the npm tarball, installs it into an isolated project to verify the modula
 ```bash
 npm run test:install # runs node test-e2e.mts
 ```
+Package and loader checks remain deterministic. If the configured model provider rejects a live prompt before guard behavior can run because credits, rate limits, capacity, or overload make the provider unavailable, that live case is reported as unavailable rather than as a guard failure. Other live-runtime failures still fail the suite.
 
 ### 4. Full Verification Suite
 Runs typecheck, unit tests, and live runtime installation tests in sequence:

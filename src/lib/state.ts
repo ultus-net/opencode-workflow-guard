@@ -291,3 +291,13 @@ export function getSubagentMutationBudget(root: string): number {
 	}
 	return 50;
 }
+
+export function isLearningEnabled(root: string): boolean {
+	return process.env.WORKFLOW_GUARD_LEARNING === "1";
+}
+
+export function getLearningInterventionBudget(root: string): number {
+	const configured = getProjectConfig(root).maxLearningInterventions;
+	if (typeof configured === "number" && configured >= 0) return Math.floor(configured);
+	return 3;
+}

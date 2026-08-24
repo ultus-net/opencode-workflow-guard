@@ -22,6 +22,7 @@ export interface ProjectConfig {
 	requireReview?: boolean;
 	requireDocumentation?: boolean;
 	maxSubagentMutations?: number;
+	maxLearningInterventions?: number;
 }
 
 export interface VerifyResult {
@@ -76,4 +77,62 @@ export interface ShellMutation {
 	kind: "redirect" | "command";
 	target?: string;
 	what: string;
+}
+
+export type LearningStage = "exposed" | "developing" | "demonstrated" | "independent" | "critique";
+export type LearningEvidenceKind = LearningStage | "needs-reinforcement";
+export type LearningOpportunityType = "design" | "debugging" | "new-concept";
+
+export interface LearningEvidence {
+	concept: string;
+	kind: LearningEvidenceKind;
+	summary: string;
+	timestamp: number;
+	sessionID?: string;
+	project?: string;
+}
+
+export interface LearnerConcept {
+	stage: LearningStage;
+	lastObservedAt: number;
+	evidence: LearningEvidence[];
+}
+
+export interface LearnerProfile {
+	version: 1;
+	concepts: Record<string, LearnerConcept>;
+}
+
+export interface LearningOpportunity {
+	type: LearningOpportunityType;
+	concept: string;
+	relevance: number;
+	consequence: number;
+}
+
+export type ProjectMemoryKind = "fact" | "decision" | "constraint" | "lesson";
+export type ProjectMemorySource = "user" | "file" | "git" | "tool" | "agent" | "portable";
+
+export interface ProjectMemoryRecord {
+	id: string;
+	projectId: string;
+	kind: ProjectMemoryKind;
+	content: string;
+	source: ProjectMemorySource;
+	createdAt: number;
+	sessionID?: string;
+	commit?: string;
+	paths: string[];
+	supersedes?: string;
+	status: "current" | "superseded";
+}
+
+export interface ProjectMemoryInput {
+	kind: ProjectMemoryKind;
+	content: string;
+	source: ProjectMemorySource;
+	sessionID?: string;
+	commit?: string;
+	paths?: string[];
+	supersedes?: string;
 }

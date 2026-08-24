@@ -20,18 +20,18 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 
 ---
 
-### 3. `Blocked todowrite: only one task may be 'in_progress'`
+### 3. Multiple tasks are `in_progress`
 
-- **Symptoms:** `todowrite` fails with a message restricting parallel in-progress tasks.
-- **Root Cause:** Policy 1 enforces a strict focus rule: only one task may be `in_progress` at any time.
-- **Solution:** Keep one task `in_progress` and the rest `pending`. Mark the current task `completed` before advancing the next task to `in_progress`.
+- **Symptoms:** A task list contains multiple `in_progress` items during parallel work.
+- **Root Cause:** This is supported. Policy 1 permits multiple tasks to be `in_progress` so independent work and subagents can proceed concurrently.
+- **Solution:** No correction is required. Keep each active item in every replacement list until it is explicitly marked `completed` or `cancelled`.
 
 ---
 
 ### 4. `Blocked todowrite: active task '...' was removed`
 
 - **Symptoms:** `todowrite` is blocked after an active item disappears from the submitted list.
-- **Root Cause:** Policy 1 requires active tasks to be explicitly completed or cancelled rather than silently removed. Independent items may otherwise be completed out of order.
+- **Root Cause:** Each `todowrite` call replaces the complete list. Policy 1 therefore requires active tasks to be explicitly completed or cancelled rather than silently omitted. Independent items may otherwise be completed out of order.
 - **Solution:** Keep the task in the list and mark it `completed` or `cancelled` before removing it in a later request.
 
 ---
