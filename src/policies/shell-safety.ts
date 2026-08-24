@@ -89,10 +89,10 @@ const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice:
 ];
 
 export function checkInteractiveTtyCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
-	const monitorCommands = command.split(/[;&|\n]+/).filter((segment) => /\b(?:top|htop|btop|atop|glances)\b/i.test(segment));
+	const monitorCommands = command.split(/[;&|\n]+/).filter((segment) => /(?:^|[;&|\s])(?:top|htop|btop|atop|glances)(?:$|[;&|\s])/i.test(segment));
 	if (monitorCommands.some((segment) =>
-		/\b(?:htop|btop|atop|glances)\b/i.test(segment) ||
-		(/\btop\b/i.test(segment) && !/(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
+		/(?:^|[;&|\s])(?:htop|btop|atop|glances)(?:$|[;&|\s])/i.test(segment) ||
+		(/(?:^|[;&|\s])top(?:$|[;&|\s])/i.test(segment) && !/(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
 	)) {
 		return {
 			isInteractive: true,
@@ -105,7 +105,7 @@ export function checkInteractiveTtyCommand(command: string): { isInteractive: bo
 			if (
 				name === "interactive process monitor" &&
 				monitorCommands.length > 0 &&
-				monitorCommands.every((segment) => /\btop\b/i.test(segment) && /(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
+				monitorCommands.every((segment) => /(?:^|[;&|\s])top(?:$|[;&|\s])/i.test(segment) && /(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
 			) {
 				continue;
 			}
