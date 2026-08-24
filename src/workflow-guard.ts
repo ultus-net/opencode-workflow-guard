@@ -9,9 +9,11 @@
  */
 
 import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
+import type { LearningEvidenceKind } from "./lib/types.ts";
 import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { join } from "node:path";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -23,6 +25,9 @@ export type {
 	AuditEntry,
 	GitInvocation,
 	ShellMutation,
+	LearnerProfile,
+	LearningEvidence,
+	LearningOpportunity,
 } from "./lib/types.ts";
 
 // ── State & runtime context ──────────────────────────────────────────────────
@@ -48,6 +53,8 @@ import {
 	isReviewRequired,
 	isDocumentationRequired,
 	getSubagentMutationBudget,
+	isLearningEnabled,
+	getLearningInterventionBudget,
 	recordReviewResult,
 	getLastReviewResult,
 	resetReviewState,
@@ -70,6 +77,8 @@ export {
 	isReviewRequired,
 	isDocumentationRequired,
 	getSubagentMutationBudget,
+	isLearningEnabled,
+	getLearningInterventionBudget,
 	recordReviewResult,
 	getLastReviewResult,
 	resetReviewState,
@@ -88,6 +97,48 @@ import {
 } from "./lib/utils.ts";
 
 export { getCleanEnv };
+
+// ── Adaptive learning engine ─────────────────────────────────────────────────
+import {
+	loadLearnerProfile,
+	recordLearningEvidence,
+	selectLearningOpportunity,
+	updateLearnerProfile,
+} from "./lib/learning.ts";
+export {
+	createLearnerProfile,
+	getLearnerProfilePath,
+	loadLearnerProfile,
+	recordLearningEvidence,
+	saveLearnerProfile,
+	selectLearningOpportunity,
+	updateLearnerProfile,
+} from "./lib/learning.ts";
+
+// ── Project memory ───────────────────────────────────────────────────────────
+export {
+	getProjectMemoryDir,
+	getProjectMemoryIdentity,
+	ensureProjectMemoryExcluded,
+	isProjectMemoryFresh,
+	openProjectMemory,
+	recordProjectMemory,
+	searchProjectMemory,
+	getRecentProjectMemory,
+	exportProjectKnowledge,
+	importProjectKnowledge,
+} from "./lib/project-memory.ts";
+import {
+	exportProjectKnowledge,
+	ensureProjectMemoryExcluded,
+	getProjectMemoryIdentity,
+	getRecentProjectMemory,
+	importProjectKnowledge,
+	isProjectMemoryFresh,
+	openProjectMemory,
+	recordProjectMemory,
+	searchProjectMemory,
+} from "./lib/project-memory.ts";
 
 // ── Audit & durable verification cache ───────────────────────────────────────
 import {
@@ -784,12 +835,12 @@ async function guardToolCallImpl(
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
 			const descFlag = isAz ? "--description" : "--body";
+			const preflightFailures: string[] = [];
 
 			// Policy 19: conflict-free mergeability gate before opening PR
 			const conflictCheck = checkMergeConflicts(currentRoot);
 			if (conflictCheck.hasConflicts) {
-				logBlock(`[workflow-guard] blocked ${prTool}: merge conflicts detected`);
-				return `Blocked: ${conflictCheck.reason}`;
+				preflightFailures.push(conflictCheck.reason ?? "Branch has merge conflicts with its base branch.");
 			}
 
 			// Policy 20: branch already merged/closed
@@ -797,10 +848,7 @@ async function guardToolCallImpl(
 			if (branch) {
 				const mergedStatus = isBranchAlreadyMergedOrClosed(currentRoot, branch);
 				if (mergedStatus.merged) {
-					logBlock(
-						`[workflow-guard] blocked ${prTool}: branch already merged/closed`,
-					);
-					return `Blocked: ${mergedStatus.reason}`;
+					preflightFailures.push(mergedStatus.reason ?? "Branch is already merged or closed.");
 				}
 			}
 
@@ -816,11 +864,7 @@ async function guardToolCallImpl(
 					review.gitStatus === getGitStatusSummary(currentRoot) &&
 					review.worktreeFingerprint === getGitWorktreeFingerprint(currentRoot);
 				if (!reviewMatchesContext) {
-					logBlock(`[workflow-guard] blocked ${prTool}: review approval required`);
-					return (
-						`Blocked: PR creation requires a passing review approval. ` +
-						"Invoke a secondary review subagent to record an approval using the record_review tool first."
-					);
+					preflightFailures.push("Passing secondary review approval is required; invoke a secondary review subagent and record approval with record_review.");
 				}
 			}
 
@@ -828,11 +872,7 @@ async function guardToolCallImpl(
 			if (isDocumentationRequired(currentRoot)) {
 				const hasDocChange = branchHasDocumentationChange(currentRoot);
 				if (!hasDocChange) {
-					logBlock(`[workflow-guard] blocked ${prTool}: documentation update required`);
-					return (
-						`Blocked: PR requires documentation updates (Policy 21). ` +
-						"Update README.md or relevant documentation in docs/ before opening a PR."
-					);
+					preflightFailures.push("Documentation update is required (Policy 21); update README.md or relevant documentation in docs/.");
 				}
 			}
 
@@ -843,19 +883,19 @@ async function guardToolCallImpl(
 				branchChangelog ||
 				prSegments.every((segment) => prBodyIncludesChangelog(segment));
 			if (!hasChangelog) {
-				logBlock(`[workflow-guard] blocked ${prTool}: no changelog found`);
-				return (
-					`Blocked: PR must include a changelog. Either update a ` +
-					`CHANGELOG file in this branch's diff, or include a ` +
-					`'Changelog:' section in the PR description (${descFlag}).`
-				);
+				preflightFailures.push(`Changelog is required; update a CHANGELOG file or include a 'Changelog:' section in the PR description (${descFlag}).`);
 			}
 
 			// Lockfile synchronization pre-flight gate
 			const lockCheck = checkLockfileSync(currentRoot);
 			if (lockCheck.isOutOfSync) {
-				logBlock(`[workflow-guard] blocked ${prTool}: ${lockCheck.reason}`);
-				return `Blocked: ${lockCheck.reason}`;
+				preflightFailures.push(lockCheck.reason ?? "Dependency lockfile is out of sync with its manifest.");
+			}
+
+			if (preflightFailures.length > 0) {
+				const reason = `Blocked: PR preflight failed:\n${preflightFailures.map((failure) => `- ${failure}`).join("\n")}`;
+				logBlock(`[workflow-guard] blocked ${prTool}: ${preflightFailures.length} preflight requirement(s) failed`);
+				return reason;
 			}
 		}
 
@@ -956,6 +996,18 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	setWorkspaceRoot(effectiveRoot);
 	setSdkClient(ctx.client);
 	reloadProjectConfig(effectiveRoot);
+	const learningEnabled = isLearningEnabled(effectiveRoot);
+	const learningInterventions = new Map<string, number>();
+	const portableMemoryPath = join(effectiveRoot, ".opencode", "memory", "project-memory.jsonl");
+	let projectMemory: ReturnType<typeof openProjectMemory> | undefined;
+	try {
+		projectMemory = openProjectMemory(getProjectMemoryIdentity(effectiveRoot));
+		ensureProjectMemoryExcluded(effectiveRoot);
+		importProjectKnowledge(projectMemory, portableMemoryPath, (content) => secretIn(content) !== undefined);
+	} catch {
+		try { projectMemory?.close(); } catch {}
+		projectMemory = undefined;
+	}
 
 	try {
 		await (ctx.client as any)?.app?.log?.({
@@ -969,6 +1021,120 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 
 	return {
 		tool: {
+			project_memory_search: tool({
+				description: "Search current durable knowledge for this project. Returns concise typed records with provenance; superseded records are excluded.",
+				args: { query: tool.schema.string() },
+				execute: async (args) => projectMemory ? JSON.stringify(args.query.length <= 500 ? searchProjectMemory(projectMemory, args.query, 8) : [], null, 2) : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
+			}),
+			project_memory_record: tool({
+				description: "Record a durable project fact, decision, constraint, or lesson when it will matter in future sessions. Do not record transient tool output, secrets, or speculative hypotheses.",
+				args: {
+					kind: tool.schema.string().describe("fact, decision, constraint, or lesson"),
+					content: tool.schema.string(),
+					paths: tool.schema.array(tool.schema.string()),
+					supersedes: tool.schema.string().optional(),
+				},
+				execute: async (args, toolContext) => {
+					if (!projectMemory) return "[workflow-guard] Project memory unavailable; core guard enforcement remains active.";
+					if (!(["fact", "decision", "constraint", "lesson"] as string[]).includes(args.kind)) return "[workflow-guard] Project memory rejected: invalid kind.";
+					const detectedSecret = secretIn(args.content);
+					if (detectedSecret) return `[workflow-guard] Project memory rejected: possible secret detected (${detectedSecret}).`;
+					const record = recordProjectMemory(projectMemory, {
+						kind: args.kind as "fact" | "decision" | "constraint" | "lesson",
+						content: args.content,
+						source: "agent",
+						sessionID: toolContext.sessionID,
+						commit: getCurrentGitCommitHash(effectiveRoot),
+						paths: args.paths,
+						supersedes: args.supersedes || undefined,
+					});
+					return JSON.stringify(record);
+				},
+			}),
+			project_memory_export: tool({
+				description: "Explicitly promote selected durable project-memory records to the human-readable repo-local .opencode/memory/project-memory.jsonl file. Nothing is exported automatically.",
+				args: { ids: tool.schema.array(tool.schema.string()) },
+				execute: async (args) => {
+					if (!projectMemory) return "[workflow-guard] Project memory unavailable; core guard enforcement remains active.";
+					if (args.ids.length > 100 || args.ids.some((id) => id.length > 200)) return "[workflow-guard] Project memory export rejected: invalid record IDs.";
+					const count = exportProjectKnowledge(projectMemory, args.ids, portableMemoryPath, (content) => secretIn(content) !== undefined);
+					return `[workflow-guard] Exported ${count} project-memory record(s) to .opencode/memory/project-memory.jsonl.`;
+				},
+			}),
+			project_memory_import: tool({
+				description: "Import the fixed repo-local .opencode/memory/project-memory.jsonl file into this project's local working-memory index.",
+				args: {},
+				execute: async () => projectMemory ? `[workflow-guard] Imported ${importProjectKnowledge(projectMemory, portableMemoryPath, (content) => secretIn(content) !== undefined)} new project-memory record(s).` : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
+			}),
+			...(learningEnabled ? {
+				learning_profile: tool({
+					description: "Inspect the local evidence-based learner profile so teaching can build on demonstrated knowledge without assuming unobserved concepts are gaps.",
+					args: {},
+					execute: async () => JSON.stringify(loadLearnerProfile(), null, 2),
+				}),
+				learning_checkpoint: tool({
+					description: "At a high-value design decision, debugging moment, or important new concept, rank candidate Socratic learning opportunities. If one is selected, ask one concise question before continuing the work; do not turn routine syntax into a lesson.",
+					args: {
+						opportunities: tool.schema.array(tool.schema.object({
+							type: tool.schema.string().describe("design, debugging, or new-concept"),
+							concept: tool.schema.string().describe("Transferable engineering concept"),
+							relevance: tool.schema.number().describe("Current-task relevance from 0 to 1"),
+							consequence: tool.schema.number().describe("Decision consequence from 0 to 1"),
+						})),
+					},
+					execute: async (args, toolContext) => {
+						const valid = args.opportunities.slice(0, 20).filter((candidate): candidate is typeof candidate & { type: "design" | "debugging" | "new-concept" } =>
+							(candidate.type === "design" || candidate.type === "debugging" || candidate.type === "new-concept") &&
+							candidate.concept.length > 0 && candidate.concept.length <= 100 &&
+							candidate.relevance >= 0 && candidate.relevance <= 1 && candidate.consequence >= 0 && candidate.consequence <= 1,
+						);
+						const used = learningInterventions.get(toolContext.sessionID) ?? 0;
+						const selected = selectLearningOpportunity(loadLearnerProfile(), valid, {
+							interventionsThisSession: used,
+							maxInterventionsPerSession: getLearningInterventionBudget(effectiveRoot),
+						});
+						if (!selected) return JSON.stringify({ intervene: false, reason: "No opportunity selected or session learning budget reached." });
+						learningInterventions.set(toolContext.sessionID, used + 1);
+						return JSON.stringify({ intervene: true, opportunity: selected, guidance: "Ask one question, use the answer as task context, briefly reconcile if useful, then continue building." });
+					},
+				}),
+				learning_record: tool({
+					description: "Record concise evidence from a real Socratic interaction after observing the learner's reasoning. Record what was demonstrated, not a grade or an inferred deficit.",
+					args: {
+						concept: tool.schema.string(),
+						kind: tool.schema.string().describe("exposed, developing, demonstrated, independent, critique, or needs-reinforcement"),
+						summary: tool.schema.string().describe("Short factual description of observed reasoning"),
+					},
+					execute: async (args, toolContext) => {
+						const validKinds = new Set(["exposed", "developing", "demonstrated", "independent", "critique", "needs-reinforcement"]);
+						if (!validKinds.has(args.kind)) return "[workflow-guard] Learning evidence rejected: invalid evidence kind.";
+						if (args.concept.length < 1 || args.concept.length > 100 || args.summary.length < 1 || args.summary.length > 1000) {
+							return "[workflow-guard] Learning evidence rejected: concept must be 1-100 characters and summary 1-1000 characters.";
+						}
+						try {
+							updateLearnerProfile((profile) => {
+								if (!profile.concepts[args.concept] && Object.keys(profile.concepts).length >= 500) {
+									throw new Error("concept-limit");
+								}
+								recordLearningEvidence(profile, {
+									concept: args.concept,
+									kind: args.kind as LearningEvidenceKind,
+									summary: args.summary,
+									timestamp: Date.now(),
+									sessionID: toolContext.sessionID,
+									project: effectiveRoot,
+								});
+							});
+						} catch (error) {
+							if ((error as Error).message === "concept-limit") {
+								return "[workflow-guard] Learning evidence rejected: learner profile concept limit reached.";
+							}
+							throw error;
+						}
+						return `[workflow-guard] Learning evidence recorded for ${args.concept}.`;
+					},
+				}),
+			} : {}),
 			guard_status: tool({
 				description:
 					"Inspect active guardrails, current branch protection, and verification/review status.",
@@ -1289,6 +1455,13 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					);
 				}
 				contextBlocks.push(stateLines.join("\n"));
+				const projectKnowledge = (projectMemory ? getRecentProjectMemory(projectMemory, 20) : [])
+					.filter((memory) => memory.source !== "portable" && isProjectMemoryFresh(memory, effectiveRoot))
+					.slice(0, 8);
+				if (projectKnowledge.length > 0) {
+					const lines = projectKnowledge.map((memory) => `- [${memory.kind}:${memory.id.slice(0, 8)}] ${memory.content.slice(0, 300)}`);
+					contextBlocks.push(`## Project Memory\n${lines.join("\n")}\nTreat these as historical project knowledge; verify against current repository state when relevant files have changed.`);
+				}
 
 				if (Array.isArray(output?.context)) {
 					output.context.push(contextBlocks.join("\n\n"));
@@ -1366,15 +1539,15 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			} catch {}
 		},
 
-		// Keep tool descriptions honest: todowrite's description reflects the
-		// finalization gates so the model is not surprised by verification blocks.
+		// Keep tool descriptions honest: todowrite's description reflects lifecycle
+		// and finalization gates so the model is not surprised by preventable blocks.
 		"tool.definition": async (input, output) => {
 			if (input.toolID !== "todowrite") return;
 			const description = typeof output.description === "string" ? output.description : "";
 			if (description.includes("verification evidence")) return;
 			output.description =
 				description +
-				"\n\nNote: marking every task completed triggers the workflow guard's finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply.";
+				"\n\nWorkflow Guard lifecycle: each todowrite call replaces the complete task list. Preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled; do not omit active tasks when adding new work. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply.";
 		},
 
 		event: async ({

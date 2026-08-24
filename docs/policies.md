@@ -9,7 +9,7 @@
 ### 1. Task Breakdown & Lifecycle (`todowrite`)
 - **Pre-edit Gate:** All file-editing tools (`edit`, `write`, `apply_patch`) are blocked until the session has an active task list in OpenCode's native todo system (`todowrite`, persisted at `GET /session/:id/todo`).
 - **Flexible Task Execution:** Tasks can be completed in any order as work concludes without artificial sequential blockers, maintaining maximum pair-programming DX.
-- **No Silent Deletion:** Active tasks cannot be deleted without being explicitly marked `completed` or `cancelled`.
+- **No Silent Deletion:** Each `todowrite` update replaces the complete list. Active tasks must remain in subsequent updates until they are explicitly marked `completed` or `cancelled`.
 - **Subagent Inheritance & Role Confinement:** Subagents automatically inherit active tasks from their parent session via the `parentID` hierarchy. Subagents spawned with read-only roles (`reviewer`, `planner`, `advisor`, `critic`, `explorer`, `scout`, `evaluator`) are hard-confined: file mutations, lifecycle tools, and mutating shell commands are strictly blocked.
 - **Subagent Mutation Budget:** Subagent sessions are protected by a mutation safety budget (`maxSubagentMutations` in project config or `WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS` env, default 50) to terminate runaway edit loops deterministically.
 
@@ -25,6 +25,7 @@
   - The branch diff adds/modifies a `.changeset/*.md` fragment file (Changesets workflow), OR
   - The PR description (`--body`, `--description`, or `--body-file`/`-F`) contains a `Changelog:` section.
 - **Lockfile Synchronization Gate:** Whenever package manifests (`package.json`, `Cargo.toml`, `go.mod`) are modified, PR creation is blocked until their corresponding lockfiles (`package-lock.json`/`bun.lock`/`pnpm-lock.yaml`/`yarn.lock`, `Cargo.lock`, `go.sum`) are updated.
+- When multiple PR prerequisites fail at once, the guard reports all detected preflight failures together so they can be resolved before retrying PR creation.
 
 ### 4. Destructive CLI Operations Guard
 - Blocks destructive filesystem, infrastructure, cloud, database, and git operations unless the **user** explicitly overrides via environment variable.
@@ -145,7 +146,7 @@
 - Uses the `experimental.text.complete` hook; claim detection is a conservative phrase heuristic to avoid false positives on casual wording.
 
 ### Tool Description Honesty
-- Via the `tool.definition` hook, the guard enriches the `todowrite` tool's description with the finalization-gate note (verification evidence required after the last mutation), so the model is not surprised by blocks at completion time. Other tools are untouched, and the enrichment is idempotent.
+- Via the `tool.definition` hook, the guard enriches the `todowrite` tool's description with its replacement-list lifecycle and finalization gates (including verification evidence required after the last mutation), so the model is not surprised by preventable lifecycle blocks. Other tools are untouched, and the enrichment is idempotent.
 
 ---
 

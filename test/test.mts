@@ -55,6 +55,20 @@ import {
 	getWorktreeStorageDir,
 	getCleanGitEnv,
 	checkCompletionClaims,
+	createLearnerProfile,
+	loadLearnerProfile,
+	recordLearningEvidence,
+	saveLearnerProfile,
+	selectLearningOpportunity,
+	updateLearnerProfile,
+	openProjectMemory,
+	recordProjectMemory,
+	searchProjectMemory,
+	exportProjectKnowledge,
+	importProjectKnowledge,
+	getProjectMemoryIdentity,
+	ensureProjectMemoryExcluded,
+	isProjectMemoryFresh,
 	default as defaultExport,
 } from "../src/workflow-guard.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
@@ -1075,6 +1089,13 @@ check(
 
 // Review Requirement gating on PR creation
 resetReviewState();
+const combinedPrPreflight = await shell("gh pr create --title t --body 'no release notes'");
+check(
+	"PR preflight reports review and changelog failures together",
+	typeof combinedPrPreflight === "string" &&
+		combinedPrPreflight.includes("Passing secondary review approval is required") &&
+		combinedPrPreflight.includes("Changelog is required"),
+);
 check(
 	"PR creation blocked when requireReview is true and no review recorded",
 	blocked(await shell("gh pr create --title t --body 'Changelog: update'")),
@@ -1825,6 +1846,10 @@ const defPlugin = await WorkflowGuard({ directory: root, worktree: root, client:
 const todoDef = { description: "Write the todo list.", parameters: {} };
 await defPlugin["tool.definition"]?.({ toolID: "todowrite" } as any, todoDef);
 check("tool.definition adds finalization gate note to todowrite", todoDef.description.includes("verification evidence"));
+check(
+	"tool.definition explains todowrite replacement-list lifecycle",
+	todoDef.description.includes("replaces the complete task list") && todoDef.description.includes("do not omit active tasks"),
+);
 const otherDef = { description: "Read a file.", parameters: {} };
 await defPlugin["tool.definition"]?.({ toolID: "read" } as any, otherDef);
 check("tool.definition leaves other tools untouched", otherDef.description === "Read a file.");
@@ -1832,6 +1857,192 @@ check("tool.definition leaves other tools untouched", otherDef.description === "
 const idemDef = { description: todoDef.description, parameters: {} };
 await defPlugin["tool.definition"]?.({ toolID: "todowrite" } as any, idemDef);
 check("tool.definition enrichment is idempotent", idemDef.description === todoDef.description);
+
+// Socratic learning engine: evidence is explicit and interventions favor
+// relevant gaps without repeatedly interrupting demonstrated knowledge.
+const learner = createLearnerProfile();
+check("new learner profile starts without inferred knowledge gaps", Object.keys(learner.concepts).length === 0);
+recordLearningEvidence(learner, {
+	concept: "dependency-boundaries",
+	kind: "demonstrated",
+	summary: "Chose an interface boundary to isolate an external API client.",
+	sessionID: "s-learning",
+	timestamp: 100,
+});
+check(
+	"learning evidence records demonstrated reasoning with provenance",
+	learner.concepts["dependency-boundaries"]?.evidence[0]?.sessionID === "s-learning" &&
+		learner.concepts["dependency-boundaries"]?.stage === "demonstrated",
+);
+const newConcept = selectLearningOpportunity(learner, [
+	{ type: "new-concept", concept: "transaction-boundaries", relevance: 0.9, consequence: 0.7 },
+	{ type: "new-concept", concept: "dependency-boundaries", relevance: 0.9, consequence: 0.7 },
+]);
+check("adaptive selection favors an unobserved concept over demonstrated knowledge", newConcept?.concept === "transaction-boundaries");
+const designMoment = selectLearningOpportunity(learner, [
+	{ type: "design", concept: "state-ownership", relevance: 1, consequence: 0.9 },
+	{ type: "new-concept", concept: "syntax-detail", relevance: 0.4, consequence: 0.1 },
+]);
+check("consequential design decisions outrank low-value novelty", designMoment?.concept === "state-ownership");
+const cooledDown = selectLearningOpportunity(learner, [
+	{ type: "debugging", concept: "failure-model", relevance: 1, consequence: 1 },
+], { interventionsThisSession: 2, maxInterventionsPerSession: 2 });
+check("session learning budget prevents excessive interruptions", cooledDown === undefined);
+check(
+	"low-value novelty does not interrupt the session",
+	selectLearningOpportunity(learner, [{ type: "new-concept", concept: "minor-syntax", relevance: 0.1, consequence: 0.1 }]) === undefined,
+);
+recordLearningEvidence(learner, {
+	concept: "dependency-boundaries",
+	kind: "needs-reinforcement",
+	summary: "Needed help applying the boundary in a new context.",
+	timestamp: 200,
+});
+check(
+	"reinforcement evidence increases future teaching priority",
+	selectLearningOpportunity(learner, [{ type: "design", concept: "dependency-boundaries", relevance: 0.7, consequence: 0.5 }])?.concept === "dependency-boundaries",
+);
+const learnerPath = join(root, "learning", "profile.json");
+saveLearnerProfile(learner, learnerPath);
+const reloadedLearner = loadLearnerProfile(learnerPath);
+check(
+	"learner profile persists locally with evidence intact",
+	reloadedLearner.concepts["dependency-boundaries"]?.evidence[0]?.summary.includes("external API") === true,
+);
+check("invalid learner profile fails closed to an empty profile", loadLearnerProfile(join(root, "missing-profile.json")).version === 1);
+const malformedLearnerPath = join(root, "malformed-profile.json");
+writeFileSync(malformedLearnerPath, JSON.stringify({ version: 1, concepts: { broken: { stage: "demonstrated", lastObservedAt: 1 } } }));
+check("malformed persisted learner concepts fail closed", Object.keys(loadLearnerProfile(malformedLearnerPath).concepts).length === 0);
+writeFileSync(`${learnerPath}.lock`, "busy");
+let busyProfileRejected = false;
+try { updateLearnerProfile(() => {}, learnerPath); } catch { busyProfileRejected = true; }
+check("profile lock prevents concurrent evidence overwrite", busyProfileRejected);
+rmSync(`${learnerPath}.lock`);
+
+const prevLearning = process.env.WORKFLOW_GUARD_LEARNING;
+const prevDataHome = process.env.XDG_DATA_HOME;
+delete process.env.WORKFLOW_GUARD_LEARNING;
+const learningDisabledPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
+check("repository cannot expose learning tools without user opt-in", !(learningDisabledPlugin.tool as any)?.learning_profile);
+process.env.WORKFLOW_GUARD_LEARNING = "1";
+process.env.XDG_DATA_HOME = join(root, "learning-data");
+const learningPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
+check("learning mode registers profile tool when explicitly enabled", !!learningPlugin.tool?.learning_profile);
+check("learning mode registers adaptive checkpoint tool", !!learningPlugin.tool?.learning_checkpoint);
+check("learning mode registers evidence recorder", !!learningPlugin.tool?.learning_record);
+const checkpointResult = JSON.parse(await (learningPlugin.tool as any).learning_checkpoint.execute({
+	opportunities: [{ type: "design", concept: "application-state", relevance: 1, consequence: 0.9 }],
+}, { sessionID: "s-learning-tools" }));
+check("learning checkpoint selects a high-value design moment", checkpointResult.intervene === true && checkpointResult.opportunity.concept === "application-state");
+const invalidCheckpointResult = JSON.parse(await (learningPlugin.tool as any).learning_checkpoint.execute({
+	opportunities: [{ type: "design", concept: "invalid-score", relevance: 4, consequence: 4 }],
+}, { sessionID: "s-learning-invalid" }));
+check("learning checkpoint rejects out-of-range scoring inputs", invalidCheckpointResult.intervene === false);
+await (learningPlugin.tool as any).learning_record.execute({
+	concept: "application-state",
+	kind: "developing",
+	summary: "Reasoned about which component should own shared application state.",
+}, { sessionID: "s-learning-tools" });
+const persistedFromTool = JSON.parse(await (learningPlugin.tool as any).learning_profile.execute({}));
+check("learning tool persists session evidence in the global-local profile", persistedFromTool.concepts["application-state"]?.evidence[0]?.sessionID === "s-learning-tools");
+if (prevLearning === undefined) delete process.env.WORKFLOW_GUARD_LEARNING;
+else process.env.WORKFLOW_GUARD_LEARNING = prevLearning;
+if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
+else process.env.XDG_DATA_HOME = prevDataHome;
+
+// Project memory: private working knowledge is indexed locally while only
+// explicitly promoted durable records cross the repository boundary.
+const memoryDir = join(root, "project-memory-data");
+const memoryDb = openProjectMemory("project-test", memoryDir);
+const decision = recordProjectMemory(memoryDb, {
+	kind: "decision",
+	content: "Use SQLite as the authoritative local project-memory index.",
+	source: "user",
+	sessionID: "s-memory",
+	paths: ["src/lib/project-memory.ts"],
+	commit: "abc1234",
+});
+check("project memory persists provenance in SQLite", searchProjectMemory(memoryDb, "SQLite authoritative", 5)[0]?.sessionID === "s-memory");
+recordProjectMemory(memoryDb, {
+	kind: "decision",
+	content: "Use SQLite FTS5 for deterministic local memory retrieval.",
+	source: "user",
+	supersedes: decision.id,
+});
+check("superseded project knowledge is excluded from normal retrieval", searchProjectMemory(memoryDb, "authoritative local", 5).every((memory) => memory.id !== decision.id));
+const privateFact = recordProjectMemory(memoryDb, { kind: "fact", content: "A transient local observation.", source: "agent" });
+const portableConstraint = recordProjectMemory(memoryDb, { kind: "constraint", content: "Project memory committed to Git must be human-readable.", source: "user" });
+const portablePath = join(root, ".opencode", "memory", "project-memory.jsonl");
+exportProjectKnowledge(memoryDb, [portableConstraint.id], portablePath);
+const portableText = readFileSync(portablePath, "utf8");
+check("repo-local knowledge exports only explicitly promoted records", portableText.includes(portableConstraint.id) && !portableText.includes(privateFact.id));
+const unsafeLocalMemory = recordProjectMemory(memoryDb, { kind: "fact", content: "unsafe-export-boundary", source: "agent" });
+exportProjectKnowledge(memoryDb, [unsafeLocalMemory.id], portablePath, (content) => content.includes("unsafe-export"));
+check("repo-local export rejects unsafe local memory at promotion boundary", readFileSync(portablePath, "utf8") === "");
+exportProjectKnowledge(memoryDb, [portableConstraint.id], portablePath);
+const importedDb = openProjectMemory("project-import", join(root, "project-memory-import"));
+const imported = importProjectKnowledge(importedDb, portablePath);
+check("repo-local knowledge bootstraps a new local index", imported === 1 && searchProjectMemory(importedDb, "human-readable", 5).length === 1);
+memoryDb.close();
+importedDb.close();
+
+const freshnessRoot = join(root, "memory-freshness-repo");
+mkdirSync(freshnessRoot);
+spawnSync("git", ["init", "-q"], { cwd: freshnessRoot });
+writeFileSync(join(freshnessRoot, "tracked.txt"), "original\n");
+spawnSync("git", ["add", "tracked.txt"], { cwd: freshnessRoot });
+spawnSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "initial"], { cwd: freshnessRoot });
+const freshnessCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: freshnessRoot, encoding: "utf8" }).stdout.trim();
+const freshnessMemory = { ...portableConstraint, commit: freshnessCommit, paths: ["tracked.txt"] };
+check("project memory identity is stable for the same repository", getProjectMemoryIdentity(freshnessRoot) === getProjectMemoryIdentity(freshnessRoot));
+check("project memory starts fresh at its recorded commit", isProjectMemoryFresh(freshnessMemory, freshnessRoot));
+writeFileSync(join(freshnessRoot, "untracked.txt"), "untracked\n");
+check("untracked referenced paths make project memory stale", !isProjectMemoryFresh({ ...freshnessMemory, paths: ["untracked.txt"] }, freshnessRoot));
+writeFileSync(join(freshnessRoot, "tracked.txt"), "unstaged change\n");
+check("unstaged path changes make project memory stale", !isProjectMemoryFresh(freshnessMemory, freshnessRoot));
+spawnSync("git", ["add", "tracked.txt"], { cwd: freshnessRoot });
+check("staged path changes make project memory stale", !isProjectMemoryFresh(freshnessMemory, freshnessRoot));
+check("project memory installs clone-local portable-memory exclusion", ensureProjectMemoryExcluded(freshnessRoot) && readFileSync(join(freshnessRoot, ".git", "info", "exclude"), "utf8").includes(".opencode/memory/"));
+const linkedWorktree = join(root, "memory-linked-worktree");
+const worktreeResult = spawnSync("git", ["worktree", "add", "-q", "--detach", linkedWorktree, "HEAD"], { cwd: freshnessRoot });
+check("linked worktree creation succeeds for project-memory identity test", worktreeResult.status === 0);
+check("linked worktrees share one project-memory identity", getProjectMemoryIdentity(freshnessRoot) === getProjectMemoryIdentity(linkedWorktree));
+
+const rejectedPortablePath = join(root, "rejected-portable.jsonl");
+writeFileSync(rejectedPortablePath, JSON.stringify({ id: "portable-secret", kind: "fact", content: "reject-this-content", paths: [] }) + "\n");
+const rejectedDb = openProjectMemory("project-rejected", join(root, "project-memory-rejected"));
+check("portable import supports rejecting unsafe content before persistence", importProjectKnowledge(rejectedDb, rejectedPortablePath, (content) => content.includes("reject-this")) === 0);
+rejectedDb.close();
+
+const supersessionPortablePath = join(root, "supersession-portable.jsonl");
+const supersessionDb = openProjectMemory("project-supersession", join(root, "project-memory-supersession"));
+const localPrivateMemory = recordProjectMemory(supersessionDb, { kind: "fact", content: "Private local memory remains authoritative.", source: "user" }, "known-local-id");
+writeFileSync(supersessionPortablePath, JSON.stringify({ id: "portable-superseder", kind: "fact", content: "Repository supplied memory.", paths: [], supersedes: localPrivateMemory.id }) + "\n");
+importProjectKnowledge(supersessionDb, supersessionPortablePath);
+check("portable import cannot supersede private local memory", searchProjectMemory(supersessionDb, "Private local authoritative", 5).some((memory) => memory.id === localPrivateMemory.id));
+supersessionDb.close();
+
+process.env.XDG_DATA_HOME = join(root, "project-memory-tools");
+const memoryPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
+check("plugin registers project-memory search and explicit export tools", !!memoryPlugin.tool?.project_memory_search && !!memoryPlugin.tool?.project_memory_export);
+const secretMemory = await (memoryPlugin.tool as any).project_memory_record.execute({ kind: "fact", content: "-----BEGIN PRIVATE " + "KEY-----", paths: [] }, { sessionID: "s-memory-tools" });
+check("project memory refuses secret-like durable content", secretMemory.includes("possible secret"));
+const toolMemory = JSON.parse(await (memoryPlugin.tool as any).project_memory_record.execute({ kind: "constraint", content: "Keep durable project knowledge concise and reviewable.", paths: [] }, { sessionID: "s-memory-tools" }));
+const memorySearch = JSON.parse(await (memoryPlugin.tool as any).project_memory_search.execute({ query: "concise reviewable" }));
+check("project-memory tools record and retrieve durable knowledge", memorySearch[0]?.id === toolMemory.id);
+const memoryCompact = { context: [] as string[] };
+await memoryPlugin["experimental.session.compacting"]?.({ sessionID: "s-memory-tools" } as any, memoryCompact as any);
+check("compaction injects bounded project knowledge", memoryCompact.context.some((context) => context.includes("## Project Memory") && context.includes("concise and reviewable")));
+check("compaction never automatically injects repository-sourced portable knowledge", memoryCompact.context.every((context) => !context.includes("Project memory committed to Git must be human-readable.")));
+
+const blockedDataHome = join(root, "blocked-data-home");
+writeFileSync(blockedDataHome, "not a directory");
+process.env.XDG_DATA_HOME = blockedDataHome;
+const memoryUnavailablePlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
+const unavailableMemory = await (memoryUnavailablePlugin.tool as any).project_memory_search.execute({ query: "anything" });
+check("project-memory initialization failure leaves core guard hooks active", typeof memoryUnavailablePlugin["tool.execute.before"] === "function" && unavailableMemory.includes("core guard enforcement remains active"));
+if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
+else process.env.XDG_DATA_HOME = prevDataHome;
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;

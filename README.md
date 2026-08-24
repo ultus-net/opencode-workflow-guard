@@ -75,6 +75,27 @@ For complete policy specifications and override rules, see [docs/policies.md](do
 | `record_review` | Record a secondary reviewer subagent's verdict evaluated against the review rubric |
 | `guard_worktree_create` | Create an isolated git worktree directory for concurrent subagent execution |
 | `guard_worktree_cleanup` | Snapshot-commit remaining changes and remove an isolated worktree directory |
+| `learning_profile` | Inspect the evidence-based local learner profile (when learning mode is enabled) |
+| `learning_checkpoint` | Rank high-value Socratic opportunities while respecting the session intervention budget |
+| `learning_record` | Persist concise evidence observed during a real learning interaction |
+| `project_memory_search` | Search current durable project knowledge in the local index |
+| `project_memory_record` | Record a durable fact, decision, constraint, or lesson with provenance |
+| `project_memory_export` | Explicitly promote selected records to repo-local human-readable JSONL |
+| `project_memory_import` | Import promoted repo-local knowledge into the local index |
+
+### Experimental Socratic Learning
+
+Learning mode is opt-in and advisory: it never blocks tool calls or weakens deterministic guardrails. Enable it by setting `WORKFLOW_GUARD_LEARNING=1` in the user environment before OpenCode starts. Project configuration cannot enable learning or expose the global profile on its own. `maxLearningInterventions` defaults to 3 per session and can be set to `0` in `.opencode/workflow-guard.json[c]` to suppress checkpoints.
+
+The learner profile is global to the local user and follows the XDG data convention: `$XDG_DATA_HOME/opencode/workflow-guard/learner-profile.json`, or `~/.local/share/opencode/workflow-guard/learner-profile.json` when `XDG_DATA_HOME` is unset. It stores distilled concept evidence, session/project provenance, and progression (`exposed` through `critique`), not conversation transcripts or numeric grades. Unobserved concepts remain unknown rather than being labeled knowledge gaps. Back up or delete this file independently from project repositories as desired.
+
+### Project Memory
+
+Project memory keeps durable working knowledge between sessions without treating conversation history as project truth. Facts, decisions, constraints, and lessons are stored in a local SQLite/FTS5 index under `$XDG_DATA_HOME/opencode/workflow-guard/project-memory/`, or `~/.local/share/opencode/workflow-guard/project-memory/` when `XDG_DATA_HOME` is unset. Git repositories are identified from their common Git directory, so linked worktrees share the same local project index.
+
+The local index is private working memory. Nothing from it is committed automatically. `project_memory_export` promotes only the explicitly selected current record IDs to `.opencode/memory/project-memory.jsonl`, a human-readable portable representation that another clone can import. The plugin adds `.opencode/memory/` to the clone-local `.git/info/exclude` by default; teams that deliberately want to version promoted knowledge can remove that exclusion or force-add the JSONL file. SQLite databases themselves should not be committed.
+
+Memory is supporting context, not authority. Superseded records are excluded from normal retrieval, recording and plugin imports reject content recognized by Workflow Guard's secret detector, and compaction injects at most eight recent current local records. Portable repository records are never injected automatically; they are available through explicit memory search after import. A local record tied to repository paths and a Git commit is omitted from compaction when those paths have committed, staged, or unstaged changes after that commit. Always prefer current repository state when it conflicts with historical memory.
 
 ---
 
