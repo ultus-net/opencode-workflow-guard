@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.1
+
+### Patch Changes
+
+- 717d986: Harden workspace boundary mutator scanning, review fingerprinting, and OpenCode 1.18.21 package entrypoints:
+
+    - Expose native `./server` and `./tui` package entrypoints in `package.json`, removing the ambiguous `./ui` export that npm parsed as GitHub shorthand.
+    - Add `dd of=` and `truncate` to recognized workspace file mutations under Policy 8.
+    - Scan every destination in multi-redirection commands rather than only the first redirect match.
+    - Preserve TTY hang protections for interactive monitors while permitting batch top commands (`top -b -n 1`).
+    - Bind secondary review approvals to worktree SHA-256 diff fingerprints covering staged, unstaged, and untracked file content.
+    - Clarify command-level guardrails vs OS kernel sandboxing in documentation.
+
+- dc1b33c: Consolidate process-monitor detection into one token-scoped check, make the review
+  fingerprint commit-independent (index blob hashes + worktree-vs-index diff + untracked contents), and
+  evaluate the boundary fallback lazily only when specific detectors miss.
+
 ## 1.4.0
 
 ### Minor Changes
