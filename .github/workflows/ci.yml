@@ -48,7 +48,8 @@ jobs:
       - run: npm test
 
   # ───── Heavier checks ─────
-  # Install a pinned OpenCode CLI so a green E2E job proves the live loader ran.
+  # Install a pinned OpenCode CLI so package/load checks always run. Model-driven
+  # probes skip only when the external provider is unavailable.
   e2e:
     name: E2E (plugin load / opencode)
     runs-on: ubuntu-latest

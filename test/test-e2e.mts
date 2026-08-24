@@ -8,8 +8,35 @@ let fail = 0;
 const check = (name: string, cond: unknown): void => {
 	cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name));
 };
+const providerUnavailable = (output: string): boolean => {
+	const cleanOutput = output.replace(/\x1b\[[0-9;]*m/g, "");
+	const providerFailure = /Provider finish_reason: network_error|This request would exceed your available credits given your current in-flight requests/i;
+	if (!providerFailure.test(cleanOutput)) return false;
+	const otherFailure = cleanOutput
+		.replace(/Provider finish_reason: network_error/gi, "")
+		.replace(/Error:?\s*This request would exceed your available credits given your current in-flight requests[^\n]*/gi, "");
+	return !/(?:Error:|failed to load|Cannot find module)/i.test(otherFailure);
+};
+const liveCheck = (name: string, cond: unknown, output: string): boolean => {
+	if (!cond && providerUnavailable(output)) {
+		console.log("SKIP: " + name + " (model provider unavailable)");
+		return true;
+	}
+	check(name, cond);
+	return Boolean(cond);
+};
 
 console.log("- OpenCode Plugin Installation & Runtime Load Test -");
+check("provider network failure is recognized as unavailable", providerUnavailable("Provider finish_reason: network_error"));
+check(
+	"provider capacity failure is recognized as unavailable",
+	providerUnavailable("This request would exceed your available credits given your current in-flight requests."),
+);
+check("ordinary runtime failure remains a test failure", !providerUnavailable("Error: plugin failed to load"));
+check(
+	"provider failure cannot mask a runtime failure",
+	!providerUnavailable("Provider finish_reason: network_error\nError: plugin failed to load"),
+);
 
 // 1. Set up a fresh isolated project with plugin installed. These package
 // checks run even when the optional live OpenCode binary is unavailable.
@@ -93,8 +120,8 @@ const blockedByGuard =
 	output1.includes("[workflow-guard] Blocked: no active todo item") ||
 	output1.includes("blocked write: no active todo item") ||
 	output1.includes("shell file mutation with no active todo item");
-check("plugin loaded and intercepted mutation without active todo", blockedByGuard);
-if (!blockedByGuard) {
+const taskGateChecked = liveCheck("plugin loaded and intercepted mutation without active todo", blockedByGuard, output1);
+if (!taskGateChecked) {
 	console.log("  task-gate output tail:");
 	console.log(output1.slice(-2_000));
 }
@@ -115,8 +142,8 @@ const boundaryBlocked =
 	output2.includes("escapes workspace root") ||
 	output2.includes("path escapes workspace") ||
 	output2.includes("outside the workspace root");
-check("plugin loaded and enforced workspace boundary escape guard", boundaryBlocked);
-if (!boundaryBlocked) {
+const boundaryChecked = liveCheck("plugin loaded and enforced workspace boundary escape guard", boundaryBlocked, output2);
+if (!boundaryChecked) {
 	console.log("  boundary-test output tail:");
 	console.log(output2.slice(-2_000));
 }
@@ -134,9 +161,9 @@ const run3 = spawnSync(
 
 const targetFile = join(testDir, "verified.txt");
 const fileCreated = existsSync(targetFile) && readFileSync(targetFile, "utf8").includes("installed-ok");
-check("compliant workflow with todowrite succeeded through plugin", fileCreated);
-if (!fileCreated) {
-	const output3 = run3.stdout + run3.stderr;
+const output3 = run3.stdout + run3.stderr;
+const workflowChecked = liveCheck("compliant workflow with todowrite succeeded through plugin", fileCreated, output3);
+if (!workflowChecked) {
 	console.log("  compliant-workflow output tail:");
 	console.log(output3.slice(-2_000));
 }
