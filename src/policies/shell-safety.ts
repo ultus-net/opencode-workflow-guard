@@ -38,7 +38,9 @@ export function checkPackageHygiene(command: string): { isViolating: boolean; na
 
 // AI agents running in non-interactive terminal subshells hang indefinitely when an
 // interactive prompt (vim, nano, less, top, sudo, npm init without -y, apt without -y,
-// git rebase -i) waits for TTY input.
+// git rebase -i) waits for TTY input. Process monitors are handled separately in
+// checkProcessMonitorCommand because `top` can run in a safe batch mode, while the
+// other monitors cannot.
 
 const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice: string }> = [
 	{
@@ -50,11 +52,6 @@ const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice:
 		regex: /\b(?:less|more|most)\b/i,
 		name: "terminal pager",
 		advice: "Use cat, head, or grep with non-interactive pipes instead of interactive pagers.",
-	},
-	{
-		regex: /\b(?:top|htop|btop|atop|glances)\b/i,
-		name: "interactive process monitor",
-		advice: "Use ps aux, uptime, or batch flags (e.g. top -b -n 1) instead of interactive monitors.",
 	},
 	{
 		regex: /\bsudo\b/i,
@@ -88,27 +85,31 @@ const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice:
 	},
 ];
 
-export function checkInteractiveTtyCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
-	const monitorCommands = command.split(/[;&|\n]+/).filter((segment) => /(?:^|[;&|\s])(?:top|htop|btop|atop|glances)(?:$|[;&|\s])/i.test(segment));
-	if (monitorCommands.some((segment) =>
-		/(?:^|[;&|\s])(?:htop|btop|atop|glances)(?:$|[;&|\s])/i.test(segment) ||
-		(/(?:^|[;&|\s])top(?:$|[;&|\s])/i.test(segment) && !/(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
-	)) {
-		return {
-			isInteractive: true,
-			name: "interactive process monitor",
-			advice: "Use ps aux, uptime, or batch flags (e.g. top -b -n 1) instead of interactive monitors.",
-		};
+const MONITOR_ADVICE = "Use ps aux, uptime, or batch flags (e.g. top -b -n 1) instead of interactive monitors.";
+// Process monitoring tokens are matched on whitespace/segment boundaries so that
+// an unrelated word such as `desktop`, a hyphenated filename like `top-level-dir`,
+// or a quoted argument like `echo "top"` is not mistaken for the `top` command.
+const ALWAYS_INTERACTIVE_MONITOR_RE = /(?:^|[;&|\s])(?:htop|btop|atop|glances)(?:$|[;&|\s])/i;
+const TOP_COMMAND_RE = /(?:^|[;&|\s])top(?:$|[;&|\s])/i;
+const TOP_BATCH_FLAG_RE = /(?:^|\s)(?:--batch|-[A-Za-z]*b[A-Za-z]*)(?:\s|$)/i;
+
+function checkProcessMonitorCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
+	for (const segment of command.split(/[;&|\n]+/)) {
+		if (ALWAYS_INTERACTIVE_MONITOR_RE.test(segment)) {
+			return { isInteractive: true, name: "interactive process monitor", advice: MONITOR_ADVICE };
+		}
+		if (TOP_COMMAND_RE.test(segment) && !TOP_BATCH_FLAG_RE.test(segment)) {
+			return { isInteractive: true, name: "interactive process monitor", advice: MONITOR_ADVICE };
+		}
 	}
+	return { isInteractive: false };
+}
+
+export function checkInteractiveTtyCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
+	const monitor = checkProcessMonitorCommand(command);
+	if (monitor.isInteractive) return monitor;
 	for (const { regex, name, advice } of INTERACTIVE_COMMAND_PATTERNS) {
 		if (regex.test(command)) {
-			if (
-				name === "interactive process monitor" &&
-				monitorCommands.length > 0 &&
-				monitorCommands.every((segment) => /(?:^|[;&|\s])top(?:$|[;&|\s])/i.test(segment) && /(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
-			) {
-				continue;
-			}
 			return { isInteractive: true, name, advice };
 		}
 	}

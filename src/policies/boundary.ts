@@ -198,6 +198,9 @@ export function shellMutationIn(segment: string): ShellMutation | undefined {
 	return undefined;
 }
 
+const SIMPLE_MUTATION_COMMANDS = new Set(["touch", "mkdir", "rm", "unlink", "rmdir", "truncate"]);
+const TRANSFER_COMMANDS = new Set(["cp", "mv", "ln"]);
+
 export function simpleFilesystemMutations(segment: string): ShellMutation[] {
 	const words = shellWords(unwrapShellCommand(segment));
 	const command = words[0];
@@ -208,13 +211,16 @@ export function simpleFilesystemMutations(segment: string): ShellMutation[] {
 		return words
 			.slice(1)
 			.filter((word) => word.startsWith("of=") && word.length > 3)
-			.map((word) => ({
-				kind: "command" as const,
-				target: word.slice(3),
-				what: `dd output to '${word.slice(3)}'`,
-			}));
+			.map((word) => {
+				const target = word.slice(3);
+				return {
+					kind: "command" as const,
+					target,
+					what: `dd output to '${target}'`,
+				};
+			});
 	}
-	if (!new Set(["touch", "mkdir", "rm", "unlink", "rmdir", "truncate"]).has(command)) return [];
+	if (!SIMPLE_MUTATION_COMMANDS.has(command)) return [];
 	return words
 		.slice(1)
 		.filter((word) => !word.startsWith("-"))
@@ -229,7 +235,7 @@ export function filesystemTransferInfo(
 	segment: string,
 ): { sources: string[]; destination?: string } | undefined {
 	const words = shellWords(unwrapShellCommand(segment));
-	if (!words[0] || !new Set(["cp", "mv", "ln"]).has(words[0])) return undefined;
+	if (!words[0] || !TRANSFER_COMMANDS.has(words[0])) return undefined;
 	const operands: string[] = [];
 	let targetDirectory: string | undefined;
 	for (let i = 1; i < words.length; i++) {
@@ -313,9 +319,11 @@ export async function guardShellMutation(
 			what: `tee to '${target}'`,
 		}));
 		const redirectMutations = redirectMutationsIn(segment.trim());
-		const fallbackMutation = shellMutationIn(segment.trim());
 		const mutations = [...simpleMutations, ...teeMutations, ...redirectMutations];
-		if (mutations.length === 0 && fallbackMutation) mutations.push(fallbackMutation);
+		if (mutations.length === 0) {
+			const fallbackMutation = shellMutationIn(segment.trim());
+			if (fallbackMutation) mutations.push(fallbackMutation);
+		}
 		for (const mutation of mutations) {
 			hasMutation = true;
 			const secret = secretIn(segment);
