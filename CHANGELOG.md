@@ -18,7 +18,7 @@
   evaluate the boundary fallback lazily only when specific detectors miss.
 
 - Harden shell, Git, secret-file, interpreter, and destructive-command parsing against option and quoting evasions; make CI/release failures propagate instead of reporting false success.
-- Keep deterministic OpenCode E2E checks required while treating provider network outages as unavailable model-driven probes instead of guard failures.
+- Keep deterministic OpenCode package/load E2E checks required while making external-provider model probes explicitly opt-in.
 
 ## 1.4.0
 

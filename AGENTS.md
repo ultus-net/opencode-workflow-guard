@@ -6,12 +6,12 @@
 - `src/lib/` holds shared engine services: `state` (runtime state + AsyncLocalStorage), `utils`, `audit` (incl. durable verify cache), `verify`, `review`, `worktree`, `types`. Policy modules must read runtime context via these getters, never module-level captures.
 - `src/workflow-guard-ui.ts` is the optional TUI companion; it is installed separately from the server plugin.
 - `test/test.mts` is an executable in-memory/adversarial harness, not a framework suite. It has no per-test CLI filter; add a focused regression check and run `npm test`.
-- `test/test-e2e.mts` packs the npm tarball, installs it into an isolated project, copies the plugin (with `src/lib/` and `src/policies/`) into `.opencode/plugins/`, and launches real `opencode run` sessions. It skips successfully when `opencode` is absent from `PATH`, so a CI-green E2E job does not prove the live loader ran unless the binary was present.
+- `test/test-e2e.mts` packs the npm tarball, installs it into an isolated project, copies the plugin (with `src/lib/` and `src/policies/`) into `.opencode/plugins/`, and verifies real OpenCode startup without a model provider. Set `WORKFLOW_GUARD_LIVE_E2E=1` to additionally launch model-driven `opencode run` policy probes.
 
 ## Verification
 - Use Node 22+ locally. CI runs unit tests on Node 22 and 24; `docs/testing.md` documents Node >=22.18 for `test.mts`.
 - Fast checks: `npm run typecheck` and `npm test`.
-- Live loader/hook check: `npm run test:install`; it is slower and model-driven, so inspect captured output when it fails rather than assuming the guard logic failed.
+- Package/loader check: `npm run test:install`; model-driven hook probes are opt-in with `WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install`.
 - Full local sequence: `npm run typecheck && npm test && npm run test:install`. CI additionally runs `npm audit --audit-level=high`.
 - `npm run build` is only a typecheck alias; this package ships the TypeScript plugin source rather than emitted build artifacts.
 
