@@ -10,7 +10,8 @@
 - **Pre-edit Gate:** All file-editing tools (`edit`, `write`, `apply_patch`) are blocked until the session has an active task list in OpenCode's native todo system (`todowrite`, persisted at `GET /session/:id/todo`).
 - **Flexible Task Execution:** Tasks can be completed in any order as work concludes without artificial sequential blockers, maintaining maximum pair-programming DX.
 - **No Silent Deletion:** Active tasks cannot be deleted without being explicitly marked `completed` or `cancelled`.
-- **Subagent Inheritance:** Subagents (which have `todowrite` denied by default) automatically inherit active tasks from their parent session via the `parentID` hierarchy.
+- **Subagent Inheritance & Role Confinement:** Subagents automatically inherit active tasks from their parent session via the `parentID` hierarchy. Subagents spawned with read-only roles (`reviewer`, `planner`, `advisor`, `critic`, `explorer`, `scout`, `evaluator`) are hard-confined: file mutations, lifecycle tools, and mutating shell commands are strictly blocked.
+- **Subagent Mutation Budget:** Subagent sessions are protected by a mutation safety budget (`maxSubagentMutations` in project config or `WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS` env, default 50) to terminate runaway edit loops deterministically.
 
 ### 2. No Pushes to Protected Branches
 - `git push ... main` and `git push ... master` are blocked in all shell commands, including direct refs, refspecs (`git push origin HEAD:main`, `git push origin feature/x:main`), deletion refspecs (`git push origin :main`), and forced refspecs (`git push origin +main`).
@@ -18,16 +19,17 @@
 - Git global options (`-C`, `--git-dir`, `--work-tree`, `-c`) are parsed before matching, so `git -C /repo push origin main` is gated on `/repo`'s branch.
 - Normal pushes and force-pushes to feature branches are allowed.
 
-### 3. PR Changelog & Changesets Requirement
+### 3. PR Changelog, Changesets & Lockfile Synchronization Requirement
 - `gh pr create` and `az repos pr create` are blocked unless:
   - The branch diff modifies a `CHANGELOG` file, OR
   - The branch diff adds/modifies a `.changeset/*.md` fragment file (Changesets workflow), OR
   - The PR description (`--body`, `--description`, or `--body-file`/`-F`) contains a `Changelog:` section.
+- **Lockfile Synchronization Gate:** Whenever package manifests (`package.json`, `Cargo.toml`, `go.mod`) are modified, PR creation is blocked until their corresponding lockfiles (`package-lock.json`/`bun.lock`/`pnpm-lock.yaml`/`yarn.lock`, `Cargo.lock`, `go.sum`) are updated.
 
 ### 4. Destructive CLI Operations Guard
 - Blocks destructive filesystem, infrastructure, cloud, database, and git operations unless the **user** explicitly overrides via environment variable.
 - **Blocked:**
-  - Filesystem: `rm -rf`, `rm -r`, forced deletion of system/home paths
+  - Filesystem & Disks: `rm -rf`, `rm -r`, forced deletion of system/home paths, disk wipes (`mkfs`, `wipefs`, `parted`, `sfdisk`), raw block writes (`dd of=/dev/...`, `shred /dev/...`), recursive permission/ownership clobbering (`chmod -R ... /`, `chown -R ... ~`), reverse shells & raw sockets (`/dev/tcp/...`, `nc -e`, `socat exec:`)
   - Kubernetes: `kubectl delete`, `kubectl drain`, `kubectl cordon`, `kubectl rollout undo/restart`
   - Helm: `helm uninstall`, `helm rollback`, `helm delete`
   - IaC: `terraform destroy`, `tofu destroy`, `pulumi destroy`
@@ -70,7 +72,7 @@
 
 ### 10. Evidence-Based Verification
 - When the agent attempts to mark **every** task completed (finalizing the request), the guard requires passing verification evidence.
-- Verification (`WORKFLOW_GUARD_VERIFY` env, project `verifyCommand`, or auto-detected `npm test` from `package.json`) executes in an isolated environment with scrubbed credentials, output caps, token-efficient stdout/stderr snipping, and strict timeout protection. Environment configuration takes precedence over project configuration.
+- Verification (`WORKFLOW_GUARD_VERIFY` env, project `verifyCommand`, or auto-detected test/typecheck runner across ecosystems: `package.json` (`npm test`, `npm run typecheck`, `npm run check`, `npm run build`), `Cargo.toml` (`cargo test`), `go.mod` (`go test ./...`), `pytest.ini`/`pyproject.toml` (`pytest`), or `deno.json` (`deno test`)) executes in an isolated environment with scrubbed credentials, output caps, token-efficient stdout/stderr snipping, and strict timeout protection. Environment configuration takes precedence over project configuration.
 - **Git State & Snapshot Binding:** Verification evidence records the current git commit hash (`git rev-parse HEAD`) and working tree status. If unverified edits or index modifications occur after verification, fresh verification is enforced.
 - **Durable Disk Cache:** Passing verification results are cached to `~/.local/state/opencode/workflow-guard/last-verify.json`, allowing session restarts and multi-agent handoffs to retain valid verification evidence without redundant test runs. Durable evidence is **workspace-bound**: a cached result is only accepted for the workspace that produced it, so a passing run in one project can never satisfy finalization in another.
 - If verification fails, finalization is blocked with a structured summary of error markers, stack traces, and failure output.
@@ -167,7 +169,8 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 - All spawned git commands run with a sanitized environment: inherited git context variables (`GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`, ...) are stripped so the tools resolve the repository from their working directory alone. This makes them safe to invoke from inside git hooks, which export those variables.
 
 ### Inspection Tools
-- `guard_status`, `guard_audit`, `guard_why`, and `record_review` provide runtime introspection of guardrail state, audit entries, block explanations, and reviewer decisions.
+- `guard_status`, `guard_audit`, `guard_why`, `guard_review_rubric`, and `record_review` provide runtime introspection of guardrail state, audit entries, block explanations, reviewer rubric definitions, and reviewer decisions.
+- **Priority-Ranked Review Gate:** `guard_review_rubric` includes P0-P3 severity tiers. When recording reviews via `record_review`, approvals that include active P0 (blocker) or P1 (major defect) issues are rejected until blockers are resolved.
 
 ---
 

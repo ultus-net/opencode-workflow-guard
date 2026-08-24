@@ -244,6 +244,24 @@ export function secretSourceInFilesystemCommand(segment: string): string | undef
 	return undefined;
 }
 
+export function detectShellMutation(command: string): ShellMutation | undefined {
+	for (const segment of command.split(/[\n|;&]+/)) {
+		const simpleMutations = simpleFilesystemMutations(segment);
+		if (simpleMutations.length > 0) return simpleMutations[0];
+		const teeTargets = teeTargetsIn(segment);
+		if (teeTargets.length > 0) {
+			return {
+				kind: "command",
+				target: teeTargets[0],
+				what: `tee to '${teeTargets[0]}'`,
+			};
+		}
+		const fallback = shellMutationIn(segment.trim());
+		if (fallback) return fallback;
+	}
+	return undefined;
+}
+
 export async function guardShellMutation(
 	command: string,
 	sessionID: string | undefined,

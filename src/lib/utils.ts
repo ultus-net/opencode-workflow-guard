@@ -29,6 +29,20 @@ export function normalize(cmd: string): string {
 	return cmd.replace(/\s+/g, " ");
 }
 
+export function decodeShellEscapes(text: string): string {
+	return text
+		// ANSI-C quoting wrapper: $'...' -> ...
+		.replace(/\$'([^']*)'/g, "$1")
+		// Hex escapes: \xHH
+		.replace(/\\x([0-9a-fA-F]{2})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+		// Unicode escapes: \uHHHH
+		.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
+		// Octal escapes: \0OO or \OOO (e.g. \162 -> 'r')
+		.replace(/\\([0-3][0-7]{2})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
+		// Single character escapes: \c -> c (e.g. \r\m -> rm)
+		.replace(/\\(.)/g, "$1");
+}
+
 export function shellWords(command: string): string[] {
 	return (command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map((word) =>
 		word.replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2"),
@@ -69,14 +83,69 @@ export function splitShellSegments(command: string): string[] {
 }
 
 export function unwrapShellWords(command: string): string[] {
-	const words = shellWords(command.trim());
+	let cleanCmd = decodeShellEscapes(command.trim());
+	// Strip outer grouping parentheses/braces if present e.g. ( git commit ) or { git commit; }
+	while (
+		(cleanCmd.startsWith("(") && cleanCmd.endsWith(")")) ||
+		(cleanCmd.startsWith("{") && cleanCmd.endsWith("}"))
+	) {
+		cleanCmd = cleanCmd.slice(1, -1).trim();
+		if (cleanCmd.endsWith(";")) cleanCmd = cleanCmd.slice(0, -1).trim();
+	}
+
+	const words = shellWords(cleanCmd);
 	let i = 0;
 	while (i < words.length) {
-		if (words[i] === "command") {
+		const rawWord = words[i]!;
+		const word = rawWord.replace(/^[\({]+/, "").replace(/[\)};]+$/, "");
+		if (!word) {
 			i++;
 			continue;
 		}
-		if (words[i] === "sudo") {
+
+		if (word === "command" || word === "exec" || word === "eval" || word === "nohup") {
+			i++;
+			continue;
+		}
+		if (word === "nice") {
+			i++;
+			if (i < words.length && (words[i] === "-n" || words[i]?.startsWith("-n"))) {
+				if (words[i] === "-n") i += 2;
+				else i++;
+			}
+			continue;
+		}
+		if (word === "timeout") {
+			i++;
+			while (i < words.length && words[i]!.startsWith("-")) {
+				const opt = words[i++]!;
+				if ((opt === "-k" || opt === "-s" || opt === "--signal" || opt === "--kill-after") && i < words.length) {
+					i++;
+				}
+			}
+			if (i < words.length && /^\d+[smhd]?$/.test(words[i]!)) {
+				i++;
+			}
+			continue;
+		}
+		if (word === "stdbuf") {
+			i++;
+			while (i < words.length && words[i]!.startsWith("-")) {
+				const opt = words[i++]!;
+				if ((opt === "-i" || opt === "-o" || opt === "-e") && i < words.length) {
+					i++;
+				}
+			}
+			continue;
+		}
+		if (word === "time") {
+			i++;
+			while (i < words.length && words[i]!.startsWith("-")) {
+				i++;
+			}
+			continue;
+		}
+		if (word === "sudo" || word === "doas") {
 			i++;
 			const valueOptions = new Set([
 				"-u",
@@ -100,7 +169,7 @@ export function unwrapShellWords(command: string): string[] {
 			}
 			continue;
 		}
-		if (words[i] === "env") {
+		if (word === "env") {
 			i++;
 			const valueOptions = new Set([
 				"-u",
@@ -111,24 +180,27 @@ export function unwrapShellWords(command: string): string[] {
 				"--split-string",
 			]);
 			while (i < words.length) {
-				const word = words[i]!;
-				if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+				const w = words[i]!;
+				if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
 					i++;
 					continue;
 				}
-				if (!word.startsWith("-")) break;
+				if (!w.startsWith("-")) break;
 				i++;
-				if (valueOptions.has(word) && i < words.length) i++;
+				if (valueOptions.has(w) && i < words.length) i++;
 			}
 			continue;
 		}
-		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i]!)) {
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
 			i++;
 			continue;
 		}
 		break;
 	}
-	return words.slice(i);
+	return words
+		.slice(i)
+		.map((w) => w.replace(/^[\({]+/, "").replace(/[\)};]+$/, ""))
+		.filter(Boolean);
 }
 
 export function unwrapShellCommand(command: string): string {

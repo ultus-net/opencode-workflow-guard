@@ -78,3 +78,62 @@ export function prBodyIncludesChangelog(command: string): boolean {
 	}
 	return false;
 }
+
+export function checkLockfileSync(root: string): { isOutOfSync: boolean; manifest?: string; lockfile?: string; reason?: string } {
+	try {
+		let modifiedFiles: string[] = [];
+		const baseCandidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
+		for (const base of baseCandidates) {
+			const mergeBase = spawnSync("git", ["merge-base", "HEAD", base], { cwd: root, encoding: "utf8", timeout: 10_000 });
+			if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) continue;
+			const diff = spawnSync("git", ["diff", "--name-only", `${mergeBase.stdout.trim()}...HEAD`], { cwd: root, encoding: "utf8", timeout: 10_000 });
+			if (diff.status === 0 && diff.stdout.trim()) {
+				modifiedFiles = diff.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+				break;
+			}
+		}
+		const headDiff = spawnSync("git", ["diff", "--name-only", "HEAD"], { cwd: root, encoding: "utf8", timeout: 10_000 });
+		if (headDiff.status === 0 && headDiff.stdout.trim()) {
+			const uncommitted = headDiff.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+			modifiedFiles = Array.from(new Set([...modifiedFiles, ...uncommitted]));
+		}
+		const untracked = spawnSync("git", ["status", "--porcelain"], { cwd: root, encoding: "utf8", timeout: 10_000 });
+		if (untracked.status === 0 && untracked.stdout.trim()) {
+			const files = untracked.stdout.split("\n").map((l) => l.slice(3).trim()).filter(Boolean);
+			modifiedFiles = Array.from(new Set([...modifiedFiles, ...files]));
+		}
+
+		const manifestToLockfiles: Array<{ manifest: RegExp; lockfiles: RegExp; name: string }> = [
+			{
+				manifest: /(?:^|\/)package\.json$/,
+				lockfiles: /(?:^|\/)(?:package-lock\.json|bun\.lock|bun\.lockb|pnpm-lock\.yaml|yarn\.lock)$/,
+				name: "package.json",
+			},
+			{
+				manifest: /(?:^|\/)Cargo\.toml$/,
+				lockfiles: /(?:^|\/)Cargo\.lock$/,
+				name: "Cargo.toml",
+			},
+			{
+				manifest: /(?:^|\/)go\.mod$/,
+				lockfiles: /(?:^|\/)go\.sum$/,
+				name: "go.mod",
+			},
+		];
+
+		for (const item of manifestToLockfiles) {
+			const hasManifest = modifiedFiles.some((f) => item.manifest.test(f));
+			if (hasManifest) {
+				const hasLockfile = modifiedFiles.some((f) => item.lockfiles.test(f));
+				if (!hasLockfile) {
+					return {
+						isOutOfSync: true,
+						manifest: item.name,
+						reason: `Package manifest '${item.name}' was modified without updating its corresponding lockfile. Run the package manager install/lock command before opening a PR.`,
+					};
+				}
+			}
+		}
+	} catch {}
+	return { isOutOfSync: false };
+}

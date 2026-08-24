@@ -48,6 +48,18 @@ export const LIVE_MUTATION_PATTERNS: LivePattern[] = [
 	{ re: /\b(?:curl|wget)\b[^;&]*\|\s*(?:bash|sh|zsh)\b/, what: ["remote ", "download piped directly to a shell"].join("") },
 	// Destructive git operations
 	{ re: /\bgit\s+push\b[^|;&]*(?:--force\b|--force-with-lease\b|\s-f\b)/, what: ["force ", "push"].join("") },
+	// Low-level disk / filesystem / partition destruction
+	{ re: /\b(?:mkfs(?:\.[a-z0-9]+)?|wipefs|parted|sfdisk|gdisk)\b/, what: ["disk/filesystem ", "format or partition manipulation"].join("") },
+	{ re: /\bdd\s+[^|;&]*\bof=\/dev\/(?:sd[a-z]|nvme\d|vd[a-z]|hd[a-z]|disk\d|rdisk\d|loop\d)/, what: ["raw disk/block device ", "overwrite via dd"].join("") },
+	{ re: /\bshred\s+[^|;&]*\/dev\/(?:sd[a-z]|nvme\d|vd[a-z]|hd[a-z]|disk\d|rdisk\d|loop\d)/, what: ["disk device ", "shredding"].join("") },
+	// Recursive permission/ownership clobbering on root or home
+	{ re: /\bchmod\s+-[a-zA-Z]*[rR][a-zA-Z]*\s+\S+\s+(?:\/|~|\$HOME)(?:\s|$)/, what: ["recursive ", "permission clobbering of root/home path"].join("") },
+	{ re: /\bchown\s+-[a-zA-Z]*[rR][a-zA-Z]*\s+\S+\s+(?:\/|~|\$HOME)(?:\s|$)/, what: ["recursive ", "ownership clobbering of root/home path"].join("") },
+	// Network reverse shell / raw socket execution / data exfiltration channels
+	{ re: /\/dev\/(?:tcp|udp)\/[a-zA-Z0-9_.-]+\/\d+/, what: ["raw network socket / ", "reverse shell channel (/dev/tcp or /dev/udp)"].join("") },
+	{ re: /\b(?:nc|ncat|netcat)\b[^|;&]*-[a-zA-Z]*e[a-zA-Z]*\s+(?:\/bin\/(?:ba)?sh|sh|bash|cmd\.exe|powershell)/i, what: ["netcat reverse ", "shell execution (-e)"].join("") },
+	{ re: /\bsocat\b[^|;&]*\bexec:\s*['"]?(?:\/bin\/(?:ba)?sh|sh|bash)/i, what: ["socat interactive ", "reverse shell spawn"].join("") },
+	{ re: /\bmknod\s+\S+\s+p\b/, what: ["named FIFO pipe ", "creation (reverse shell backpipe)"].join("") },
 ];
 
 export function liveMutationIn(command: string): string | undefined {

@@ -21,6 +21,7 @@ export interface ProjectConfig {
 	verifyCommand?: string;
 	requireReview?: boolean;
 	requireDocumentation?: boolean;
+	maxSubagentMutations?: number;
 }
 
 export interface VerifyResult {

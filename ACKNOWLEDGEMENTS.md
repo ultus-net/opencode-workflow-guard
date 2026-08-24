@@ -19,5 +19,8 @@
 * **[`changesets`](https://github.com/changesets/changesets)** by the [Changesets Team](https://github.com/changesets/changesets)  
   * For the fragment-based changelog and versioning model that prevents merge conflicts across parallel feature PRs.
 
+* **[`oh-my-pi`](https://github.com/can1357/oh-my-pi)** by [@can1357](https://github.com/can1357), **`omp-guardrails`** by [@breathi3552](https://github.com/breathi3552), **`agentsflow`** by [@xzhang17](https://github.com/xzhang17), **`tools`** by [@marcelsud](https://github.com/marcelsud), and the **Claude Code** security hook community  
+  * Inspired the hardened shell wrapper tokenization/normalization in **`unwrapShellWords`**, multi-ecosystem verification detection in **Policy 10**, structured severity ranking (P0-P3 blocker gate) for the secondary review rubric in **Policy 19 / `guard_review_rubric`**, disk wipe, reverse shell & system permission signatures in **Policy 4**, lockfile synchronization checks in **Policy 3**, and subagent read-only role confinement & mutation budgets in **Policy 1**.
+
 * **[OpenCode Team at Anomaly](https://github.com/anomalyco/opencode)**  
   * For building the OpenCode terminal AI coding agent and its extensible plugin architecture (`@opencode-ai/plugin`).
