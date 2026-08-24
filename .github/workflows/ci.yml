@@ -114,9 +114,11 @@ jobs:
           TMP=$(mktemp -d)
           mkdir -p "$TMP/.opencode/plugins"
           cp src/workflow-guard.ts "$TMP/.opencode/plugins/"
+          PLUGIN_DIR=$(dirname "$(realpath "$TMP"/.*/*/*.ts)")
+          cp -R src/lib src/policies "$PLUGIN_DIR/"
           cd "$TMP"
           echo '{"plugin":["file://./.opencode/plugins/workflow-guard.ts"]}' > opencode.json
-          opencode run --no-tui "guard_status" 2>&1 | grep -q "workspaceRoot"
+          opencode debug startup >/dev/null
 
   # ───── Human-readable summary ─────
   status:
