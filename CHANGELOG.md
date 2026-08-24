@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.0
+
+### Minor Changes
+
+- 9da1ed5: Add durable local project memory with SQLite full-text retrieval, explicit human-readable repository promotion, provenance, supersession, and bounded freshness-aware compaction context.
+- 9da1ed5: Add an opt-in Socratic learning prototype with adaptive checkpoints and a local evidence-based learner profile.
+
+### Patch Changes
+
+- 9da1ed5: Clarify todo replacement-list semantics and report all detected PR preflight failures in one actionable block.
+
 ## 1.4.1
 
 ### Patch Changes
