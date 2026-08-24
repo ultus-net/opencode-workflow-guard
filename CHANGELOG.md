@@ -17,6 +17,8 @@
   fingerprint commit-independent (index blob hashes + worktree-vs-index diff + untracked contents), and
   evaluate the boundary fallback lazily only when specific detectors miss.
 
+- Harden shell, Git, secret-file, interpreter, and destructive-command parsing against option and quoting evasions; make CI/release failures propagate instead of reporting false success.
+
 ## 1.4.0
 
 ### Minor Changes

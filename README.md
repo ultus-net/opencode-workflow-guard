@@ -32,7 +32,7 @@ For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json` 
 ```bash
 npm run typecheck    # Strict TypeScript check (0 errors)
 npm test             # Run 415+ unit and adversarial tests
-npm run test:all     # Run full verification suite (typecheck + unit + live e2e)
+npm run test:all     # Typecheck + unit + install checks; live OpenCode checks run when its CLI is available
 ```
 
 ---
