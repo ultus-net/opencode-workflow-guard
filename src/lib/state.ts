@@ -275,3 +275,15 @@ export function isDocumentationRequired(root: string): boolean {
 	const cfg = getProjectConfig(root);
 	return cfg.requireDocumentation === true;
 }
+
+export function getSubagentMutationBudget(root: string): number {
+	if (process.env.WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS) {
+		const parsed = parseInt(process.env.WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS, 10);
+		if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+	}
+	const cfg = getProjectConfig(root);
+	if (typeof cfg.maxSubagentMutations === "number" && cfg.maxSubagentMutations > 0) {
+		return cfg.maxSubagentMutations;
+	}
+	return 50;
+}

@@ -47,6 +47,7 @@ import {
 	stripJsonComments,
 	isReviewRequired,
 	isDocumentationRequired,
+	getSubagentMutationBudget,
 	recordReviewResult,
 	getLastReviewResult,
 	resetReviewState,
@@ -68,6 +69,7 @@ export {
 	stripJsonComments,
 	isReviewRequired,
 	isDocumentationRequired,
+	getSubagentMutationBudget,
 	recordReviewResult,
 	getLastReviewResult,
 	resetReviewState,
@@ -179,7 +181,10 @@ import {
 	hasPrCreateInvocation,
 	branchHasChangelogChange,
 	prBodyIncludesChangelog,
+	checkLockfileSync,
 } from "./policies/changelog.ts";
+
+export { checkLockfileSync };
 
 import { liveMutationIn, extractEditContent } from "./policies/destructive.ts";
 
@@ -197,6 +202,7 @@ import {
 	isPathOutsideWorkspace,
 	extractPatchPaths,
 	guardShellMutation,
+	detectShellMutation,
 } from "./policies/boundary.ts";
 
 import { isSecretPath, secretIn, secretFileReadIn, isEnvFilePath, generateMaskedEnvSchema } from "./policies/secrets.ts";
@@ -240,12 +246,37 @@ function logBlock(message: string): void {
 	} catch {}
 }
 
+const READ_ONLY_ROLES = new Set([
+	"reviewer",
+	"planner",
+	"advisor",
+	"critic",
+	"explorer",
+	"scout",
+	"evaluator",
+]);
+
+export function isReadOnlyRole(agent?: string): boolean {
+	if (!agent) return false;
+	const lower = agent.toLowerCase().trim();
+	return READ_ONLY_ROLES.has(lower) || Array.from(READ_ONLY_ROLES).some((r) => lower.includes(r));
+}
+
 async function guardToolCallImpl(
 	toolName: string,
 	input: unknown,
-	context?: { sessionID?: string },
+	context?: { sessionID?: string; worktree?: string; directory?: string; agent?: string },
 ): Promise<string | undefined> {
 	const currentRoot = getWorkspaceRoot();
+
+	// ── Role confinement: subagents in read-only roles cannot mutate files ──
+	if (context?.agent && isReadOnlyRole(context.agent)) {
+		if (EDIT_TOOL_NAMES.has(toolName) || toolName.startsWith("guard_worktree_")) {
+			const reason = `Blocked: subagent with read-only role '${context.agent}' cannot perform file mutations or lifecycle changes.`;
+			logBlock(`[workflow-guard] ${reason}`);
+			return reason;
+		}
+	}
 
 	// ── Policy 17: secret file read block via read tool ──
 	if (toolName === "read" || toolName === "read_file") {
@@ -498,6 +529,18 @@ async function guardToolCallImpl(
 				"item is completed, create a fresh todo list before " +
 				"starting new work."
 			);
+		}
+		if (context?.sessionID) {
+			const parentID = await fetchParentSessionID(context.sessionID);
+			if (parentID) {
+				const count = getMutationCount(context.sessionID);
+				const budget = getSubagentMutationBudget(currentRoot);
+				if (count >= budget) {
+					const reason = `Blocked: subagent session '${context.sessionID}' has reached its mutation budget (${count}/${budget}). Hand work back to parent orchestrator.`;
+					logBlock(`[workflow-guard] ${reason}`);
+					return reason;
+				}
+			}
 		}
 		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
 		return undefined;
@@ -802,6 +845,13 @@ async function guardToolCallImpl(
 					`'Changelog:' section in the PR description (${descFlag}).`
 				);
 			}
+
+			// Lockfile synchronization pre-flight gate
+			const lockCheck = checkLockfileSync(currentRoot);
+			if (lockCheck.isOutOfSync) {
+				logBlock(`[workflow-guard] blocked ${prTool}: ${lockCheck.reason}`);
+				return `Blocked: ${lockCheck.reason}`;
+			}
 		}
 
 		const hasGitMutation = gitInvocations.some((invocation) => {
@@ -811,6 +861,35 @@ async function guardToolCallImpl(
 				/\bgit\s+(?:switch|checkout)\b/.test(normalizedInvocation)
 			);
 		});
+
+		if (context?.agent && isReadOnlyRole(context.agent)) {
+			const mutation = detectShellMutation(command);
+			if (mutation) {
+				logBlock(`[workflow-guard] blocked shell mutation for read-only role ${context.agent}: ${mutation.what}`);
+				return `Blocked: subagent with read-only role '${context.agent}' cannot perform shell file mutations (${mutation.what}).`;
+			}
+			if (hasGitMutation) {
+				logBlock(`[workflow-guard] blocked git mutation for read-only role ${context.agent}`);
+				return `Blocked: subagent with read-only role '${context.agent}' cannot mutate git history or state.`;
+			}
+		}
+
+		const shellMut = detectShellMutation(command);
+		if (hasGitMutation || shellMut) {
+			if (context?.sessionID) {
+				const parentID = await fetchParentSessionID(context.sessionID);
+				if (parentID) {
+					const count = getMutationCount(context.sessionID);
+					const budget = getSubagentMutationBudget(currentRoot);
+					if (count >= budget) {
+						const reason = `Blocked: subagent session '${context.sessionID}' has reached its mutation budget (${count}/${budget}). Hand work back to parent orchestrator.`;
+						logBlock(`[workflow-guard] ${reason}`);
+						return reason;
+					}
+				}
+			}
+		}
+
 		if (hasGitMutation) {
 			recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
 		}
@@ -826,9 +905,13 @@ async function guardToolCallImpl(
 export async function guardToolCall(
 	toolName: string,
 	input: unknown,
-	context?: { sessionID?: string },
+	context?: { sessionID?: string; worktree?: string; directory?: string; agent?: string },
 ): Promise<string | undefined> {
-	const reason = await guardToolCallImpl(toolName, input, context);
+	const customRoot = context?.worktree || context?.directory;
+	const runImpl = () => guardToolCallImpl(toolName, input, context);
+	const reason = customRoot
+		? await runWithRuntimeState(customRoot, getSdkClient(), runImpl)
+		: await runImpl();
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	const isMutation = EDIT_TOOL_NAMES.has(toolName);
 	const record = asRecord(input);
@@ -998,6 +1081,14 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 							`evaluate each axis, and include findings per axis in the summary.`
 						);
 					}
+					if (args.passed) {
+						if (/(?:^|\s)(?:\[p[01]\]|p[01]\s*:\s*(?:blocker|defect|vulnerability|error|bug|issue)|p[01]\s+blocker)/i.test(args.summary)) {
+							return (
+								"[workflow-guard] Review rejected: cannot record approval when P0 or P1 blockers are flagged in findings. " +
+								"Resolve all P0/P1 issues before approving or record review with passed=false."
+							);
+						}
+					}
 					recordReviewResult(
 						args.reviewer,
 						args.summary,
@@ -1116,12 +1207,23 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		},
 
 		"tool.execute.before": async (input, output) => {
-			return runWithRuntimeState(effectiveRoot, ctx.client, async () => {
+			const toolWorktree =
+				(input as { worktree?: string })?.worktree ||
+				(input as { directory?: string })?.directory ||
+				(output as { worktree?: string })?.worktree ||
+				(output as { directory?: string })?.directory ||
+				effectiveRoot;
+			const toolAgent =
+				(input as { agent?: string })?.agent ||
+				(output as { agent?: string })?.agent;
+			return runWithRuntimeState(toolWorktree, ctx.client, async () => {
 				const args =
 					(output as { args?: unknown } | undefined)?.args ??
 					(input as { args?: unknown }).args;
 				const reason = await guardToolCall(input.tool, args, {
 					sessionID: input.sessionID,
+					worktree: toolWorktree,
+					agent: toolAgent,
 				});
 				if (reason !== undefined) {
 					await emitBlockFeedback(reason);

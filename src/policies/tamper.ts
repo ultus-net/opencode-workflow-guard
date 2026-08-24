@@ -1,6 +1,7 @@
 import { realpathSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
+import { decodeShellEscapes } from "../lib/utils.ts";
 
 export const PROTECTED_PATH_REASON =
 	"Blocked: modifying Open" +
@@ -23,10 +24,9 @@ export const SETTINGS_TAMPER_PATTERNS: RegExp[] = [
 ];
 
 export function normalizeShellEvasion(text: string): string {
-	return text
+	return decodeShellEscapes(text)
 		.replace(/'([^']*)'/g, "$1")
-		.replace(/"([^"]*)"/g, "$1")
-		.replace(/\\(.)/g, "$1");
+		.replace(/"([^"]*)"/g, "$1");
 }
 
 export function normalizeGlobPathEvasion(text: string): string {

@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { getCleanEnv, normalize } from "./utils.ts";
 import { getProjectConfig } from "./state.ts";
@@ -18,11 +18,35 @@ export function detectVerifyCommand(root: string): string | undefined {
 		return cmd || undefined;
 	}
 	try {
-		const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8")) as {
-			scripts?: Record<string, string>;
-		};
-		if (pkg.scripts?.test) return "npm test";
+		const pkgPath = join(root, "package.json");
+		if (existsSync(pkgPath)) {
+			const pkg = JSON.parse(readFileSync(pkgPath, "utf8")) as {
+				scripts?: Record<string, string>;
+			};
+			if (pkg.scripts?.test) return "npm test";
+			if (pkg.scripts?.typecheck) return "npm run typecheck";
+			if (pkg.scripts?.check) return "npm run check";
+			if (pkg.scripts?.build) return "npm run build";
+		}
 	} catch {}
+
+	if (existsSync(join(root, "Cargo.toml"))) {
+		return "cargo test";
+	}
+	if (existsSync(join(root, "go.mod"))) {
+		return "go test ./...";
+	}
+	if (
+		existsSync(join(root, "pytest.ini")) ||
+		existsSync(join(root, "pyproject.toml")) ||
+		existsSync(join(root, "setup.py"))
+	) {
+		return "pytest";
+	}
+	if (existsSync(join(root, "deno.json")) || existsSync(join(root, "deno.jsonc"))) {
+		return "deno test";
+	}
+
 	return undefined;
 }
 
