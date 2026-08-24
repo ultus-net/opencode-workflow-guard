@@ -1,5 +1,5 @@
 ---
-"opencode-workflow-guard": refactor
+"opencode-workflow-guard": patch
 ---
 
 Consolidate process-monitor detection into one token-scoped check, make the review
