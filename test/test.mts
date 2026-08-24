@@ -517,11 +517,12 @@ check("block write containing Slack xox token", blocked(await call("write", { fi
 // ── New: shell.env scrub ──
 console.log("- shell.env scrub -");
 const envHooks = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
-const envObj: Record<string, string> = { AWS_SECRET: "x", OPENAI_API_KEY: "y", NORMAL: "keep" };
+const envObj: Record<string, string> = { AWS_SECRET: "x", OPENAI_API_KEY: "y", GITHUB_TOKEN: "token", GH_TOKEN: "token2", NORMAL: "keep" };
 if (typeof envHooks["shell.env"] === "function") {
 	await envHooks["shell.env"]({} as any, { env: envObj } as any);
 }
 check("sensitive keys emptied", envObj.AWS_SECRET === "" && envObj.OPENAI_API_KEY === "");
+check("github keys preserved", envObj.GITHUB_TOKEN === "token" && envObj.GH_TOKEN === "token2");
 check("normal key preserved", envObj.NORMAL === "keep");
 
 // ── New: command.executed channel ──
@@ -664,13 +665,19 @@ check(
 	!verifyTimeout.passed && verifyTimeout.output.includes("timed out"),
 );
 
+process.env.AWS_SECRET = "secret";
+process.env.OPENAI_API_KEY = "secret2";
+process.env.GITHUB_TOKEN = "gh_token";
 const cleanEnv = getCleanEnv();
 check(
-	"getCleanEnv strips sensitive keys",
+	"getCleanEnv strips sensitive keys while preserving github tokens",
 	cleanEnv.AWS_SECRET === undefined &&
 		cleanEnv.OPENAI_API_KEY === undefined &&
-		cleanEnv.GITHUB_TOKEN === undefined,
+		cleanEnv.GITHUB_TOKEN === "gh_token",
 );
+delete process.env.AWS_SECRET;
+delete process.env.OPENAI_API_KEY;
+delete process.env.GITHUB_TOKEN;
 
 // 6. Verification freshness & todowrite finalization
 const verifyRepo = mkdtempSync(join(tmpdir(), "wg-verify-repo-"));

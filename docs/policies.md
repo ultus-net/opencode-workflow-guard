@@ -82,7 +82,7 @@
 - Flagged content is blocked before the write with an actionable message. Secret-file reads also resolve existing symlink aliases, and copying/moving/linking a known secret path under another name is blocked.
 
 ### 12. Shell Environment Scrub
-- Sensitive environment variables (`AWS_*`, `KUBE*`, `OPENAI*`, `ANTHROPIC*`, `GH_/GITHUB_*`, `GOOGLE_/GCP_`, `AZURE_`, `SLACK_`, `NPM_`, `DOCKER_`, `KUBECONFIG`, and fixed names like `GITHUB_TOKEN`, `OPENAI_API_KEY`, `KUBECONFIG`, `NPM_TOKEN`) are **emptied** in agent shells by the `shell.env` hook.
+- Sensitive environment variables (`AWS_*`, `KUBE*`, `OPENAI*`, `ANTHROPIC*`, `GOOGLE_/GCP_`, `AZURE_`, `SLACK_`, `NPM_`, `DOCKER_`, `KUBECONFIG`, and fixed names like `OPENAI_API_KEY`, `KUBECONFIG`, `NPM_TOKEN`) are **emptied** in agent shells by the `shell.env` hook. GitHub tokens (`GITHUB_TOKEN`, `GH_TOKEN`) are preserved so `gh` CLI and git operations function without recurring login prompts.
 - This prevents the agent from carrying live credentials by default. The user can still grant access through OpenCode's own permission system if a task genuinely needs it.
 
 ### 13. Command-Channel Audit

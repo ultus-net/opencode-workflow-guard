@@ -148,7 +148,7 @@ export const SENSITIVE_ENV_KEYS = [
 	"SLACK_TOKEN",
 ];
 export const SENSITIVE_ENV_RE =
-	/^(AWS_|KUBE|OPENAI|ANTHROPIC|GH_TOKEN|GITHUB_TOKEN|GOOGLE_|GCP_|AZURE_|SLACK_|NPM_|DOCKER_|KUBECONFIG)/;
+	/^(AWS_|KUBE|OPENAI|ANTHROPIC|GOOGLE_|GCP_|AZURE_|SLACK_|NPM_|DOCKER_|KUBECONFIG)/;
 
 export function getCleanEnv(): Record<string, string> {
 	const env: Record<string, string> = { ...(process.env as Record<string, string>) };
