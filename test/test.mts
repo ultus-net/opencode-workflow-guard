@@ -20,6 +20,7 @@ import {
 	snipVerifyOutput,
 	getCurrentGitCommitHash,
 	getGitStatusSummary,
+	getGitWorktreeFingerprint,
 	getVerifyCacheFilePath,
 	persistVerifyCache,
 	loadVerifyCache,
@@ -365,6 +366,10 @@ check("literal secret in shell redirect is blocked", blocked(await call("bash", 
 check("touch checks every target for workspace escape", blocked(await call("bash", { command: "touch /tmp/wg-outside-touch local-touch" }, { sessionID: "s-active" })));
 check("mkdir checks every target for workspace escape", blocked(await call("bash", { command: "mkdir /tmp/wg-outside-dir local-dir" }, { sessionID: "s-active" })));
 check("rm checks every target for workspace escape", blocked(await call("bash", { command: "rm /tmp/wg-outside-file local-file" }, { sessionID: "s-active" })));
+check("truncate outside workspace is blocked", blocked(await call("bash", { command: "truncate -s 0 /tmp/wg-outside-file" }, { sessionID: "s-active" })));
+check("dd output outside workspace is blocked", blocked(await call("bash", { command: "dd if=/dev/zero of=/tmp/wg-outside-file bs=1 count=1" }, { sessionID: "s-active" })));
+check("dd cannot hide an outside redirect", blocked(await call("bash", { command: "dd if=/dev/zero of=local bs=1 count=1 > /tmp/wg-outside-redirect" }, { sessionID: "s-active" })));
+check("truncate cannot hide an outside redirect", blocked(await call("bash", { command: "truncate -s 0 local > /tmp/wg-outside-redirect" }, { sessionID: "s-active" })));
 
 // mv mutates its sources: sources outside the workspace or protected paths
 // must block even when the destination is inside the workspace.
@@ -403,6 +408,7 @@ check("ampersand redirect &> with tilde (~/.bashrc) is blocked", blocked(await c
 check("fd duplication 2>&1 is not treated as a file mutation", !(await call("bash", { command: "ls missing 2>&1" }, { sessionID: "s-empty" })));
 check("fd duplication >&2 is not treated as a file mutation", !(await call("bash", { command: "echo err >&2" }, { sessionID: "s-empty" })));
 check("attached redirect x>file is detected as mutation", blocked(await call("bash", { command: "printf hi>src/b.ts" }, { sessionID: "s-empty" })));
+check("every redirect target is checked for workspace escape", blocked(await call("bash", { command: "printf hi > src/b.ts > /tmp/wg-outside-redirect" }, { sessionID: "s-active" })));
 check("tee --append outside workspace is blocked", blocked(await call("bash", { command: "echo x | tee --append /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
 check("tee -ai outside workspace is blocked", blocked(await call("bash", { command: "echo x | tee -ai /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
 check("tee -- flag separator outside workspace is blocked", blocked(await call("bash", { command: "echo x | tee -- /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
@@ -851,6 +857,21 @@ const reviewRes = getLastReviewResult();
 check("recordReviewResult records passed reviewer and summary", reviewRes?.passed === true && reviewRes?.reviewer === "reviewer-subagent");
 await call("edit", { filePath: join(root, "after-review.ts"), content: "changed" }, { sessionID: "s-active" });
 check("new mutation invalidates prior review approval", getLastReviewResult() === undefined);
+
+const fingerprintRepo = mkdtempSync(join(tmpdir(), "wg-review-fingerprint-"));
+spawnSync("git", ["init", "-b", "feature/review"], { cwd: fingerprintRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: fingerprintRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: fingerprintRepo });
+writeFileSync(join(fingerprintRepo, "reviewed.txt"), "base\n");
+spawnSync("git", ["add", "reviewed.txt"], { cwd: fingerprintRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: fingerprintRepo });
+writeFileSync(join(fingerprintRepo, "reviewed.txt"), "first revision\n");
+const statusBeforeContentChange = getGitStatusSummary(fingerprintRepo);
+const fingerprintBeforeContentChange = getGitWorktreeFingerprint(fingerprintRepo);
+writeFileSync(join(fingerprintRepo, "reviewed.txt"), "second revision\n");
+check("dirty tracked content change keeps porcelain status", getGitStatusSummary(fingerprintRepo) === statusBeforeContentChange);
+check("dirty tracked content change updates review fingerprint", getGitWorktreeFingerprint(fingerprintRepo) !== fingerprintBeforeContentChange);
+rmSync(fingerprintRepo, { recursive: true, force: true });
 
 // 9. Secret-File READ Blocks (Policy 17)
 console.log("- Policy 17: Secret-File READ Blocks -");
@@ -1355,6 +1376,9 @@ check("checkInteractiveTtyCommand detects vim", checkInteractiveTtyCommand("vim 
 check("checkInteractiveTtyCommand detects nano", checkInteractiveTtyCommand("nano /tmp/foo").isInteractive);
 check("checkInteractiveTtyCommand detects less", checkInteractiveTtyCommand("less file.txt").isInteractive);
 check("checkInteractiveTtyCommand detects top", checkInteractiveTtyCommand("top").isInteractive);
+check("checkInteractiveTtyCommand permits top batch mode", !checkInteractiveTtyCommand("top -b -n 1").isInteractive);
+check("top batch mode does not hide another interactive monitor", checkInteractiveTtyCommand("top -b -n 1; htop").isInteractive);
+check("top batch mode does not hide a later interactive top", checkInteractiveTtyCommand("top -b -n 1; top").isInteractive);
 check("checkInteractiveTtyCommand detects sudo", checkInteractiveTtyCommand("sudo apt-get update").isInteractive);
 check("checkInteractiveTtyCommand detects git rebase -i", checkInteractiveTtyCommand("git rebase -i HEAD~2").isInteractive);
 check("checkInteractiveTtyCommand detects npm init without -y", checkInteractiveTtyCommand("npm init").isInteractive);
@@ -1367,6 +1391,7 @@ check("checkInteractiveTtyCommand permits regular non-interactive command", !che
 check("shell tool blocks nano", blocked(await shell("nano README.md")));
 check("shell tool blocks less", blocked(await shell("less package.json")));
 check("shell tool blocks top", blocked(await shell("top")));
+check("shell tool allows top batch mode", !(await shell("top -b -n 1")));
 check("shell tool blocks npm init without flag", blocked(await shell("npm init")));
 check("shell tool allows npm init -y", !(await shell("npm init -y")));
 

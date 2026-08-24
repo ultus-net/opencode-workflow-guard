@@ -127,23 +127,29 @@ export function teeTargetsIn(segment: string): string[] {
 	return targets;
 }
 
-export function shellMutationIn(segment: string): ShellMutation | undefined {
-	const redirectMatch = segment.match(
-		/(?:^|[\s>]|(?<=[^\s"']))([0-9]*&?>>?&?)\s*["']?([^\s>&|;"']+)/,
-	);
-	if (redirectMatch?.[1] && redirectMatch?.[2]) {
+function redirectMutationsIn(segment: string): ShellMutation[] {
+	const mutations: ShellMutation[] = [];
+	const redirectRe = /(?:^|[\s>]|(?<=[^\s"']))([0-9]*&?>>?&?)\s*["']?([^\s>&|;"']+)/g;
+	for (const redirectMatch of segment.matchAll(redirectRe)) {
+		if (!redirectMatch[1] || !redirectMatch[2]) continue;
 		const op = redirectMatch[1];
 		const target = redirectMatch[2];
 		// Filter fd duplication (e.g. 2>&1, >&2) where target is purely an fd number
 		const isFdDup = op.endsWith("&") && /^\d+$/.test(target);
 		if (!isFdDup && !/^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(target)) {
-			return {
+			mutations.push({
 				kind: "redirect",
 				target,
 				what: `file redirect to '${target}'`,
-			};
+			});
 		}
 	}
+	return mutations;
+}
+
+export function shellMutationIn(segment: string): ShellMutation | undefined {
+	const redirectMutation = redirectMutationsIn(segment)[0];
+	if (redirectMutation) return redirectMutation;
 	const teeTargets = teeTargetsIn(segment);
 	if (teeTargets.length > 0) {
 		return {
@@ -195,9 +201,20 @@ export function shellMutationIn(segment: string): ShellMutation | undefined {
 export function simpleFilesystemMutations(segment: string): ShellMutation[] {
 	const words = shellWords(unwrapShellCommand(segment));
 	const command = words[0];
-	if (!command || !new Set(["touch", "mkdir", "rm", "unlink", "rmdir"]).has(command)) {
+	if (!command) {
 		return [];
 	}
+	if (command === "dd") {
+		return words
+			.slice(1)
+			.filter((word) => word.startsWith("of=") && word.length > 3)
+			.map((word) => ({
+				kind: "command" as const,
+				target: word.slice(3),
+				what: `dd output to '${word.slice(3)}'`,
+			}));
+	}
+	if (!new Set(["touch", "mkdir", "rm", "unlink", "rmdir", "truncate"]).has(command)) return [];
 	return words
 		.slice(1)
 		.filter((word) => !word.startsWith("-"))
@@ -295,14 +312,10 @@ export async function guardShellMutation(
 			target,
 			what: `tee to '${target}'`,
 		}));
+		const redirectMutations = redirectMutationsIn(segment.trim());
 		const fallbackMutation = shellMutationIn(segment.trim());
-		const mutations = simpleMutations.length > 0
-			? simpleMutations
-			: teeMutations.length > 0
-				? teeMutations
-				: fallbackMutation
-					? [fallbackMutation]
-					: [];
+		const mutations = [...simpleMutations, ...teeMutations, ...redirectMutations];
+		if (mutations.length === 0 && fallbackMutation) mutations.push(fallbackMutation);
 		for (const mutation of mutations) {
 			hasMutation = true;
 			const secret = secretIn(segment);

@@ -60,7 +60,7 @@
 - The agent is prompted to create a feature branch first (`git switch -c feat/my-feature`).
 
 ### 8. Workspace Boundary Guard
-- File modification tools (`edit`, `write`, `apply_patch`) and common shell mutations (redirection `>`, `>>`, `&>`, `>&`, `tee`, `sed -i`, `cp`/`mv`/`ln`, `touch`, `mkdir`, `rm`, `git apply`/`git am`) are validated to ensure targets cannot escape the current workspace root via `../` traversal, symlinks, absolute paths, or shell expansions (`~`, `~user`, `$HOME`). Unresolvable `$VARIABLE` references fail closed.
+- File modification tools (`edit`, `write`, `apply_patch`) and recognized shell mutations (redirection `>`, `>>`, `&>`, `>&`, `tee`, `sed -i`, `cp`/`mv`/`ln`, `touch`, `mkdir`, `rm`, `truncate`, `dd of=`, `git apply`/`git am`) are validated to ensure detected targets cannot escape the current workspace root via `../` traversal, symlinks, absolute paths, or shell expansions (`~`, `~user`, `$HOME`). Unresolvable `$VARIABLE` references fail closed. This is command-level enforcement, not filesystem sandboxing; arbitrary programs and dynamically computed paths require the OS isolation described under Known Limits.
 - `tee` flag parsing generically skips option flags (`-a`, `--append`, `-ai`, `--`) and validates all specified target files against the boundary.
 - `mv` sources are validated too: moving a file from outside the workspace (or a protected settings/plugin file to an innocuous name) is blocked, since `mv` mutates the source.
 - External repository git writes (`git -C /other-repo commit`, `git --git-dir=/other-repo/.git push`, `GIT_DIR=/other-repo/.git git push`, `GIT_WORK_TREE=...`) are also confined to the workspace.

@@ -1,4 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { getCleanEnv, normalize } from "./utils.ts";
@@ -112,6 +113,33 @@ export function getGitStatusSummary(root: string): string | undefined {
 		if (res.status === 0) {
 			return res.stdout.trim();
 		}
+	} catch {}
+	return undefined;
+}
+
+export function getGitWorktreeFingerprint(root: string): string | undefined {
+	try {
+		const diff = spawnSync("git", ["diff", "--no-ext-diff", "HEAD", "--"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (diff.status !== 0 || untracked.status !== 0) return undefined;
+		const hash = createHash("sha256").update(diff.stdout);
+		for (const file of untracked.stdout.split("\0").filter(Boolean).sort()) {
+			hash.update("\0" + file + "\0");
+			try {
+				hash.update(readFileSync(join(root, file)));
+			} catch {
+				return undefined;
+			}
+		}
+		return hash.digest("hex");
 	} catch {}
 	return undefined;
 }

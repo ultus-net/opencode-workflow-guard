@@ -42,6 +42,9 @@ export interface ReviewResult {
 	timestamp: number;
 	targetSessionID?: string;
 	workspace?: string;
+	commitHash?: string;
+	gitStatus?: string;
+	worktreeFingerprint?: string;
 }
 
 export interface AuditEntry {

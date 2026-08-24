@@ -110,6 +110,7 @@ import {
 	snipVerifyOutput,
 	getCurrentGitCommitHash,
 	getGitStatusSummary,
+	getGitWorktreeFingerprint,
 } from "./lib/verify.ts";
 
 export {
@@ -118,6 +119,7 @@ export {
 	snipVerifyOutput,
 	getCurrentGitCommitHash,
 	getGitStatusSummary,
+	getGitWorktreeFingerprint,
 };
 
 // ── Secondary review rubric ──────────────────────────────────────────────────
@@ -808,8 +810,11 @@ async function guardToolCallImpl(
 					: getLastReviewResult();
 				const reviewMatchesContext =
 					review?.passed === true &&
-					(!review.workspace || review.workspace === currentRoot) &&
-					(!review.targetSessionID || review.targetSessionID === context?.sessionID);
+					review.workspace === resolve(currentRoot) &&
+					(!review.targetSessionID || review.targetSessionID === context?.sessionID) &&
+					review.commitHash === getCurrentGitCommitHash(currentRoot) &&
+					review.gitStatus === getGitStatusSummary(currentRoot) &&
+					review.worktreeFingerprint === getGitWorktreeFingerprint(currentRoot);
 				if (!reviewMatchesContext) {
 					logBlock(`[workflow-guard] blocked ${prTool}: review approval required`);
 					return (

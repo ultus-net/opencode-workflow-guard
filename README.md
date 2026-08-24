@@ -25,6 +25,8 @@ Add to your project's `opencode.json` or global `~/.config/opencode/opencode.jso
 
 *Requires OpenCode >= 1.18.* See [docs/installation.md](docs/installation.md) for full setup options and TUI companion badge configuration.
 
+For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json` as well. Do not use `opencode-workflow-guard/ui`; npm parses that unscoped slash form as GitHub shorthand rather than a package export, which can trigger Git credential prompts. The package exposes OpenCode's native `./server` and `./tui` entrypoints so the package root is sufficient in both configs.
+
 ### 2. Verification
 
 ```bash
@@ -41,7 +43,7 @@ The plugin enforces **24 deterministic policy rules** across four main pillars:
 
 * **Branch & History Protection:** Enforces feature-branch workflows (blocks edits/commits on `main`/`master`), hard-blocks direct or forced pushes to protected branches, enforces mergeability pre-flight checks, and requires PR changelogs / changesets.
 * **Task & Verification Discipline:** Gates file mutations on active `todowrite` tasks with subagent inheritance, blocks silent task deletion, enforces fresh test verification evidence before task completion, and journals completion claims vs. verification mismatches.
-* **Secrets & Workspace Confinement:** Confines all edits, shell redirects, and git operations within the workspace root (symlink & `../` escape safe), scrubs sensitive environment variables in agent subshells, and redacts `.env` reads with safe schema masks.
+* **Secrets & Workspace Confinement:** Confines edit tools and recognized shell/git mutations within the workspace root (including symlink and `../` escape checks), scrubs sensitive environment variables in agent subshells, and redacts `.env` reads with safe schema masks. Arbitrary executables are not OS-sandboxed; use containers or filesystem isolation when hard confinement is required.
 * **Destructive CLI & Environment Safety:** Intercepts destructive cloud/database/infrastructure commands, stops script laundering and interpreter evasion, blocks TTY hangs (`vim`, `nano`, `sudo`), and guards against dangerous package manager flags.
 
 For complete policy specifications and override rules, see [docs/policies.md](docs/policies.md).
