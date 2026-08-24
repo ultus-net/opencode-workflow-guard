@@ -46,23 +46,19 @@ Files in your plugin directory are automatically loaded by the OpenCode server p
 
 To enable the dynamic prompt-bar badge - `[Workflow Guard: Active]` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
-1. Place `workflow-guard-ui.tsx` in your config directory (outside `plugins/`):
-```bash
-mkdir -p ~/.config/opencode/ui
-cp src/workflow-guard-ui.ts ~/.config/opencode/ui/workflow-guard-ui.tsx
-```
-
-2. Reference it in your `~/.config/opencode/tui.json`:
+Reference the same package name in `~/.config/opencode/tui.json`:
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "file:///absolute/path/to/.config/opencode/ui/workflow-guard-ui.tsx"
+    "opencode-workflow-guard"
   ]
 }
 ```
 
-The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime `dependency` of this package, so npm installs it automatically alongside `opencode-workflow-guard` — no extra install is needed. Imports resolve from the config directory's `node_modules`, not OpenCode's own runtime: for the manual file-copy install above, ensure `@opentui/solid` is reachable from that directory tree (e.g. install it in the same parent directory where OpenCode's config lives).
+The package exports OpenCode's conventional `./server` and `./tui` entrypoints, so OpenCode selects the correct module for each runtime automatically. Do not configure `opencode-workflow-guard/ui`: npm interprets an unscoped `name/path` spec as GitHub shorthand, which can invoke Git and its configured credential helper instead of loading the package export.
+
+The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime `dependency` of this package, so npm installs it automatically alongside `opencode-workflow-guard` - no extra install is needed.
 
 ---
 

@@ -11,15 +11,8 @@ const check = (name: string, cond: unknown): void => {
 
 console.log("- OpenCode Plugin Installation & Runtime Load Test -");
 
-// 1. Verify opencode binary is available
-const opencodeCheck = spawnSync("opencode", ["--version"], { encoding: "utf8" });
-if (opencodeCheck.status !== 0) {
-	console.log("SKIP: opencode CLI is not available in PATH. Skipping live runtime load tests.");
-	process.exit(0);
-}
-console.log(`  Found OpenCode version: ${opencodeCheck.stdout.trim()}`);
-
-// 2. Set up a fresh isolated project with plugin installed
+// 1. Set up a fresh isolated project with plugin installed. These package
+// checks run even when the optional live OpenCode binary is unavailable.
 const testDir = mkdtempSync(join(tmpdir(), "wg-install-test-"));
 
 // Verify the publish artifact resolves its modular entrypoint, not only the
@@ -35,10 +28,34 @@ const installResult = spawnSync("npm", ["install", "--ignore-scripts", tarballPa
 	encoding: "utf8",
 });
 const packageEntry = join(testDir, "node_modules", "opencode-workflow-guard", "src", "workflow-guard.ts");
+const installedPackageJson = JSON.parse(readFileSync(join(testDir, "node_modules", "opencode-workflow-guard", "package.json"), "utf8"));
 check(
 	"npm tarball installs modular plugin entrypoint",
 	packResult.status === 0 && installResult.status === 0 && existsSync(packageEntry),
 );
+check("npm package exposes OpenCode server entrypoint", installedPackageJson.exports?.["./server"] === "./src/workflow-guard.ts");
+check("npm package exposes OpenCode TUI entrypoint", installedPackageJson.exports?.["./tui"] === "./src/workflow-guard-ui.ts");
+check("npm package does not expose ambiguous /ui entrypoint", installedPackageJson.exports?.["./ui"] === undefined);
+
+const serverImport = spawnSync("node", ["--input-type=module", "-e", `
+	const serverUrl = import.meta.resolve('opencode-workflow-guard/server', 'file://' + process.cwd() + '/dummy.js');
+	const tuiUrl = import.meta.resolve('opencode-workflow-guard/tui', 'file://' + process.cwd() + '/dummy.js');
+	if (!serverUrl.endsWith('/src/workflow-guard.ts') || !tuiUrl.endsWith('/src/workflow-guard-ui.ts')) process.exit(2);
+`], {
+	cwd: testDir,
+	encoding: "utf8",
+});
+check("packed server entrypoint resolves correctly", serverImport.status === 0);
+
+// 2. Verify opencode binary is available for live runtime tests.
+const opencodeCheck = spawnSync("opencode", ["--version"], { encoding: "utf8" });
+if (opencodeCheck.status !== 0) {
+	console.log("SKIP: opencode CLI is not available in PATH. Package checks passed; skipping live runtime load tests.");
+	rmSync(testDir, { recursive: true, force: true });
+	console.log(`\n${pass} passed, ${fail} failed`);
+	process.exit(fail > 0 ? 1 : 0);
+}
+console.log(`  Found OpenCode version: ${opencodeCheck.stdout.trim()}`);
 
 const pluginsDir = join(testDir, ".opencode", "plugins");
 mkdirSync(pluginsDir, { recursive: true });

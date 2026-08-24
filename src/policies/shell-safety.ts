@@ -89,8 +89,26 @@ const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice:
 ];
 
 export function checkInteractiveTtyCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
+	const monitorCommands = command.split(/[;&|\n]+/).filter((segment) => /(?:^|[;&|\s])(?:top|htop|btop|atop|glances)(?:$|[;&|\s])/i.test(segment));
+	if (monitorCommands.some((segment) =>
+		/(?:^|[;&|\s])(?:htop|btop|atop|glances)(?:$|[;&|\s])/i.test(segment) ||
+		(/(?:^|[;&|\s])top(?:$|[;&|\s])/i.test(segment) && !/(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
+	)) {
+		return {
+			isInteractive: true,
+			name: "interactive process monitor",
+			advice: "Use ps aux, uptime, or batch flags (e.g. top -b -n 1) instead of interactive monitors.",
+		};
+	}
 	for (const { regex, name, advice } of INTERACTIVE_COMMAND_PATTERNS) {
 		if (regex.test(command)) {
+			if (
+				name === "interactive process monitor" &&
+				monitorCommands.length > 0 &&
+				monitorCommands.every((segment) => /(?:^|[;&|\s])top(?:$|[;&|\s])/i.test(segment) && /(?:^|\s)-[A-Za-z]*b[A-Za-z]*(?:\s|$)/i.test(segment))
+			) {
+				continue;
+			}
 			return { isInteractive: true, name, advice };
 		}
 	}

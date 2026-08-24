@@ -2,7 +2,7 @@ import { realpathSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { persistVerifyCache } from "./audit.ts";
-import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary } from "./verify.ts";
+import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint } from "./verify.ts";
 import type {
 	TodoSdkClient,
 	ProjectConfig,
@@ -149,13 +149,17 @@ export function recordReviewResult(
 	targetSessionID?: string,
 	workspace?: string,
 ): void {
+	const root = resolve(workspace ?? getWorkspaceRoot());
 	lastReview = {
 		reviewer,
 		summary: summary.slice(-4000),
 		passed,
 		timestamp: Date.now(),
 		targetSessionID,
-		workspace,
+		workspace: root,
+		commitHash: getCurrentGitCommitHash(root),
+		gitStatus: getGitStatusSummary(root),
+		worktreeFingerprint: getGitWorktreeFingerprint(root),
 	};
 	if (targetSessionID) sessionReviews.set(targetSessionID, lastReview);
 }
