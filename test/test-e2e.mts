@@ -76,6 +76,16 @@ spawnSync("git", ["init", "-b", "feat/install-verification"], { cwd: testDir });
 spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: testDir });
 spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
 
+const startup = spawnSync("opencode", ["debug", "startup"], { cwd: testDir, encoding: "utf8", timeout: 30_000 });
+check("OpenCode loads plugin without a model provider", startup.status === 0);
+
+if (process.env.WORKFLOW_GUARD_LIVE_E2E !== "1") {
+	console.log("SKIP: model-driven policy probes require WORKFLOW_GUARD_LIVE_E2E=1.");
+	rmSync(testDir, { recursive: true, force: true });
+	console.log(`\n${pass} passed, ${fail} failed`);
+	process.exit(fail > 0 ? 1 : 0);
+}
+
 // 3. Test: Direct edit without task list is blocked by the loaded plugin
 console.log("  Running live OpenCode prompt to verify plugin intercept...");
 const run1 = spawnSync(

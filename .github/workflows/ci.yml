@@ -48,7 +48,8 @@ jobs:
       - run: npm test
 
   # ───── Heavier checks ─────
-  # Install a pinned OpenCode CLI so a green E2E job proves the live loader ran.
+  # Install a pinned OpenCode CLI so package and provider-free loader checks run.
+  # Model-driven probes are opt-in because external providers are not a CI invariant.
   e2e:
     name: E2E (plugin load / opencode)
     runs-on: ubuntu-latest
