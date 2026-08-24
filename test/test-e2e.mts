@@ -135,6 +135,11 @@ const run3 = spawnSync(
 const targetFile = join(testDir, "verified.txt");
 const fileCreated = existsSync(targetFile) && readFileSync(targetFile, "utf8").includes("installed-ok");
 check("compliant workflow with todowrite succeeded through plugin", fileCreated);
+if (!fileCreated) {
+	const output3 = run3.stdout + run3.stderr;
+	console.log("  compliant-workflow output tail:");
+	console.log(output3.slice(-2_000));
+}
 
 // Clean up
 rmSync(testDir, { recursive: true, force: true });

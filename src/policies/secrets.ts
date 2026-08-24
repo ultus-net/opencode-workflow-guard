@@ -1,6 +1,7 @@
 import { realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
+import { shellWords, unwrapShellCommand } from "../lib/utils.ts";
 
 export const SAFE_ENV_FIXTURE_RE =
 	/\.env\.(example|sample|template|dist|schema)(\.[\w-]+)*$/i;
@@ -154,5 +155,16 @@ export function secretFileReadIn(segment: string): string | undefined {
 	}
 	const simpleMatch = segment.match(SIMPLE_FILE_READ_COMMAND_RE);
 	if (simpleMatch?.[1] && isSecretPath(simpleMatch[1])) return simpleMatch[1];
+	const words = shellWords(unwrapShellCommand(segment));
+	if (["cat", "head", "tail", "less", "more", "od", "hexdump", "strings", "base64", "xxd", "nl", "view", "nano", "vim"].includes(words[0] ?? "")) {
+		for (const operand of words.slice(1).filter((word) => !word.startsWith("-"))) {
+			if (isSecretPath(operand)) return operand;
+		}
+	}
+	if (words[0] === "dd") {
+		for (const word of words.slice(1)) {
+			if (word.startsWith("if=") && isSecretPath(word.slice(3))) return word.slice(3);
+		}
+	}
 	return undefined;
 }

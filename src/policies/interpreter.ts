@@ -4,7 +4,7 @@ import { isPathOutsideWorkspace } from "./boundary.ts";
 export function extractInterpreterPayload(segment: string): string[] {
 	const payloads: string[] = [];
 	const inlineMatch = segment.match(
-		/\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\s+(?:-[a-zA-Z]*[ce]\s+)(?:"([^"]*)"|'([^']*)')/i,
+		/\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\s+(?:-[a-zA-Z]*[ce])\s*(?:"([^"]*)"|'([^']*)')/i,
 	);
 	if (inlineMatch?.[1] || inlineMatch?.[2]) {
 		payloads.push(inlineMatch[1] ?? inlineMatch[2] ?? "");
@@ -49,9 +49,14 @@ export function secretPathInPayload(payload: string): string | undefined {
 	return undefined;
 }
 
-const FUNCTION_TARGET_PATTERNS: RegExp[] = [
+const WRITE_TARGET_PATTERNS: RegExp[] = [
 	/\b(?:writeFileSync|writeFile|appendFile|appendFileSync|createWriteStream|unlink|unlinkSync|rmSync|rmdirSync|mkdirSync|renameSync|copyFileSync|cpSync|truncateSync)\s*\(\s*["']([^"']+)["']/g,
-	/\b(?:open|os\.remove|os\.unlink|os\.rmdir|os\.mkdir|os\.makedirs|os\.rename|shutil\.rmtree|shutil\.copy|shutil\.copy2|shutil\.move|Path)\s*\(\s*["']([^"']+)["']/g,
+	/\b(?:renameSync|copyFileSync|cpSync)\s*\(\s*["'][^"']+["']\s*,\s*["']([^"']+)["']/g,
+	/\b(?:os\.remove|os\.unlink|os\.rmdir|os\.mkdir|os\.makedirs|os\.rename|shutil\.rmtree|shutil\.copy|shutil\.copy2|shutil\.move)\s*\(\s*["']([^"']+)["']/g,
+	/\b(?:os\.rename|shutil\.copy|shutil\.copy2|shutil\.move)\s*\(\s*["'][^"']+["']\s*,\s*["']([^"']+)["']/g,
+	/\bopen\s*\(\s*["']([^"']+)["']\s*,\s*["'][^"']*[wax+][^"']*["']/g,
+	/\bPath\s*\(\s*["']([^"']+)["']\s*\)\s*\.\s*(?:write_text|write_bytes|unlink|mkdir|touch|rename|replace)\s*\(/g,
+	/\bPath\s*\(\s*["'][^"']+["']\s*\)\s*\.\s*(?:rename|replace)\s*\(\s*["']([^"']+)["']/g,
 	/[>]{1,2}\s*["']?([^\s;&"'|)]+)/g,
 ];
 
@@ -63,7 +68,7 @@ const FUNCTION_TARGET_PATTERNS: RegExp[] = [
 export function outsideWritePathInPayload(payload: string, root: string): string | undefined {
 	const candidates = new Set<string>();
 
-	for (const pattern of FUNCTION_TARGET_PATTERNS) {
+	for (const pattern of WRITE_TARGET_PATTERNS) {
 		const matches = payload.matchAll(pattern);
 		for (const m of matches) {
 			if (m[1]) candidates.add(m[1]);
@@ -77,4 +82,14 @@ export function outsideWritePathInPayload(payload: string, root: string): string
 		}
 	}
 	return undefined;
+}
+
+export function writePathsInPayload(payload: string): string[] {
+	const candidates = new Set<string>();
+	for (const pattern of WRITE_TARGET_PATTERNS) {
+		for (const match of payload.matchAll(pattern)) {
+			if (match[1]) candidates.add(match[1]);
+		}
+	}
+	return [...candidates];
 }

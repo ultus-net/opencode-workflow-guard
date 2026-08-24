@@ -158,10 +158,11 @@ export function shellMutationIn(segment: string): ShellMutation | undefined {
 			what: `tee to '${teeTargets[0]!}'`,
 		};
 	}
-	const sedMatch = segment.match(/\bsed\s+(?:-(?:[a-zA-Z]*i[a-zA-Z]*|i\S*)\s+)+[^\s;&|]+/);
-	if (sedMatch) {
-		const tokens = sedMatch[0]!.split(/\s+/);
-		const target = tokens[tokens.length - 1];
+	const sedWords = shellWords(unwrapShellCommand(segment));
+	if (sedWords[0] === "sed" && sedWords.slice(1).some((word) => /^-(?:[a-zA-Z]*i|i\S*)$/.test(word) || /^--in-place(?:=.*)?$/.test(word))) {
+		const operands = sedWords.slice(1).filter((word) => !word.startsWith("-"));
+		const target = operands.at(-1);
+		if (!target) return undefined;
 		return { kind: "command", target, what: `sed -i on '${target}'` };
 	}
 	const transfer = filesystemTransferInfo(segment);
@@ -219,6 +220,34 @@ export function simpleFilesystemMutations(segment: string): ShellMutation[] {
 					what: `dd output to '${target}'`,
 				};
 			});
+	}
+	if (command === "sed") {
+		let inPlace = false;
+		let scriptSupplied = false;
+		const targets: string[] = [];
+		for (let i = 1; i < words.length; i++) {
+			const word = words[i]!;
+			if (/^-(?:[a-zA-Z]*i|i\S*)$/.test(word) || /^--in-place(?:=.*)?$/.test(word)) {
+				inPlace = true;
+				continue;
+			}
+			if (word === "-e" || word === "--expression" || word === "-f" || word === "--file") {
+				scriptSupplied = true;
+				i++;
+				continue;
+			}
+			if (/^(?:-e|--expression=|-f|--file=)/.test(word) || word.startsWith("-")) {
+				if (/^(?:-e|--expression=)/.test(word)) scriptSupplied = true;
+				continue;
+			}
+			if (!scriptSupplied) {
+				scriptSupplied = true;
+				continue;
+			}
+			targets.push(word);
+		}
+		if (!inPlace) return [];
+		return targets.map((target) => ({ kind: "command" as const, target, what: `sed -i on '${target}'` }));
 	}
 	if (!SIMPLE_MUTATION_COMMANDS.has(command)) return [];
 	return words

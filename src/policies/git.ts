@@ -16,6 +16,22 @@ export const PROTECTED_BRANCHES = new Set(["main", "master"]);
 export const PUSH_TO_MAIN_RE =
 	/\bgit\s+push\b[^|;&]*(?:^|\s)\+?[\w./-]*:(?:main|master)(?![\w./-])|\bgit\s+push\b[^|;&]*(?:\s|\/)(?:main|master)(?![\w./-])/;
 
+export function hasUnsafeGitAlias(command: string): boolean {
+	return splitShellSegments(command).some((segment) => {
+		const words = unwrapShellWords(segment);
+		const gitIndex = words.findIndex((word, index) =>
+			word === "git" && words.slice(0, index).every((prefix) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(prefix)),
+		);
+		if (gitIndex < 0) return false;
+		const args = words.slice(gitIndex + 1);
+		return args.some((arg, index) =>
+			/^-calias\./i.test(arg) ||
+			/^--config-env=alias\./i.test(arg) ||
+			((arg === "-c" || arg === "--config-env") && /^alias\./i.test(args[index + 1] ?? "")),
+		);
+	});
+}
+
 export const GIT_BRANCH_CREATE_RE =
 	/\bgit\s+(?:checkout\s+-b|switch\s+(?:-c|--create))\b/;
 
