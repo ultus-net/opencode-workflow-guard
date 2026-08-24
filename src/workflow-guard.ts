@@ -221,6 +221,7 @@ import {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	hasUnsafeGitAlias,
 } from "./policies/git.ts";
 
 export {
@@ -266,6 +267,7 @@ import {
 	extractInterpreterPayload,
 	secretPathInPayload,
 	outsideWritePathInPayload,
+	writePathsInPayload,
 } from "./policies/interpreter.ts";
 export { extractInterpreterPayload, secretPathInPayload, outsideWritePathInPayload };
 
@@ -476,7 +478,7 @@ async function guardToolCallImpl(
 			logBlock(`[workflow-guard] blocked ${toolName}: protected path ${target}`);
 			return PROTECTED_PATH_REASON;
 		}
-		if (target && isSecretPath(target) && !allowLive) {
+		if (target && isSecretPath(target)) {
 			logBlock(`[workflow-guard] blocked ${toolName}: secret file path ${target}`);
 			return (
 				`Blocked: modifying secret file '${target}' directly is not permitted. ` +
@@ -493,7 +495,7 @@ async function guardToolCallImpl(
 					);
 					return PROTECTED_PATH_REASON;
 				}
-				if (isSecretPath(patchPath) && !allowLive) {
+				if (isSecretPath(patchPath)) {
 					logBlock(
 						`[workflow-guard] blocked apply_patch: secret file path ${patchPath}`,
 					);
@@ -553,14 +555,9 @@ async function guardToolCallImpl(
 					}
 				}
 			}
-			for (const content of extractEditContent(input)) {
-				if (isSettingsTamper(content)) {
-					logBlock(
-						`[workflow-guard] blocked ${toolName}: payload tampers with settings`,
-					);
-					return PROTECTED_PATH_REASON;
-				}
-			}
+		}
+		for (const content of extractEditContent(input)) {
+			if (isSettingsTamper(content)) return PROTECTED_PATH_REASON;
 		}
 
 		if (onProtectedBranch(currentRoot)) {
@@ -647,6 +644,9 @@ async function guardToolCallImpl(
 		}
 
 		const normalizedCommand = normalizeGitCommands(command);
+		if (hasUnsafeGitAlias(command)) {
+			return "Blocked: per-invocation Git aliases cannot be used because they can hide guarded Git operations.";
+		}
 		const gitInvocations = splitShellSegments(command)
 			.map((segment) => parseGitInvocation(segment.trim()))
 			.filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
@@ -697,8 +697,7 @@ async function guardToolCallImpl(
 		}
 
 		// ── Policy 17: secret file reads via shell ──
-		if (!allowLive) {
-			for (const segment of command.split(/[\n|;&]+/)) {
+		for (const segment of command.split(/[\n|;&]+/)) {
 				const secretFile = secretFileReadIn(segment.trim());
 				if (secretFile) {
 					logBlock(
@@ -709,7 +708,6 @@ async function guardToolCallImpl(
 						"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
 					);
 				}
-			}
 		}
 
 		// ── Policy 18: interpreter inline evasion scanner ──
@@ -723,6 +721,21 @@ async function guardToolCallImpl(
 				);
 				return `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`;
 			}
+			const writePaths = writePathsInPayload(payload);
+			if (writePaths.length > 0) {
+				if (context?.agent && isReadOnlyRole(context.agent)) {
+					return `Blocked: subagent with read-only role '${context.agent}' cannot perform shell file mutations.`;
+				}
+				for (const path of writePaths) {
+					if (isProtectedPath(path)) return PROTECTED_PATH_REASON;
+				}
+				if (onProtectedBranch(currentRoot)) return branchGuardReason();
+				const todos = await effectiveTodos(context?.sessionID);
+				if (todos !== undefined && !hasActiveTodo(todos)) {
+					return "Blocked: inline interpreter file mutation with no active todo item.";
+				}
+				recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
+			}
 
 			if (!allowLive) {
 				const normPayload = normalizeGitCommands(normalize(payload));
@@ -733,23 +746,10 @@ async function guardToolCallImpl(
 					);
 					return `Blocked: inline interpreter script contains a ${liveCheck}. Interpreter payloads cannot smuggle live destructive commands past the guard.`;
 				}
-				if (isSettingsTamper(payload)) {
-					logBlock(
-						`[workflow-guard] blocked interpreter payload with settings tamper`,
-					);
-					return PROTECTED_PATH_REASON;
-				}
-				const secretPath = secretPathInPayload(payload);
-				if (secretPath) {
-					logBlock(
-						`[workflow-guard] blocked interpreter payload accessing secret file: ${secretPath}`,
-					);
-					return (
-						`Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted. ` +
-						"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
-					);
-				}
 			}
+			if (isSettingsTamper(payload)) return PROTECTED_PATH_REASON;
+			const secretPath = secretPathInPayload(payload);
+			if (secretPath) return `Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted.`;
 		}
 
 		// ── Policies 1, 7 & 8: shell file mutations get the same gates as edits ──

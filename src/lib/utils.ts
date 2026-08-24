@@ -44,9 +44,42 @@ export function decodeShellEscapes(text: string): string {
 }
 
 export function shellWords(command: string): string[] {
-	return (command.match(/(?:[^\s"']+|"[^"]*"|'[^']*')+/g) ?? []).map((word) =>
-		word.replace(/^(?:"([\s\S]*)"|'([\s\S]*)')$/, "$1$2"),
-	);
+	const words: string[] = [];
+	let word = "";
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	let started = false;
+	for (const char of command) {
+		if (escaped) {
+			word += char;
+			escaped = false;
+			started = true;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			escaped = true;
+			started = true;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			if (!quote) quote = char;
+			else if (quote === char) quote = undefined;
+			else word += char;
+			started = true;
+			continue;
+		}
+		if (!quote && /\s/.test(char)) {
+			if (started) words.push(word);
+			word = "";
+			started = false;
+			continue;
+		}
+		word += char;
+		started = true;
+	}
+	if (escaped) word += "\\";
+	if (started) words.push(word);
+	return words;
 }
 
 export function splitShellSegments(command: string): string[] {

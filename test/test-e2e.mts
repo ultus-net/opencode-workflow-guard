@@ -88,6 +88,16 @@ spawnSync("git", ["init", "-b", "feat/install-verification"], { cwd: testDir });
 spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: testDir });
 spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
 
+const startup = spawnSync("opencode", ["debug", "startup"], { cwd: testDir, encoding: "utf8", timeout: 30_000 });
+check("OpenCode loads plugin without a model provider", startup.status === 0);
+
+if (process.env.WORKFLOW_GUARD_LIVE_E2E !== "1") {
+	console.log("SKIP: model-driven policy probes require WORKFLOW_GUARD_LIVE_E2E=1.");
+	rmSync(testDir, { recursive: true, force: true });
+	console.log(`\n${pass} passed, ${fail} failed`);
+	process.exit(fail > 0 ? 1 : 0);
+}
+
 // 3. Test: Direct edit without task list is blocked by the loaded plugin
 console.log("  Running live OpenCode prompt to verify plugin intercept...");
 const run1 = spawnSync(
@@ -146,7 +156,12 @@ const run3 = spawnSync(
 
 const targetFile = join(testDir, "verified.txt");
 const fileCreated = existsSync(targetFile) && readFileSync(targetFile, "utf8").includes("installed-ok");
-checkLive("compliant workflow with todowrite succeeded through plugin", fileCreated, run3.stdout + run3.stderr);
+const output3 = run3.stdout + run3.stderr;
+const run3AccountedFor = checkLive("compliant workflow with todowrite succeeded through plugin", fileCreated, output3);
+if (!run3AccountedFor) {
+	console.log("  compliant-workflow output tail:");
+	console.log(output3.slice(-2_000));
+}
 
 // Clean up
 rmSync(testDir, { recursive: true, force: true });

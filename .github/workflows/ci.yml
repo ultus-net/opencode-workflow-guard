@@ -48,9 +48,8 @@ jobs:
       - run: npm test
 
   # ───── Heavier checks ─────
-  # The live runtime test needs an `opencode` binary; if one is not on PATH the
-  # test suite exits 0 (SKIP), so it stays optional. When opencode becomes
-  # installable via npm the binary is picked up automatically.
+  # Install a pinned OpenCode CLI so package and provider-free loader checks run.
+  # Model-driven probes are opt-in because external providers are not a CI invariant.
   e2e:
     name: E2E (plugin load / opencode)
     runs-on: ubuntu-latest
@@ -61,6 +60,7 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
+      - run: npm install --global opencode-ai@1.18.21
       - run: npm run test:install
 
   # ───── Supply-chain gate ─────
@@ -109,15 +109,17 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
+      - run: npm install --global opencode-ai@1.18.21
       - name: Smoke test guard loading
         run: |
-          if ! command -v opencode &>/dev/null; then echo "SKIP"; exit 0; fi
           TMP=$(mktemp -d)
           mkdir -p "$TMP/.opencode/plugins"
           cp src/workflow-guard.ts "$TMP/.opencode/plugins/"
+          PLUGIN_DIR=$(dirname "$(realpath "$TMP"/.*/*/*.ts)")
+          cp -R src/lib src/policies "$PLUGIN_DIR/"
           cd "$TMP"
           echo '{"plugin":["file://./.opencode/plugins/workflow-guard.ts"]}' > opencode.json
-          opencode run --no-tui "guard_status" 2>&1 | grep -q "workspaceRoot"
+          opencode debug startup >/dev/null
 
   # ───── Human-readable summary ─────
   status:
@@ -134,4 +136,20 @@ jobs:
           echo "audit:     ${{ needs.audit.result }}"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "changelog: ${{ needs.changelog.result }}"
+          fi
+
+          for result in \
+            "${{ needs.typecheck.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.e2e.result }}" \
+            "${{ needs.audit.result }}" \
+            "${{ needs.dogfood.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "::error::Required CI job did not succeed: $result"
+              exit 1
+            fi
+          done
+          if [ "${{ github.event_name }}" = "pull_request" ] && [ "${{ needs.changelog.result }}" != "success" ] && [ "${{ needs.changelog.result }}" != "skipped" ]; then
+            echo "::error::Changelog gate did not succeed"
+            exit 1
           fi

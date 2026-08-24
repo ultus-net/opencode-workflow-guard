@@ -1,4 +1,4 @@
-import { asRecord } from "../lib/utils.ts";
+import { asRecord, shellWords, splitShellSegments } from "../lib/utils.ts";
 
 export interface LivePattern {
 	re: RegExp;
@@ -62,9 +62,48 @@ export const LIVE_MUTATION_PATTERNS: LivePattern[] = [
 	{ re: /\bmknod\s+\S+\s+p\b/, what: ["named FIFO pipe ", "creation (reverse shell backpipe)"].join("") },
 ];
 
+const KUBECTL_VALUE_GLOBALS = new Set([
+	"--as", "--as-group", "--as-uid", "--as-user-extra", "--cache-dir", "--certificate-authority", "--client-certificate", "--client-key",
+	"--cluster", "--context", "--kubeconfig", "--kuberc", "--namespace", "--password", "--profile", "--profile-output", "--request-timeout",
+	"--server", "--storage-driver-buffer-duration", "--storage-driver-db", "--storage-driver-host", "--storage-driver-password", "--storage-driver-table",
+	"--storage-driver-user", "--tls-server-name", "--token", "--user", "--username", "-n", "-s",
+]);
+const KUBECTL_BOOLEAN_GLOBALS = new Set(["--disable-compression", "--insecure-skip-tls-verify", "--match-server-version", "--storage-driver-secure", "--version", "--warnings-as-errors"]);
+
+function normalizedKubectlCommands(command: string): string {
+	const normalized: string[] = [];
+	for (const segment of splitShellSegments(command)) {
+		const words = shellWords(segment);
+		for (let i = 0; i < words.length; i++) {
+			if (words[i] !== "kubectl") continue;
+			let j = i + 1;
+			while (j < words.length) {
+				const option = words[j];
+				const name = option.split("=", 1)[0];
+				if (/^-[ns].+/.test(option) && !option.startsWith("--")) {
+					j++;
+					continue;
+				}
+				if (KUBECTL_VALUE_GLOBALS.has(name)) {
+					j += option.includes("=") ? 1 : 2;
+					continue;
+				}
+				if (KUBECTL_BOOLEAN_GLOBALS.has(name)) {
+					j++;
+					continue;
+				}
+				break;
+			}
+			if (j < words.length) normalized.push(`kubectl ${words.slice(j).join(" ")}`);
+		}
+	}
+	return normalized.join(" ; ");
+}
+
 export function liveMutationIn(command: string): string | undefined {
+	const optionNormalized = `${normalizedKubectlCommands(command)} ; ${command.replace(/\b(terraform|tofu)\s+(?:(?:-chdir(?:=\S+|\s+\S+)|-(?:no-color|version))\s+)*/g, "$1 ")}`;
 	for (const { re, what } of LIVE_MUTATION_PATTERNS) {
-		if (re.test(command)) {
+		if (re.test(command) || re.test(optionNormalized)) {
 			return what;
 		}
 	}

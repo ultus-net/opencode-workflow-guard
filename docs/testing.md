@@ -18,10 +18,11 @@ Runs the comprehensive unit and adversarial tests covering all guard policies, l
 npm test            # runs node test.mts (Node >= 22.18) or bun test.mts
 ```
 
-### 3. Live OpenCode Runtime & Install Tests
-Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies `src/workflow-guard.ts` plus `src/lib/` and `src/policies/` into `.opencode/plugins/` and runs live `opencode run` sessions to verify that OpenCode's real runtime loader discovers, loads, and executes the plugin hooks:
+### 3. OpenCode Runtime & Install Tests
+Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies `src/workflow-guard.ts` plus `src/lib/` and `src/policies/` into `.opencode/plugins/` and verifies that OpenCode's real runtime loader discovers the plugin without a model provider. Model-driven `opencode run` hook probes are opt-in:
 ```bash
-npm run test:install # runs node test-e2e.mts
+npm run test:install # package install + provider-free OpenCode loader check
+WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # also run model-driven policy probes
 ```
 Package and loader checks remain deterministic. If the configured model provider rejects a live prompt before guard behavior can run because credits, rate limits, capacity, or overload make the provider unavailable, that live case is reported as unavailable rather than as a guard failure. Other live-runtime failures still fail the suite.
 

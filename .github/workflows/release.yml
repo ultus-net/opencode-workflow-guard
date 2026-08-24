@@ -66,11 +66,11 @@ jobs:
       # and GitHub Releases are generated for any unreleased tags on publish.
       - name: Push git tags and create GitHub Releases
         run: |
-          git push --tags || true
+          git push --tags
           for tag in $(git tag --points-at HEAD); do
             if ! gh release view "$tag" &>/dev/null; then
               echo "Creating GitHub Release for $tag"
-              gh release create "$tag" --generate-notes --title "$tag" || true
+              gh release create "$tag" --generate-notes --title "$tag"
             fi
           done
         env:

@@ -944,6 +944,63 @@ check("write tool blocks new file through symlink alias into .opencode", blocked
 rmSync(protectedAliasDir, { recursive: true, force: true });
 setWorkspaceRoot(root);
 
+console.log("- Known bypass regressions -");
+check("quote-concatenated git push to main is blocked", blocked(await shell("g''it push main")));
+check("quote-concatenated gh pr create is blocked", blocked(await shell("g''h pr create --title t --body 'no release notes here'")));
+check("git -c push alias cannot hide push to main", blocked(await shell("git -c alias.p=push p origin HEAD:main")));
+check("git --config-env alias cannot hide push to main", blocked(await shell("ALIAS=push git --config-env=alias.p=ALIAS p origin HEAD:main")));
+check("non-git config-env alias text is allowed", !(await shell("echo --config-env=alias.p=ALIAS")));
+check("sed -i outside workspace is blocked", blocked(await call("bash", { command: "sed -i 's/a/b/' /tmp/wg-outside-sed" }, { sessionID: "s-active" })));
+check("sed --in-place outside workspace is blocked", blocked(await call("bash", { command: "sed --in-place 's/a/b/' /tmp/wg-outside-sed" }, { sessionID: "s-active" })));
+check("sed --in-place suffix outside workspace is blocked", blocked(await call("bash", { command: "sed --in-place=.bak 's/a/b/' /tmp/wg-outside-sed" }, { sessionID: "s-active" })));
+check("sed -i checks every file operand", blocked(await call("bash", { command: "sed -i 's/a/b/' /tmp/wg-outside-sed safe.txt" }, { sessionID: "s-active" })));
+check("dd cannot read .env", blocked(await shell("dd if=.env of=/dev/null")));
+check("cluster CLI global options cannot hide destructive verb", blocked(await shell(["kubectl --context prod del", "ete pod foo"].join(""))));
+check("cluster CLI boolean global option cannot hide destructive verb", blocked(await shell("kubectl --warnings-as-errors delete pod foo")));
+check("cluster CLI valued global option cannot hide destructive verb", blocked(await shell("kubectl --request-timeout 5s delete pod foo")));
+check("cluster CLI short namespace option cannot hide destructive verb", blocked(await shell("kubectl -n prod delete pod foo")));
+check("cluster CLI attached short option cannot hide destructive verb", blocked(await shell("kubectl -nprod delete pod foo")));
+check("cluster CLI impersonation option cannot hide destructive verb", blocked(await shell("kubectl --as admin delete pod foo")));
+check("cluster CLI user-extra option cannot hide destructive verb", blocked(await shell("kubectl --as-user-extra scope=admin delete pod foo")));
+check("cluster CLI kuberc option cannot hide destructive verb", blocked(await shell("kubectl --kuberc prefs.kuberc delete pod foo")));
+check("cluster CLI storage-driver value cannot hide destructive verb", blocked(await shell("kubectl --storage-driver-host db.internal delete pod foo")));
+check("cluster CLI storage-driver boolean cannot hide destructive verb", blocked(await shell("kubectl --storage-driver-secure delete pod foo")));
+check("cluster CLI TLS option cannot hide destructive verb", blocked(await shell("kubectl --certificate-authority ca.pem delete pod foo")));
+check("cluster CLI quoted global value cannot hide destructive verb", blocked(await shell('kubectl --context "prod cluster" delete pod foo')));
+check("cluster CLI escaped global value cannot hide destructive verb", blocked(await shell("kubectl --context prod\\ cluster delete pod foo")));
+check("cluster CLI boolean equals option cannot hide destructive verb", blocked(await shell("kubectl --warnings-as-errors=false delete pod foo")));
+check("IaC CLI global options cannot hide destructive verb", blocked(await shell(["terraform -chdir=. des", "troy"].join(""))));
+check("IaC CLI boolean global option cannot hide destructive verb", blocked(await shell("terraform -no-color destroy")));
+check("attached interpreter -c form cannot read .env", blocked(await shell("python3 -c\"print(open('.env').read())\"")));
+check("python open read stays allowed for read-only role", !(await call("bash", { command: "python3 -c \"print(open('README.md').read())\"" }, { sessionID: "s-active", agent: "reviewer" })));
+check("python Path read stays allowed without todos", !(await call("bash", { command: "python3 -c \"from pathlib import Path; print(Path('README.md').read_text())\"" }, { sessionID: "s-empty" })));
+check("node rename destination outside workspace is blocked", blocked(await call("bash", { command: "node -e \"require('fs').renameSync('safe.txt', '/tmp/wg-outside-rename')\"" }, { sessionID: "s-active" })));
+check("python shutil copy destination outside workspace is blocked", blocked(await call("bash", { command: "python3 -c \"import shutil; shutil.copy('safe.txt', '/tmp/wg-outside-copy')\"" }, { sessionID: "s-active" })));
+check("python Path rename destination outside workspace is blocked", blocked(await call("bash", { command: "python3 -c \"from pathlib import Path; Path('safe.txt').rename('/tmp/wg-outside-rename')\"" }, { sessionID: "s-active" })));
+
+const multiReadAliasDir = mkdtempSync(join(tmpdir(), "wg-multi-read-alias-"));
+writeFileSync(join(multiReadAliasDir, ".env"), "SECRET=value\n");
+writeFileSync(join(multiReadAliasDir, "safe.txt"), "safe\n");
+symlinkSync(join(multiReadAliasDir, ".env"), join(multiReadAliasDir, "alias.txt"));
+setWorkspaceRoot(multiReadAliasDir);
+check("multi-operand cat checks symlinked secret second operand", blocked(await shell("cat safe.txt alias.txt")));
+rmSync(multiReadAliasDir, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
+check("inline node writeFileSync needs active todos", blocked(await call("bash", { command: "node -e \"require('fs').writeFileSync('inline-node.txt', 'x')\"" }, { sessionID: "s-empty" })));
+check("inline node writeFileSync is blocked for read-only role", blocked(await call("bash", { command: "node -e \"require('fs').writeFileSync('inline-node.txt', 'x')\"" }, { sessionID: "s-active", agent: "reviewer" })));
+const inlineNodeRepo = mkdtempSync(join(tmpdir(), "wg-inline-node-main-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: inlineNodeRepo });
+setWorkspaceRoot(inlineNodeRepo);
+check("inline node writeFileSync is blocked on protected branch", blocked(await call("bash", { command: "node -e \"require('fs').writeFileSync('inline-node.txt', 'x')\"" }, { sessionID: "s-active" })));
+rmSync(inlineNodeRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
+process.env.WORKFLOW_GUARD_ALLOW_LIVE = "1";
+check("allow-live does not allow secret reads", blocked(await shell("cat .env")));
+check("allow-live does not allow settings tamper", blocked(await call("bash", { command: ["echo x > open", "code.json"].join("") }, { sessionID: "s-active" })));
+delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
+
 // 10. Interpreter Inline Evasion Scanner (Policy 18)
 console.log("- Policy 18: Interpreter Inline Evasion Scanner -");
 check("extractInterpreterPayload extracts python -c", extractInterpreterPayload('python3 -c "import os; os.system(\'ls\')"' ).length > 0);
