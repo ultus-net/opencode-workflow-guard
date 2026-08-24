@@ -145,7 +145,11 @@ export function importProjectKnowledge(store: ProjectMemoryStore, path: string, 
 			if (!parsed.id || typeof parsed.id !== "string" || parsed.id.length > 200 || /[\0\r\n]/.test(parsed.id) || typeof parsed.content !== "string" || rejectContent(parsed.content) || !KINDS.has(parsed.kind as ProjectMemoryKind)) continue;
 			const exists = store.db.prepare("SELECT 1 FROM memories WHERE id = ? AND project_id = ?").get(parsed.id, store.projectId);
 			if (exists) continue;
-			recordProjectMemory(store, { kind: parsed.kind as ProjectMemoryKind, content: parsed.content, source: "portable", paths: Array.isArray(parsed.paths) ? parsed.paths : [], commit: parsed.commit, supersedes: parsed.supersedes }, parsed.id);
+			const superseded = typeof parsed.supersedes === "string"
+				? store.db.prepare("SELECT source FROM memories WHERE id = ? AND project_id = ?").get(parsed.supersedes, store.projectId) as { source?: string } | undefined
+				: undefined;
+			const supersedes = superseded?.source === "portable" ? parsed.supersedes : undefined;
+			recordProjectMemory(store, { kind: parsed.kind as ProjectMemoryKind, content: parsed.content, source: "portable", paths: Array.isArray(parsed.paths) ? parsed.paths : [], commit: parsed.commit, supersedes }, parsed.id);
 			imported++;
 		} catch {}
 	}

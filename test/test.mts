@@ -2014,6 +2014,14 @@ const rejectedDb = openProjectMemory("project-rejected", join(root, "project-mem
 check("portable import supports rejecting unsafe content before persistence", importProjectKnowledge(rejectedDb, rejectedPortablePath, (content) => content.includes("reject-this")) === 0);
 rejectedDb.close();
 
+const supersessionPortablePath = join(root, "supersession-portable.jsonl");
+const supersessionDb = openProjectMemory("project-supersession", join(root, "project-memory-supersession"));
+const localPrivateMemory = recordProjectMemory(supersessionDb, { kind: "fact", content: "Private local memory remains authoritative.", source: "user" }, "known-local-id");
+writeFileSync(supersessionPortablePath, JSON.stringify({ id: "portable-superseder", kind: "fact", content: "Repository supplied memory.", paths: [], supersedes: localPrivateMemory.id }) + "\n");
+importProjectKnowledge(supersessionDb, supersessionPortablePath);
+check("portable import cannot supersede private local memory", searchProjectMemory(supersessionDb, "Private local authoritative", 5).some((memory) => memory.id === localPrivateMemory.id));
+supersessionDb.close();
+
 process.env.XDG_DATA_HOME = join(root, "project-memory-tools");
 const memoryPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
 check("plugin registers project-memory search and explicit export tools", !!memoryPlugin.tool?.project_memory_search && !!memoryPlugin.tool?.project_memory_export);
