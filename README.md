@@ -68,6 +68,7 @@ For complete policy specifications and override rules, see [docs/policies.md](do
 
 | Tool | Purpose |
 |---|---|
+| `guard_next_tasks` | Load `TODO.md`, or fall back to repository roadmap/plan/task Markdown when deciding what to work on next |
 | `guard_status` | Inspect active guardrails, current branch protection, and verification/review status |
 | `guard_why` | Simulate and explain whether a specific tool call or command would be blocked |
 | `guard_audit` | View recent audit log entries recorded in `workflow-guard.jsonl` |

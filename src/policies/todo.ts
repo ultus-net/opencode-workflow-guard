@@ -35,6 +35,12 @@ export async function fetchParentSessionID(sessionID: string): Promise<string | 
 export async function effectiveTodos(
 	sessionID: string | undefined,
 ): Promise<TodoItem[] | undefined> {
+	return (await effectiveTodosWithOwner(sessionID))?.todos;
+}
+
+export async function effectiveTodosWithOwner(
+	sessionID: string | undefined,
+): Promise<{ todos: TodoItem[]; ownerSessionID?: string } | undefined> {
 	if (!sessionID) return undefined;
 	const seen = new Set<string>();
 	let current: string | undefined = sessionID;
@@ -42,10 +48,10 @@ export async function effectiveTodos(
 		seen.add(current);
 		const todos = await fetchSessionTodos(current);
 		if (todos === undefined) return undefined;
-		if (todos.length > 0) return todos;
+		if (todos.length > 0) return { todos, ownerSessionID: current };
 		current = await fetchParentSessionID(current);
 	}
-	return [];
+	return { todos: [] };
 }
 
 export async function effectiveTodoOwnerSessionID(

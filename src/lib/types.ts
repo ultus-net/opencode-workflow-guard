@@ -7,6 +7,10 @@ export interface TodoSdkClient {
 	session?: {
 		todo?: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
 		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown } }>;
+		promptAsync?: (opts: {
+			path: { id: string };
+			body: { messageID?: string; parts: Array<{ type: "text"; text: string }> };
+		}) => Promise<unknown>;
 	};
 	tui?: {
 		showToast?: (opts: { body: { title?: string; message: string; variant?: string } }) => Promise<unknown>;
