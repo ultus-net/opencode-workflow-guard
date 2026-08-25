@@ -53,10 +53,7 @@ import {
 	resetVerifyState,
 	sessionMutationTimestamps,
 	sessionVerifyResults,
-	loadProjectConfig,
 	getProjectConfig,
-	reloadProjectConfig,
-	stripJsonComments,
 	isReviewRequired,
 	isDocumentationRequired,
 	getSubagentMutationBudget,
@@ -68,6 +65,7 @@ import {
 	resetReviewState,
 	sessionReviews,
 } from "./lib/state.ts";
+import { loadProjectConfig, reloadProjectConfig, stripJsonComments } from "./lib/project-config.ts";
 
 export {
 	setWorkspaceRoot,
