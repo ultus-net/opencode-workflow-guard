@@ -62,6 +62,7 @@ const serverImport = spawnSync("node", ["--input-type=module", "-e", `
 		encoding: "utf8",
 	});
 check("packed server and TUI entrypoints resolve correctly", serverImport.status === 0);
+check("server and TUI package specs resolve to different modules", installedPackageJson.exports?.["."] !== installedPackageJson.exports?.["./tui"]);
 
 // 2. Verify opencode binary is available for live runtime tests.
 const opencodeCheck = spawnSync("opencode", ["--version"], { encoding: "utf8" });

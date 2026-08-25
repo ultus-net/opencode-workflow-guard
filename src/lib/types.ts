@@ -31,6 +31,8 @@ export interface ProjectConfig {
 	requireReview?: boolean;
 	requireDocumentation?: boolean;
 	recoveryCheckpoints?: boolean;
+	projectMemory?: boolean;
+	learning?: boolean;
 	maxSubagentMutations?: number;
 	maxLearningInterventions?: number;
 }

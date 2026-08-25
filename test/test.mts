@@ -75,7 +75,7 @@ import {
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint } from "../src/lib/checkpoint.ts";
-import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
+import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
 let fail = 0;
@@ -942,8 +942,18 @@ check("command.executed event is audited", evtAuditAfter > evtAuditBefore);
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
 let registeredOrder: number | undefined;
+let registeredTuiCommands: Array<{ name: string; run?: Function }> = [];
+let tuiDialogSelectProps: any;
+const tuiCommandOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-command-options-"));
 const fakeTuiApi = {
 	theme: { current: { success: "#00ff00" } },
+	state: { path: { worktree: tuiCommandOptionsDir, directory: tuiCommandOptionsDir } },
+	keymap: { registerLayer: ({ commands }: { commands: Array<{ name: string; run?: Function }> }) => { registeredTuiCommands = commands; } },
+	ui: {
+		DialogSelect: (props: any) => { tuiDialogSelectProps = props; return {} as any; },
+		dialog: { replace: (render: Function) => render(), clear() {} },
+		toast() {},
+	},
 	slots: {
 		register: ({ order, slots }: { order?: number; slots: Record<string, Function> }) => {
 			registeredOrder = order;
@@ -955,6 +965,43 @@ await WorkflowGuardTui(fakeTuiApi as any, undefined, {} as any);
 check("tui plugin registers with order", registeredOrder === 1);
 check("tui plugin registers session_prompt_right slot", typeof registeredSlots.session_prompt_right === "function");
 check("tui plugin registers home_prompt_right slot", typeof registeredSlots.home_prompt_right === "function");
+check("tui plugin registers project-options command through keymap", registeredTuiCommands.some((command) => command.name === "workflow-guard.project-options"));
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+tuiDialogSelectProps?.onSelect?.({ value: "recoveryCheckpoints" });
+check("tui project-options command persists selected recovery setting", readRecoveryCheckpointsOption(tuiCommandOptionsDir) === true);
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+tuiDialogSelectProps?.onSelect?.({ value: "projectMemory" });
+check("tui project-options command can disable project memory", readProjectOption(tuiCommandOptionsDir, "projectMemory") === false);
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+tuiDialogSelectProps?.onSelect?.({ value: "learning" });
+check("tui project-options command can enable learner mode", readProjectOption(tuiCommandOptionsDir, "learning") === true);
+rmSync(tuiCommandOptionsDir, { recursive: true, force: true });
+const tuiOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-options-"));
+check("recovery checkpoint project option defaults off", readRecoveryCheckpointsOption(tuiOptionsDir) === false);
+mkdirSync(join(tuiOptionsDir, ".opencode"), { recursive: true });
+writeFileSync(join(tuiOptionsDir, ".opencode", "workflow-guard.jsonc"), "{\n  // keep this comment\n  \"requireReview\": true,\n}\n");
+const tuiOptionsPath = writeRecoveryCheckpointsOption(tuiOptionsDir, true);
+const tuiOptionsRaw = readFileSync(tuiOptionsPath, "utf8");
+check("recovery checkpoint project option uses existing JSONC", tuiOptionsPath === join(tuiOptionsDir, ".opencode", "workflow-guard.jsonc") && readRecoveryCheckpointsOption(tuiOptionsDir) === true);
+check("recovery checkpoint project option preserves JSONC comments, trailing commas, and settings", tuiOptionsRaw.includes("// keep this comment") && tuiOptionsRaw.includes('"requireReview": true,') && tuiOptionsRaw.includes('"recoveryCheckpoints": true'));
+writeFileSync(join(tuiOptionsDir, ".opencode", "workflow-guard.json"), "{\n  \"recoveryCheckpoints\": false\n}\n");
+check("recovery checkpoint project option matches server JSON precedence", readRecoveryCheckpointsOption(tuiOptionsDir) === false && writeRecoveryCheckpointsOption(tuiOptionsDir, true) === join(tuiOptionsDir, ".opencode", "workflow-guard.json"));
+const malformedOptions = join(tuiOptionsDir, ".opencode", "workflow-guard.json");
+writeFileSync(malformedOptions, "{ invalid jsonc\n");
+let malformedRejected = false;
+try { writeRecoveryCheckpointsOption(tuiOptionsDir, true); } catch { malformedRejected = true; }
+check("recovery checkpoint project option refuses malformed JSONC without rewriting", malformedRejected && readFileSync(malformedOptions, "utf8") === "{ invalid jsonc\n");
+rmSync(join(tuiOptionsDir, ".opencode"), { recursive: true, force: true });
+const defaultOptionsPath = writeRecoveryCheckpointsOption(tuiOptionsDir, true);
+check("recovery checkpoint project option creates default .opencode JSON", defaultOptionsPath === join(tuiOptionsDir, ".opencode", "workflow-guard.json") && existsSync(defaultOptionsPath));
+const outsideTuiOptions = mkdtempSync(join(tmpdir(), "wg-tui-options-outside-"));
+rmSync(join(tuiOptionsDir, ".opencode"), { recursive: true, force: true });
+symlinkSync(outsideTuiOptions, join(tuiOptionsDir, ".opencode"), "dir");
+let tuiSymlinkRejected = false;
+try { writeRecoveryCheckpointsOption(tuiOptionsDir, true); } catch { tuiSymlinkRejected = true; }
+check("recovery checkpoint project option refuses symlink escape", tuiSymlinkRejected && !existsSync(join(outsideTuiOptions, "workflow-guard.json")));
+rmSync(outsideTuiOptions, { recursive: true, force: true });
+rmSync(tuiOptionsDir, { recursive: true, force: true });
 
 // ── Adversarial tests & hardened invariants ──
 console.log("- Adversarial tests & hardened invariants -");
@@ -2444,6 +2491,7 @@ let toastHandler: ((event: any) => void) | undefined;
 const fakeTuiBadgeApi = {
 	theme: { current: { success: "green", warning: "yellow", error: "red" } },
 	route: { current: { name: "session", params: { sessionID: "s-badge" } } },
+	keymap: { registerLayer() {} },
 	event: {
 		on(type: string, handler: (event: any) => void) {
 			if (type === "tui.toast.show") toastHandler = handler;
@@ -2614,6 +2662,13 @@ const prevDataHome = process.env.XDG_DATA_HOME;
 delete process.env.WORKFLOW_GUARD_LEARNING;
 const learningDisabledPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
 check("repository cannot expose learning tools without user opt-in", !(learningDisabledPlugin.tool as any)?.learning_profile);
+const projectOptionRoot = mkdtempSync(join(tmpdir(), "wg-feature-options-"));
+mkdirSync(join(projectOptionRoot, ".opencode"), { recursive: true });
+writeFileSync(join(projectOptionRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ learning: true, projectMemory: false }));
+const projectOptionPlugin = await WorkflowGuard({ directory: projectOptionRoot, worktree: projectOptionRoot, client: fakeClient as any } as any);
+check("project option can explicitly enable learner mode", !!projectOptionPlugin.tool?.learning_profile);
+check("project option can disable project-memory tools", !(projectOptionPlugin.tool as any)?.project_memory_search);
+rmSync(projectOptionRoot, { recursive: true, force: true });
 process.env.WORKFLOW_GUARD_LEARNING = "1";
 process.env.XDG_DATA_HOME = join(root, "learning-data");
 const learningPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);

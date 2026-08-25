@@ -58,6 +58,7 @@ import {
 	isDocumentationRequired,
 	getSubagentMutationBudget,
 	isLearningEnabled,
+	isProjectMemoryEnabled,
 	getLearningInterventionBudget,
 	recordReviewResult,
 	getLastReviewResult,
@@ -1055,10 +1056,12 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	setSdkClient(ctx.client);
 	reloadProjectConfig(effectiveRoot);
 	const learningEnabled = isLearningEnabled(effectiveRoot);
+	const projectMemoryEnabled = isProjectMemoryEnabled(effectiveRoot);
 	const learningInterventions = new Map<string, number>();
 	const portableMemoryPath = join(effectiveRoot, ".opencode", "memory", "project-memory.jsonl");
 	let projectMemory: ReturnType<typeof openProjectMemory> | undefined;
 	try {
+		if (!projectMemoryEnabled) throw new Error("Project memory disabled");
 		projectMemory = openProjectMemory(getProjectMemoryIdentity(effectiveRoot));
 		ensureProjectMemoryExcluded(effectiveRoot);
 		importProjectKnowledge(projectMemory, portableMemoryPath, (content) => secretIn(content) !== undefined);
@@ -1111,7 +1114,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						: JSON.stringify({ sources: [], message: "No TODO, roadmap, plan, tasks, or backlog Markdown files found." });
 				},
 			}),
-			project_memory_search: tool({
+			...(projectMemoryEnabled ? { project_memory_search: tool({
 				description: "Search current durable knowledge for this project. Returns concise typed records with provenance; superseded records are excluded.",
 				args: { query: tool.schema.string() },
 				execute: async (args) => projectMemory ? JSON.stringify(args.query.length <= 500 ? searchProjectMemory(projectMemory, args.query, 8) : [], null, 2) : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
@@ -1155,7 +1158,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				description: "Import the fixed repo-local .opencode/memory/project-memory.jsonl file into this project's local working-memory index.",
 				args: {},
 				execute: async () => projectMemory ? `[workflow-guard] Imported ${importProjectKnowledge(projectMemory, portableMemoryPath, (content) => secretIn(content) !== undefined)} new project-memory record(s).` : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
-			}),
+			}) } : {}),
 			...(learningEnabled ? {
 				learning_profile: tool({
 					description: "Inspect the local evidence-based learner profile so teaching can build on demonstrated knowledge without assuming unobserved concepts are gaps.",
