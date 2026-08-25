@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.1
+
+### Patch Changes
+
+- 3158e12: Clarify Workflow Guard's role as a deterministic policy and enforcement layer rather than an agent harness, and distinguish optional memory and learning context features from core guardrails.
+- b8c3b06: Document the roadmap for configurable interactive and unattended plugin operation.
+
 ## 1.8.0
 
 ### Minor Changes
