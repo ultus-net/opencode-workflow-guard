@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -26,8 +26,14 @@ import {
 	loadVerifyCache,
 	isEnvFilePath,
 	generateMaskedEnvSchema,
+	dynamicShellSyntaxIn,
 	getAuditFilePath,
 	getRecentAuditEntries,
+	getRecentVerifyHistory,
+	getVerifyHistoryFilePath,
+	managedConfigDiagnostic,
+	summarizeInput,
+	extractReviewFollowups,
 	buildReviewRubric,
 	recordReviewResult,
 	getLastReviewResult,
@@ -64,6 +70,9 @@ import {
 	openProjectMemory,
 	recordProjectMemory,
 	searchProjectMemory,
+	recordReviewFollowup,
+	listReviewFollowups,
+	resolveReviewFollowup,
 	exportProjectKnowledge,
 	importProjectKnowledge,
 	getProjectMemoryIdentity,
@@ -74,7 +83,8 @@ import {
 } from "../src/workflow-guard.ts";
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
-import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint } from "../src/lib/checkpoint.ts";
+import { audit } from "../src/lib/audit.ts";
+import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
@@ -551,6 +561,7 @@ const hooks = await pluginFn({
 	$: undefined as any,
 });
 check("plugin returns tool.execute.before hook", typeof hooks["tool.execute.before"] === "function");
+check("managed startup diagnostic avoids provenance claims", managedConfigDiagnostic("win32", {}).includes("not verified") && managedConfigDiagnostic("win32", {}).includes("location is unknown"));
 // Real opencode hook contract: args arrive on the SECOND parameter.
 const invoke = (tool: string, args: unknown, sessionID = "s-hook") =>
 	hooks["tool.execute.before"]?.({ tool, sessionID, callID: "c" }, { args });
@@ -899,6 +910,11 @@ if (typeof pluginWithToast.event === "function") {
 check("event hook emits no intrusive startup toast", toasts.length === 0);
 
 // ── New: audit trail ──
+const privateAuditCommand = "deploy --credential SHOULD_NOT_BE_PERSISTED --target staging";
+const privateSummary = summarizeInput({ command: privateAuditCommand }) as { command?: { bytes?: number; sha256?: string } };
+check("audit summaries fingerprint commands without persisting their contents", privateSummary.command?.bytes === Buffer.byteLength(privateAuditCommand) && privateSummary.command?.sha256?.length === 64 && !JSON.stringify(privateSummary).includes("SHOULD_NOT_BE_PERSISTED"));
+const extractedFollowups = extractReviewFollowups("Test Integrity: covered\n- P2: first issue\n- P3 second issue\nSecurity: safe");
+check("review summaries extract independently resolvable P2/P3 findings", extractedFollowups.length === 2 && extractedFollowups[0]?.severity === "P2" && extractedFollowups[1]?.summary === "- P3 second issue");
 console.log("- Audit trail -");
 const auditPath = getAuditFilePath();
 const auditSizeBefore = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
@@ -909,6 +925,8 @@ check(
 	"audit trail records shell decisions",
 	auditSizeAfter > auditSizeBefore,
 );
+for (let i = 0; i < 5; i++) audit({ ts: new Date().toISOString(), tool: "retention-probe", decision: "allow", reason: "x".repeat(1024 * 1024) });
+check("audit trail compacts after exceeding retention cap", statSync(getAuditFilePath()).size < 4 * 1024 * 1024);
 
 // ── New: secret-content scan ──
 console.log("- Secret-content scan -");
@@ -1116,6 +1134,14 @@ check(
 );
 
 const verifyTimeout = await runVerify("sleep 5", root, 100);
+const verifyDynamic = await runVerify("printf $(printf dangerous)", root);
+check("runVerify blocks dynamic shell expansion", !verifyDynamic.passed && verifyDynamic.output.includes("dynamic command/process substitution"));
+check("dynamic shell syntax detects command substitution", dynamicShellSyntaxIn("echo $(dangerous)") !== undefined && dynamicShellSyntaxIn("echo `dangerous`") !== undefined);
+check("dynamic shell syntax detects process substitution", dynamicShellSyntaxIn("diff <(safe) <(unsafe)") !== undefined);
+check("dynamic shell syntax detects IFS construction", dynamicShellSyntaxIn("git${IFS}push origin main") !== undefined && dynamicShellSyntaxIn("git${IFS:- }push") !== undefined);
+check("dynamic shell syntax detects ambiguous whitespace", dynamicShellSyntaxIn("git\rpush") !== undefined && dynamicShellSyntaxIn("git\u00a0push") !== undefined);
+check("dynamic shell syntax detects malformed quote boundaries", dynamicShellSyntaxIn("echo 'unterminated") !== undefined && dynamicShellSyntaxIn("echo trailing\\") !== undefined);
+check("dynamic shell syntax preserves quoted literals", dynamicShellSyntaxIn("printf '%s' '$(literal) `literal` <(literal) $IFS'") === undefined);
 check(
 	"runVerify terminates timed-out verification commands safely",
 	!verifyTimeout.passed && verifyTimeout.output.includes("timed out"),
@@ -1614,6 +1640,18 @@ const reviewToolResult = await customPlugin.tool?.record_review?.execute(
 );
 check("record_review tool execution succeeds", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
 
+fakeParents.set("s-reviewer-followups", "s-active");
+await customPlugin.tool?.record_review?.execute(
+	{
+		reviewer: "subagent-followups",
+		summary: "Test integrity: covered. Task completeness: done. Cleanliness: clean. Security: safe. Platform: compatible.\nP2: first durable issue\nP3: second durable issue",
+		passed: true,
+	},
+	{ sessionID: "s-reviewer-followups", agent: "reviewer", worktree: root, directory: root } as any,
+);
+const durableReviewFollowups = JSON.parse(String(await customPlugin.tool?.guard_review_followups?.execute({}, {} as any))) as Array<{ severity?: string; summary?: string }>;
+check("record_review persists multiple P2/P3 findings independently", durableReviewFollowups.some((item) => item.severity === "P2" && item.summary?.includes("first durable issue")) && durableReviewFollowups.some((item) => item.severity === "P3" && item.summary?.includes("second durable issue")));
+
 // Rubric enforcement: summaries that skip the axes are rejected
 fakeParents.set("s-reviewer-thin", "s-active");
 const thinReviewResult = await customPlugin.tool?.record_review?.execute(
@@ -1882,6 +1920,14 @@ const testVerifyCache = {
 persistVerifyCache(testVerifyCache);
 const loadedCache = loadVerifyCache();
 check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
+recordVerifyResult("npm test -- failing-history-probe", { passed: false, output: "history failure" }, "s-history");
+const failedHistory = getRecentVerifyHistory(5).find((entry) => entry.passed === false);
+check("durable verification history retains failed runs without raw command/output", failedHistory?.command.startsWith("sha256:") === true && failedHistory?.output.startsWith("sha256:") === true);
+check("durable verification history is private", (statSync(getVerifyHistoryFilePath()).mode & 0o777) === 0o600);
+writeFileSync(getVerifyHistoryFilePath(), JSON.stringify({ ...testVerifyCache, command: "legacy secret command", output: "legacy secret output" }) + "\n");
+recordVerifyResult("replacement command", { passed: false, output: "replacement output" }, "s-history-migration");
+check("durable verification history discards legacy raw payloads", !readFileSync(getVerifyHistoryFilePath(), "utf8").includes("legacy secret"));
+check("failed verification history does not replace passing cache", loadVerifyCache()?.passed === true);
 
 // Durable verification evidence is workspace-bound: a passing run from
 // workspace A must never satisfy finalization in workspace B, even when
@@ -2008,6 +2054,26 @@ const restoredCheckpoint = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-
 check("recovery checkpoint restores tracked workspace state", restoredCheckpoint.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "user change\n");
 check("recovery checkpoint restores pre-run untracked content", readFileSync(join(checkpointDir, "untracked.txt"), "utf8") === "user untracked\n");
 
+writeFileSync(join(checkpointDir, "tracked.txt"), "rollback baseline\n");
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+createRecoveryCheckpoint(checkpointDir, "rollback-failure-session", 1);
+writeFileSync(join(checkpointDir, "tracked.txt"), "rollback agent change\n");
+finalizeRecoveryCheckpoint(checkpointDir, "rollback-failure-session", 1);
+let injectedRestoreApply = false;
+setCheckpointGitForTesting((workspace, args) => {
+	if (args[0] === "stash" && args[1] === "apply") {
+		injectedRestoreApply = true;
+		throw new Error("injected restore failure");
+	}
+	if (injectedRestoreApply && args[0] === "reset" && args[1] === "--hard") throw new Error("injected rollback failure");
+	const result = spawnSync("git", ["-C", workspace, ...args], { encoding: "utf8" });
+	if (result.status !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
+	return result.stdout.trim();
+});
+const rollbackFailure = restoreRecoveryCheckpoint(checkpointDir, "rollback-failure-session", 1);
+setCheckpointGitForTesting();
+check("recovery checkpoint surfaces secondary rollback failure", !rollbackFailure.ok && rollbackFailure.error?.includes("injected restore failure") && rollbackFailure.error.includes("Recovery rollback also failed: injected rollback failure"));
+
 const cleanCheckpointDir = mkdtempSync(join(tmpdir(), "workflow-guard-clean-checkpoint-"));
 spawnSync("git", ["init", "-q", cleanCheckpointDir]);
 spawnSync("git", ["-C", cleanCheckpointDir, "config", "user.email", "test@example.com"]);
@@ -2020,6 +2086,18 @@ writeFileSync(join(cleanCheckpointDir, "created-during-run.txt"), "agent output\
 finalizeRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
 const cleanCheckpointRestore = restoreRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
 check("recovery checkpoint removes untracked files created from a clean checkpoint", cleanCheckpointRestore.ok && !existsSync(join(cleanCheckpointDir, "created-during-run.txt")));
+for (let i = 0; i < 101; i++) createRecoveryCheckpoint(cleanCheckpointDir, `retention-session-${i}`, 1);
+const retainedCheckpointCount = Array.from({ length: 101 }, (_, i) => listRecoveryCheckpoints(cleanCheckpointDir, `retention-session-${i}`).length).reduce((sum, count) => sum + count, 0);
+check("recovery checkpoint metadata retains at most 100 entries", retainedCheckpointCount === 100 && listRecoveryCheckpoints(cleanCheckpointDir, "retention-session-0").length === 0 && listRecoveryCheckpoints(cleanCheckpointDir, "retention-session-100").length === 1);
+const corruptCheckpointMetadata = join(cleanCheckpointDir, ".git", "workflow-guard", "recovery-checkpoints.json");
+writeFileSync(corruptCheckpointMetadata, "{corrupt");
+const corruptMetadataBefore = readFileSync(corruptCheckpointMetadata, "utf8");
+const checkpointWithCorruptMetadata = createRecoveryCheckpoint(cleanCheckpointDir, "corrupt-metadata-session", 1);
+check("recovery checkpoint refuses to overwrite corrupt metadata", !checkpointWithCorruptMetadata && readFileSync(corruptCheckpointMetadata, "utf8") === corruptMetadataBefore);
+writeFileSync(corruptCheckpointMetadata, JSON.stringify({ workspace: resolve(cleanCheckpointDir), checkpoints: [{ sessionID: "malformed" }] }));
+const malformedMetadataBefore = readFileSync(corruptCheckpointMetadata, "utf8");
+const checkpointWithMalformedMetadata = createRecoveryCheckpoint(cleanCheckpointDir, "malformed-metadata-session", 1);
+check("recovery checkpoint refuses structurally invalid metadata", !checkpointWithMalformedMetadata && readFileSync(corruptCheckpointMetadata, "utf8") === malformedMetadataBefore);
 writeFileSync(join(checkpointDir, "tracked.txt"), "later user edit\n");
 const interferenceRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
 check("recovery checkpoint refuses intervening workspace changes", !interferenceRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "later user edit\n");
@@ -2708,6 +2786,16 @@ const decision = recordProjectMemory(memoryDb, {
 	commit: "abc1234",
 });
 check("project memory persists provenance in SQLite", searchProjectMemory(memoryDb, "SQLite authoritative", 5)[0]?.sessionID === "s-memory");
+const followup = recordReviewFollowup(memoryDb, {
+	severity: "P2",
+	summary: "Surface rollback failures and add fault-injection coverage.",
+	reviewer: "independent-full-branch-review",
+	sessionID: "s-memory",
+	commit: "abc1234",
+	paths: ["src/lib/checkpoint.ts"],
+}, "checkpoint-rollback-observability");
+check("review follow-ups persist as open local project debt", listReviewFollowups(memoryDb)[0]?.id === followup.id);
+check("review follow-ups resolve explicitly", resolveReviewFollowup(memoryDb, followup.id) && listReviewFollowups(memoryDb).length === 0 && listReviewFollowups(memoryDb, "resolved")[0]?.resolvedAt !== undefined);
 recordProjectMemory(memoryDb, {
 	kind: "decision",
 	content: "Use SQLite FTS5 for deterministic local memory retrieval.",

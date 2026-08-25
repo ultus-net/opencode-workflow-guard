@@ -29,6 +29,42 @@ export function normalize(cmd: string): string {
 	return cmd.replace(/\s+/g, " ");
 }
 
+export function dynamicShellSyntaxIn(command: string): string | undefined {
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (let i = 0; i < command.length; i += 1) {
+		const char = command[i]!;
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (char === "'") {
+			if (!quote) quote = "'";
+			else if (quote === "'") quote = undefined;
+			continue;
+		}
+		if (char === '"') {
+			if (!quote) quote = '"';
+			else if (quote === '"') quote = undefined;
+			continue;
+		}
+		if (quote === "'") continue;
+		if (char === "`" || (char === "$" && command[i + 1] === "(") || (!quote && (char === "<" || char === ">") && command[i + 1] === "(")) {
+			return "dynamic command/process substitution";
+		}
+		if (char === "$" && /^(?:IFS\b|\{IFS(?:\}|[:\[]))/.test(command.slice(i + 1))) return "dynamic IFS expansion";
+		if (!quote && (char === "\r" || /[\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]/u.test(char))) {
+			return "ambiguous shell whitespace";
+		}
+	}
+	if (quote || escaped) return "malformed shell quoting";
+	return undefined;
+}
+
 export function decodeShellEscapes(text: string): string {
 	return text
 		// ANSI-C quoting wrapper: $'...' -> ...

@@ -92,6 +92,7 @@ export {
 // ── Shared shell/env utilities ───────────────────────────────────────────────
 import {
 	asRecord,
+	dynamicShellSyntaxIn,
 	extractCommands,
 	normalize,
 	shellWrappersChangeCwd,
@@ -103,7 +104,7 @@ import {
 	SENSITIVE_ENV_RE,
 } from "./lib/utils.ts";
 
-export { getCleanEnv };
+export { getCleanEnv, dynamicShellSyntaxIn };
 
 // ── Adaptive learning engine ─────────────────────────────────────────────────
 import {
@@ -132,6 +133,9 @@ export {
 	recordProjectMemory,
 	searchProjectMemory,
 	getRecentProjectMemory,
+	recordReviewFollowup,
+	listReviewFollowups,
+	resolveReviewFollowup,
 	exportProjectKnowledge,
 	importProjectKnowledge,
 } from "./lib/project-memory.ts";
@@ -142,8 +146,11 @@ import {
 	getRecentProjectMemory,
 	importProjectKnowledge,
 	isProjectMemoryFresh,
+	listReviewFollowups,
 	openProjectMemory,
 	recordProjectMemory,
+	recordReviewFollowup,
+	resolveReviewFollowup,
 	searchProjectMemory,
 } from "./lib/project-memory.ts";
 
@@ -159,7 +166,28 @@ import {
 	summarizeInput,
 } from "./lib/audit.ts";
 
-export { getAuditFilePath, getVerifyCacheFilePath, persistVerifyCache, loadVerifyCache, getRecentAuditEntries };
+export { getAuditFilePath, getVerifyCacheFilePath, getVerifyHistoryFilePath, persistVerifyCache, loadVerifyCache, getRecentAuditEntries, getRecentVerifyHistory } from "./lib/audit.ts";
+export { summarizeInput };
+
+export function extractReviewFollowups(summary: string): Array<{ severity: "P2" | "P3"; summary: string }> {
+	return summary.split(/\r?\n/).map((line) => ({
+		line: line.trim(),
+		severity: line.match(/(?:^|\s)(P[23])(?:\b|[:])/i)?.[1]?.toUpperCase() as "P2" | "P3" | undefined,
+	})).filter((finding): finding is { line: string; severity: "P2" | "P3" } => Boolean(finding.line && finding.severity))
+		.map((finding) => ({ severity: finding.severity, summary: finding.line }));
+}
+
+export function managedConfigDiagnostic(platform = process.platform, env: NodeJS.ProcessEnv = process.env): string {
+	const directory = platform === "darwin"
+		? "/Library/Application Support/opencode"
+		: platform === "win32"
+			? env.ProgramData ? join(env.ProgramData, "opencode") : undefined
+			: platform === "linux" ? "/etc/opencode" : undefined;
+	const detected = directory !== undefined && ["opencode.json", "opencode.jsonc"].some((name) => existsSync(join(directory, name)));
+	return directory
+		? `managed config ${detected ? "detected" : "not detected"} at ${directory}; plugin provenance is not verified by the OpenCode V1 API`
+		: "managed config location is unknown on this platform; plugin provenance is not verified by the OpenCode V1 API";
+}
 
 // ── Verification engine ──────────────────────────────────────────────────────
 import {
@@ -667,6 +695,8 @@ async function guardToolCallImpl(
 
 	const commands = extractCommands(input);
 	for (const raw of commands) {
+		const dynamicSyntax = dynamicShellSyntaxIn(raw);
+		if (dynamicSyntax) return `Blocked: command contains ${dynamicSyntax} that cannot be safely classified without executing shell expansion.`;
 		const command = normalize(raw);
 
 		// ── Policy 22: non-interactive shell & TTY hang guard ──
@@ -1059,7 +1089,11 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	const projectMemoryEnabled = isProjectMemoryEnabled(effectiveRoot);
 	const learningInterventions = new Map<string, number>();
 	const portableMemoryPath = join(effectiveRoot, ".opencode", "memory", "project-memory.jsonl");
+	let followupStore: ReturnType<typeof openProjectMemory> | undefined;
 	let projectMemory: ReturnType<typeof openProjectMemory> | undefined;
+	try {
+		followupStore = openProjectMemory(getProjectMemoryIdentity(effectiveRoot));
+	} catch {}
 	try {
 		if (!projectMemoryEnabled) throw new Error("Project memory disabled");
 		projectMemory = openProjectMemory(getProjectMemoryIdentity(effectiveRoot));
@@ -1075,12 +1109,13 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			body: {
 				service: "workflow-guard",
 				level: "info",
-				message: `Workflow Guard plugin initialized for ${effectiveRoot}`,
+				message: `Workflow Guard plugin initialized for ${effectiveRoot}; ${managedConfigDiagnostic()}`,
 			},
 		});
 	} catch {}
 
 	const pendingPostEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
+	const toolStartedAt = new Map<string, number>();
 	const pendingReadObservations = new Map<string, ReadObservation>();
 	const activeRecoveryRuns = new Map<string, number>();
 	const postEditKey = (sessionID: string, callID: string) => `${sessionID}\0${callID}`;
@@ -1360,10 +1395,34 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						parentSessionID,
 						toolContext.worktree || toolContext.directory,
 					);
+					if (followupStore && !secretIn(args.summary)) {
+						const findings = extractReviewFollowups(args.summary);
+						for (const finding of findings) {
+							recordReviewFollowup(followupStore, {
+								severity: finding.severity,
+								summary: finding.summary,
+								reviewer: args.reviewer,
+								sessionID: toolContext.sessionID,
+								commit: getCurrentGitCommitHash(effectiveRoot),
+							});
+						}
+					}
 					return args.passed
 						? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.`
 						: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
 				},
+			}),
+			guard_review_followups: tool({
+				description: "List durable local P2/P3 review follow-ups for this project. Open findings are technical debt that should be addressed rather than indefinitely deferred.",
+				args: {},
+				execute: async () => JSON.stringify(followupStore ? listReviewFollowups(followupStore) : [], null, 2),
+			}),
+			guard_review_followup_resolve: tool({
+				description: "Resolve a durable local review follow-up after the underlying issue has been fixed and verified.",
+				args: { id: tool.schema.string() },
+				execute: async (args) => followupStore && resolveReviewFollowup(followupStore, args.id)
+					? `[workflow-guard] Review follow-up ${args.id} resolved.`
+					: `[workflow-guard] Review follow-up ${args.id} was not open or was not found.`,
 			}),
 			guard_review_rubric: tool({
 				description:
@@ -1494,6 +1553,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					await emitBlockFeedback(reason);
 					throw new Error(`[workflow-guard] ${reason}`);
 				}
+				toolStartedAt.set(postEditKey(input.sessionID, input.callID), Date.now());
 				if (input.tool === "read") {
 					const target = editTargets(args, toolWorktree)[0];
 					if (target) {
@@ -1509,6 +1569,18 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		},
 
 		"tool.execute.after": async (input, output) => {
+			const telemetryKey = postEditKey(input.sessionID, input.callID);
+			const startedAt = toolStartedAt.get(telemetryKey);
+			toolStartedAt.delete(telemetryKey);
+			audit({
+				ts: new Date().toISOString(),
+				sessionID: input.sessionID,
+				callID: input.callID,
+				tool: input.tool,
+				decision: "allow",
+				phase: "outcome",
+				durationMs: startedAt === undefined ? undefined : Date.now() - startedAt,
+			});
 			releaseFileClaims(input.sessionID, input.callID);
 			if (input.tool === "read") {
 				const readKey = postEditKey(input.sessionID, input.callID);
@@ -1577,6 +1649,11 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					stateLines.push(
 						`- Secondary Review: ${lastR.passed ? "APPROVED" : "CHANGES REQUESTED"} by ${lastR.reviewer}`,
 					);
+				}
+				const openFollowups = followupStore ? listReviewFollowups(followupStore, "open", 8) : [];
+				if (openFollowups.length > 0) {
+					stateLines.push(`- Open Review Follow-ups: ${openFollowups.length} local P2/P3 item(s)`);
+					contextBlocks.push(`## Review Follow-ups\n${openFollowups.map((item) => `- [${item.severity}:${item.id.slice(0, 8)}] ${item.summary.slice(0, 300)}`).join("\n")}\nTreat these as durable technical debt: address relevant items when practical and resolve them explicitly after verification.`);
 				}
 				contextBlocks.push(stateLines.join("\n"));
 				const projectKnowledge = (projectMemory ? getRecentProjectMemory(projectMemory, 20) : [])
@@ -1692,6 +1769,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
+					for (const key of toolStartedAt.keys()) if (key.startsWith(`${sessionID}\0`)) toolStartedAt.delete(key);
 					const recoveryRun = activeRecoveryRuns.get(sessionID);
 					if (recoveryRun !== undefined) {
 						finalizeRecoveryCheckpoint(effectiveRoot, sessionID, recoveryRun);
@@ -1713,6 +1791,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
+					for (const key of toolStartedAt.keys()) if (key.startsWith(`${sessionID}\0`)) toolStartedAt.delete(key);
 					activeRecoveryRuns.delete(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}

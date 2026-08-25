@@ -1,7 +1,7 @@
 import { realpathSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { persistVerifyCache } from "./audit.ts";
+import { persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint } from "./verify.ts";
 import type {
 	TodoSdkClient,
@@ -124,6 +124,7 @@ export function recordVerifyResult(
 		workspaceRoot: resolve(root),
 	};
 	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
+	persistVerifyHistory(lastVerify);
 	if (lastVerify.passed) {
 		persistVerifyCache(lastVerify);
 	}

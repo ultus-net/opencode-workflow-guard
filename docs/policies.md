@@ -177,8 +177,10 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 - All spawned git commands run with a sanitized environment: inherited git context variables (`GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`, ...) are stripped so the tools resolve the repository from their working directory alone. This makes them safe to invoke from inside git hooks, which export those variables.
 
 ### Inspection Tools
-- `guard_status`, `guard_audit`, `guard_why`, `guard_review_rubric`, and `record_review` provide runtime introspection of guardrail state, audit entries, block explanations, reviewer rubric definitions, and reviewer decisions.
+- `guard_status`, `guard_audit`, `guard_why`, `guard_review_rubric`, `record_review`, `guard_review_followups`, and `guard_review_followup_resolve` provide runtime introspection of guardrail state, audit entries, block explanations, reviewer rubric definitions, reviewer decisions, and durable local review debt.
 - **Priority-Ranked Review Gate:** `guard_review_rubric` includes P0-P3 severity tiers. When recording reviews via `record_review`, approvals that include active P0 (blocker) or P1 (major defect) issues are rejected until blockers are resolved.
+- **Durable Lower-Priority Follow-ups:** Accepted review summaries containing a P2 or P3 finding are persisted in the project's local Workflow Guard SQLite database. Open findings are included in compacted agent context and remain open across sessions until explicitly resolved with `guard_review_followup_resolve`; they are not silently discarded with the review session.
+- **Privacy-Safe Local Telemetry:** Guard decisions remain in the local audit JSONL. Tool after-hook observations add `callID` and duration records for local diagnosis and performance analysis; the current hook API does not distinguish success from every failure path, so these records do not claim a success outcome. Command and patch bodies are never written to the journal; only their byte count and SHA-256 fingerprint are retained for correlation.
 
 ---
 

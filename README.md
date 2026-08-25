@@ -57,6 +57,7 @@ For complete policy specifications and override rules, see [docs/policies.md](do
 |---|---|
 | [**Policy Reference**](docs/policies.md) | Comprehensive specification of all 24 enforced policies, invariants, and override semantics |
 | [**Installation & Configuration**](docs/installation.md) | Setup options, global vs. local install, worktree isolation, and project configuration |
+| [**Managed Deployment**](docs/managed-deployment.md) | Administrator-managed OpenCode policy, platform locations, and startup diagnostics |
 | [**Troubleshooting**](docs/troubleshooting.md) | Diagnosing policy blocks, common false positives, and emergency override procedures |
 | [**Testing Architecture**](docs/testing.md) | Test harness design, adversarial regression matrix, and CI verification |
 | [**Contributing Guide**](CONTRIBUTING.md) | Development workflow, coding conventions, test requirements, and changeset PR rules |
@@ -74,6 +75,8 @@ For complete policy specifications and override rules, see [docs/policies.md](do
 | `guard_audit` | View recent audit log entries recorded in `workflow-guard.jsonl` |
 | `guard_review_rubric` | Generate the 5-axis secondary review rubric for the current branch diff |
 | `record_review` | Record a secondary reviewer subagent's verdict evaluated against the review rubric |
+| `guard_review_followups` | List durable local P2/P3 review findings that remain open across sessions |
+| `guard_review_followup_resolve` | Resolve a durable review finding after its underlying issue is fixed and verified |
 | `guard_worktree_create` | Create an isolated git worktree directory for concurrent subagent execution |
 | `guard_worktree_cleanup` | Snapshot-commit remaining changes and remove an isolated worktree directory |
 | `learning_profile` | Inspect the evidence-based local learner profile (when learning mode is enabled) |

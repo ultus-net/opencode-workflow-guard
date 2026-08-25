@@ -3,7 +3,7 @@ import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFil
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
-import type { ProjectMemoryInput, ProjectMemoryKind, ProjectMemoryRecord, ProjectMemorySource } from "./types.ts";
+import type { ProjectMemoryInput, ProjectMemoryKind, ProjectMemoryRecord, ProjectMemorySource, ReviewFollowup, ReviewFollowupInput } from "./types.ts";
 
 const KINDS = new Set<ProjectMemoryKind>(["fact", "decision", "constraint", "lesson"]);
 const SOURCES = new Set<ProjectMemorySource>(["user", "file", "git", "tool", "agent", "portable"]);
@@ -58,8 +58,51 @@ export function openProjectMemory(projectId: string, directory = getProjectMemor
 			paths TEXT NOT NULL, supersedes TEXT, status TEXT NOT NULL DEFAULT 'current'
 		);
 		CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, content);
+		CREATE TABLE IF NOT EXISTS review_followups (
+			id TEXT PRIMARY KEY, project_id TEXT NOT NULL, severity TEXT NOT NULL, summary TEXT NOT NULL,
+			reviewer TEXT NOT NULL, created_at INTEGER NOT NULL, resolved_at INTEGER, session_id TEXT,
+			commit_sha TEXT, paths TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open'
+		);
 	`);
 	return { db, projectId, close: () => db.close() };
+}
+
+function followupRowToRecord(row: Record<string, unknown>): ReviewFollowup {
+	return {
+		id: String(row.id), projectId: String(row.project_id), severity: String(row.severity) as ReviewFollowup["severity"],
+		summary: String(row.summary), reviewer: String(row.reviewer), createdAt: Number(row.created_at),
+		resolvedAt: row.resolved_at ? Number(row.resolved_at) : undefined, sessionID: row.session_id ? String(row.session_id) : undefined,
+		commit: row.commit_sha ? String(row.commit_sha) : undefined, paths: JSON.parse(String(row.paths)) as string[],
+		status: String(row.status) as ReviewFollowup["status"],
+	};
+}
+
+export function recordReviewFollowup(store: ProjectMemoryStore, input: ReviewFollowupInput, id: string = randomUUID()): ReviewFollowup {
+	if (input.severity !== "P2" && input.severity !== "P3") throw new Error("Review follow-up severity must be P2 or P3.");
+	if (!input.summary.trim() || input.summary.length > 4000) throw new Error("Review follow-up summary must be 1-4000 characters.");
+	if (!input.reviewer.trim() || input.reviewer.length > 200) throw new Error("Invalid review follow-up reviewer.");
+	if ((input.paths?.length ?? 0) > 20 || input.paths?.some((path) => !path || path.length > 500 || isAbsolute(path) || path.split(/[\\/]/).includes("..") || /[\0\r\n]/.test(path))) throw new Error("Invalid review follow-up paths.");
+	if (input.sessionID && input.sessionID.length > 200) throw new Error("Invalid review follow-up session ID.");
+	if (input.commit && !/^[0-9a-f]{7,64}$/i.test(input.commit)) throw new Error("Invalid review follow-up commit.");
+	const createdAt = Date.now();
+	store.db.prepare("INSERT INTO review_followups VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, 'open')").run(
+		id, store.projectId, input.severity, input.summary.trim(), input.reviewer.trim(), createdAt,
+		input.sessionID ?? null, input.commit ?? null, JSON.stringify(input.paths ?? []),
+	);
+	return { id, projectId: store.projectId, ...input, summary: input.summary.trim(), reviewer: input.reviewer.trim(), paths: input.paths ?? [], createdAt, status: "open" };
+}
+
+export function listReviewFollowups(store: ProjectMemoryStore, status: "open" | "resolved" = "open", limit = 50): ReviewFollowup[] {
+	const rows = store.db.prepare("SELECT * FROM review_followups WHERE project_id = ? AND status = ? ORDER BY created_at DESC LIMIT ?")
+		.all(store.projectId, status, Math.max(1, Math.min(limit, 200))) as Record<string, unknown>[];
+	return rows.map(followupRowToRecord);
+}
+
+export function resolveReviewFollowup(store: ProjectMemoryStore, id: string): boolean {
+	if (!id || id.length > 200 || /[\0\r\n]/.test(id)) return false;
+	const result = store.db.prepare("UPDATE review_followups SET status = 'resolved', resolved_at = ? WHERE id = ? AND project_id = ? AND status = 'open'")
+		.run(Date.now(), id, store.projectId);
+	return Number(result.changes) === 1;
 }
 
 function validateInput(input: ProjectMemoryInput): void {

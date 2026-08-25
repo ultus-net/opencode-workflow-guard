@@ -12,11 +12,10 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Targeted Post-Edit Validation
 
-- Add an optional project configuration for file-scoped validators, pairing path patterns with deterministic commands (for example, Python files with Ruff or TypeScript files with a focused typecheck).
-- Run matching validators through `tool.execute.after` when a before/after filesystem digest proves the targeted file changed, so local breakage is reported immediately rather than waiting for final verification. Do not claim success-only semantics while the installed hook API lacks a success discriminator.
-- Keep the existing finalization verifier authoritative; post-edit validation is fast feedback, not a replacement for fresh whole-project verification.
-- Define explicit timeout, output-limit, credential-scrubbing, and failure semantics before implementation. Do not infer validators from language or globally install tools.
-- Add adversarial tests for path matching, filenames containing shell metacharacters, validator failures/timeouts, and concurrent parent/subagent mutations.
+- Implemented: configured file-scoped validators run after a digest proves a direct edit changed the target, with bounded execution and adversarial path/concurrency coverage. Final whole-project verification remains authoritative.
+- Project configuration pairs file patterns with explicit deterministic validator commands rather than inferring language tools or installing them globally.
+- Matching validators run through `tool.execute.after` when before/after filesystem digests prove the targeted file changed, providing fast feedback without replacing final verification.
+- Timeout, output-limit, credential-scrubbing, failure, path-matching, shell-metacharacter, and concurrent-mutation behavior has regression coverage.
 
 ## Concurrent File Claims
 
@@ -34,11 +33,22 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Durable Recovery Checkpoints
 
-- Evaluate opt-in workspace checkpoints before genuine root-session user runs so agent changes can be rolled back independently of verification evidence or worktree cleanup.
-- Use Cline's checkpoint implementation as the reference model: preserve untracked files, keep checkpoint objects reachable without polluting the user's stash list, exclude subagents, and avoid replacing the original checkpoint when a run resumes or continues synthetically.
-- Prove hook ordering and concurrent-session behavior before implementation. OpenCode 1.18.21 has no direct equivalent of Cline's `beforeRun`, so a `chat.message`-based approximation must not be described as a pre-run snapshot until its timing is demonstrated.
-- Make restoration provenance- and interference-sensitive. Aider's `/undo` refuses commits not created by Aider in the current chat, merge commits, files with intervening uncommitted changes, and the case where local HEAD equals the current `origin/<branch>` tip; checkpoint recovery should likewise avoid overwriting later user/agent work merely because a snapshot exists.
-- Keep checkpoints recovery-only; they must not make destructive operations permissible or weaken the existing workspace, Git, verification, and review gates.
+- Implemented: opt-in root-session recovery checkpoints use private reachable Git objects, preserve untracked/staged state, and refuse restoration when session or workspace interference makes recovery unsafe.
+- Checkpoints are created only for genuine root-session user runs; subagents and synthetic continuation messages do not replace the run checkpoint.
+- Private reachable Git objects preserve tracked, staged, and untracked state without polluting the user's stash list.
+- Restoration is provenance- and interference-sensitive and remains recovery-only; it does not weaken workspace, Git, verification, or review gates.
+
+### Recovery Follow-up
+
+- Implemented: checkpoint restoration preserves the primary restore error and surfaces a secondary compensating-rollback failure in the returned diagnostic. Fault-injection coverage exercises the dual-failure path while the recovery ref remains retained for manual recovery.
+
+## Local Operational Telemetry
+
+- Implemented: audit decisions are durable local JSONL records, and completed after-hook observations carry session/call correlation and execution duration. Raw command and patch bodies are not persisted; they are represented by byte count and SHA-256 fingerprint so repeated inputs can be correlated without retaining credentials or source payloads.
+- Implemented: P2/P3 review findings are durable per-project local SQLite follow-ups with explicit open/resolved state and are surfaced to agents during context compaction. Review summaries containing P2/P3 findings are recorded automatically when the secondary review is accepted.
+- Implemented: audit JSONL and verification-history JSONL are size-bounded, and recovery metadata retains the newest 100 checkpoints while pruning the corresponding private Git refs.
+- Implemented: every verification result, including failed runs, is appended to bounded durable local history while the latest passing cache remains available for restart recovery.
+- Evaluate supported tool-result/failure lifecycle signals in future OpenCode APIs so success and failure can be correlated with the existing decision/after-hook records. The current `tool.execute.after` API has no success discriminator, so telemetry deliberately does not label these observations as successes.
 
 ## Repeated Tool-Failure Detection
 
@@ -49,16 +59,16 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Dynamic Shell Expansion Hardening
 
-- Add adversarial coverage for executable-producing shell syntax that literal command normalization cannot faithfully classify, especially command substitution (`$()` and backticks), process substitution, IFS-based construction, carriage returns, Unicode whitespace, malformed quote/token boundaries, and relevant Zsh expansion forms.
+- Implemented: shell execution and configured verification fail closed on quote-aware detection of command/process substitution, IFS-based token construction, ambiguous carriage-return/Unicode whitespace, and malformed quote/escape boundaries that literal command normalization cannot faithfully classify.
+- Adversarial coverage includes `$()` and backticks, process substitution, IFS construction, carriage returns, Unicode whitespace, malformed quote/token boundaries, and quoted inert literals.
 - Use Claude Code's Bash security parser and regression corpus as a reference for syntax classes, not as a parser to transplant. Prefer deterministic fail-closed handling at hard policy boundaries when expansion would require executing shell semantics to discover the effective command.
 - Preserve the current sequential hard-policy checks: an allow decision from a narrower rule must never bypass later destructive-command, secret, tamper, workspace, or Git checks.
 - Keep configured verification exit codes literal. Do not import interactive command semantics that reinterpret nonzero statuses for tools such as `grep`, `rg`, `diff`, or `test`.
 
 ## Managed Deployment Hardening
 
-- Document an enterprise deployment profile that installs workflow-guard alongside OpenCode's administrator-controlled managed settings (`/etc/opencode/` on Linux, the corresponding managed locations on macOS/Windows).
-- Use managed OpenCode settings for controls the host already enforces well, such as permissions and provider policy, while keeping workflow invariants in the plugin rather than creating a second configuration-precedence system.
-- Evaluate a startup diagnostic that reports whether the expected guard and managed policy are active. Keep this diagnostic observational unless OpenCode exposes a supported way to establish plugin provenance/trust.
+- Implemented: `docs/managed-deployment.md` documents deployment alongside OpenCode's administrator-controlled managed settings on Linux, macOS, and Windows, using host-managed permissions/provider policy while retaining workflow invariants in the plugin.
+- Implemented: startup app logs report whether file-based managed configuration is detected at the platform's standard location while explicitly stating that OpenCode's V1 API does not verify plugin provenance.
 - Treat Codex's `allow_managed_hooks_only` as the reference governance model, not as a capability OpenCode currently has: managed configuration precedence does not itself prove that untrusted project plugins cannot run.
 
 ## Deferred: Hard Completion Gate

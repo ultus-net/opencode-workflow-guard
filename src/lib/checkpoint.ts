@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { getGitWorktreeFingerprint } from "./verify.ts";
@@ -21,6 +21,8 @@ interface CheckpointStore {
 	checkpoints: RecoveryCheckpoint[];
 }
 
+const MAX_RECOVERY_CHECKPOINTS = 100;
+
 const gitIdentityEnv = {
 	GIT_AUTHOR_NAME: "OpenCode Workflow Guard",
 	GIT_AUTHOR_EMAIL: "workflow-guard@localhost",
@@ -29,11 +31,18 @@ const gitIdentityEnv = {
 };
 
 function git(workspace: string, args: string[], env: NodeJS.ProcessEnv = {}): string {
+	if (gitForTesting) return gitForTesting(workspace, args, env);
 	return execFileSync("git", ["-C", workspace, ...args], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
 		env: { ...getCleanGitEnv(), ...gitIdentityEnv, ...env },
 	}).trim();
+}
+
+let gitForTesting: ((workspace: string, args: string[], env?: NodeJS.ProcessEnv) => string) | undefined;
+
+export function setCheckpointGitForTesting(runner?: typeof gitForTesting): void {
+	gitForTesting = runner;
 }
 
 function gitDir(workspace: string): string {
@@ -45,13 +54,26 @@ function metadataPath(workspace: string): string {
 	return join(gitDir(workspace), "workflow-guard", "recovery-checkpoints.json");
 }
 
+function isRecoveryCheckpoint(value: unknown): value is RecoveryCheckpoint {
+	if (!value || typeof value !== "object") return false;
+	const entry = value as Record<string, unknown>;
+	return typeof entry.sessionID === "string"
+		&& Number.isInteger(entry.run) && (entry.run as number) >= 0
+		&& typeof entry.ref === "string" && entry.ref.length > 0
+		&& (entry.kind === "commit" || entry.kind === "stash")
+		&& typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
+		&& (entry.endFingerprint === undefined || typeof entry.endFingerprint === "string")
+		&& (entry.endAt === undefined || (typeof entry.endAt === "number" && Number.isFinite(entry.endAt)));
+}
+
 function loadStore(workspace: string): CheckpointStore {
 	const path = metadataPath(workspace);
+	if (!existsSync(path)) return { workspace: resolve(workspace), checkpoints: [] };
 	try {
 		const value = JSON.parse(readFileSync(path, "utf8")) as CheckpointStore;
-		if (value.workspace === resolve(workspace) && Array.isArray(value.checkpoints)) return value;
+		if (value.workspace === resolve(workspace) && Array.isArray(value.checkpoints) && value.checkpoints.every(isRecoveryCheckpoint)) return value;
 	} catch {}
-	return { workspace: resolve(workspace), checkpoints: [] };
+	throw new Error("Recovery checkpoint metadata is corrupt; refusing to overwrite existing recovery information.");
 }
 
 function saveStore(workspace: string, store: CheckpointStore): void {
@@ -88,6 +110,17 @@ function updateStore<T>(workspace: string, update: (store: CheckpointStore) => T
 		saveStore(workspace, store);
 		return result;
 	});
+}
+
+function pruneCheckpoints(workspace: string, store: CheckpointStore): void {
+	if (store.checkpoints.length <= MAX_RECOVERY_CHECKPOINTS) return;
+	const sorted = [...store.checkpoints].sort((a, b) => a.createdAt - b.createdAt);
+	const remove = sorted.slice(0, sorted.length - MAX_RECOVERY_CHECKPOINTS);
+	const removed = new Set(remove.map((entry) => `${entry.sessionID}\0${entry.run}`));
+	for (const entry of remove) {
+		try { git(workspace, ["update-ref", "-d", privateRef(entry.sessionID, entry.run)]); } catch {}
+	}
+	store.checkpoints = store.checkpoints.filter((entry) => !removed.has(`${entry.sessionID}\0${entry.run}`));
 }
 
 function recoveryBoundaryFingerprint(workspace: string): string | undefined {
@@ -165,6 +198,7 @@ export function createRecoveryCheckpoint(workspace: string, sessionID: string, r
 			git(root, ["update-ref", privateRef(sessionID, run), ref]);
 			const checkpoint: RecoveryCheckpoint = { sessionID, run, ref, kind, createdAt: Date.now() };
 			store.checkpoints.push(checkpoint);
+			pruneCheckpoints(root, store);
 			saveStore(root, store);
 			return checkpoint;
 		});
@@ -245,6 +279,7 @@ export function restoreRecoveryCheckpoint(
 				if (transactionRef) git(root, ["update-ref", "-d", transactionRef]);
 				return { ok: true };
 			} catch (error) {
+				let rollbackError: unknown;
 				if (originalHead) {
 					try {
 						git(root, ["reset", "--hard", originalHead]);
@@ -258,9 +293,13 @@ export function restoreRecoveryCheckpoint(
 							} catch {}
 							git(root, ["update-ref", "-d", transactionRef]);
 						}
-					} catch {}
+					} catch (error) {
+						rollbackError = error;
+					}
 				}
-				return { ok: false, error: error instanceof Error ? error.message : String(error) };
+				const primary = error instanceof Error ? error.message : String(error);
+				const rollback = rollbackError instanceof Error ? rollbackError.message : rollbackError === undefined ? undefined : String(rollbackError);
+				return { ok: false, error: rollback ? `${primary} Recovery rollback also failed: ${rollback}` : primary };
 			}
 		});
 	} catch (error) {
