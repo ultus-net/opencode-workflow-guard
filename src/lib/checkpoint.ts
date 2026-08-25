@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { getGitWorktreeFingerprint } from "./verify.ts";
@@ -56,11 +56,12 @@ function metadataPath(workspace: string): string {
 
 function loadStore(workspace: string): CheckpointStore {
 	const path = metadataPath(workspace);
+	if (!existsSync(path)) return { workspace: resolve(workspace), checkpoints: [] };
 	try {
 		const value = JSON.parse(readFileSync(path, "utf8")) as CheckpointStore;
 		if (value.workspace === resolve(workspace) && Array.isArray(value.checkpoints)) return value;
 	} catch {}
-	return { workspace: resolve(workspace), checkpoints: [] };
+	throw new Error("Recovery checkpoint metadata is corrupt; refusing to overwrite existing recovery information.");
 }
 
 function saveStore(workspace: string, store: CheckpointStore): void {

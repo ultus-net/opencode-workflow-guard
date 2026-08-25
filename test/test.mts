@@ -30,6 +30,7 @@ import {
 	getAuditFilePath,
 	getRecentAuditEntries,
 	getRecentVerifyHistory,
+	getVerifyHistoryFilePath,
 	managedConfigDiagnostic,
 	summarizeInput,
 	extractReviewFollowups,
@@ -1920,7 +1921,9 @@ persistVerifyCache(testVerifyCache);
 const loadedCache = loadVerifyCache();
 check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
 recordVerifyResult("npm test -- failing-history-probe", { passed: false, output: "history failure" }, "s-history");
-check("durable verification history retains failed runs", getRecentVerifyHistory(5).some((entry) => entry.command === "npm test -- failing-history-probe" && entry.passed === false));
+const failedHistory = getRecentVerifyHistory(5).find((entry) => entry.passed === false);
+check("durable verification history retains failed runs without raw command/output", failedHistory?.command.startsWith("sha256:") === true && failedHistory?.output.startsWith("sha256:") === true);
+check("durable verification history is private", (statSync(getVerifyHistoryFilePath()).mode & 0o777) === 0o600);
 check("failed verification history does not replace passing cache", loadVerifyCache()?.passed === true);
 
 // Durable verification evidence is workspace-bound: a passing run from
@@ -2083,6 +2086,11 @@ check("recovery checkpoint removes untracked files created from a clean checkpoi
 for (let i = 0; i < 101; i++) createRecoveryCheckpoint(cleanCheckpointDir, `retention-session-${i}`, 1);
 const retainedCheckpointCount = Array.from({ length: 101 }, (_, i) => listRecoveryCheckpoints(cleanCheckpointDir, `retention-session-${i}`).length).reduce((sum, count) => sum + count, 0);
 check("recovery checkpoint metadata retains at most 100 entries", retainedCheckpointCount === 100 && listRecoveryCheckpoints(cleanCheckpointDir, "retention-session-0").length === 0 && listRecoveryCheckpoints(cleanCheckpointDir, "retention-session-100").length === 1);
+const corruptCheckpointMetadata = join(cleanCheckpointDir, ".git", "workflow-guard", "recovery-checkpoints.json");
+writeFileSync(corruptCheckpointMetadata, "{corrupt");
+const corruptMetadataBefore = readFileSync(corruptCheckpointMetadata, "utf8");
+const checkpointWithCorruptMetadata = createRecoveryCheckpoint(cleanCheckpointDir, "corrupt-metadata-session", 1);
+check("recovery checkpoint refuses to overwrite corrupt metadata", !checkpointWithCorruptMetadata && readFileSync(corruptCheckpointMetadata, "utf8") === corruptMetadataBefore);
 writeFileSync(join(checkpointDir, "tracked.txt"), "later user edit\n");
 const interferenceRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
 check("recovery checkpoint refuses intervening workspace changes", !interferenceRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "later user edit\n");

@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, statSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -31,7 +31,8 @@ export function getVerifyHistoryFilePath(): string {
 }
 
 function appendBoundedJsonl(path: string, value: unknown, maxBytes: number, retainBytes: number): void {
-	appendFileSync(path, JSON.stringify(value) + "\n", "utf8");
+	appendFileSync(path, JSON.stringify(value) + "\n", { encoding: "utf8", mode: 0o600 });
+	chmodSync(path, 0o600);
 	const stat = statSync(path);
 	if (stat.size <= maxBytes) return;
 	const fd = openSync(path, "r");
@@ -46,14 +47,18 @@ function appendBoundedJsonl(path: string, value: unknown, maxBytes: number, reta
 	const firstNewline = text.indexOf("\n");
 	const retained = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
 	const temp = `${path}.${process.pid}.tmp`;
-	writeFileSync(temp, retained, "utf8");
+	writeFileSync(temp, retained, { encoding: "utf8", mode: 0o600 });
 	renameSync(temp, path);
 }
 
 export function persistVerifyHistory(verifyData: NonNullable<VerifyResult>): void {
 	try {
 		mkdirSync(AUDIT_DIR, { recursive: true });
-		appendBoundedJsonl(VERIFY_HISTORY_FILE, verifyData, MAX_VERIFY_HISTORY_BYTES, RETAIN_VERIFY_HISTORY_BYTES);
+		appendBoundedJsonl(VERIFY_HISTORY_FILE, {
+			...verifyData,
+			command: `sha256:${createHash("sha256").update(verifyData.command).digest("hex")}`,
+			output: `sha256:${createHash("sha256").update(verifyData.output).digest("hex")}`,
+		}, MAX_VERIFY_HISTORY_BYTES, RETAIN_VERIFY_HISTORY_BYTES);
 	} catch {}
 }
 
@@ -75,7 +80,8 @@ export function getRecentVerifyHistory(limit = 10): NonNullable<VerifyResult>[] 
 export function persistVerifyCache(verifyData: NonNullable<VerifyResult>): void {
 	try {
 		mkdirSync(AUDIT_DIR, { recursive: true });
-		writeFileSync(VERIFY_CACHE_FILE, JSON.stringify(verifyData, null, 2), "utf8");
+		writeFileSync(VERIFY_CACHE_FILE, JSON.stringify(verifyData, null, 2), { encoding: "utf8", mode: 0o600 });
+		chmodSync(VERIFY_CACHE_FILE, 0o600);
 	} catch {}
 }
 
