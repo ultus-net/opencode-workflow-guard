@@ -284,15 +284,21 @@ spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: changesetRepo })
 writeFileSync(join(changesetRepo, "code.ts"), "export const a = 1;\n");
 spawnSync("git", ["add", "-A"], { cwd: changesetRepo });
 spawnSync("git", ["commit", "-m", "init"], { cwd: changesetRepo });
-spawnSync("git", ["switch", "-c", "feat/with-changeset"], { cwd: changesetRepo });
-mkdirSync(join(changesetRepo, ".changeset"), { recursive: true });
-writeFileSync(join(changesetRepo, ".changeset", "my-change.md"), "---\n\"pkg\": patch\n---\nFixed bug\n");
-spawnSync("git", ["add", "-A"], { cwd: changesetRepo });
-spawnSync("git", ["commit", "-m", "add changeset"], { cwd: changesetRepo });
-setWorkspaceRoot(changesetRepo);
+const changesetWorktree = mkdtempSync(join(tmpdir(), "wg-changeset-worktree-"));
+rmSync(changesetWorktree, { recursive: true, force: true });
+spawnSync("git", ["worktree", "add", "-b", "feat/with-changeset", changesetWorktree], { cwd: changesetRepo });
+mkdirSync(join(changesetWorktree, ".changeset"), { recursive: true });
+writeFileSync(join(changesetWorktree, ".changeset", "my-change.md"), "---\n\"pkg\": patch\n---\nFixed bug\n");
+spawnSync("git", ["add", "-A"], { cwd: changesetWorktree });
+spawnSync("git", ["commit", "-m", "add changeset"], { cwd: changesetWorktree });
+setWorkspaceRoot(changesetWorktree);
 check("branch with .changeset/*.md satisfies PR changelog check (no body needed)", !(await shell("gh pr create --title t --body 'clean pr description'")));
-rmSync(changesetRepo, { recursive: true, force: true });
+setWorkspaceRoot(changesetRepo);
+check("linked shell workdir changeset satisfies PR changelog check", !(await call("bash", { command: "gh pr create --title t --body 'clean pr description'", workdir: changesetWorktree })));
 setWorkspaceRoot(root);
+check("unrelated shell workdir cannot supply PR changelog evidence", blocked(await call("bash", { command: "gh pr create --title t --body 'clean pr description'", workdir: changesetWorktree })));
+spawnSync("git", ["worktree", "remove", "--force", changesetWorktree], { cwd: changesetRepo });
+rmSync(changesetRepo, { recursive: true, force: true });
 
 console.log("- Policy 4: destructive commands -");
 check("block kubectl delete", blocked(await shell("kubectl delete pod foo")));
