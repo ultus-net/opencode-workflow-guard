@@ -16,6 +16,7 @@ import { editTargets, runPostEditValidators, snapshotFile } from "./policies/pos
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
 import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
 import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
+import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
 import { guardToolCallImpl, isReadOnlyRole } from "./lib/guard-dispatcher.ts";
 import { createCustomTools } from "./lib/custom-tools.ts";
 export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
@@ -369,6 +370,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	} catch {}
 
 	const toolLifecycle = new ToolInvocationLifecycle();
+	const toolOutcomes = new ToolOutcomeTracker();
 
 	return {
 		tool: createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions }),
@@ -596,9 +598,41 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		event: async ({
 			event,
 		}: { event: { type?: string; properties?: unknown } }) => {
+			if (event?.type === "message.part.updated") {
+				const outcome = toolOutcomes.record((event.properties as { part?: ToolOutcomePart })?.part ?? {});
+				if (outcome) {
+					audit({
+						ts: new Date().toISOString(),
+						sessionID: outcome.sessionID,
+						callID: outcome.callID,
+						tool: outcome.tool,
+						decision: "allow",
+						phase: "outcome",
+						durationMs: outcome.durationMs,
+						reason: outcome.status,
+					});
+					if (outcome.status === "error" && outcome.repeatedFailureCount === 3) {
+						audit({
+							ts: new Date().toISOString(),
+							sessionID: outcome.sessionID,
+							callID: outcome.callID,
+							tool: outcome.tool,
+							decision: "allow",
+							phase: "event",
+							reason: "repeated-equivalent-failure:3",
+						});
+						logObservation(ctx.client, `[workflow-guard] ${outcome.tool} failed equivalently 3 times in this session; change approach or inspect the underlying failure before retrying.`);
+					}
+				}
+			}
+			if (event?.type === "session.deleted") {
+				const sessionID = (event.properties as { info?: { id?: unknown } })?.info?.id;
+				if (typeof sessionID === "string") toolOutcomes.clearSession(sessionID);
+			}
 			if (event?.type === "session.idle") {
 				const sessionID = (event.properties as { sessionID?: unknown })?.sessionID;
 				if (typeof sessionID === "string") {
+					toolOutcomes.clearSession(sessionID);
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
 					toolLifecycle.clearSession(sessionID);
