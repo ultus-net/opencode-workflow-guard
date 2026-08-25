@@ -4,6 +4,7 @@ import { createElement, insert, setProp } from "@opentui/solid";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser";
+import { projectConfigPath } from "./lib/project-config.ts";
 import { canonicalPath } from "./policies/file-claims.ts";
 
 type Child = JSX.Element | string | number | null | undefined | false;
@@ -33,16 +34,8 @@ let lastBlockedReason: string | undefined;
 const sessionBlockedReasons = new Map<string, string>();
 const badgeNodes = new Map<string, unknown>();
 
-function projectOptionsPath(root: string): string {
-	const opencodeJsonc = join(root, ".opencode", "workflow-guard.jsonc");
-	const opencodeJson = join(root, ".opencode", "workflow-guard.json");
-	const rootJsonc = join(root, "workflow-guard.jsonc");
-	const rootJson = join(root, "workflow-guard.json");
-	return [opencodeJson, opencodeJsonc, rootJson, rootJsonc].find(existsSync) ?? opencodeJson;
-}
-
 export function readProjectOption(root: string, option: "recoveryCheckpoints" | "projectMemory" | "learning"): boolean {
-	const path = projectOptionsPath(root);
+	const path = projectConfigPath(root);
 	if (!existsSync(path)) return option === "projectMemory";
 	const errors: ParseError[] = [];
 	const config = parse(readFileSync(path, "utf8"), errors, { allowTrailingComma: true });
@@ -51,7 +44,7 @@ export function readProjectOption(root: string, option: "recoveryCheckpoints" | 
 }
 
 function writeProjectOption(root: string, option: "recoveryCheckpoints" | "projectMemory" | "learning", enabled: boolean): string {
-	const path = projectOptionsPath(root);
+	const path = projectConfigPath(root);
 	const raw = existsSync(path) ? readFileSync(path, "utf8") : "{}\n";
 	const errors: ParseError[] = [];
 	parse(raw, errors, { allowTrailingComma: true });

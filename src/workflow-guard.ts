@@ -8,15 +8,18 @@
  * from ./lib/, and re-exports the public helper surface for tests.
  */
 
-import { tool, type Plugin, type PluginModule } from "@opencode-ai/plugin";
-import type { LearningEvidenceKind } from "./lib/types.ts";
-import { spawnSync } from "node:child_process";
+import { type Plugin, type PluginModule } from "@opencode-ai/plugin";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { join } from "node:path";
-import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
+import { editTargets, runPostEditValidators, snapshotFile } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
-import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason, type ReadObservation } from "./policies/stale-write.ts";
+import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
+import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
+import { guardToolCallImpl, isReadOnlyRole } from "./lib/guard-dispatcher.ts";
+import { createCustomTools } from "./lib/custom-tools.ts";
+export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
+export { extractReviewFollowups } from "./lib/custom-tools.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -91,28 +94,16 @@ export {
 
 // ── Shared shell/env utilities ───────────────────────────────────────────────
 import {
-	asRecord,
+	extractRecordTargetPath,
 	dynamicShellSyntaxIn,
-	extractCommands,
-	normalize,
-	shellWrappersChangeCwd,
-	splitShellSegments,
-	unwrapShellCommand,
 	getCleanEnv,
 	showBlockToast,
-	SENSITIVE_ENV_KEYS,
-	SENSITIVE_ENV_RE,
+	isSensitiveEnvKey,
 } from "./lib/utils.ts";
 
 export { getCleanEnv, dynamicShellSyntaxIn };
 
 // ── Adaptive learning engine ─────────────────────────────────────────────────
-import {
-	loadLearnerProfile,
-	recordLearningEvidence,
-	selectLearningOpportunity,
-	updateLearnerProfile,
-} from "./lib/learning.ts";
 export {
 	createLearnerProfile,
 	getLearnerProfilePath,
@@ -139,20 +130,7 @@ export {
 	exportProjectKnowledge,
 	importProjectKnowledge,
 } from "./lib/project-memory.ts";
-import {
-	exportProjectKnowledge,
-	ensureProjectMemoryExcluded,
-	getProjectMemoryIdentity,
-	getRecentProjectMemory,
-	importProjectKnowledge,
-	isProjectMemoryFresh,
-	listReviewFollowups,
-	openProjectMemory,
-	recordProjectMemory,
-	recordReviewFollowup,
-	resolveReviewFollowup,
-	searchProjectMemory,
-} from "./lib/project-memory.ts";
+import { ensureProjectMemoryExcluded, getProjectMemoryIdentity, getRecentProjectMemory, importProjectKnowledge, isProjectMemoryFresh, listReviewFollowups, openProjectMemory } from "./lib/project-memory.ts";
 
 // ── Audit & durable verification cache ───────────────────────────────────────
 import {
@@ -160,7 +138,6 @@ import {
 	getVerifyCacheFilePath,
 	persistVerifyCache,
 	loadVerifyCache,
-	getRecentAuditEntries,
 	audit,
 	logDecision,
 	summarizeInput,
@@ -168,14 +145,6 @@ import {
 
 export { getAuditFilePath, getVerifyCacheFilePath, getVerifyHistoryFilePath, persistVerifyCache, loadVerifyCache, getRecentAuditEntries, getRecentVerifyHistory } from "./lib/audit.ts";
 export { summarizeInput };
-
-export function extractReviewFollowups(summary: string): Array<{ severity: "P2" | "P3"; summary: string }> {
-	return summary.split(/\r?\n/).map((line) => ({
-		line: line.trim(),
-		severity: line.match(/(?:^|\s)(P[23])(?:\b|[:])/i)?.[1]?.toUpperCase() as "P2" | "P3" | undefined,
-	})).filter((finding): finding is { line: string; severity: "P2" | "P3" } => Boolean(finding.line && finding.severity))
-		.map((finding) => ({ severity: finding.severity, summary: finding.line }));
-}
 
 export function managedConfigDiagnostic(platform = process.platform, env: NodeJS.ProcessEnv = process.env): string {
 	const directory = platform === "darwin"
@@ -236,9 +205,8 @@ import {
 	fetchSessionTodos,
 	fetchParentSessionID,
 	fetchParentSession,
+	subagentMutationBudgetReason,
 	effectiveTodos,
-	effectiveTodoOwnerSessionID,
-	hasActiveTodo,
 } from "./policies/todo.ts";
 import {
 	clearContinuationState,
@@ -250,7 +218,6 @@ import {
 	createRecoveryCheckpoint,
 	finalizeRecoveryCheckpoint,
 	nextRecoveryRun,
-	restoreRecoveryCheckpoint,
 } from "./lib/checkpoint.ts";
 import { discoverPlanningSources } from "./policies/planning.ts";
 export { discoverPlanningSources };
@@ -258,20 +225,12 @@ export { discoverPlanningSources };
 export { validateTodoLifecycle };
 
 import {
-	PUSH_TO_MAIN_RE,
-	GIT_WRITE_RE,
-	GIT_BRANCH_CREATE_RE,
 	currentGitBranch,
 	onProtectedBranch,
 	isProtectedBranchName,
-	pushedProtectedBranchIn,
-	branchGuardReason,
-	parseGitInvocation,
-	normalizeGitCommands,
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
-	hasUnsafeGitAlias,
 } from "./policies/git.ts";
 
 export {
@@ -282,34 +241,18 @@ export {
 };
 
 import {
-	hasPrCreateInvocation,
-	branchHasChangelogChange,
-	prBodyIncludesChangelog,
 	checkLockfileSync,
 } from "./policies/changelog.ts";
 
 export { checkLockfileSync };
 
-import { liveMutationIn, extractEditContent } from "./policies/destructive.ts";
-
-import { mcpMutationTool } from "./policies/mcp.ts";
-
 import {
-	PROTECTED_PATH_REASON,
 	isProtectedPath,
-	isSettingsTamper,
 } from "./policies/tamper.ts";
 
 export { isProtectedPath };
 
-import {
-	isPathOutsideWorkspace,
-	extractPatchPaths,
-	guardShellMutation,
-	detectShellMutation,
-} from "./policies/boundary.ts";
-
-import { isSecretPath, secretIn, secretFileReadIn, isEnvFilePath, generateMaskedEnvSchema } from "./policies/secrets.ts";
+import { isSecretPath, secretIn, isEnvFilePath, generateMaskedEnvSchema } from "./policies/secrets.ts";
 
 export { isSecretPath, isEnvFilePath, generateMaskedEnvSchema };
 
@@ -317,7 +260,6 @@ import {
 	extractInterpreterPayload,
 	secretPathInPayload,
 	outsideWritePathInPayload,
-	writePathsInPayload,
 } from "./policies/interpreter.ts";
 export { extractInterpreterPayload, secretPathInPayload, outsideWritePathInPayload };
 
@@ -337,694 +279,12 @@ export { checkCompletionClaims };
 
 export { checkInteractiveTtyCommand, checkPackageHygiene, sendDesktopNotification, escapeAppleScriptString };
 
-const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
-
-function logBlock(message: string): void {
-	try {
-		void (getSdkClient() as any)?.app?.log?.({
-			body: {
-				service: "workflow-guard",
-				level: "warn",
-				message,
-			},
-		});
-	} catch {}
-}
-
 function logObservation(client: unknown, message: string): void {
 	try {
 		void (client as any)?.app?.log?.({
 			body: { service: "workflow-guard", level: "info", message },
 		});
 	} catch {}
-}
-
-const READ_ONLY_ROLES = new Set([
-	"reviewer",
-	"planner",
-	"advisor",
-	"critic",
-	"explorer",
-	"scout",
-	"evaluator",
-]);
-
-export function isReadOnlyRole(agent?: string): boolean {
-	if (!agent) return false;
-	const lower = agent.toLowerCase().trim();
-	return READ_ONLY_ROLES.has(lower) || Array.from(READ_ONLY_ROLES).some((r) => lower.includes(r));
-}
-
-async function guardToolCallImpl(
-	toolName: string,
-	input: unknown,
-	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
-): Promise<string | undefined> {
-	const currentRoot = getWorkspaceRoot();
-
-	// ── Role confinement: subagents in read-only roles cannot mutate files ──
-	if (context?.agent && isReadOnlyRole(context.agent)) {
-		if (EDIT_TOOL_NAMES.has(toolName) || toolName.startsWith("guard_worktree_")) {
-			const reason = `Blocked: subagent with read-only role '${context.agent}' cannot perform file mutations or lifecycle changes.`;
-			logBlock(`[workflow-guard] ${reason}`);
-			return reason;
-		}
-	}
-
-	// ── Policy 17: secret file read block via read tool ──
-	if (toolName === "read" || toolName === "read_file") {
-		const record = asRecord(input);
-		const target =
-			typeof record?.filePath === "string"
-				? record.filePath
-				: typeof record?.path === "string"
-					? record.path
-					: typeof input === "string"
-						? input
-						: "";
-		if (target && isSecretPath(target)) {
-			logBlock(`[workflow-guard] blocked read: secret file ${target}`);
-			if (isEnvFilePath(target)) {
-				let schemaHint = "";
-				try {
-					const resolvedTarget = resolve(currentRoot, target);
-					if (existsSync(resolvedTarget)) {
-						const raw = readFileSync(resolvedTarget, "utf8");
-						const masked = generateMaskedEnvSchema(raw);
-						schemaHint = `\n\nSafe variable schema mask:\n\`\`\`\n${masked.slice(0, 800)}\n\`\`\``;
-					}
-				} catch {}
-				return (
-					`Blocked: reading sensitive credential file '${target}' directly is not permitted. ` +
-					`Use environment variables or reference safe templates.${schemaHint}`
-				);
-			}
-			return (
-				`Blocked: reading sensitive credential/secret file '${target}' is not permitted. ` +
-				"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
-			);
-		}
-		return undefined;
-	}
-
-	// ── Policy 1: todowrite lifecycle validation & finalization gates ──
-	if (toolName === "todowrite") {
-		const record = asRecord(input);
-		const rawTodos = record?.todos;
-		if (Array.isArray(rawTodos)) {
-			const newTodos = rawTodos as any[];
-			const existingTodos = context?.sessionID
-				? await fetchSessionTodos(context.sessionID)
-				: undefined;
-			const err = validateTodoLifecycle(newTodos, existingTodos);
-			if (err) {
-				logBlock(`[workflow-guard] ${err}`);
-				return err;
-			}
-
-			const allDone =
-				newTodos.length > 0 &&
-				newTodos.every((t) => {
-					const s = String(t.status ?? "");
-					return s === "completed" || s === "cancelled";
-				});
-			if (allDone) {
-				// Policy 19: conflict-free mergeability gate before task completion/handoff
-				const conflictCheck = checkMergeConflicts(currentRoot);
-				if (conflictCheck.hasConflicts) {
-					const reason = `Blocked todowrite: ${conflictCheck.reason}`;
-					logBlock(`[workflow-guard] ${reason}`);
-					return reason;
-				}
-
-				// Policy 10: evidence-based verification
-				const command = detectVerifyCommand(currentRoot);
-				if (command) {
-					const sessionID = context?.sessionID;
-					let verifyResult = sessionID
-						? sessionVerifyResults.get(sessionID)
-						: lastVerify;
-
-					// Recover durable evidence from disk when in-memory state is missing.
-					// Durable evidence is bound to the workspace that produced it: without
-					// this check a passing run from a different project (identical verify
-					// command, non-git state) could satisfy finalization here.
-					if (!verifyResult) {
-						const diskCached = loadVerifyCache();
-						if (
-							diskCached &&
-							diskCached.passed &&
-							diskCached.command === command &&
-							diskCached.workspaceRoot === resolve(currentRoot)
-						) {
-							verifyResult = diskCached;
-						}
-					}
-
-					const mutationTimestamp = sessionID
-						? (sessionMutationTimestamps.get(sessionID) ?? 0)
-						: lastMutationTimestamp;
-
-					const currentCommit = getCurrentGitCommitHash(currentRoot);
-					const currentGitStatus = getGitStatusSummary(currentRoot);
-
-					const gitStateMatches =
-						!verifyResult?.commitHash ||
-						(verifyResult.commitHash === currentCommit &&
-							verifyResult.gitStatus === currentGitStatus);
-
-					const isFresh =
-						verifyResult !== undefined &&
-						verifyResult.passed &&
-						verifyResult.command === command &&
-						verifyResult.timestamp >= mutationTimestamp &&
-						gitStateMatches;
-
-					if (!isFresh) {
-						const result = await runVerify(command, currentRoot);
-						recordVerifyResult(command, result, sessionID, currentRoot);
-						if (!result.passed) {
-							const tail = snipVerifyOutput(result.output, result.passed).slice(-500);
-							const reason =
-								`Blocked todowrite: all tasks marked done but verification is failing ` +
-								`(${command}). Fix the failure before finishing; ` +
-								`output tail: ${tail}`;
-							logBlock(`[workflow-guard] ${reason}`);
-							return reason;
-						}
-					}
-				}
-			}
-		}
-		return undefined;
-	}
-
-	// ── Policies 1, 6, 7, 8 & 9: edit/write/patch gates ──
-	if (EDIT_TOOL_NAMES.has(toolName)) {
-		const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
-		const record = asRecord(input);
-		const target =
-			typeof record?.filePath === "string"
-				? record.filePath
-				: typeof record?.path === "string"
-					? record.path
-					: typeof input === "string"
-						? input
-						: "";
-
-		if (target && isProtectedPath(target)) {
-			logBlock(`[workflow-guard] blocked ${toolName}: protected path ${target}`);
-			return PROTECTED_PATH_REASON;
-		}
-		if (target && isSecretPath(target)) {
-			logBlock(`[workflow-guard] blocked ${toolName}: secret file path ${target}`);
-			return (
-				`Blocked: modifying secret file '${target}' directly is not permitted. ` +
-				"Store credentials in environment variables or safe secret stores instead."
-			);
-		}
-		if (toolName === "apply_patch") {
-			const patchText =
-				typeof record?.patchText === "string" ? record.patchText : "";
-			for (const patchPath of extractPatchPaths(patchText)) {
-				if (isProtectedPath(patchPath)) {
-					logBlock(
-						`[workflow-guard] blocked apply_patch: protected path ${patchPath}`,
-					);
-					return PROTECTED_PATH_REASON;
-				}
-				if (isSecretPath(patchPath)) {
-					logBlock(
-						`[workflow-guard] blocked apply_patch: secret file path ${patchPath}`,
-					);
-					return `Blocked: modifying secret file '${patchPath}' directly is not permitted.`;
-				}
-				if (isPathOutsideWorkspace(patchPath, currentRoot)) {
-					logBlock(
-						`[workflow-guard] blocked apply_patch: patch target escapes workspace: ${patchPath}`,
-					);
-					return `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`;
-				}
-			}
-		}
-
-		if (target && isPathOutsideWorkspace(target, currentRoot)) {
-			logBlock(
-				`[workflow-guard] blocked ${toolName}: path escapes workspace: ${target}`,
-			);
-			return `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`;
-		}
-
-		for (const content of extractEditContent(input)) {
-			const secret = secretIn(content);
-			if (secret) {
-				logBlock(
-					`[workflow-guard] blocked ${toolName}: payload contains ${secret}`,
-				);
-				return (
-					`Blocked: payload appears to contain a ${secret}. ` +
-					"Secrets must not be committed to the repository. Store them " +
-					"in a secret manager or environment file excluded from git, " +
-					"and reference them by name instead."
-				);
-			}
-		}
-
-		if (!allowLive) {
-			for (const content of extractEditContent(input)) {
-				const lines = content.split("\n");
-				for (const line of lines) {
-					const trimmed = line.trim();
-					if (trimmed.startsWith("#") || trimmed.startsWith("//") || trimmed.startsWith("/*") || trimmed.startsWith("*")) {
-						continue;
-					}
-					const normalizedContent = normalizeGitCommands(line);
-					const what = liveMutationIn(normalizedContent);
-					if (what) {
-						logBlock(
-							`[workflow-guard] blocked ${toolName}: payload contains ${what}`,
-						);
-						return (
-							`Blocked: the file you are writing contains a ${what}. ` +
-							"Script files are not a way to smuggle destructive commands " +
-							"past the shell guard. Only the user can allow live mutations " +
-							"(WORKFLOW_GUARD_ALLOW_LIVE=1)."
-						);
-					}
-				}
-			}
-		}
-		for (const content of extractEditContent(input)) {
-			if (isSettingsTamper(content)) return PROTECTED_PATH_REASON;
-		}
-
-		if (onProtectedBranch(currentRoot)) {
-			logBlock(
-				`[workflow-guard] blocked ${toolName}: on protected branch ${currentGitBranch(currentRoot)}`,
-			);
-			return branchGuardReason();
-		}
-		const todos = await effectiveTodos(context?.sessionID);
-		if (todos !== undefined && !hasActiveTodo(todos)) {
-			logBlock(
-				`[workflow-guard] blocked ${toolName}: no active todo item (session ${context?.sessionID ?? "?"})`,
-			);
-			return (
-				"Blocked: no active todo item. First break the request down " +
-				"with the todowrite tool (create items with status 'pending' " +
-				"or 'in_progress'), then work them through, marking " +
-				"each completed via todowrite as you finish it. When every " +
-				"item is completed, create a fresh todo list before " +
-				"starting new work."
-			);
-		}
-		if (context?.sessionID) {
-			const parentID = await fetchParentSessionID(context.sessionID);
-			if (parentID) {
-				const count = getMutationCount(context.sessionID);
-				const budget = getSubagentMutationBudget(currentRoot);
-				if (count >= budget) {
-					const reason = `Blocked: subagent session '${context.sessionID}' has reached its mutation budget (${count}/${budget}). Hand work back to parent orchestrator.`;
-					logBlock(`[workflow-guard] ${reason}`);
-					return reason;
-				}
-			}
-		}
-		if (context?.sessionID && context.callID) {
-			if (toolName === "edit" || toolName === "write") {
-				for (const path of editTargets(input, currentRoot)) {
-					const staleReason = staleWriteReason(path, context.sessionID);
-					if (staleReason) {
-						logBlock(`[workflow-guard] ${staleReason}`);
-						return staleReason;
-					}
-				}
-			}
-			const claimReason = claimFiles(editTargets(input, currentRoot), context.sessionID, context.callID);
-			if (claimReason) {
-				logBlock(`[workflow-guard] ${claimReason}`);
-				return claimReason;
-			}
-		}
-		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
-		return undefined;
-	}
-
-	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
-
-	// ── Policy 5: MCP tools that mutate GitHub / Azure / DevOps ──
-	if (!allowLive) {
-		const mcpWhat = mcpMutationTool(toolName);
-		if (mcpWhat) {
-			logBlock(
-				`[workflow-guard] blocked MCP tool ${toolName} (${mcpWhat} mutation)`,
-			);
-			return (
-				`Blocked: ${toolName} mutates ${mcpWhat} - a live ` +
-				"system. Changes must be made in code unless the user " +
-				"explicitly allows live changes. Only the user can override " +
-				"this, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment " +
-				"variable set before launching the agent."
-			);
-		}
-	}
-
-	if (!SHELL_TOOL_NAMES.has(toolName)) {
-		return undefined;
-	}
-
-	const commands = extractCommands(input);
-	for (const raw of commands) {
-		const dynamicSyntax = dynamicShellSyntaxIn(raw);
-		if (dynamicSyntax) return `Blocked: command contains ${dynamicSyntax} that cannot be safely classified without executing shell expansion.`;
-		const command = normalize(raw);
-
-		// ── Policy 22: non-interactive shell & TTY hang guard ──
-		const ttyCheck = checkInteractiveTtyCommand(command);
-		if (ttyCheck.isInteractive) {
-			logBlock(`[workflow-guard] blocked interactive TTY command: ${command.slice(0, 100)}`);
-			return (
-				`Blocked: '${command.slice(0, 60)}' is an ${ttyCheck.name} and will hang non-interactive agent execution. ` +
-				`${ttyCheck.advice}`
-			);
-		}
-
-		// ── Policy 23: package supply-chain & dependency hygiene guard ──
-		const packageCheck = checkPackageHygiene(command);
-		if (packageCheck.isViolating && !allowLive) {
-			logBlock(`[workflow-guard] blocked package supply-chain violation: ${command.slice(0, 100)}`);
-			return (
-				`Blocked: '${command.slice(0, 60)}' is a ${packageCheck.name}. ` +
-				`${packageCheck.advice}`
-			);
-		}
-
-		const normalizedCommand = normalizeGitCommands(command);
-		if (hasUnsafeGitAlias(command)) {
-			return "Blocked: per-invocation Git aliases cannot be used because they can hide guarded Git operations.";
-		}
-		const gitInvocations = splitShellSegments(command)
-			.map((segment) => parseGitInvocation(segment.trim()))
-			.filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
-		const effectiveRoot = gitInvocations[0]?.repoDir ?? currentRoot;
-
-		// Workspace boundary check for external git repo targets
-		for (const invocation of gitInvocations) {
-			const normalizedInvocation = `git ${invocation.rest}`;
-			// The workspace boundary has no allow-live override (same invariant as
-			// file redirects/mv): an external repository write is out of bounds even
-			// with WORKFLOW_GUARD_ALLOW_LIVE=1.
-			if (
-				isPathOutsideWorkspace(invocation.repoDir, currentRoot) &&
-				(GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))
-			) {
-				logBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
-				return `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`;
-			}
-		}
-
-		// ── Policy 7: changes only on feature branches ──
-		for (const invocation of gitInvocations) {
-			if (GIT_WRITE_RE.test(`git ${invocation.rest}`) && onProtectedBranch(invocation.repoDir)) {
-				logBlock(
-					`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`,
-				);
-				return branchGuardReason();
-			}
-		}
-
-		// Policy 20: base freshness when creating a fresh branch
-		if (GIT_BRANCH_CREATE_RE.test(normalizedCommand)) {
-			const behindCheck = checkBranchBaseIsUpToDate(effectiveRoot);
-			if (behindCheck.isBehind) {
-				logBlock(
-					`[workflow-guard] blocked branch creation: base is behind remote ${behindCheck.baseRef}`,
-				);
-				return `Blocked: ${behindCheck.reason}`;
-			}
-		}
-
-		// ── Policy 6: block self-modification of approval gates ──
-		if (isSettingsTamper(command)) {
-			logBlock(
-				`[workflow-guard] blocked settings tamper: ${command.slice(0, 120)}`,
-			);
-			return PROTECTED_PATH_REASON;
-		}
-
-		// ── Policy 17: secret file reads via shell ──
-		for (const segment of command.split(/[\n|;&]+/)) {
-				const secretFile = secretFileReadIn(segment.trim());
-				if (secretFile) {
-					logBlock(
-						`[workflow-guard] blocked shell read of secret file: ${secretFile}`,
-					);
-					return (
-						`Blocked: reading sensitive credential/secret file '${secretFile}' via shell is not permitted. ` +
-						"Reference environment variables by name or inspect safe templates (e.g. .env.example) instead."
-					);
-				}
-		}
-
-		// ── Policy 18: interpreter inline evasion scanner ──
-		for (const payload of extractInterpreterPayload(command)) {
-			// Workspace boundary check inside inline interpreter payloads has no
-			// allow-live override (same invariant as file redirects).
-			const outsidePath = outsideWritePathInPayload(payload, currentRoot);
-			if (outsidePath) {
-				logBlock(
-					`[workflow-guard] blocked interpreter payload writing outside workspace: ${outsidePath}`,
-				);
-				return `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`;
-			}
-			const writePaths = writePathsInPayload(payload);
-			if (writePaths.length > 0) {
-				if (context?.agent && isReadOnlyRole(context.agent)) {
-					return `Blocked: subagent with read-only role '${context.agent}' cannot perform shell file mutations.`;
-				}
-				for (const path of writePaths) {
-					if (isProtectedPath(path)) return PROTECTED_PATH_REASON;
-				}
-				if (onProtectedBranch(currentRoot)) return branchGuardReason();
-				const todos = await effectiveTodos(context?.sessionID);
-				if (todos !== undefined && !hasActiveTodo(todos)) {
-					return "Blocked: inline interpreter file mutation with no active todo item.";
-				}
-				recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
-			}
-
-			if (!allowLive) {
-				const normPayload = normalizeGitCommands(normalize(payload));
-				const liveCheck = liveMutationIn(normPayload);
-				if (liveCheck) {
-					logBlock(
-						`[workflow-guard] blocked interpreter payload containing ${liveCheck}`,
-					);
-					return `Blocked: inline interpreter script contains a ${liveCheck}. Interpreter payloads cannot smuggle live destructive commands past the guard.`;
-				}
-			}
-			if (isSettingsTamper(payload)) return PROTECTED_PATH_REASON;
-			const secretPath = secretPathInPayload(payload);
-			if (secretPath) return `Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted.`;
-		}
-
-		// ── Policies 1, 7 & 8: shell file mutations get the same gates as edits ──
-		const shellMutationReason = await guardShellMutation(
-			command,
-			context?.sessionID,
-		);
-		if (shellMutationReason) {
-			logBlock(
-				`[workflow-guard] blocked shell mutation: ${command.slice(0, 120)}`,
-			);
-			return shellMutationReason;
-		}
-
-		// ── Policy 4: live-system mutations (env var is the ONLY override) ──
-		if (!allowLive) {
-			const what = liveMutationIn(normalizedCommand) ?? liveMutationIn(command);
-			if (what) {
-				logBlock(
-					`[workflow-guard] blocked ${what}: ${command.slice(0, 120)}`,
-				);
-				return (
-					`Blocked: ${what} targets a live system. Changes must be ` +
-					"made in code (IaC, migrations, source) unless the user " +
-					"explicitly allows live changes. Only the user can override " +
-					"this, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment " +
-					"variable set before launching the agent."
-				);
-			}
-		}
-
-		// ── Policy 2: block git push to main/master ──
-		if (PUSH_TO_MAIN_RE.test(normalizedCommand)) {
-			logBlock(
-				`[workflow-guard] blocked push to main/master: ${command}`,
-			);
-			return (
-				"Blocked: direct pushes to main/master are not allowed. " +
-				"Create a feature branch and open a PR instead."
-			);
-		}
-		// Policy 2 (cont.): configured protected branches receive the same
-		// destination-side push protection as main/master.
-		for (const invocation of gitInvocations) {
-			const pushText = `git ${invocation.rest}`;
-			if (!/\bgit\s+push\b/.test(pushText)) continue;
-			const pushedBranch = pushedProtectedBranchIn(pushText, invocation.repoDir);
-			if (pushedBranch) {
-				logBlock(
-					`[workflow-guard] blocked push to protected branch '${pushedBranch}': ${command}`,
-				);
-				return (
-					`Blocked: direct pushes to protected branch '${pushedBranch}' are not allowed. ` +
-					"Create a feature branch and open a PR instead."
-				);
-			}
-		}
-
-		// ── Policy 20: block push from protected or already-merged branches ──
-		for (const invocation of gitInvocations) {
-			if (!/\bgit\s+push\b/.test(`git ${invocation.rest}`)) continue;
-			if (onProtectedBranch(invocation.repoDir)) {
-				logBlock(`[workflow-guard] blocked push from protected branch: ${command}`);
-				return branchGuardReason();
-			}
-			const branch = currentGitBranch(invocation.repoDir);
-			if (branch) {
-				const mergedStatus = isBranchAlreadyMergedOrClosed(
-					invocation.repoDir,
-					branch,
-				);
-				if (mergedStatus.merged) {
-					logBlock(
-						`[workflow-guard] blocked push to merged/closed branch: ${branch}`,
-					);
-					return `Blocked: ${mergedStatus.reason}`;
-				}
-			}
-		}
-
-		// ── Policy 3: PRs must include a changelog (GitHub & Azure DevOps) ──
-		if (hasPrCreateInvocation(raw)) {
-			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
-			const prTool = isAz ? "az repos pr create" : "gh pr create";
-			const descFlag = isAz ? "--description" : "--body";
-			const preflightFailures: string[] = [];
-
-			// Policy 19: conflict-free mergeability gate before opening PR
-			const conflictCheck = checkMergeConflicts(currentRoot);
-			if (conflictCheck.hasConflicts) {
-				preflightFailures.push(conflictCheck.reason ?? "Branch has merge conflicts with its base branch.");
-			}
-
-			// Policy 20: branch already merged/closed
-			const branch = currentGitBranch(currentRoot);
-			if (branch) {
-				const mergedStatus = isBranchAlreadyMergedOrClosed(currentRoot, branch);
-				if (mergedStatus.merged) {
-					preflightFailures.push(mergedStatus.reason ?? "Branch is already merged or closed.");
-				}
-			}
-
-			if (isReviewRequired(currentRoot)) {
-				const review = context?.sessionID
-					? (sessionReviews.get(context.sessionID) ?? getLastReviewResult())
-					: getLastReviewResult();
-				const reviewMatchesContext =
-					review?.passed === true &&
-					review.workspace === resolve(currentRoot) &&
-					(!review.targetSessionID || review.targetSessionID === context?.sessionID) &&
-					review.commitHash === getCurrentGitCommitHash(currentRoot) &&
-					review.gitStatus === getGitStatusSummary(currentRoot) &&
-					review.worktreeFingerprint === getGitWorktreeFingerprint(currentRoot);
-				if (!reviewMatchesContext) {
-					preflightFailures.push("Passing secondary review approval is required; invoke a secondary review subagent and record approval with record_review.");
-				}
-			}
-
-			// Policy 21: documentation review & update check
-			if (isDocumentationRequired(currentRoot)) {
-				const hasDocChange = branchHasDocumentationChange(currentRoot);
-				if (!hasDocChange) {
-					preflightFailures.push("Documentation update is required (Policy 21); update README.md or relevant documentation in docs/.");
-				}
-			}
-
-			const branchChangelog = branchHasChangelogChange(currentRoot);
-			let shellCwdKnown = true;
-			const prSegments: Array<{ segment: string; invocationRoot: string | null }> = [];
-			for (const segment of splitShellSegments(raw)) {
-				const unwrapped = unwrapShellCommand(segment);
-				if (/(?:^|\s)(?:(?:builtin|command)\s+)?(?:cd|pushd|popd)(?:\s|$)/.test(unwrapped)) shellCwdKnown = false;
-				if (hasPrCreateInvocation(segment)) {
-					const wrapperChangesCwd = shellWrappersChangeCwd(segment);
-					prSegments.push({ segment, invocationRoot: shellCwdKnown && !wrapperChangesCwd ? currentRoot : null });
-				}
-			}
-			const hasChangelog =
-				branchChangelog ||
-				prSegments.every(({ segment, invocationRoot }) => prBodyIncludesChangelog(segment, invocationRoot));
-			if (!hasChangelog) {
-				preflightFailures.push(`Changelog is required; update a CHANGELOG file or include a 'Changelog:' section in the PR description (${descFlag}).`);
-			}
-
-			// Lockfile synchronization pre-flight gate
-			const lockCheck = checkLockfileSync(currentRoot);
-			if (lockCheck.isOutOfSync) {
-				preflightFailures.push(lockCheck.reason ?? "Dependency lockfile is out of sync with its manifest.");
-			}
-
-			if (preflightFailures.length > 0) {
-				const reason = `Blocked: PR preflight failed:\n${preflightFailures.map((failure) => `- ${failure}`).join("\n")}`;
-				logBlock(`[workflow-guard] blocked ${prTool}: ${preflightFailures.length} preflight requirement(s) failed`);
-				return reason;
-			}
-		}
-
-		const hasGitMutation = gitInvocations.some((invocation) => {
-			const normalizedInvocation = `git ${invocation.rest}`;
-			return (
-				GIT_WRITE_RE.test(normalizedInvocation) ||
-				/\bgit\s+(?:switch|checkout)\b/.test(normalizedInvocation)
-			);
-		});
-
-		if (context?.agent && isReadOnlyRole(context.agent)) {
-			const mutation = detectShellMutation(command);
-			if (mutation) {
-				logBlock(`[workflow-guard] blocked shell mutation for read-only role ${context.agent}: ${mutation.what}`);
-				return `Blocked: subagent with read-only role '${context.agent}' cannot perform shell file mutations (${mutation.what}).`;
-			}
-			if (hasGitMutation) {
-				logBlock(`[workflow-guard] blocked git mutation for read-only role ${context.agent}`);
-				return `Blocked: subagent with read-only role '${context.agent}' cannot mutate git history or state.`;
-			}
-		}
-
-		const shellMut = detectShellMutation(command);
-		if (hasGitMutation || shellMut) {
-			if (context?.sessionID) {
-				const parentID = await fetchParentSessionID(context.sessionID);
-				if (parentID) {
-					const count = getMutationCount(context.sessionID);
-					const budget = getSubagentMutationBudget(currentRoot);
-					if (count >= budget) {
-						const reason = `Blocked: subagent session '${context.sessionID}' has reached its mutation budget (${count}/${budget}). Hand work back to parent orchestrator.`;
-						logBlock(`[workflow-guard] ${reason}`);
-						return reason;
-					}
-				}
-			}
-		}
-
-		if (hasGitMutation) {
-			recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
-		}
-	}
-
-	return undefined;
 }
 
 /**
@@ -1043,13 +303,7 @@ export async function guardToolCall(
 		: await runImpl();
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	const isMutation = EDIT_TOOL_NAMES.has(toolName);
-	const record = asRecord(input);
-	const targetPath =
-		typeof record?.filePath === "string"
-			? record.filePath
-			: typeof record?.path === "string"
-				? record.path
-				: undefined;
+	const targetPath = extractRecordTargetPath(input);
 	logDecision(toolName, input, context, reason, {
 		mutation: isMutation,
 		targetPath,
@@ -1114,420 +368,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		});
 	} catch {}
 
-	const pendingPostEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
-	const toolStartedAt = new Map<string, number>();
-	const pendingReadObservations = new Map<string, ReadObservation>();
-	const activeRecoveryRuns = new Map<string, number>();
-	const postEditKey = (sessionID: string, callID: string) => `${sessionID}\0${callID}`;
+	const toolLifecycle = new ToolInvocationLifecycle();
 
 	return {
-		tool: {
-			...(getProjectConfig(effectiveRoot).recoveryCheckpoints === true ? {
-				guard_recovery_restore: tool({
-					description: "Restore this root session's workspace to its pre-run recovery checkpoint. Refuses if the run has not gone idle or if the workspace changed after that boundary.",
-					args: { run: tool.schema.number() },
-					execute: async (args, toolContext) => {
-						if (!Number.isInteger(args.run) || args.run < 1) return "[workflow-guard] Recovery rejected: run must be a positive integer.";
-						const parent = await fetchParentSession(toolContext.sessionID);
-						if (!parent.ok) return "[workflow-guard] Recovery rejected: could not confirm this is a root session.";
-						if (parent.parentID) return "[workflow-guard] Recovery rejected: only root sessions can restore their checkpoints.";
-						const result = restoreRecoveryCheckpoint(effectiveRoot, toolContext.sessionID, args.run);
-						return result.ok
-							? `[workflow-guard] Restored recovery checkpoint for run ${args.run}.`
-							: `[workflow-guard] Recovery rejected: ${result.error}`;
-					},
-				}),
-			} : {}),
-			guard_next_tasks: tool({
-				description:
-					"Load durable repository task context when deciding what to work on next. Prefers TODO.md; if absent, discovers conventional roadmap, plan, tasks, backlog, and docs/plans Markdown files.",
-				args: {},
-				execute: async () => {
-					const sources = discoverPlanningSources(effectiveRoot);
-					return sources.length > 0
-						? JSON.stringify({ sources }, null, 2)
-						: JSON.stringify({ sources: [], message: "No TODO, roadmap, plan, tasks, or backlog Markdown files found." });
-				},
-			}),
-			...(projectMemoryEnabled ? { project_memory_search: tool({
-				description: "Search current durable knowledge for this project. Returns concise typed records with provenance; superseded records are excluded.",
-				args: { query: tool.schema.string() },
-				execute: async (args) => projectMemory ? JSON.stringify(args.query.length <= 500 ? searchProjectMemory(projectMemory, args.query, 8) : [], null, 2) : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
-			}),
-			project_memory_record: tool({
-				description: "Record a durable project fact, decision, constraint, or lesson when it will matter in future sessions. Do not record transient tool output, secrets, or speculative hypotheses.",
-				args: {
-					kind: tool.schema.string().describe("fact, decision, constraint, or lesson"),
-					content: tool.schema.string(),
-					paths: tool.schema.array(tool.schema.string()),
-					supersedes: tool.schema.string().optional(),
-				},
-				execute: async (args, toolContext) => {
-					if (!projectMemory) return "[workflow-guard] Project memory unavailable; core guard enforcement remains active.";
-					if (!(["fact", "decision", "constraint", "lesson"] as string[]).includes(args.kind)) return "[workflow-guard] Project memory rejected: invalid kind.";
-					const detectedSecret = secretIn(args.content);
-					if (detectedSecret) return `[workflow-guard] Project memory rejected: possible secret detected (${detectedSecret}).`;
-					const record = recordProjectMemory(projectMemory, {
-						kind: args.kind as "fact" | "decision" | "constraint" | "lesson",
-						content: args.content,
-						source: "agent",
-						sessionID: toolContext.sessionID,
-						commit: getCurrentGitCommitHash(effectiveRoot),
-						paths: args.paths,
-						supersedes: args.supersedes || undefined,
-					});
-					return JSON.stringify(record);
-				},
-			}),
-			project_memory_export: tool({
-				description: "Explicitly promote selected durable project-memory records to the human-readable repo-local .opencode/memory/project-memory.jsonl file. Nothing is exported automatically.",
-				args: { ids: tool.schema.array(tool.schema.string()) },
-				execute: async (args) => {
-					if (!projectMemory) return "[workflow-guard] Project memory unavailable; core guard enforcement remains active.";
-					if (args.ids.length > 100 || args.ids.some((id) => id.length > 200)) return "[workflow-guard] Project memory export rejected: invalid record IDs.";
-					const count = exportProjectKnowledge(projectMemory, args.ids, portableMemoryPath, (content) => secretIn(content) !== undefined);
-					return `[workflow-guard] Exported ${count} project-memory record(s) to .opencode/memory/project-memory.jsonl.`;
-				},
-			}),
-			project_memory_import: tool({
-				description: "Import the fixed repo-local .opencode/memory/project-memory.jsonl file into this project's local working-memory index.",
-				args: {},
-				execute: async () => projectMemory ? `[workflow-guard] Imported ${importProjectKnowledge(projectMemory, portableMemoryPath, (content) => secretIn(content) !== undefined)} new project-memory record(s).` : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
-			}) } : {}),
-			...(learningEnabled ? {
-				learning_profile: tool({
-					description: "Inspect the local evidence-based learner profile so teaching can build on demonstrated knowledge without assuming unobserved concepts are gaps.",
-					args: {},
-					execute: async () => JSON.stringify(loadLearnerProfile(), null, 2),
-				}),
-				learning_checkpoint: tool({
-					description: "At a high-value design decision, debugging moment, or important new concept, rank candidate Socratic learning opportunities. If one is selected, ask one concise question before continuing the work; do not turn routine syntax into a lesson.",
-					args: {
-						opportunities: tool.schema.array(tool.schema.object({
-							type: tool.schema.string().describe("design, debugging, or new-concept"),
-							concept: tool.schema.string().describe("Transferable engineering concept"),
-							relevance: tool.schema.number().describe("Current-task relevance from 0 to 1"),
-							consequence: tool.schema.number().describe("Decision consequence from 0 to 1"),
-						})),
-					},
-					execute: async (args, toolContext) => {
-						const valid = args.opportunities.slice(0, 20).filter((candidate): candidate is typeof candidate & { type: "design" | "debugging" | "new-concept" } =>
-							(candidate.type === "design" || candidate.type === "debugging" || candidate.type === "new-concept") &&
-							candidate.concept.length > 0 && candidate.concept.length <= 100 &&
-							candidate.relevance >= 0 && candidate.relevance <= 1 && candidate.consequence >= 0 && candidate.consequence <= 1,
-						);
-						const used = learningInterventions.get(toolContext.sessionID) ?? 0;
-						const selected = selectLearningOpportunity(loadLearnerProfile(), valid, {
-							interventionsThisSession: used,
-							maxInterventionsPerSession: getLearningInterventionBudget(effectiveRoot),
-						});
-						if (!selected) return JSON.stringify({ intervene: false, reason: "No opportunity selected or session learning budget reached." });
-						learningInterventions.set(toolContext.sessionID, used + 1);
-						return JSON.stringify({ intervene: true, opportunity: selected, guidance: "Ask one question, use the answer as task context, briefly reconcile if useful, then continue building." });
-					},
-				}),
-				learning_record: tool({
-					description: "Record concise evidence from a real Socratic interaction after observing the learner's reasoning. Record what was demonstrated, not a grade or an inferred deficit.",
-					args: {
-						concept: tool.schema.string(),
-						kind: tool.schema.string().describe("exposed, developing, demonstrated, independent, critique, or needs-reinforcement"),
-						summary: tool.schema.string().describe("Short factual description of observed reasoning"),
-					},
-					execute: async (args, toolContext) => {
-						const validKinds = new Set(["exposed", "developing", "demonstrated", "independent", "critique", "needs-reinforcement"]);
-						if (!validKinds.has(args.kind)) return "[workflow-guard] Learning evidence rejected: invalid evidence kind.";
-						if (args.concept.length < 1 || args.concept.length > 100 || args.summary.length < 1 || args.summary.length > 1000) {
-							return "[workflow-guard] Learning evidence rejected: concept must be 1-100 characters and summary 1-1000 characters.";
-						}
-						try {
-							updateLearnerProfile((profile) => {
-								if (!profile.concepts[args.concept] && Object.keys(profile.concepts).length >= 500) {
-									throw new Error("concept-limit");
-								}
-								recordLearningEvidence(profile, {
-									concept: args.concept,
-									kind: args.kind as LearningEvidenceKind,
-									summary: args.summary,
-									timestamp: Date.now(),
-									sessionID: toolContext.sessionID,
-									project: effectiveRoot,
-								});
-							});
-						} catch (error) {
-							if ((error as Error).message === "concept-limit") {
-								return "[workflow-guard] Learning evidence rejected: learner profile concept limit reached.";
-							}
-							throw error;
-						}
-						return `[workflow-guard] Learning evidence recorded for ${args.concept}.`;
-					},
-				}),
-			} : {}),
-			guard_status: tool({
-				description:
-					"Inspect active guardrails, current branch protection, and verification/review status.",
-				args: {},
-				execute: async () => {
-					const root = getWorkspaceRoot();
-					const branch = currentGitBranch(root) ?? "unknown";
-					const isProtected = onProtectedBranch(root);
-					const lastV = getLastVerifyResult();
-					const lastR = getLastReviewResult();
-					const lastMut = getLastMutationTimestamp();
-					const cfg = loadProjectConfig(root);
-					return JSON.stringify(
-						{
-							workspaceRoot: root,
-							branch,
-							onProtectedBranch: isProtected,
-							lastMutationTimestamp: lastMut,
-							mutationCount: getMutationCount(),
-							lastVerify: lastV
-								? {
-										command: lastV.command,
-										passed: lastV.passed,
-										fresh: lastV.timestamp >= lastMut,
-										commitHash: lastV.commitHash,
-									}
-								: null,
-							lastReview: lastR
-								? {
-										reviewer: lastR.reviewer,
-										passed: lastR.passed,
-										summary: lastR.summary,
-									}
-								: null,
-							projectConfig: {
-								protectedBranches: cfg.protectedBranches ?? ["main", "master"],
-								verifyCommand: detectVerifyCommand(root) ?? null,
-								requireReview: isReviewRequired(root),
-								requireDocumentation: isDocumentationRequired(root),
-							},
-						},
-						null,
-						2,
-					);
-				},
-			}),
-			guard_audit: tool({
-				description:
-					"View recent audit entries recorded by opencode-workflow-guard.",
-				args: {
-					limit: tool.schema
-						.number()
-						.optional()
-						.describe("Maximum entries to return (default 10)"),
-				},
-				execute: async (args) => {
-					const limit =
-						typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10;
-					return JSON.stringify(getRecentAuditEntries(limit), null, 2);
-				},
-			}),
-			guard_why: tool({
-				description:
-					"Simulate and explain whether a specific tool call or command would be blocked by guardrails.",
-				args: {
-					tool: tool.schema
-						.string()
-						.describe("Tool name (e.g. bash, edit, write, read, apply_patch)"),
-					input: tool.schema
-						.record(tool.schema.string(), tool.schema.any())
-						.optional()
-						.describe("Tool input arguments"),
-				},
-				execute: async (args) => {
-					const reason = await guardToolCallImpl(args.tool, args.input ?? {});
-					return reason
-						? `BLOCKED: ${reason}`
-						: "ALLOWED: Satisfies all current guardrails.";
-				},
-			}),
-			record_review: tool({
-				description:
-					"Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric.",
-				args: {
-					reviewer: tool.schema
-						.string()
-						.describe("Identifier/name of the reviewer subagent"),
-					summary: tool.schema
-						.string()
-						.describe("Review findings summary across the 5 core review axes"),
-					passed: tool.schema
-						.boolean()
-						.describe("True if change is approved, false if changes requested"),
-				},
-				execute: async (args, toolContext) => {
-					const parentSessionID = await fetchParentSessionID(toolContext.sessionID);
-					if (!parentSessionID) {
-						return "[workflow-guard] Review rejected: record_review must be called from a secondary/subagent session.";
-					}
-					// The rubric is the contract: a recorded review must demonstrate it
-					// was evaluated against the 5 axes, not just assert a verdict.
-					const axesRefs = [
-						"test integrity",
-						"task completeness",
-						"cleanliness",
-						"security",
-						"platform",
-					];
-					const summaryLower = args.summary.toLowerCase();
-					const referenced = axesRefs.filter((axis) => summaryLower.includes(axis));
-					if (referenced.length < 3) {
-						return (
-							`[workflow-guard] Review rejected: summary must reference the review axes ` +
-							`(found ${referenced.length}/5). Call guard_review_rubric to get the rubric, ` +
-							`evaluate each axis, and include findings per axis in the summary.`
-						);
-					}
-					if (args.passed) {
-						if (/(?:^|\s)(?:\[p[01]\]|p[01]\s*:\s*(?:blocker|defect|vulnerability|error|bug|issue)|p[01]\s+blocker)/i.test(args.summary)) {
-							return (
-								"[workflow-guard] Review rejected: cannot record approval when P0 or P1 blockers are flagged in findings. " +
-								"Resolve all P0/P1 issues before approving or record review with passed=false."
-							);
-						}
-					}
-					recordReviewResult(
-						args.reviewer,
-						args.summary,
-						args.passed,
-						parentSessionID,
-						toolContext.worktree || toolContext.directory,
-					);
-					if (followupStore && !secretIn(args.summary)) {
-						const findings = extractReviewFollowups(args.summary);
-						for (const finding of findings) {
-							recordReviewFollowup(followupStore, {
-								severity: finding.severity,
-								summary: finding.summary,
-								reviewer: args.reviewer,
-								sessionID: toolContext.sessionID,
-								commit: getCurrentGitCommitHash(effectiveRoot),
-							});
-						}
-					}
-					return args.passed
-						? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.`
-						: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
-				},
-			}),
-			guard_review_followups: tool({
-				description: "List durable local P2/P3 review follow-ups for this project. Open findings are technical debt that should be addressed rather than indefinitely deferred.",
-				args: {},
-				execute: async () => JSON.stringify(followupStore ? listReviewFollowups(followupStore) : [], null, 2),
-			}),
-			guard_review_followup_resolve: tool({
-				description: "Resolve a durable local review follow-up after the underlying issue has been fixed and verified.",
-				args: { id: tool.schema.string() },
-				execute: async (args) => followupStore && resolveReviewFollowup(followupStore, args.id)
-					? `[workflow-guard] Review follow-up ${args.id} resolved.`
-					: `[workflow-guard] Review follow-up ${args.id} was not open or was not found.`,
-			}),
-			guard_review_rubric: tool({
-				description:
-					"Get the secondary-review rubric for the current branch diff. The orchestrator calls this, spawns a reviewer subagent with the rubric as the prompt, then the reviewer records its verdict via record_review.",
-				args: {
-					base: tool.schema
-						.string()
-						.optional()
-						.describe("Base ref to diff against (default: origin/main, origin/master, main)"),
-				},
-				execute: async (args) => {
-					const sanitizedBase =
-						typeof args.base === "string" &&
-						!args.base.startsWith("-") &&
-						!/[\s;'"\0]/.test(args.base)
-							? args.base
-							: undefined;
-					const bases = sanitizedBase
-						? [sanitizedBase]
-						: ["origin/main", "origin/master", "main", "master"];
-					let diffText = "";
-					for (const base of bases) {
-						const res = spawnSync(
-							"git",
-							["diff", "--", `${base}...HEAD`],
-							{ cwd: getWorkspaceRoot(), encoding: "utf8", timeout: 10_000 },
-						);
-						if (res.status === 0 && res.stdout.trim()) {
-							diffText = res.stdout;
-							break;
-						}
-					}
-					if (!diffText) {
-						const last = spawnSync("git", ["diff", "--", "HEAD~1"], {
-							cwd: getWorkspaceRoot(),
-							encoding: "utf8",
-							timeout: 10_000,
-						});
-						diffText = last.status === 0 ? last.stdout : "(no diff available)";
-					}
-					return buildReviewRubric(diffText);
-				},
-			}),
-			guard_worktree_create: tool({
-				description:
-					"Create an isolated git worktree directory for concurrent subagent execution.",
-				args: {
-					branch: tool.schema
-						.string()
-						.describe("Branch name for the isolated worktree (e.g. 'feat/subagent-task')"),
-					baseBranch: tool.schema
-						.string()
-						.optional()
-						.describe("Base branch to branch off of (defaults to HEAD)"),
-				},
-				execute: async (args, toolContext) => {
-					const todos = await effectiveTodos(toolContext.sessionID);
-					if (todos !== undefined && !hasActiveTodo(todos)) {
-						return (
-							"[workflow-guard] Blocked: worktree creation with no active todo item. " +
-							"Break the request down with todowrite first, then create worktrees."
-						);
-					}
-					const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot;
-					const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", toolRoot);
-					if (!res.success) {
-						return `[workflow-guard] Failed to create worktree: ${res.error}`;
-					}
-					recordMutation(
-						(await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID,
-					);
-					return (
-						`[workflow-guard] Worktree created successfully at: ${res.worktreePath}\n` +
-						`Run subagent tasks or pass worktree directory context to isolate file mutations.`
-					);
-				},
-			}),
-			guard_worktree_cleanup: tool({
-				description:
-					"Commit a final snapshot and remove an isolated git worktree directory.",
-				args: {
-					worktreePath: tool.schema
-						.string()
-						.describe("Path of the worktree directory to clean up"),
-				},
-				execute: async (args, toolContext) => {
-					const todos = await effectiveTodos(toolContext.sessionID);
-					if (todos !== undefined && !hasActiveTodo(todos)) {
-						return (
-							"[workflow-guard] Blocked: worktree cleanup with no active todo item. " +
-							"Break the request down with todowrite first, then clean up worktrees."
-						);
-					}
-					const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot;
-					const res = cleanupGitWorktree(args.worktreePath, toolRoot);
-					if (!res.success) {
-						return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
-					}
-					recordMutation(
-						(await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID,
-					);
-					return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
-				},
-			}),
-		},
+		tool: createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions }),
 
 		"tool.execute.before": async (input, output) => {
 			const toolWorktree =
@@ -1553,25 +397,23 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					await emitBlockFeedback(reason);
 					throw new Error(`[workflow-guard] ${reason}`);
 				}
-				toolStartedAt.set(postEditKey(input.sessionID, input.callID), Date.now());
+				toolLifecycle.start(input.sessionID, input.callID);
 				if (input.tool === "read") {
 					const target = editTargets(args, toolWorktree)[0];
 					if (target) {
 						const observation = beginReadObservation(target);
-						if (observation) pendingReadObservations.set(postEditKey(input.sessionID, input.callID), observation);
+						if (observation) toolLifecycle.setReadObservation(input.sessionID, input.callID, observation);
 					}
 				}
 				if (EDIT_TOOL_NAMES.has(input.tool)) {
 					const snapshots = editTargets(args, toolWorktree).map(snapshotFile);
-					if (snapshots.length) pendingPostEditSnapshots.set(postEditKey(input.sessionID, input.callID), { root: toolWorktree, snapshots });
+					if (snapshots.length) toolLifecycle.setPostEditSnapshots(input.sessionID, input.callID, toolWorktree, snapshots);
 				}
 			});
 		},
 
 		"tool.execute.after": async (input, output) => {
-			const telemetryKey = postEditKey(input.sessionID, input.callID);
-			const startedAt = toolStartedAt.get(telemetryKey);
-			toolStartedAt.delete(telemetryKey);
+			const startedAt = toolLifecycle.finish(input.sessionID, input.callID);
 			audit({
 				ts: new Date().toISOString(),
 				sessionID: input.sessionID,
@@ -1583,14 +425,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			});
 			releaseFileClaims(input.sessionID, input.callID);
 			if (input.tool === "read") {
-				const readKey = postEditKey(input.sessionID, input.callID);
-				const observation = pendingReadObservations.get(readKey);
-				pendingReadObservations.delete(readKey);
+				const observation = toolLifecycle.takeReadObservation(input.sessionID, input.callID);
 				if (observation) recordSuccessfulRead(observation, input.sessionID);
 			}
-			const key = postEditKey(input.sessionID, input.callID);
-			const pending = pendingPostEditSnapshots.get(key);
-			pendingPostEditSnapshots.delete(key);
+			const pending = toolLifecycle.takePostEditSnapshots(input.sessionID, input.callID);
 			if (!pending) return;
 			await runWithRuntimeState(pending.root, ctx.client, async () => {
 				const reports = await Promise.all(pending.snapshots.map((before) => runPostEditValidators(pending.root, before)));
@@ -1675,14 +513,8 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				const env = (output as { env?: Record<string, string> }).env;
 				if (env && typeof env === "object") {
 					const scrubbed: string[] = [];
-					for (const key of SENSITIVE_ENV_KEYS) {
-						if (key in env && env[key] !== "") {
-							env[key] = "";
-							scrubbed.push(key);
-						}
-					}
 					for (const key of Object.keys(env)) {
-						if (SENSITIVE_ENV_RE.test(key) && env[key] !== "") {
+						if (isSensitiveEnvKey(key) && env[key] !== "") {
 							env[key] = "";
 							scrubbed.push(key);
 						}
@@ -1758,7 +590,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			if (!parent.ok || parent.parentID) return;
 			const run = nextRecoveryRun(effectiveRoot, input.sessionID);
 			const checkpoint = createRecoveryCheckpoint(effectiveRoot, input.sessionID, run);
-			if (checkpoint) activeRecoveryRuns.set(input.sessionID, run);
+			if (checkpoint) toolLifecycle.setRecoveryRun(input.sessionID, run);
 		},
 
 		event: async ({
@@ -1769,11 +601,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
-					for (const key of toolStartedAt.keys()) if (key.startsWith(`${sessionID}\0`)) toolStartedAt.delete(key);
-					const recoveryRun = activeRecoveryRuns.get(sessionID);
+					toolLifecycle.clearSession(sessionID);
+					const recoveryRun = toolLifecycle.takeRecoveryRun(sessionID);
 					if (recoveryRun !== undefined) {
 						finalizeRecoveryCheckpoint(effectiveRoot, sessionID, recoveryRun);
-						activeRecoveryRuns.delete(sessionID);
 					}
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
 				}
@@ -1791,8 +622,8 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
-					for (const key of toolStartedAt.keys()) if (key.startsWith(`${sessionID}\0`)) toolStartedAt.delete(key);
-					activeRecoveryRuns.delete(sessionID);
+					toolLifecycle.clearSession(sessionID);
+					toolLifecycle.takeRecoveryRun(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}
 			}
