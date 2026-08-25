@@ -14,9 +14,10 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { join } from "node:path";
-import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
+import { editTargets, runPostEditValidators, snapshotFile } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
-import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason, type ReadObservation } from "./policies/stale-write.ts";
+import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
+import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -1085,11 +1086,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		});
 	} catch {}
 
-	const pendingPostEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
-	const toolStartedAt = new Map<string, number>();
-	const pendingReadObservations = new Map<string, ReadObservation>();
-	const activeRecoveryRuns = new Map<string, number>();
-	const postEditKey = (sessionID: string, callID: string) => `${sessionID}\0${callID}`;
+	const toolLifecycle = new ToolInvocationLifecycle();
 
 	return {
 		tool: {
@@ -1524,25 +1521,23 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					await emitBlockFeedback(reason);
 					throw new Error(`[workflow-guard] ${reason}`);
 				}
-				toolStartedAt.set(postEditKey(input.sessionID, input.callID), Date.now());
+				toolLifecycle.start(input.sessionID, input.callID);
 				if (input.tool === "read") {
 					const target = editTargets(args, toolWorktree)[0];
 					if (target) {
 						const observation = beginReadObservation(target);
-						if (observation) pendingReadObservations.set(postEditKey(input.sessionID, input.callID), observation);
+						if (observation) toolLifecycle.setReadObservation(input.sessionID, input.callID, observation);
 					}
 				}
 				if (EDIT_TOOL_NAMES.has(input.tool)) {
 					const snapshots = editTargets(args, toolWorktree).map(snapshotFile);
-					if (snapshots.length) pendingPostEditSnapshots.set(postEditKey(input.sessionID, input.callID), { root: toolWorktree, snapshots });
+					if (snapshots.length) toolLifecycle.setPostEditSnapshots(input.sessionID, input.callID, toolWorktree, snapshots);
 				}
 			});
 		},
 
 		"tool.execute.after": async (input, output) => {
-			const telemetryKey = postEditKey(input.sessionID, input.callID);
-			const startedAt = toolStartedAt.get(telemetryKey);
-			toolStartedAt.delete(telemetryKey);
+			const startedAt = toolLifecycle.finish(input.sessionID, input.callID);
 			audit({
 				ts: new Date().toISOString(),
 				sessionID: input.sessionID,
@@ -1554,14 +1549,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			});
 			releaseFileClaims(input.sessionID, input.callID);
 			if (input.tool === "read") {
-				const readKey = postEditKey(input.sessionID, input.callID);
-				const observation = pendingReadObservations.get(readKey);
-				pendingReadObservations.delete(readKey);
+				const observation = toolLifecycle.takeReadObservation(input.sessionID, input.callID);
 				if (observation) recordSuccessfulRead(observation, input.sessionID);
 			}
-			const key = postEditKey(input.sessionID, input.callID);
-			const pending = pendingPostEditSnapshots.get(key);
-			pendingPostEditSnapshots.delete(key);
+			const pending = toolLifecycle.takePostEditSnapshots(input.sessionID, input.callID);
 			if (!pending) return;
 			await runWithRuntimeState(pending.root, ctx.client, async () => {
 				const reports = await Promise.all(pending.snapshots.map((before) => runPostEditValidators(pending.root, before)));
@@ -1723,7 +1714,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			if (!parent.ok || parent.parentID) return;
 			const run = nextRecoveryRun(effectiveRoot, input.sessionID);
 			const checkpoint = createRecoveryCheckpoint(effectiveRoot, input.sessionID, run);
-			if (checkpoint) activeRecoveryRuns.set(input.sessionID, run);
+			if (checkpoint) toolLifecycle.setRecoveryRun(input.sessionID, run);
 		},
 
 		event: async ({
@@ -1734,11 +1725,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
-					for (const key of toolStartedAt.keys()) if (key.startsWith(`${sessionID}\0`)) toolStartedAt.delete(key);
-					const recoveryRun = activeRecoveryRuns.get(sessionID);
+					toolLifecycle.clearSession(sessionID);
+					const recoveryRun = toolLifecycle.takeRecoveryRun(sessionID);
 					if (recoveryRun !== undefined) {
 						finalizeRecoveryCheckpoint(effectiveRoot, sessionID, recoveryRun);
-						activeRecoveryRuns.delete(sessionID);
 					}
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
 				}
@@ -1756,8 +1746,8 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
-					for (const key of toolStartedAt.keys()) if (key.startsWith(`${sessionID}\0`)) toolStartedAt.delete(key);
-					activeRecoveryRuns.delete(sessionID);
+					toolLifecycle.clearSession(sessionID);
+					toolLifecycle.takeRecoveryRun(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}
 			}
