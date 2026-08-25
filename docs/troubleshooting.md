@@ -68,15 +68,17 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 
 ---
 
-### 9. TUI plugin is configured but does not appear
+### 9. TUI plugin is missing or remains on an older release
 
-- **Symptoms:** `~/.config/opencode/tui.json` contains `"opencode-workflow-guard"`, but Workflow Guard does not appear in OpenCode's TUI plugins or an older cached package lacks the `./tui` export.
-- **Root Cause:** OpenCode can retain a stale npm package under `~/.cache/opencode/packages/` after Workflow Guard is upgraded.
-- **Solution:** Exit OpenCode, remove only Workflow Guard's cached package directories, verify they are gone, and restart OpenCode so it fetches the current package:
+- **Symptoms:** Workflow Guard does not appear in the TUI, or npm reports a newer Workflow Guard release while OpenCode still runs an older one.
+- **Root Cause:** OpenCode caches npm plugins. A bare package name is resolved as `@latest`, but an already-populated package cache can continue using the version that originally populated that cache key. Running `npm update` in `~/.config/opencode` does not update this OpenCode-managed plugin installation.
+- **Solution:** Use OpenCode's documented plugin installer with the explicit version you want. `--force` replaces the configured plugin version, and the explicit version gives OpenCode a new package-cache key:
 
-```sh
-rm -rf ~/.cache/opencode/packages/opencode-workflow-guard ~/.cache/opencode/packages/opencode-workflow-guard@latest
-ls -d ~/.cache/opencode/packages/opencode-workflow-guard* 2>/dev/null || echo "Workflow Guard cache cleared"
+```bash
+VERSION=$(npm view opencode-workflow-guard version)
+opencode plugin "opencode-workflow-guard@$VERSION" --global --force
 ```
 
-Confirm `~/.config/opencode/tui.json` registers `"opencode-workflow-guard"` (not `"opencode-workflow-guard/tui"`), then start `opencode`.
+OpenCode documents `opencode plugin <module>` as installing a plugin and updating its config, with `--global` for global config and `--force` to replace an existing plugin version: https://opencode.ai/docs/cli/#plugin. Its plugin documentation also describes npm plugins as OpenCode-managed, cached installations: https://opencode.ai/docs/plugins/#how-plugins-are-installed.
+
+After the command reports `Detected server + tui targets`, confirm it reports replacements/additions for both the OpenCode and TUI config files, then restart OpenCode. Manual cache deletion should not be necessary.
