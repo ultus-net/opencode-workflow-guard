@@ -84,6 +84,7 @@ import {
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
 import { audit } from "../src/lib/audit.ts";
+import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 
@@ -203,6 +204,8 @@ check("allow push to main-backup (ref-like path)", !(await shell("git push origi
 console.log("- Policy 3: PR changelog (GitHub & Azure DevOps) -");
 check("block gh pr create without changelog", blocked(await shell("gh pr create --title t --body 'no changes here'")));
 check("allow gh pr create with Changelog: body", !(await shell("gh pr create --title t --body 'Changelog: fixed stuff'")));
+check("allow gh pr create with Summary release information", !(await shell("gh pr create --title t --body '## Summary\n- Fix stale tool outcome tracking'")));
+check("allow gh pr create with Release notes", !(await shell("gh pr create --title t --body '## Release notes\n- Raise the subagent mutation budget'")));
 const bodyFile = join(root, "pr-body.md");
 writeFileSync(bodyFile, "## Changelog\n- fix\n");
 check("allow gh pr create with -F body-file containing changelog", !(await shell(`gh pr create -F ${bodyFile}`)));
@@ -957,6 +960,29 @@ if (typeof cmdEvt.event === "function") {
 const evtAuditAfter = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
 check("command.executed event is audited", evtAuditAfter > evtAuditBefore);
 
+const toolOutcomeAuditBefore = getRecentAuditEntries(20);
+if (typeof cmdEvt.event === "function") {
+	await cmdEvt.event({ event: { type: "message.part.updated", properties: { part: { type: "tool", sessionID: "s-outcome", callID: "outcome-ok", tool: "bash", state: { status: "completed", input: { command: "true" }, output: "", title: "bash", metadata: {}, time: { start: 1, end: 2 } } } } } } as any);
+	for (let i = 1; i <= 3; i++) {
+		await cmdEvt.event({ event: { type: "message.part.updated", properties: { part: { type: "tool", sessionID: "s-outcome", callID: `outcome-fail-${i}`, tool: "bash", state: { status: "error", input: { command: `attempt-${i}` }, error: "connection refused at localhost", time: { start: i, end: i + 1 } } } } } } as any);
+	}
+}
+const toolOutcomeAudit = getRecentAuditEntries(20).slice(0, 5);
+check("tool-part events record explicit completed outcomes", toolOutcomeAudit.some((entry) => entry.callID === "outcome-ok" && entry.phase === "outcome" && entry.reason === "completed"));
+check("tool-part events record explicit error outcomes without raw errors", toolOutcomeAudit.some((entry) => entry.callID === "outcome-fail-1" && entry.phase === "outcome" && entry.reason === "error" && !JSON.stringify(entry).includes("connection refused")));
+check("third equivalent tool failure records retry-loop recovery feedback", toolOutcomeAudit.some((entry) => entry.callID === "outcome-fail-3" && entry.reason === "repeated-equivalent-failure:3"));
+
+const outcomeTracker = new ToolOutcomeTracker();
+const failedPart = (callID: string, error: string) => ({ type: "tool", sessionID: "s-tracker", callID, tool: "bash", state: { status: "error", error } } as const);
+check("duplicate terminal tool updates are ignored", !!outcomeTracker.record(failedPart("duplicate", "same failure")) && outcomeTracker.record(failedPart("duplicate", "same failure")) === undefined);
+outcomeTracker.record({ type: "tool", sessionID: "s-tracker", callID: "success", tool: "bash", state: { status: "completed" } });
+check("successful tool outcomes reset equivalent failure tracking", outcomeTracker.record(failedPart("after-success", "same failure"))?.repeatedFailureCount === 1);
+outcomeTracker.record(failedPart("different", "different failure"));
+check("distinct failures reset equivalent failure tracking", outcomeTracker.record(failedPart("after-different", "same failure"))?.repeatedFailureCount === 1);
+const boundedTracker = new ToolOutcomeTracker();
+for (let i = 0; i <= 1024; i++) boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: `call-${i}`, tool: "bash", state: { status: "completed" } });
+check("terminal call deduplication is bounded per session", boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: "call-0", tool: "bash", state: { status: "completed" } })?.status === "completed");
+
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
 let registeredOrder: number | undefined;
@@ -1553,7 +1579,7 @@ check(
 	"PR preflight reports review and changelog failures together",
 	typeof combinedPrPreflight === "string" &&
 		combinedPrPreflight.includes("Passing secondary review approval is required") &&
-		combinedPrPreflight.includes("Changelog is required"),
+		combinedPrPreflight.includes("Release information is required"),
 );
 check(
 	"PR creation blocked when requireReview is true and no review recorded",
@@ -1731,6 +1757,7 @@ const roShellBlock = await call(
 check("read-only advisor agent blocked from shell file mutation", blocked(roShellBlock));
 
 // Subagent Mutation Budget
+check("default subagent mutation budget is 100", getSubagentMutationBudget(root) === 100);
 process.env.WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS = "2";
 fakeParents.set("s-budget-subagent", "s-active");
 todo("s-budget-subagent", item("budgeted work", "in_progress"));

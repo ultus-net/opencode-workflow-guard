@@ -55,7 +55,7 @@ See `docs/testing.md` for the full coverage matrix.
 
 - Every PR must document its change using one of these methods (mirrors Policy 3):
   - **Preferred:** Add a changeset file with `npx changeset` (creates `.changeset/<name>.md`), avoiding merge conflicts with parallel PRs.
-  - Add a `Changelog:` section in the PR description.
+  - Add a release-information section such as `Summary`, `Changes`, `Release notes`, or `Changelog` in the PR description.
   - Update `CHANGELOG.md` directly.
 - Keep documentation synchronized: if you change behavior, update README,
   policy docs, and troubleshooting guide.
