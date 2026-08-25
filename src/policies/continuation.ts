@@ -48,6 +48,7 @@ export async function continueUnfinishedSession(sessionID: string): Promise<bool
 					parts: [{
 						type: "text",
 						text: "Workflow Guard: unfinished todos remain. Continue working through them. If you need user input, use the question tool instead of ending the run.",
+						synthetic: true,
 					}],
 				},
 			});

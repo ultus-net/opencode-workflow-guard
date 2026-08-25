@@ -2577,13 +2577,15 @@ check("plugin instances keep SDK client state isolated", !activeInstanceBlocked 
 // handoff rather than ownership, so only the owning session is resumed.
 const continuationPrompts: string[] = [];
 const continuationMessageIDs = new Map<string, string[]>();
+const continuationParts = new Map<string, Array<{ type: "text"; text: string; synthetic?: boolean }>>();
 const continuationClient = {
 	session: {
 		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
 		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: fakeParents.get(path.id) } }),
-		promptAsync: async ({ path, body }: { path: { id: string }; body: { messageID: string } }) => {
+		promptAsync: async ({ path, body }: { path: { id: string }; body: { messageID: string; parts: Array<{ type: "text"; text: string; synthetic?: boolean }> } }) => {
 			continuationPrompts.push(path.id);
 			continuationMessageIDs.set(path.id, [...(continuationMessageIDs.get(path.id) ?? []), body.messageID]);
+			continuationParts.set(path.id, body.parts);
 		},
 	},
 };
@@ -2591,6 +2593,7 @@ const continuationPlugin = await WorkflowGuard({ directory: root, worktree: root
 todo("s-resume", item("finish work", "pending"));
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume" } } } as any);
 check("session idle auto-continues unfinished owned todos", continuationPrompts.join(",") === "s-resume");
+check("automatic continuation is synthetic so it does not suppress session title generation", continuationParts.get("s-resume")?.every((part) => part.synthetic === true) === true);
 
 todo("s-resume-done", item("finished", "completed"));
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-done" } } } as any);
