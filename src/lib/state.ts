@@ -1,7 +1,8 @@
 import { realpathSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { persistVerifyCache, persistVerifyHistory } from "./audit.ts";
+import { projectConfigCandidates } from "./project-config.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint } from "./verify.ts";
 import type {
 	TodoSdkClient,
@@ -243,13 +244,7 @@ export function stripJsonComments(jsonc: string): string {
 }
 
 export function loadProjectConfig(root: string): ProjectConfig {
-	const candidates = [
-		join(root, ".opencode", "workflow-guard.json"),
-		join(root, ".opencode", "workflow-guard.jsonc"),
-		join(root, "workflow-guard.json"),
-		join(root, "workflow-guard.jsonc"),
-	];
-	for (const candidate of candidates) {
+	for (const candidate of projectConfigCandidates(root)) {
 		try {
 			const raw = readFileSync(candidate, "utf8");
 			const sanitized = stripJsonComments(raw);

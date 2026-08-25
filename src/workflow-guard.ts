@@ -92,6 +92,8 @@ export {
 // ── Shared shell/env utilities ───────────────────────────────────────────────
 import {
 	asRecord,
+	extractRecordTargetPath,
+	extractTargetPath,
 	dynamicShellSyntaxIn,
 	extractCommands,
 	normalize,
@@ -100,8 +102,7 @@ import {
 	unwrapShellCommand,
 	getCleanEnv,
 	showBlockToast,
-	SENSITIVE_ENV_KEYS,
-	SENSITIVE_ENV_RE,
+	isSensitiveEnvKey,
 } from "./lib/utils.ts";
 
 export { getCleanEnv, dynamicShellSyntaxIn };
@@ -236,6 +237,7 @@ import {
 	fetchSessionTodos,
 	fetchParentSessionID,
 	fetchParentSession,
+	subagentMutationBudgetReason,
 	effectiveTodos,
 	effectiveTodoOwnerSessionID,
 	hasActiveTodo,
@@ -393,15 +395,7 @@ async function guardToolCallImpl(
 
 	// ── Policy 17: secret file read block via read tool ──
 	if (toolName === "read" || toolName === "read_file") {
-		const record = asRecord(input);
-		const target =
-			typeof record?.filePath === "string"
-				? record.filePath
-				: typeof record?.path === "string"
-					? record.path
-					: typeof input === "string"
-						? input
-						: "";
+		const target = extractTargetPath(input) ?? "";
 		if (target && isSecretPath(target)) {
 			logBlock(`[workflow-guard] blocked read: secret file ${target}`);
 			if (isEnvFilePath(target)) {
@@ -523,14 +517,7 @@ async function guardToolCallImpl(
 	if (EDIT_TOOL_NAMES.has(toolName)) {
 		const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 		const record = asRecord(input);
-		const target =
-			typeof record?.filePath === "string"
-				? record.filePath
-				: typeof record?.path === "string"
-					? record.path
-					: typeof input === "string"
-						? input
-						: "";
+		const target = extractTargetPath(input) ?? "";
 
 		if (target && isProtectedPath(target)) {
 			logBlock(`[workflow-guard] blocked ${toolName}: protected path ${target}`);
@@ -639,15 +626,10 @@ async function guardToolCallImpl(
 			);
 		}
 		if (context?.sessionID) {
-			const parentID = await fetchParentSessionID(context.sessionID);
-			if (parentID) {
-				const count = getMutationCount(context.sessionID);
-				const budget = getSubagentMutationBudget(currentRoot);
-				if (count >= budget) {
-					const reason = `Blocked: subagent session '${context.sessionID}' has reached its mutation budget (${count}/${budget}). Hand work back to parent orchestrator.`;
-					logBlock(`[workflow-guard] ${reason}`);
-					return reason;
-				}
+			const reason = await subagentMutationBudgetReason(context.sessionID, currentRoot);
+			if (reason) {
+				logBlock(`[workflow-guard] ${reason}`);
+				return reason;
 			}
 		}
 		if (context?.sessionID && context.callID) {
@@ -1006,15 +988,10 @@ async function guardToolCallImpl(
 		const shellMut = detectShellMutation(command);
 		if (hasGitMutation || shellMut) {
 			if (context?.sessionID) {
-				const parentID = await fetchParentSessionID(context.sessionID);
-				if (parentID) {
-					const count = getMutationCount(context.sessionID);
-					const budget = getSubagentMutationBudget(currentRoot);
-					if (count >= budget) {
-						const reason = `Blocked: subagent session '${context.sessionID}' has reached its mutation budget (${count}/${budget}). Hand work back to parent orchestrator.`;
-						logBlock(`[workflow-guard] ${reason}`);
-						return reason;
-					}
+				const reason = await subagentMutationBudgetReason(context.sessionID, currentRoot);
+				if (reason) {
+					logBlock(`[workflow-guard] ${reason}`);
+					return reason;
 				}
 			}
 		}
@@ -1043,13 +1020,7 @@ export async function guardToolCall(
 		: await runImpl();
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	const isMutation = EDIT_TOOL_NAMES.has(toolName);
-	const record = asRecord(input);
-	const targetPath =
-		typeof record?.filePath === "string"
-			? record.filePath
-			: typeof record?.path === "string"
-				? record.path
-				: undefined;
+	const targetPath = extractRecordTargetPath(input);
 	logDecision(toolName, input, context, reason, {
 		mutation: isMutation,
 		targetPath,
@@ -1675,14 +1646,8 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				const env = (output as { env?: Record<string, string> }).env;
 				if (env && typeof env === "object") {
 					const scrubbed: string[] = [];
-					for (const key of SENSITIVE_ENV_KEYS) {
-						if (key in env && env[key] !== "") {
-							env[key] = "";
-							scrubbed.push(key);
-						}
-					}
 					for (const key of Object.keys(env)) {
-						if (SENSITIVE_ENV_RE.test(key) && env[key] !== "") {
+						if (isSensitiveEnvKey(key) && env[key] !== "") {
 							env[key] = "";
 							scrubbed.push(key);
 						}

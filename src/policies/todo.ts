@@ -1,5 +1,5 @@
 import type { TodoItem } from "../lib/types.ts";
-import { getSdkClient } from "../lib/state.ts";
+import { getMutationCount, getSdkClient, getSubagentMutationBudget } from "../lib/state.ts";
 
 export const EDIT_TOOL_NAMES = new Set(["edit", "write", "patch", "apply_patch"]);
 export const ACTIVE_TODO_STATUSES = new Set(["pending", "in_progress"]);
@@ -21,6 +21,17 @@ export async function fetchSessionTodos(sessionID: string): Promise<TodoItem[] |
 export async function fetchParentSessionID(sessionID: string): Promise<string | undefined> {
 	const result = await fetchParentSession(sessionID);
 	return result.ok ? result.parentID : undefined;
+}
+
+export async function subagentMutationBudgetReason(
+	sessionID: string,
+	root: string,
+): Promise<string | undefined> {
+	if (!await fetchParentSessionID(sessionID)) return undefined;
+	const count = getMutationCount(sessionID);
+	const budget = getSubagentMutationBudget(root);
+	if (count < budget) return undefined;
+	return `Blocked: subagent session '${sessionID}' has reached its mutation budget (${count}/${budget}). Hand work back to parent orchestrator.`;
 }
 
 export async function fetchParentSession(sessionID: string): Promise<{ ok: true; parentID?: string } | { ok: false }> {
