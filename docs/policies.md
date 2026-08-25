@@ -2,6 +2,8 @@
 
 `opencode-workflow-guard` enforces workflow discipline through **deterministic TypeScript hooks** (`tool.execute.before`, `experimental.session.compacting`, `shell.env`, `permission.ask`, and `event` journaling) - not prompt rules that LLMs can ignore.
 
+It is a policy and enforcement layer, not an agent harness. Policies may constrain actions, record or explain decisions, and preserve bounded context; they do not plan, prioritize, delegate, or autonomously sequence work. Where Workflow Guard resumes an idle session, it only enforces already-owned todo lifecycle state and does not choose what the agent works on next.
+
 ---
 
 ## Policy Reference
@@ -10,10 +12,10 @@
 - **Pre-edit Gate:** All file-editing tools (`edit`, `write`, `apply_patch`) are blocked until the session has an active task list in OpenCode's native todo system (`todowrite`, persisted at `GET /session/:id/todo`).
 - **Flexible Task Execution:** Tasks can be completed in any order as work concludes without artificial sequential blockers, maintaining maximum pair-programming DX.
 - **No Silent Deletion:** Each `todowrite` update replaces the complete list. Active tasks must remain in subsequent updates until they are explicitly marked `completed` or `cancelled`.
-- **No Silent Early Exit:** When an owning session becomes `session.idle` with unfinished native todos, the guard asynchronously asks OpenCode to continue. Automatic continuations are capped at three consecutive attempts and the budget resets on genuine user input. Use OpenCode's native `question` tool when user feedback or a decision is required; question and permission interactions wait inside the active run rather than producing an idle completion.
+- **No Silent Early Exit:** When an owning session becomes `session.idle` with unfinished native todos, the guard asynchronously asks OpenCode to resume the existing run. This enforces the session's existing lifecycle state: Workflow Guard does not choose the next task, reorder work, create work, or delegate it. Automatic continuations are capped at three consecutive attempts and the budget resets on genuine user input. Use OpenCode's native `question` tool when user feedback or a decision is required; question and permission interactions wait inside the active run rather than producing an idle completion.
 - **Subagent Inheritance & Role Confinement:** Subagents automatically inherit active tasks from their parent session via the `parentID` hierarchy. Subagents spawned with read-only roles (`reviewer`, `planner`, `advisor`, `critic`, `explorer`, `scout`, `evaluator`) are hard-confined: file mutations, lifecycle tools, and mutating shell commands are strictly blocked.
 - **Handoff Safety:** An idle subagent whose effective todos are inherited from its parent is not auto-continued. Inherited work belongs to the parent and can be handed back normally.
-- **Durable Next-Work Discovery:** `guard_next_tasks` prefers a repository-root `TODO.md`; when it is absent, it reads conventional `ROADMAP.md`, `PLAN.md`, `TASKS.md`, `BACKLOG.md`, their `docs/` counterparts, and Markdown files under `docs/plans/`. These files are planning context only and never replace OpenCode's native runtime todo state.
+- **Durable Planning Context Discovery:** `guard_next_tasks` prefers a repository-root `TODO.md`; when it is absent, it reads conventional `ROADMAP.md`, `PLAN.md`, `TASKS.md`, `BACKLOG.md`, their `docs/` counterparts, and Markdown files under `docs/plans/`. The tool exposes candidate planning context without selecting, prioritizing, or sequencing tasks. These files never replace OpenCode's native runtime todo state.
 - **Subagent Mutation Budget:** Subagent sessions are protected by a mutation safety budget (`maxSubagentMutations` in project config or `WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS` env, default 100) to terminate runaway edit loops deterministically.
 - **Concurrent File Claims:** Direct `edit`, `write`, and `apply_patch` calls claim each canonical target for the tool-call lifetime. A different active session is blocked from racing the same file (including through symlink aliases); claims are released after the call, with session idle/deletion as stale-claim cleanup when an after hook is missed. Shell writers are not covered, and isolated worktrees remain preferred for substantial parallel mutations.
 - **Stale-Write Protection:** A successful `read` records a same-session fingerprint for an existing regular file using its canonical path, filesystem identity, size, nanosecond mtime, and SHA-256 content digest. Before `edit` or `write` replaces an existing file, that fingerprint must exist and still match; otherwise the call is blocked and must re-read. New-file creation is allowed without a prior read. Fingerprints are not inherited between parent/subagent sessions and are cleared on session idle/deletion. `apply_patch` and shell writers are deliberately outside this bounded mechanism; the pre-execution comparison also cannot make external changes between the check and OpenCode's write atomic.
@@ -103,14 +105,14 @@
 - Permission prompts are journaled at request time via the typed `permission.ask` plugin hook, and `permission.replied` outcomes (including rejections) are preserved instead of being labeled as allows.
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
-### 15. Compaction State & Focus Preservation
-- Integrates with OpenCode's `experimental.session.compacting` hook to inject the full active operational state into `output.context` before context summarization:
+### 15. Compaction State & Policy Context Preservation
+- Integrates with OpenCode's `experimental.session.compacting` hook to inject bounded active policy state into `output.context` before context summarization:
   - Active `todowrite` tasks with status badges and subagent hierarchy attribution.
   - Active Git branch name and protected branch status.
   - Test verification status (passed/failed, test command, and commit hash).
   - Secondary review verdicts (reviewer name and approval status).
   - Uncommitted mutation counts.
-- Ensures the model retains its operational context, security posture, and task roadmap across session compactions without hallucinations.
+- Preserves policy-relevant context across session compactions without assigning, prioritizing, or sequencing tasks for the model.
 
 ### 16. TUI Visual Feedback & Dynamic Last-Block Status
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.

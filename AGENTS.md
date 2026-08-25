@@ -1,7 +1,7 @@
 # Repository Guide
 
 ## Where Behavior Lives
-- `src/workflow-guard.ts` is the server plugin entrypoint and orchestrator: it imports policy modules from `src/policies/` and engine services from `src/lib/`, then re-exports the public helper surface for tests. Keep its default export in V1 `PluginModule` form: `{ id: "workflow-guard", server: WorkflowGuard }`. OpenCode 1.18+ can misinterpret a bare default plugin function when named helper exports are present.
+- `src/workflow-guard.ts` is the server plugin entrypoint and policy dispatcher: it imports policy modules from `src/policies/` and engine services from `src/lib/`, then re-exports the public helper surface for tests. Keep its default export in V1 `PluginModule` form: `{ id: "workflow-guard", server: WorkflowGuard }`. OpenCode 1.18+ can misinterpret a bare default plugin function when named helper exports are present.
 - `src/policies/` holds the per-policy implementations (`todo`, `continuation`, `planning`, `git`, `changelog`, `destructive`, `mcp`, `tamper`, `boundary`, `secrets`, `interpreter`, `docs`, `shell-safety` for Policies 22/23 + desktop notifications). Add new policies as new modules here, not inline in `workflow-guard.ts`.
 - `src/lib/` holds shared engine services: `state` (runtime state + AsyncLocalStorage), `utils`, `audit` (incl. durable verify cache), `verify`, `review`, `worktree`, `types`. Policy modules must read runtime context via these getters, never module-level captures.
 - `src/workflow-guard-ui.ts` is the optional TUI companion; it is installed separately from the server plugin.
