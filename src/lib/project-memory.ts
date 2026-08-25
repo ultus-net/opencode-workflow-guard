@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 import type { ProjectMemoryInput, ProjectMemoryKind, ProjectMemoryRecord, ProjectMemorySource, ReviewFollowup, ReviewFollowupInput } from "./types.ts";
 
@@ -43,6 +43,24 @@ export function isProjectMemoryFresh(memory: ProjectMemoryRecord, root: string):
 	if (result.status !== 0) return false;
 	const untracked = spawnSync("git", ["-C", root, "ls-files", "--others", "--exclude-standard", "--", ...memory.paths], { encoding: "utf8", timeout: 2_000 });
 	return untracked.status === 0 && !untracked.stdout.trim();
+}
+
+function execGit(root: string, args: string[]): Promise<{ status: number; stdout: string }> {
+	return new Promise((resolve) => {
+		execFile("git", ["-C", root, ...args], { encoding: "utf8", timeout: 2_000 }, (error, stdout) => {
+			resolve({ status: error ? (typeof error.code === "number" ? error.code : -1) : 0, stdout });
+		});
+	});
+}
+
+export async function isProjectMemoryFreshAsync(memory: ProjectMemoryRecord, root: string): Promise<boolean> {
+	if (!memory.commit || memory.paths.length === 0) return true;
+	if (!/^[0-9a-f]{7,64}$/i.test(memory.commit)) return false;
+	const [diff, untracked] = await Promise.all([
+		execGit(root, ["diff", "--quiet", memory.commit, "--", ...memory.paths]),
+		execGit(root, ["ls-files", "--others", "--exclude-standard", "--", ...memory.paths]),
+	]);
+	return diff.status === 0 && untracked.status === 0 && !untracked.stdout.trim();
 }
 
 export function openProjectMemory(projectId: string, directory = getProjectMemoryDir()): ProjectMemoryStore {

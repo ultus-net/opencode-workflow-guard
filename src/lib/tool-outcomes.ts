@@ -21,8 +21,11 @@ export interface ToolOutcome {
 	repeatedFailureCount?: number;
 }
 
+const MAX_TRACKED_CALLS = 4096;
+
 export class ToolOutcomeTracker {
 	private readonly terminalCalls = new Map<string, Set<string>>();
+	private readonly fallbackCalls = new Map<string, Set<string>>();
 	private readonly failures = new Map<string, { signature: string; count: number }>();
 
 	record(part: ToolOutcomePart): ToolOutcome | undefined {
@@ -35,7 +38,13 @@ export class ToolOutcomeTracker {
 			this.terminalCalls.set(part.sessionID, terminalCalls);
 		}
 		if (terminalCalls.has(part.callID)) return undefined;
+		const fallbackCalls = this.fallbackCalls.get(part.sessionID);
+		if (fallbackCalls?.delete(part.callID) && status === "completed") {
+			terminalCalls.add(part.callID);
+			return undefined;
+		}
 		terminalCalls.add(part.callID);
+		if (terminalCalls.size > MAX_TRACKED_CALLS) terminalCalls.delete(terminalCalls.values().next().value!);
 
 		const start = part.state?.time?.start;
 		const end = part.state?.time?.end;
@@ -53,8 +62,21 @@ export class ToolOutcomeTracker {
 		return { sessionID: part.sessionID, callID: part.callID, tool: part.tool, status, durationMs, repeatedFailureCount: count };
 	}
 
+	recordFallbackCompleted(sessionID: string, callID: string, tool: string, durationMs?: number): ToolOutcome | undefined {
+		if (this.terminalCalls.get(sessionID)?.has(callID) || this.fallbackCalls.get(sessionID)?.has(callID)) return undefined;
+		let fallbackCalls = this.fallbackCalls.get(sessionID);
+		if (!fallbackCalls) {
+			fallbackCalls = new Set();
+			this.fallbackCalls.set(sessionID, fallbackCalls);
+		}
+		fallbackCalls.add(callID);
+		if (fallbackCalls.size > MAX_TRACKED_CALLS) fallbackCalls.delete(fallbackCalls.values().next().value!);
+		return { sessionID, callID, tool, status: "completed", durationMs };
+	}
+
 	clearSession(sessionID: string): void {
 		this.failures.delete(sessionID);
 		this.terminalCalls.delete(sessionID);
+		this.fallbackCalls.delete(sessionID);
 	}
 }

@@ -1,5 +1,5 @@
 import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type { PluginModule } from "@opencode-ai/plugin";
@@ -84,6 +84,7 @@ import {
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
 import { audit } from "../src/lib/audit.ts";
+import { isProjectMemoryFreshAsync } from "../src/lib/project-memory.ts";
 import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
@@ -946,6 +947,42 @@ check(
 );
 for (let i = 0; i < 5; i++) audit({ ts: new Date().toISOString(), tool: "retention-probe", decision: "allow", reason: "x".repeat(1024 * 1024) });
 check("audit trail compacts after exceeding retention cap", statSync(getAuditFilePath()).size < 4 * 1024 * 1024);
+const concurrentAuditState = mkdtempSync(join(tmpdir(), "workflow-guard-audit-"));
+const previousStateHome = process.env.XDG_STATE_HOME;
+process.env.XDG_STATE_HOME = concurrentAuditState;
+const isolatedAudit = await import(`../src/lib/audit.ts?concurrency=${Date.now()}`);
+const isolatedAuditPath = isolatedAudit.getAuditFilePath();
+mkdirSync(join(concurrentAuditState, "opencode", "workflow-guard"), { recursive: true });
+writeFileSync(isolatedAuditPath, `${"x\n".repeat(2 * 1024 * 1024)}`);
+const concurrentWriters = Array.from({ length: 4 }, (_, index) => new Promise<void>((resolveWriter, rejectWriter) => {
+	const child = spawn(process.execPath, ["--input-type=module", "--eval", `import { audit } from ${JSON.stringify(new URL("../src/lib/audit.ts", import.meta.url).href)}; audit({ ts: new Date().toISOString(), tool: "concurrent-${index}", decision: "allow" });`], {
+		env: { ...process.env, XDG_STATE_HOME: concurrentAuditState },
+		stdio: "ignore",
+	});
+	child.once("error", rejectWriter);
+	child.once("exit", (code) => code === 0 ? resolveWriter() : rejectWriter(new Error(`Concurrent audit writer exited ${code}`)));
+}));
+await Promise.all(concurrentWriters);
+const concurrentEntries = readFileSync(isolatedAuditPath, "utf8");
+check("concurrent audit rotation preserves every serialized writer", Array.from({ length: 4 }, (_, index) => concurrentEntries.includes(`\"tool\":\"concurrent-${index}\"`)).every(Boolean));
+const lockHolder = spawn(process.execPath, ["--input-type=module", "--eval", `import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(${JSON.stringify(`${isolatedAuditPath}.lock.sqlite`)}); db.exec("BEGIN IMMEDIATE"); setTimeout(() => { db.exec("COMMIT"); db.close(); }, 100);`], { stdio: "ignore" });
+await new Promise((resolve) => setTimeout(resolve, 25));
+isolatedAudit.audit({ ts: new Date().toISOString(), tool: "contended-lock-write", decision: "allow" });
+await new Promise<void>((resolveWriter, rejectWriter) => {
+	lockHolder.once("error", rejectWriter);
+	lockHolder.once("exit", (code) => code === 0 ? resolveWriter() : rejectWriter(new Error(`Contention lock holder exited ${code}`)));
+});
+check("audit writer preserves writes across ordinary lock contention", readFileSync(isolatedAuditPath, "utf8").includes("contended-lock-write"));
+await new Promise<void>((resolveWriter, rejectWriter) => {
+	const child = spawn(process.execPath, ["--input-type=module", "--eval", `import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(${JSON.stringify(`${isolatedAuditPath}.lock.sqlite`)}); db.exec("BEGIN IMMEDIATE"); process.exit(0);`], { stdio: "ignore" });
+	child.once("error", rejectWriter);
+	child.once("exit", (code) => code === 0 ? resolveWriter() : rejectWriter(new Error(`Lock-crash probe exited ${code}`)));
+});
+isolatedAudit.audit({ ts: new Date().toISOString(), tool: "stale-lock-recovery", decision: "allow" });
+check("audit writer recovers after a lock-owning process exits", readFileSync(isolatedAuditPath, "utf8").includes("stale-lock-recovery"));
+if (previousStateHome === undefined) delete process.env.XDG_STATE_HOME;
+else process.env.XDG_STATE_HOME = previousStateHome;
+rmSync(concurrentAuditState, { recursive: true, force: true });
 
 // ── New: secret-content scan ──
 console.log("- Secret-content scan -");
@@ -988,17 +1025,27 @@ const toolOutcomeAudit = getRecentAuditEntries(20).slice(0, 5);
 check("tool-part events record explicit completed outcomes", toolOutcomeAudit.some((entry) => entry.callID === "outcome-ok" && entry.phase === "outcome" && entry.reason === "completed"));
 check("tool-part events record explicit error outcomes without raw errors", toolOutcomeAudit.some((entry) => entry.callID === "outcome-fail-1" && entry.phase === "outcome" && entry.reason === "error" && !JSON.stringify(entry).includes("connection refused")));
 check("third equivalent tool failure records retry-loop recovery feedback", toolOutcomeAudit.some((entry) => entry.callID === "outcome-fail-3" && entry.reason === "repeated-equivalent-failure:3"));
+if (typeof cmdEvt["tool.execute.after"] === "function") {
+	await cmdEvt["tool.execute.after"]({ sessionID: "s-outcome", callID: "after-only-outcome", tool: "bash" } as any, { output: "" } as any);
+}
+if (typeof cmdEvt.event === "function") {
+	await cmdEvt.event({ event: { type: "message.part.updated", properties: { part: { id: "part-after-only-outcome", messageID: "message-outcome", type: "tool", sessionID: "s-outcome", callID: "after-only-outcome", tool: "bash", state: { status: "completed", input: {}, output: "", title: "bash", metadata: {}, time: { start: 1, end: 2 } } } } } });
+}
+check("tool.execute.after provides deduplicated fallback outcome telemetry", getRecentAuditEntries(10).filter((entry) => entry.callID === "after-only-outcome" && entry.phase === "outcome").length === 1);
 
 const outcomeTracker = new ToolOutcomeTracker();
 const failedPart = (callID: string, error: string) => ({ type: "tool", sessionID: "s-tracker", callID, tool: "bash", state: { status: "error", error } } as const);
 check("duplicate terminal tool updates are ignored", !!outcomeTracker.record(failedPart("duplicate", "same failure")) && outcomeTracker.record(failedPart("duplicate", "same failure")) === undefined);
+check("authoritative errors supersede after-hook fallback completion", !!outcomeTracker.recordFallbackCompleted("s-tracker-fallback", "fallback-error", "bash") && outcomeTracker.record({ ...failedPart("fallback-error", "late failure"), sessionID: "s-tracker-fallback" })?.status === "error");
 outcomeTracker.record({ type: "tool", sessionID: "s-tracker", callID: "success", tool: "bash", state: { status: "completed" } });
 check("successful tool outcomes reset equivalent failure tracking", outcomeTracker.record(failedPart("after-success", "same failure"))?.repeatedFailureCount === 1);
 outcomeTracker.record(failedPart("different", "different failure"));
 check("distinct failures reset equivalent failure tracking", outcomeTracker.record(failedPart("after-different", "same failure"))?.repeatedFailureCount === 1);
 const boundedTracker = new ToolOutcomeTracker();
-for (let i = 0; i <= 1024; i++) boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: `call-${i}`, tool: "bash", state: { status: "completed" } });
-check("terminal call deduplication remains stable for long sessions", boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: "call-0", tool: "bash", state: { status: "completed" } }) === undefined);
+for (let i = 0; i < 4096; i++) boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: `call-${i}`, tool: "bash", state: { status: "completed" } });
+check("terminal call deduplication remains stable within its bounded window", boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: "call-0", tool: "bash", state: { status: "completed" } }) === undefined);
+for (let i = 0; i <= 4096; i++) boundedTracker.recordFallbackCompleted("s-fallback-bounded", `fallback-${i}`, "bash");
+check("fallback call deduplication evicts old calls from its bounded window", boundedTracker.recordFallbackCompleted("s-fallback-bounded", "fallback-0", "bash")?.status === "completed");
 check("invalid tool timing is omitted", new ToolOutcomeTracker().record({ type: "tool", sessionID: "s-timing", callID: "timing", tool: "bash", state: { status: "completed", time: { start: Number.NaN, end: Number.POSITIVE_INFINITY } } })?.durationMs === undefined);
 
 // TUI companion plugin registers prompt status indicator slots
@@ -2005,6 +2052,12 @@ check("durable verification history is private", (statSync(getVerifyHistoryFileP
 writeFileSync(getVerifyHistoryFilePath(), JSON.stringify({ ...testVerifyCache, command: "legacy secret command", output: "legacy secret output" }) + "\n");
 recordVerifyResult("replacement command", { passed: false, output: "replacement output" }, "s-history-migration");
 check("durable verification history discards legacy raw payloads", !readFileSync(getVerifyHistoryFilePath(), "utf8").includes("legacy secret"));
+writeFileSync(getVerifyHistoryFilePath(), JSON.stringify({ ...testVerifyCache, command: "sha256:legacy secret command", output: "sha256:legacy secret output" }) + "\n");
+recordVerifyResult("prefixed replacement command", { passed: false, output: "prefixed replacement output" }, "s-history-prefixed-migration");
+check("durable verification history rejects malformed digest prefixes", !readFileSync(getVerifyHistoryFilePath(), "utf8").includes("legacy secret"));
+writeFileSync(getVerifyHistoryFilePath(), JSON.stringify({ ...testVerifyCache, command: "later legacy command", output: "later legacy output" }) + "\n");
+recordVerifyResult("second replacement command", { passed: false, output: "second replacement output" }, "s-history-remigration");
+check("durable verification history revalidates externally replaced files", !readFileSync(getVerifyHistoryFilePath(), "utf8").includes("later legacy"));
 check("failed verification history does not replace passing cache", loadVerifyCache()?.passed === true);
 
 // Durable verification evidence is workspace-bound: a passing run from
@@ -2911,10 +2964,13 @@ const freshnessCommit = spawnSync("git", ["rev-parse", "HEAD"], { cwd: freshness
 const freshnessMemory = { ...portableConstraint, commit: freshnessCommit, paths: ["tracked.txt"] };
 check("project memory identity is stable for the same repository", getProjectMemoryIdentity(freshnessRoot) === getProjectMemoryIdentity(freshnessRoot));
 check("project memory starts fresh at its recorded commit", isProjectMemoryFresh(freshnessMemory, freshnessRoot));
+check("async project memory freshness matches fresh repository state", await isProjectMemoryFreshAsync(freshnessMemory, freshnessRoot));
 writeFileSync(join(freshnessRoot, "untracked.txt"), "untracked\n");
 check("untracked referenced paths make project memory stale", !isProjectMemoryFresh({ ...freshnessMemory, paths: ["untracked.txt"] }, freshnessRoot));
+check("async project memory freshness detects untracked referenced paths", !await isProjectMemoryFreshAsync({ ...freshnessMemory, paths: ["untracked.txt"] }, freshnessRoot));
 writeFileSync(join(freshnessRoot, "tracked.txt"), "unstaged change\n");
 check("unstaged path changes make project memory stale", !isProjectMemoryFresh(freshnessMemory, freshnessRoot));
+check("async project memory freshness detects tracked changes", !await isProjectMemoryFreshAsync(freshnessMemory, freshnessRoot));
 spawnSync("git", ["add", "tracked.txt"], { cwd: freshnessRoot });
 check("staged path changes make project memory stale", !isProjectMemoryFresh(freshnessMemory, freshnessRoot));
 check("project memory installs clone-local portable-memory exclusion", ensureProjectMemoryExcluded(freshnessRoot) && readFileSync(join(freshnessRoot, ".git", "info", "exclude"), "utf8").includes(".opencode/memory/"));
