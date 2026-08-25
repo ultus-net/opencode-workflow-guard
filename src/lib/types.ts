@@ -63,8 +63,11 @@ export interface ReviewResult {
 export interface AuditEntry {
 	ts: string;
 	sessionID?: string;
+	callID?: string;
 	tool: string;
 	decision: "allow" | "block";
+	phase?: "decision" | "outcome" | "event";
+	durationMs?: number;
 	reason?: string;
 	input?: unknown;
 	evidence?: {
@@ -147,4 +150,29 @@ export interface ProjectMemoryInput {
 	commit?: string;
 	paths?: string[];
 	supersedes?: string;
+}
+
+export type ReviewFollowupSeverity = "P2" | "P3";
+
+export interface ReviewFollowup {
+	id: string;
+	projectId: string;
+	severity: ReviewFollowupSeverity;
+	summary: string;
+	reviewer: string;
+	createdAt: number;
+	resolvedAt?: number;
+	sessionID?: string;
+	commit?: string;
+	paths: string[];
+	status: "open" | "resolved";
+}
+
+export interface ReviewFollowupInput {
+	severity: ReviewFollowupSeverity;
+	summary: string;
+	reviewer: string;
+	sessionID?: string;
+	commit?: string;
+	paths?: string[];
 }

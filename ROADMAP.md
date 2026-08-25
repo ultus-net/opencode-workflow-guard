@@ -12,11 +12,10 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Targeted Post-Edit Validation
 
-- Add an optional project configuration for file-scoped validators, pairing path patterns with deterministic commands (for example, Python files with Ruff or TypeScript files with a focused typecheck).
-- Run matching validators through `tool.execute.after` when a before/after filesystem digest proves the targeted file changed, so local breakage is reported immediately rather than waiting for final verification. Do not claim success-only semantics while the installed hook API lacks a success discriminator.
-- Keep the existing finalization verifier authoritative; post-edit validation is fast feedback, not a replacement for fresh whole-project verification.
-- Define explicit timeout, output-limit, credential-scrubbing, and failure semantics before implementation. Do not infer validators from language or globally install tools.
-- Add adversarial tests for path matching, filenames containing shell metacharacters, validator failures/timeouts, and concurrent parent/subagent mutations.
+- Implemented: configured file-scoped validators run after a digest proves a direct edit changed the target, with bounded execution and adversarial path/concurrency coverage. Final whole-project verification remains authoritative.
+- Project configuration pairs file patterns with explicit deterministic validator commands rather than inferring language tools or installing them globally.
+- Matching validators run through `tool.execute.after` when before/after filesystem digests prove the targeted file changed, providing fast feedback without replacing final verification.
+- Timeout, output-limit, credential-scrubbing, failure, path-matching, shell-metacharacter, and concurrent-mutation behavior has regression coverage.
 
 ## Concurrent File Claims
 
@@ -34,11 +33,22 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Durable Recovery Checkpoints
 
-- Evaluate opt-in workspace checkpoints before genuine root-session user runs so agent changes can be rolled back independently of verification evidence or worktree cleanup.
-- Use Cline's checkpoint implementation as the reference model: preserve untracked files, keep checkpoint objects reachable without polluting the user's stash list, exclude subagents, and avoid replacing the original checkpoint when a run resumes or continues synthetically.
-- Prove hook ordering and concurrent-session behavior before implementation. OpenCode 1.18.21 has no direct equivalent of Cline's `beforeRun`, so a `chat.message`-based approximation must not be described as a pre-run snapshot until its timing is demonstrated.
-- Make restoration provenance- and interference-sensitive. Aider's `/undo` refuses commits not created by Aider in the current chat, merge commits, files with intervening uncommitted changes, and the case where local HEAD equals the current `origin/<branch>` tip; checkpoint recovery should likewise avoid overwriting later user/agent work merely because a snapshot exists.
-- Keep checkpoints recovery-only; they must not make destructive operations permissible or weaken the existing workspace, Git, verification, and review gates.
+- Implemented: opt-in root-session recovery checkpoints use private reachable Git objects, preserve untracked/staged state, and refuse restoration when session or workspace interference makes recovery unsafe.
+- Checkpoints are created only for genuine root-session user runs; subagents and synthetic continuation messages do not replace the run checkpoint.
+- Private reachable Git objects preserve tracked, staged, and untracked state without polluting the user's stash list.
+- Restoration is provenance- and interference-sensitive and remains recovery-only; it does not weaken workspace, Git, verification, or review gates.
+
+### Recovery Follow-up
+
+- P2: surface a secondary rollback failure from checkpoint restoration and add fault-injection coverage for that path. The recovery ref is retained today, so the issue is diagnosability rather than known data loss. Keep this item open until the failure is surfaced and the regression test passes.
+
+## Local Operational Telemetry
+
+- Implemented: audit decisions are durable local JSONL records, and completed after-hook observations carry session/call correlation and execution duration. Raw command and patch bodies are not persisted; they are represented by byte count and SHA-256 fingerprint so repeated inputs can be correlated without retaining credentials or source payloads.
+- Implemented: P2/P3 review findings are durable per-project local SQLite follow-ups with explicit open/resolved state and are surfaced to agents during context compaction. Review summaries containing P2/P3 findings are recorded automatically when the secondary review is accepted.
+- Add bounded retention/rotation for audit JSONL and recovery checkpoint metadata so long-lived installations do not grow indefinitely.
+- Add durable verification-result history, including failed runs, rather than retaining only the latest passing cache entry.
+- Evaluate supported tool-result/failure lifecycle signals in future OpenCode APIs so success and failure can be correlated with the existing decision/after-hook records. The current `tool.execute.after` API has no success discriminator, so telemetry deliberately does not label these observations as successes.
 
 ## Repeated Tool-Failure Detection
 

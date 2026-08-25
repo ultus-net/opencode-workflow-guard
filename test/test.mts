@@ -28,6 +28,8 @@ import {
 	generateMaskedEnvSchema,
 	getAuditFilePath,
 	getRecentAuditEntries,
+	summarizeInput,
+	extractReviewFollowups,
 	buildReviewRubric,
 	recordReviewResult,
 	getLastReviewResult,
@@ -64,6 +66,9 @@ import {
 	openProjectMemory,
 	recordProjectMemory,
 	searchProjectMemory,
+	recordReviewFollowup,
+	listReviewFollowups,
+	resolveReviewFollowup,
 	exportProjectKnowledge,
 	importProjectKnowledge,
 	getProjectMemoryIdentity,
@@ -899,6 +904,11 @@ if (typeof pluginWithToast.event === "function") {
 check("event hook emits no intrusive startup toast", toasts.length === 0);
 
 // ── New: audit trail ──
+const privateAuditCommand = "deploy --credential SHOULD_NOT_BE_PERSISTED --target staging";
+const privateSummary = summarizeInput({ command: privateAuditCommand }) as { command?: { bytes?: number; sha256?: string } };
+check("audit summaries fingerprint commands without persisting their contents", privateSummary.command?.bytes === Buffer.byteLength(privateAuditCommand) && privateSummary.command?.sha256?.length === 64 && !JSON.stringify(privateSummary).includes("SHOULD_NOT_BE_PERSISTED"));
+const extractedFollowups = extractReviewFollowups("Test Integrity: covered\n- P2: first issue\n- P3 second issue\nSecurity: safe");
+check("review summaries extract independently resolvable P2/P3 findings", extractedFollowups.length === 2 && extractedFollowups[0]?.severity === "P2" && extractedFollowups[1]?.summary === "- P3 second issue");
 console.log("- Audit trail -");
 const auditPath = getAuditFilePath();
 const auditSizeBefore = existsSync(auditPath) ? readFileSync(auditPath, "utf8").length : 0;
@@ -1613,6 +1623,18 @@ const reviewToolResult = await customPlugin.tool?.record_review?.execute(
 	{ sessionID: "s-reviewer-tool", agent: "reviewer", worktree: root, directory: root } as any,
 );
 check("record_review tool execution succeeds", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+
+fakeParents.set("s-reviewer-followups", "s-active");
+await customPlugin.tool?.record_review?.execute(
+	{
+		reviewer: "subagent-followups",
+		summary: "Test integrity: covered. Task completeness: done. Cleanliness: clean. Security: safe. Platform: compatible.\nP2: first durable issue\nP3: second durable issue",
+		passed: true,
+	},
+	{ sessionID: "s-reviewer-followups", agent: "reviewer", worktree: root, directory: root } as any,
+);
+const durableReviewFollowups = JSON.parse(String(await customPlugin.tool?.guard_review_followups?.execute({}, {} as any))) as Array<{ severity?: string; summary?: string }>;
+check("record_review persists multiple P2/P3 findings independently", durableReviewFollowups.some((item) => item.severity === "P2" && item.summary?.includes("first durable issue")) && durableReviewFollowups.some((item) => item.severity === "P3" && item.summary?.includes("second durable issue")));
 
 // Rubric enforcement: summaries that skip the axes are rejected
 fakeParents.set("s-reviewer-thin", "s-active");
@@ -2708,6 +2730,16 @@ const decision = recordProjectMemory(memoryDb, {
 	commit: "abc1234",
 });
 check("project memory persists provenance in SQLite", searchProjectMemory(memoryDb, "SQLite authoritative", 5)[0]?.sessionID === "s-memory");
+const followup = recordReviewFollowup(memoryDb, {
+	severity: "P2",
+	summary: "Surface rollback failures and add fault-injection coverage.",
+	reviewer: "independent-full-branch-review",
+	sessionID: "s-memory",
+	commit: "abc1234",
+	paths: ["src/lib/checkpoint.ts"],
+}, "checkpoint-rollback-observability");
+check("review follow-ups persist as open local project debt", listReviewFollowups(memoryDb)[0]?.id === followup.id);
+check("review follow-ups resolve explicitly", resolveReviewFollowup(memoryDb, followup.id) && listReviewFollowups(memoryDb).length === 0 && listReviewFollowups(memoryDb, "resolved")[0]?.resolvedAt !== undefined);
 recordProjectMemory(memoryDb, {
 	kind: "decision",
 	content: "Use SQLite FTS5 for deterministic local memory retrieval.",

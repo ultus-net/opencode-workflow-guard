@@ -1,4 +1,5 @@
 import { appendFileSync, existsSync, mkdirSync, openSync, readSync, closeSync, statSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { AuditEntry, VerifyResult } from "./types.ts";
@@ -96,15 +97,17 @@ export function audit(entry: AuditEntry): void {
 export function logDecision(
 	tool: string,
 	input: unknown,
-	context: { sessionID?: string } | undefined,
+	context: { sessionID?: string; callID?: string } | undefined,
 	reason: string | undefined,
 	evidence?: AuditEntry["evidence"],
 ): void {
 	audit({
 		ts: new Date().toISOString(),
 		sessionID: context?.sessionID,
+		callID: context?.callID,
 		tool,
 		decision: reason ? "block" : "allow",
+		phase: "decision",
 		reason,
 		input: summarizeInput(input),
 		evidence,
@@ -113,7 +116,7 @@ export function logDecision(
 
 export function summarizeInput(input: unknown): unknown {
 	const record = asRecord(input);
-	if (!record) return typeof input === "string" ? input.slice(0, 200) : input;
+	if (!record) return typeof input === "string" ? summarizeSensitiveText(input) : input;
 	if (typeof record.response === "string") {
 		return {
 			sessionID: record.sessionID,
@@ -121,9 +124,16 @@ export function summarizeInput(input: unknown): unknown {
 			response: record.response,
 		};
 	}
-	if (typeof record.command === "string") return { command: record.command.slice(0, 200) };
+	if (typeof record.command === "string") return { command: summarizeSensitiveText(record.command) };
 	if (typeof record.filePath === "string") return { filePath: record.filePath };
 	if (typeof record.path === "string") return { path: record.path };
-	if (typeof record.patchText === "string") return { patchText: record.patchText.slice(0, 200) };
+	if (typeof record.patchText === "string") return { patchText: summarizeSensitiveText(record.patchText) };
 	return { keys: Object.keys(record) };
+}
+
+function summarizeSensitiveText(value: string): { bytes: number; sha256: string } {
+	return {
+		bytes: Buffer.byteLength(value, "utf8"),
+		sha256: createHash("sha256").update(value).digest("hex"),
+	};
 }
