@@ -20,9 +20,9 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Concurrent File Claims
 
-- Evaluate lightweight per-workspace file claims to detect two active sessions or subagents editing the same file concurrently.
-- Reuse local workflow-guard state rather than requiring an external coordination database.
-- Define claim lifetime and stale-claim cleanup before deciding whether conflicts should warn or block.
+- Implemented: lightweight process-local file claims detect two active sessions or subagents editing the same canonical file concurrently.
+- Claims reuse workflow-guard process state rather than requiring an external coordination database.
+- Direct edit/write/apply_patch claims block conflicting sessions for the tool-call lifetime and are released after the call. Session idle/deletion provides stale-claim cleanup when a call's after hook is missed. Shell writers remain outside this bounded claim mechanism.
 - Keep worktree isolation as the preferred mechanism for substantial parallel mutations.
 
 ## Stale-Write Protection

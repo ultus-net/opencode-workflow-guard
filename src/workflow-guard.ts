@@ -15,6 +15,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { join } from "node:path";
 import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
+import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -338,7 +339,7 @@ export function isReadOnlyRole(agent?: string): boolean {
 async function guardToolCallImpl(
 	toolName: string,
 	input: unknown,
-	context?: { sessionID?: string; worktree?: string; directory?: string; agent?: string },
+	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
 ): Promise<string | undefined> {
 	const currentRoot = getWorkspaceRoot();
 
@@ -608,6 +609,13 @@ async function guardToolCallImpl(
 					logBlock(`[workflow-guard] ${reason}`);
 					return reason;
 				}
+			}
+		}
+		if (context?.sessionID && context.callID) {
+			const claimReason = claimFiles(editTargets(input, currentRoot), context.sessionID, context.callID);
+			if (claimReason) {
+				logBlock(`[workflow-guard] ${claimReason}`);
+				return claimReason;
 			}
 		}
 		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
@@ -976,7 +984,7 @@ async function guardToolCallImpl(
 export async function guardToolCall(
 	toolName: string,
 	input: unknown,
-	context?: { sessionID?: string; worktree?: string; directory?: string; agent?: string },
+	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
 ): Promise<string | undefined> {
 	const customRoot = context?.worktree || context?.directory;
 	const runImpl = () => guardToolCallImpl(toolName, input, context);
@@ -1438,6 +1446,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					(input as { args?: unknown }).args;
 				const reason = await guardToolCall(input.tool, args, {
 					sessionID: input.sessionID,
+					callID: input.callID,
 					worktree: toolWorktree,
 					agent: toolAgent,
 				});
@@ -1453,6 +1462,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		},
 
 		"tool.execute.after": async (input, output) => {
+			releaseFileClaims(input.sessionID, input.callID);
 			const key = postEditKey(input.sessionID, input.callID);
 			const pending = pendingPostEditSnapshots.get(key);
 			pendingPostEditSnapshots.delete(key);
@@ -1617,6 +1627,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			if (event?.type === "session.idle") {
 				const sessionID = (event.properties as { sessionID?: unknown })?.sessionID;
 				if (typeof sessionID === "string") {
+					releaseFileClaims(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
 				}
 			}
@@ -1631,6 +1642,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			if (event?.type === "session.deleted") {
 				const sessionID = (event.properties as { info?: { id?: unknown } })?.info?.id;
 				if (typeof sessionID === "string") {
+					releaseFileClaims(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}
 			}

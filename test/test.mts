@@ -568,6 +568,88 @@ try {
 }
 check("hook passes allowed call through", noThrow);
 
+// Concurrent direct edits claim canonical file paths for the duration of a
+// tool call. A second session must not race the same file, including through a
+// symlink alias, while unrelated files remain independent.
+const claimsDir = mkdtempSync(join(tmpdir(), "wg-claims-"));
+writeFileSync(join(claimsDir, "shared.ts"), "before");
+writeFileSync(join(claimsDir, "other.ts"), "before");
+symlinkSync(join(claimsDir, "shared.ts"), join(claimsDir, "shared-link.ts"));
+symlinkSync(join(claimsDir, "future.ts"), join(claimsDir, "future-link.ts"));
+const claimsHooks = await pluginFn({
+	directory: claimsDir,
+	client: fakeClient as any,
+	project: {} as any,
+	worktree: claimsDir,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+todo("s-claim-a", item("edit shared file", "in_progress"));
+todo("s-claim-b", item("edit shared file", "in_progress"));
+const claimsBefore = claimsHooks["tool.execute.before"];
+const claimsAfter = claimsHooks["tool.execute.after"];
+await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-a" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "a" } });
+let claimConflict = false;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-b" }, { args: { filePath: join(claimsDir, "shared-link.ts"), content: "b" } });
+} catch (error) {
+	claimConflict = String(error).includes("claimed by another active session");
+}
+check("concurrent file claims block another session through a symlink alias", claimConflict);
+let unrelatedAllowed = true;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-other" }, { args: { filePath: join(claimsDir, "other.ts"), content: "b" } });
+} catch {
+	unrelatedAllowed = false;
+}
+check("concurrent file claims do not block unrelated files", unrelatedAllowed);
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-other", args: {} }, { title: "edit", output: "edited", metadata: {} });
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-a", args: {} }, { title: "edit", output: "edited", metadata: {} });
+let releasedAllowed = true;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-after-release" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "b" } });
+} catch {
+	releasedAllowed = false;
+}
+check("concurrent file claim releases after the owning tool call", releasedAllowed);
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-after-release", args: {} }, { title: "edit", output: "edited", metadata: {} });
+
+await claimsBefore?.({ tool: "write", sessionID: "s-claim-a", callID: "claim-dangling" }, { args: { filePath: join(claimsDir, "future.ts"), content: "a" } });
+let danglingConflict = false;
+try {
+	await claimsBefore?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-dangling-alias" }, { args: { filePath: join(claimsDir, "future-link.ts"), content: "b" } });
+} catch (error) {
+	danglingConflict = String(error).includes("claimed by another active session");
+}
+check("concurrent file claims canonicalize dangling final symlinks", danglingConflict);
+await claimsHooks.event?.({ event: { type: "session.idle", properties: { sessionID: "s-claim-a" } } } as any);
+let idleCleanupAllowed = true;
+try {
+	await claimsBefore?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-after-idle" }, { args: { filePath: join(claimsDir, "future.ts"), content: "b" } });
+} catch {
+	idleCleanupAllowed = false;
+}
+check("session idle clears stale direct-edit claims", idleCleanupAllowed);
+await claimsAfter?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-after-idle", args: {} }, { title: "write", output: "written", metadata: {} });
+
+await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-patch-owner" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "a" } });
+let patchConflict = false;
+try {
+	await claimsBefore?.({ tool: "apply_patch", sessionID: "s-claim-b", callID: "claim-patch" }, { args: { patchText: "*** Begin Patch\n*** Update File: other.ts\n-old\n+new\n*** Update File: shared.ts\n-old\n+new\n*** End Patch" } });
+} catch (error) {
+	patchConflict = String(error).includes("claimed by another active session");
+}
+check("apply_patch claims all targets atomically when one target conflicts", patchConflict);
+todo("s-claim-c", item("edit unclaimed file", "in_progress"));
+let partialPatchClaim = false;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-c", callID: "claim-patch-other" }, { args: { filePath: join(claimsDir, "other.ts"), content: "c" } });
+} catch {
+	partialPatchClaim = true;
+}
+check("blocked multi-target patch leaves no partial claims", !partialPatchClaim);
+
 // Targeted post-edit validation runs only after a matching mutation actually
 // changes the file. Validator commands never receive the filename as shell text.
 const validatorDir = mkdtempSync(join(tmpdir(), "wg-validator-"));

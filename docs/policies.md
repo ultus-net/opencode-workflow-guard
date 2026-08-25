@@ -15,6 +15,7 @@
 - **Handoff Safety:** An idle subagent whose effective todos are inherited from its parent is not auto-continued. Inherited work belongs to the parent and can be handed back normally.
 - **Durable Next-Work Discovery:** `guard_next_tasks` prefers a repository-root `TODO.md`; when it is absent, it reads conventional `ROADMAP.md`, `PLAN.md`, `TASKS.md`, `BACKLOG.md`, their `docs/` counterparts, and Markdown files under `docs/plans/`. These files are planning context only and never replace OpenCode's native runtime todo state.
 - **Subagent Mutation Budget:** Subagent sessions are protected by a mutation safety budget (`maxSubagentMutations` in project config or `WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS` env, default 50) to terminate runaway edit loops deterministically.
+- **Concurrent File Claims:** Direct `edit`, `write`, and `apply_patch` calls claim each canonical target for the tool-call lifetime. A different active session is blocked from racing the same file (including through symlink aliases); claims are released after the call, with session idle/deletion as stale-claim cleanup when an after hook is missed. Shell writers are not covered, and isolated worktrees remain preferred for substantial parallel mutations.
 
 ### 2. No Pushes to Protected Branches
 - `git push ... main` and `git push ... master` are blocked in all shell commands, including direct refs, refspecs (`git push origin HEAD:main`, `git push origin feature/x:main`), deletion refspecs (`git push origin :main`), and forced refspecs (`git push origin +main`).
