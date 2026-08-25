@@ -54,12 +54,24 @@ function metadataPath(workspace: string): string {
 	return join(gitDir(workspace), "workflow-guard", "recovery-checkpoints.json");
 }
 
+function isRecoveryCheckpoint(value: unknown): value is RecoveryCheckpoint {
+	if (!value || typeof value !== "object") return false;
+	const entry = value as Record<string, unknown>;
+	return typeof entry.sessionID === "string"
+		&& Number.isInteger(entry.run) && (entry.run as number) >= 0
+		&& typeof entry.ref === "string" && entry.ref.length > 0
+		&& (entry.kind === "commit" || entry.kind === "stash")
+		&& typeof entry.createdAt === "number" && Number.isFinite(entry.createdAt)
+		&& (entry.endFingerprint === undefined || typeof entry.endFingerprint === "string")
+		&& (entry.endAt === undefined || (typeof entry.endAt === "number" && Number.isFinite(entry.endAt)));
+}
+
 function loadStore(workspace: string): CheckpointStore {
 	const path = metadataPath(workspace);
 	if (!existsSync(path)) return { workspace: resolve(workspace), checkpoints: [] };
 	try {
 		const value = JSON.parse(readFileSync(path, "utf8")) as CheckpointStore;
-		if (value.workspace === resolve(workspace) && Array.isArray(value.checkpoints)) return value;
+		if (value.workspace === resolve(workspace) && Array.isArray(value.checkpoints) && value.checkpoints.every(isRecoveryCheckpoint)) return value;
 	} catch {}
 	throw new Error("Recovery checkpoint metadata is corrupt; refusing to overwrite existing recovery information.");
 }

@@ -54,6 +54,18 @@ function appendBoundedJsonl(path: string, value: unknown, maxBytes: number, reta
 export function persistVerifyHistory(verifyData: NonNullable<VerifyResult>): void {
 	try {
 		mkdirSync(AUDIT_DIR, { recursive: true });
+		if (existsSync(VERIFY_HISTORY_FILE)) {
+			const legacy = readFileSync(VERIFY_HISTORY_FILE, "utf8").split("\n").some((line) => {
+				if (!line.trim()) return false;
+				try {
+					const value = JSON.parse(line) as { command?: unknown; output?: unknown };
+					return typeof value.command !== "string" || !value.command.startsWith("sha256:") || typeof value.output !== "string" || !value.output.startsWith("sha256:");
+				} catch {
+					return true;
+				}
+			});
+			if (legacy) writeFileSync(VERIFY_HISTORY_FILE, "", { encoding: "utf8", mode: 0o600 });
+		}
 		appendBoundedJsonl(VERIFY_HISTORY_FILE, {
 			...verifyData,
 			command: `sha256:${createHash("sha256").update(verifyData.command).digest("hex")}`,

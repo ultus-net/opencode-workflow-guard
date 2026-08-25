@@ -1924,6 +1924,9 @@ recordVerifyResult("npm test -- failing-history-probe", { passed: false, output:
 const failedHistory = getRecentVerifyHistory(5).find((entry) => entry.passed === false);
 check("durable verification history retains failed runs without raw command/output", failedHistory?.command.startsWith("sha256:") === true && failedHistory?.output.startsWith("sha256:") === true);
 check("durable verification history is private", (statSync(getVerifyHistoryFilePath()).mode & 0o777) === 0o600);
+writeFileSync(getVerifyHistoryFilePath(), JSON.stringify({ ...testVerifyCache, command: "legacy secret command", output: "legacy secret output" }) + "\n");
+recordVerifyResult("replacement command", { passed: false, output: "replacement output" }, "s-history-migration");
+check("durable verification history discards legacy raw payloads", !readFileSync(getVerifyHistoryFilePath(), "utf8").includes("legacy secret"));
 check("failed verification history does not replace passing cache", loadVerifyCache()?.passed === true);
 
 // Durable verification evidence is workspace-bound: a passing run from
@@ -2091,6 +2094,10 @@ writeFileSync(corruptCheckpointMetadata, "{corrupt");
 const corruptMetadataBefore = readFileSync(corruptCheckpointMetadata, "utf8");
 const checkpointWithCorruptMetadata = createRecoveryCheckpoint(cleanCheckpointDir, "corrupt-metadata-session", 1);
 check("recovery checkpoint refuses to overwrite corrupt metadata", !checkpointWithCorruptMetadata && readFileSync(corruptCheckpointMetadata, "utf8") === corruptMetadataBefore);
+writeFileSync(corruptCheckpointMetadata, JSON.stringify({ workspace: resolve(cleanCheckpointDir), checkpoints: [{ sessionID: "malformed" }] }));
+const malformedMetadataBefore = readFileSync(corruptCheckpointMetadata, "utf8");
+const checkpointWithMalformedMetadata = createRecoveryCheckpoint(cleanCheckpointDir, "malformed-metadata-session", 1);
+check("recovery checkpoint refuses structurally invalid metadata", !checkpointWithMalformedMetadata && readFileSync(corruptCheckpointMetadata, "utf8") === malformedMetadataBefore);
 writeFileSync(join(checkpointDir, "tracked.txt"), "later user edit\n");
 const interferenceRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
 check("recovery checkpoint refuses intervening workspace changes", !interferenceRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "later user edit\n");
