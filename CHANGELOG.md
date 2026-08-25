@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.2
+
+### Patch Changes
+
+- e4fa9c7: Avoid blocking automatic compaction on sequential project-memory Git freshness checks and remove duplicate tool outcome audit entries.
+- 2d352a2: Mark automatic unfinished-todo continuation prompts as synthetic so OpenCode can continue generating titles for new sessions.
+
 ## 1.8.1
 
 ### Patch Changes
