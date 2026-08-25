@@ -24,6 +24,7 @@ import {
 	unwrapShellCommand,
 } from "./shell.ts";
 import { asRecord, extractTargetPath } from "./utils.ts";
+import { getProjectMemoryIdentity } from "./project-memory.ts";
 import {
 	detectVerifyCommand,
 	getCurrentGitCommitHash,
@@ -272,7 +273,7 @@ export async function guardToolCallImpl(
 				return claimReason;
 			}
 		}
-		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
+		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
 		return undefined;
 	}
 
@@ -285,6 +286,11 @@ export async function guardToolCallImpl(
 		}
 	}
 	if (!SHELL_TOOL_NAMES.has(toolName)) return undefined;
+	const shellWorkdir = asRecord(input)?.workdir;
+	const requestedShellRoot = typeof shellWorkdir === "string" ? resolve(currentRoot, shellWorkdir) : currentRoot;
+	const shellRoot = !isPathOutsideWorkspace(requestedShellRoot, currentRoot) || getProjectMemoryIdentity(requestedShellRoot) === getProjectMemoryIdentity(currentRoot)
+		? requestedShellRoot
+		: currentRoot;
 
 	for (const raw of extractCommands(input)) {
 		const dynamicSyntax = dynamicShellSyntaxIn(raw);
@@ -348,7 +354,7 @@ export async function guardToolCallImpl(
 				if (onProtectedBranch(currentRoot)) return branchGuardReason();
 				const todos = await effectiveTodos(context?.sessionID);
 				if (todos !== undefined && !hasActiveTodo(todos)) return "Blocked: inline interpreter file mutation with no active todo item.";
-				recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
+				recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
 			}
 			if (!allowLive) {
 				const liveCheck = liveMutationIn(normalizeGitCommands(normalize(payload)));
@@ -402,24 +408,25 @@ export async function guardToolCallImpl(
 			}
 		}
 		if (hasPrCreateInvocation(raw)) {
+			const prRoot = shellRoot;
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
 			const descFlag = isAz ? "--description" : "--body";
 			const preflightFailures: string[] = [];
-			const conflictCheck = checkMergeConflicts(currentRoot);
+			const conflictCheck = checkMergeConflicts(prRoot);
 			if (conflictCheck.hasConflicts) preflightFailures.push(conflictCheck.reason ?? "Branch has merge conflicts with its base branch.");
-			const branch = currentGitBranch(currentRoot);
+			const branch = currentGitBranch(prRoot);
 			if (branch) {
-				const mergedStatus = isBranchAlreadyMergedOrClosed(currentRoot, branch);
+				const mergedStatus = isBranchAlreadyMergedOrClosed(prRoot, branch);
 				if (mergedStatus.merged) preflightFailures.push(mergedStatus.reason ?? "Branch is already merged or closed.");
 			}
-			if (isReviewRequired(currentRoot)) {
+			if (isReviewRequired(prRoot)) {
 				const review = context?.sessionID ? (sessionReviews.get(context.sessionID) ?? getLastReviewResult()) : getLastReviewResult();
-				const reviewMatchesContext = review?.passed === true && review.workspace === resolve(currentRoot) && (!review.targetSessionID || review.targetSessionID === context?.sessionID) && review.commitHash === getCurrentGitCommitHash(currentRoot) && review.gitStatus === getGitStatusSummary(currentRoot) && review.worktreeFingerprint === getGitWorktreeFingerprint(currentRoot);
+				const reviewMatchesContext = review?.passed === true && review.workspace === resolve(prRoot) && (!review.targetSessionID || review.targetSessionID === context?.sessionID) && review.commitHash === getCurrentGitCommitHash(prRoot) && review.gitStatus === getGitStatusSummary(prRoot) && review.worktreeFingerprint === getGitWorktreeFingerprint(prRoot);
 				if (!reviewMatchesContext) preflightFailures.push("Passing secondary review approval is required; invoke a secondary review subagent and record approval with record_review.");
 			}
-			if (isDocumentationRequired(currentRoot) && !branchHasDocumentationChange(currentRoot)) preflightFailures.push("Documentation update is required (Policy 21); update README.md or relevant documentation in docs/.");
-			const branchChangelog = branchHasChangelogChange(currentRoot);
+			if (isDocumentationRequired(prRoot) && !branchHasDocumentationChange(prRoot)) preflightFailures.push("Documentation update is required (Policy 21); update README.md or relevant documentation in docs/.");
+			const branchChangelog = branchHasChangelogChange(prRoot);
 			let shellCwdKnown = true;
 			const prSegments: Array<{ segment: string; invocationRoot: string | null }> = [];
 			for (const segment of splitShellSegments(raw)) {
@@ -427,12 +434,12 @@ export async function guardToolCallImpl(
 				if (/(?:^|\s)(?:(?:builtin|command)\s+)?(?:cd|pushd|popd)(?:\s|$)/.test(unwrapped)) shellCwdKnown = false;
 				if (hasPrCreateInvocation(segment)) {
 					const wrapperChangesCwd = shellWrappersChangeCwd(segment);
-					prSegments.push({ segment, invocationRoot: shellCwdKnown && !wrapperChangesCwd ? currentRoot : null });
+					prSegments.push({ segment, invocationRoot: shellCwdKnown && !wrapperChangesCwd ? prRoot : null });
 				}
 			}
 			const hasChangelog = branchChangelog || prSegments.every(({ segment, invocationRoot }) => prBodyIncludesChangelog(segment, invocationRoot));
 			if (!hasChangelog) preflightFailures.push(`Release information is required; update a CHANGELOG/changeset file or include a Summary, Changes, Release notes, or Changelog section in the PR description (${descFlag}).`);
-			const lockCheck = checkLockfileSync(currentRoot);
+			const lockCheck = checkLockfileSync(prRoot);
 			if (lockCheck.isOutOfSync) preflightFailures.push(lockCheck.reason ?? "Dependency lockfile is out of sync with its manifest.");
 			if (preflightFailures.length > 0) {
 				const reason = `Blocked: PR preflight failed:\n${preflightFailures.map((failure) => `- ${failure}`).join("\n")}`;
@@ -465,7 +472,7 @@ export async function guardToolCallImpl(
 				}
 			}
 		}
-		if (hasGitMutation) recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
+		if (hasGitMutation) recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
 	}
 	return undefined;
 }

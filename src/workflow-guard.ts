@@ -47,6 +47,7 @@ import {
 	lastMutationTimestamp,
 	getLastMutationTimestamp,
 	getMutationCount,
+	getSessionMutationCount,
 	lastVerify,
 	getLastVerifyResult,
 	recordMutation,
@@ -447,20 +448,24 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					return s === "pending" || s === "in_progress";
 				});
 				const branch = currentGitBranch(effectiveRoot) ?? "unknown";
-				const isProtected = onProtectedBranch(effectiveRoot);
+				const isProtected = branch !== "unknown" && isProtectedBranchName(branch, effectiveRoot);
+				const sessionMutationCount = sessionID ? getSessionMutationCount(sessionID) : 0;
 				const lastV = sessionID
-					? (sessionVerifyResults.get(sessionID) ?? lastVerify)
+					? (sessionVerifyResults.get(sessionID) ?? (sessionMutationCount === 0 && parentID ? sessionVerifyResults.get(parentID) : undefined))
 					: lastVerify;
-				const lastR = getLastReviewResult();
-				const mutationCountVal = getMutationCount(sessionID);
+				const lastR = sessionID
+					? (sessionReviews.get(sessionID) ?? (sessionMutationCount === 0 && parentID ? sessionReviews.get(parentID) : undefined))
+					: getLastReviewResult();
+				const mutationCountVal = sessionID ? sessionMutationCount : getMutationCount();
 
 				const contextBlocks: string[] = [];
 
 				if (active && active.length > 0) {
-					const lines = active.map(
+					const lines = active.slice(0, 20).map(
 						(t) =>
-							`- [${String(t.status) === "in_progress" ? "IN PROGRESS" : "PENDING"}] ${String(t.content ?? "")}`,
+							`- [${String(t.status) === "in_progress" ? "IN PROGRESS" : "PENDING"}] ${String(t.content ?? "").slice(0, 300)}`,
 					);
+					if (active.length > 20) lines.push(`- ... ${active.length - 20} more active task(s) omitted`);
 					const attribution = parentID
 						? ` (Subagent session: ${sessionID}, Parent: ${parentID})`
 						: sessionID
@@ -488,15 +493,18 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						`- Secondary Review: ${lastR.passed ? "APPROVED" : "CHANGES REQUESTED"} by ${lastR.reviewer}`,
 					);
 				}
-				const openFollowups = followupStore ? listReviewFollowups(followupStore, "open", 8) : [];
+				let openFollowups: ReturnType<typeof listReviewFollowups> = [];
+				try { openFollowups = followupStore ? listReviewFollowups(followupStore, "open", 8) : []; } catch {}
 				if (openFollowups.length > 0) {
 					stateLines.push(`- Open Review Follow-ups: ${openFollowups.length} local P2/P3 item(s)`);
 					contextBlocks.push(`## Review Follow-ups\n${openFollowups.map((item) => `- [${item.severity}:${item.id.slice(0, 8)}] ${item.summary.slice(0, 300)}`).join("\n")}\nTreat these as durable technical debt: address relevant items when practical and resolve them explicitly after verification.`);
 				}
 				contextBlocks.push(stateLines.join("\n"));
-				const projectKnowledge = (projectMemory ? getRecentProjectMemory(projectMemory, 20) : [])
-					.filter((memory) => memory.source !== "portable" && isProjectMemoryFresh(memory, effectiveRoot))
-					.slice(0, 8);
+				let projectKnowledge: ReturnType<typeof getRecentProjectMemory> = [];
+				try {
+					projectKnowledge = (projectMemory ? getRecentProjectMemory(projectMemory, 8) : [])
+						.filter((memory) => memory.source !== "portable" && isProjectMemoryFresh(memory, effectiveRoot));
+				} catch {}
 				if (projectKnowledge.length > 0) {
 					const lines = projectKnowledge.map((memory) => `- [${memory.kind}:${memory.id.slice(0, 8)}] ${memory.content.slice(0, 300)}`);
 					contextBlocks.push(`## Project Memory\n${lines.join("\n")}\nTreat these as historical project knowledge; verify against current repository state when relevant files have changed.`);
