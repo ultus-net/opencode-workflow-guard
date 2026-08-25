@@ -12,7 +12,7 @@ export interface TodoSdkClient {
 		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown } }>;
 		promptAsync?: (opts: {
 			path: { id: string };
-			body: { messageID?: string; parts: Array<{ type: "text"; text: string }> };
+			body: { messageID?: string; parts: Array<{ type: "text"; text: string; synthetic?: boolean }> };
 		}) => Promise<unknown>;
 	};
 	tui?: {
