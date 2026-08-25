@@ -27,10 +27,10 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Stale-Write Protection
 
-- Evaluate a per-session read fingerprint for existing files so direct edit/write tools cannot overwrite state that changed after the agent observed it. Treat this as optimistic concurrency, not as a substitute for cross-session file claims.
-- Use Qwen Code and Kilo as reference models: Qwen records filesystem identity/mtime/size and fails closed when freshness cannot be verified; Kilo performs a compare-and-write against the exact bytes read immediately before constructing the edit.
-- OpenCode 1.18.21 exposes promising lifecycle data for a bounded implementation: `tool.execute.after` includes read arguments and `tool.execute.before` can block a later mutation. The installed type surface has no explicit success/failure discriminator for the after hook, so first prove that only a successful/cacheable read can seed a fingerprint; also prove path canonicalization, symlink handling, file replacement, deletion/recreation, and parent/subagent session semantics before enabling the gate.
-- Prefer content/version comparison where the tool surface makes it possible; a timestamp-only rule has filesystem-resolution and TOCTOU limits. Define separate behavior for `apply_patch` and shell writers rather than claiming that direct-tool freshness covers every mutation path.
+- Implemented: successful reads record per-session fingerprints for existing regular files, and direct `edit`/`write` calls fail closed unless the same session observed the current canonical file state.
+- Fingerprints combine filesystem identity, size, nanosecond mtime, and SHA-256 content rather than relying on timestamps alone. Canonical paths make symlink aliases converge, while replacement and deletion/recreation invalidate the observation.
+- OpenCode's tool lifecycle invokes `tool.execute.after` for completed tool results while failures use the error path, so only successful reads seed observations. Parent/subagent sessions intentionally do not share fingerprints.
+- This remains optimistic concurrency rather than an atomic compare-and-write: `apply_patch`, shell writers, and external changes in the interval between the before-hook comparison and OpenCode's write are outside this bounded mechanism. Concurrent File Claims separately protect overlapping direct mutations between guarded sessions.
 
 ## Durable Recovery Checkpoints
 

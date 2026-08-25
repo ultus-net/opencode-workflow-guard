@@ -589,6 +589,13 @@ todo("s-claim-a", item("edit shared file", "in_progress"));
 todo("s-claim-b", item("edit shared file", "in_progress"));
 const claimsBefore = claimsHooks["tool.execute.before"];
 const claimsAfter = claimsHooks["tool.execute.after"];
+const recordRead = async (before: typeof claimsBefore, after: typeof claimsAfter, sessionID: string, filePath: string, callID: string) => {
+	await before?.({ tool: "read", sessionID, callID }, { args: { filePath } });
+	await after?.({ tool: "read", sessionID, callID, args: { filePath } }, { title: "read", output: "read", metadata: {} });
+};
+await recordRead(claimsBefore, claimsAfter, "s-claim-a", join(claimsDir, "shared.ts"), "claim-read-a");
+await recordRead(claimsBefore, claimsAfter, "s-claim-b", join(claimsDir, "shared.ts"), "claim-read-b-shared");
+await recordRead(claimsBefore, claimsAfter, "s-claim-b", join(claimsDir, "other.ts"), "claim-read-b-other");
 await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-a" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "a" } });
 let claimConflict = false;
 try {
@@ -633,6 +640,7 @@ try {
 check("session idle clears stale direct-edit claims", idleCleanupAllowed);
 await claimsAfter?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-after-idle", args: {} }, { title: "write", output: "written", metadata: {} });
 
+await recordRead(claimsBefore, claimsAfter, "s-claim-a", join(claimsDir, "shared.ts"), "claim-read-after-idle");
 await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-patch-owner" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "a" } });
 let patchConflict = false;
 try {
@@ -642,6 +650,7 @@ try {
 }
 check("apply_patch claims all targets atomically when one target conflicts", patchConflict);
 todo("s-claim-c", item("edit unclaimed file", "in_progress"));
+await recordRead(claimsBefore, claimsAfter, "s-claim-c", join(claimsDir, "other.ts"), "claim-read-c-other");
 let partialPatchClaim = false;
 try {
 	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-c", callID: "claim-patch-other" }, { args: { filePath: join(claimsDir, "other.ts"), content: "c" } });
@@ -649,6 +658,102 @@ try {
 	partialPatchClaim = true;
 }
 check("blocked multi-target patch leaves no partial claims", !partialPatchClaim);
+
+// Existing files must be read by the same session before edit/write, and the
+// bytes plus filesystem identity must still match when the mutation starts.
+const staleDir = mkdtempSync(join(tmpdir(), "wg-stale-write-"));
+writeFileSync(join(staleDir, "target.ts"), "observed");
+symlinkSync(join(staleDir, "target.ts"), join(staleDir, "target-link.ts"));
+const staleHooks = await pluginFn({
+	directory: staleDir,
+	client: fakeClient as any,
+	project: {} as any,
+	worktree: staleDir,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+const staleBefore = staleHooks["tool.execute.before"];
+const staleAfter = staleHooks["tool.execute.after"];
+for (const sessionID of ["s-stale", "s-stale-other"]) todo(sessionID, item("edit observed file", "in_progress"));
+let unreadBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale", callID: "unread" }, { args: { filePath: join(staleDir, "target.ts"), content: "next" } });
+} catch (error) {
+	unreadBlocked = String(error).toLowerCase().includes("re-read");
+}
+check("stale-write protection requires reading an existing file", unreadBlocked);
+await staleBefore?.({ tool: "read", sessionID: "s-stale", callID: "read-race" }, { args: { filePath: join(staleDir, "target.ts") } });
+writeFileSync(join(staleDir, "target.ts"), "changed during read");
+await staleAfter?.({ tool: "read", sessionID: "s-stale", callID: "read-race", args: { filePath: join(staleDir, "target.ts") } }, { title: "target.ts", output: "observed", metadata: {} });
+let racedReadBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale", callID: "after-read-race" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch (error) {
+	racedReadBlocked = String(error).toLowerCase().includes("re-read");
+}
+check("stale-write protection does not authorize bytes changed during a read", racedReadBlocked);
+writeFileSync(join(staleDir, "target.ts"), "observed");
+await staleBefore?.({ tool: "read", sessionID: "s-stale", callID: "read-1" }, { args: { filePath: join(staleDir, "target-link.ts") } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale", callID: "read-1", args: { filePath: join(staleDir, "target-link.ts") } }, { title: "target-link.ts", output: "observed", metadata: {} });
+let unchangedAllowed = true;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale", callID: "fresh" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch {
+	unchangedAllowed = false;
+}
+check("stale-write protection accepts an unchanged file read through a symlink", unchangedAllowed);
+await staleAfter?.({ tool: "edit", sessionID: "s-stale", callID: "fresh", args: {} }, { title: "edit", output: "edited", metadata: {} });
+writeFileSync(join(staleDir, "target.ts"), "changed elsewhere");
+let changedBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale", callID: "stale-content" }, { args: { filePath: join(staleDir, "target-link.ts"), content: "next" } });
+} catch (error) {
+	changedBlocked = String(error).includes("changed since this session read it");
+}
+check("stale-write protection blocks changed content through a symlink alias", changedBlocked);
+writeFileSync(join(staleDir, "target.ts"), "observed");
+await staleBefore?.({ tool: "read", sessionID: "s-stale", callID: "read-2" }, { args: { filePath: join(staleDir, "target.ts") } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale", callID: "read-2", args: { filePath: join(staleDir, "target.ts") } }, { title: "target.ts", output: "observed", metadata: {} });
+rmSync(join(staleDir, "target.ts"));
+writeFileSync(join(staleDir, "target.ts"), "observed");
+let replacementBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale", callID: "stale-replacement" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch (error) {
+	replacementBlocked = String(error).includes("changed since this session read it");
+}
+check("stale-write protection detects delete and recreate with identical bytes", replacementBlocked);
+let otherSessionBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale-other", callID: "other-session" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch (error) {
+	otherSessionBlocked = String(error).toLowerCase().includes("re-read");
+}
+check("stale-write fingerprints are scoped to the reading session", otherSessionBlocked);
+let newFileAllowed = true;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale", callID: "new-file" }, { args: { filePath: join(staleDir, "new.ts"), content: "new" } });
+} catch {
+	newFileAllowed = false;
+}
+check("stale-write protection allows creating a new file without a prior read", newFileAllowed);
+await staleAfter?.({ tool: "write", sessionID: "s-stale", callID: "new-file", args: {} }, { title: "write", output: "written", metadata: {} });
+const staleAlternateRoot = mkdtempSync(join(tmpdir(), "wg-stale-root-"));
+writeFileSync(join(staleAlternateRoot, "relative.ts"), "observed");
+todo("s-stale-root", item("edit relative file", "in_progress"));
+await staleBefore?.({ tool: "read", sessionID: "s-stale-root", callID: "read-relative", worktree: staleAlternateRoot } as any, { args: { filePath: "relative.ts" } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale-root", callID: "read-relative", args: { filePath: "relative.ts" } }, { title: "relative.ts", output: "observed", metadata: {} });
+let alternateRootAllowed = true;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale-root", callID: "edit-relative", worktree: staleAlternateRoot } as any, { args: { filePath: "relative.ts", oldString: "observed", newString: "next" } });
+} catch {
+	alternateRootAllowed = false;
+}
+check("stale-write read observations retain the invocation worktree", alternateRootAllowed);
+await staleAfter?.({ tool: "edit", sessionID: "s-stale-root", callID: "edit-relative", args: {} }, { title: "edit", output: "edited", metadata: {} });
+rmSync(staleAlternateRoot, { recursive: true, force: true });
+rmSync(staleDir, { recursive: true, force: true });
 
 // Targeted post-edit validation runs only after a matching mutation actually
 // changes the file. Validator commands never receive the filename as shell text.
@@ -678,6 +783,9 @@ const validatorBefore = validatorHooks["tool.execute.before"];
 const validatorAfter = validatorHooks["tool.execute.after"];
 check("plugin returns tool.execute.after hook for post-edit validation", typeof validatorAfter === "function");
 todo("s-validator", item("validate edits", "in_progress"));
+for (const path of ["target.ts", "unchanged.ts", "semi;colon.ts"]) {
+	await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, path), `validator-read-${path}`);
+}
 const validatorArgs = { filePath: join(validatorDir, "target.ts"), content: "after" };
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-1" }, { args: validatorArgs });
 writeFileSync(validatorArgs.filePath, "after");
@@ -699,6 +807,7 @@ await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "valida
 check("filename shell metacharacters do not bypass targeted validation", metacharOutput.output.includes("validator failed"));
 
 writeFileSync(join(validatorDir, "timeout.ts"), "before");
+await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, "timeout.ts"), "validator-read-timeout");
 const timeoutArgs = { filePath: join(validatorDir, "timeout.ts"), content: "after" };
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-4" }, { args: timeoutArgs });
 writeFileSync(timeoutArgs.filePath, "after");
@@ -726,6 +835,8 @@ check("apply_patch validates changed targets containing spaces", spacedPatchOutp
 
 writeFileSync(join(validatorDir, "concurrent-a.ts"), "before");
 writeFileSync(join(validatorDir, "concurrent-b.ts"), "before");
+await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, "concurrent-a.ts"), "validator-read-concurrent-a");
+await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, "concurrent-b.ts"), "validator-read-concurrent-b");
 const concurrentA = { filePath: join(validatorDir, "concurrent-a.ts"), content: "after" };
 const concurrentB = { filePath: join(validatorDir, "concurrent-b.ts"), content: "after" };
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "concurrent-a" }, { args: concurrentA });
@@ -742,6 +853,7 @@ const alternateValidatorDir = mkdtempSync(join(tmpdir(), "wg-validator-root-"));
 writeFileSync(join(alternateValidatorDir, "root.ts"), "before");
 writeFileSync(join(alternateValidatorDir, "workflow-guard.json"), JSON.stringify({ postEditValidators: [{ pattern: "*.ts", command: "node -e \"console.error(process.cwd()); process.exit(1)\"" }] }));
 const rootArgs = { filePath: join(alternateValidatorDir, "root.ts"), content: "after" };
+await recordRead(validatorBefore, validatorAfter, "s-validator", rootArgs.filePath, "validator-read-root");
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-root" }, { args: rootArgs, worktree: alternateValidatorDir } as any);
 writeFileSync(rootArgs.filePath, "after");
 const rootOutput = { title: "edit", output: "edited", metadata: {} };
@@ -755,6 +867,7 @@ writeFileSync(
 );
 writeFileSync(join(validatorDir, "invalid-config.ts"), "before");
 const invalidConfigArgs = { filePath: join(validatorDir, "invalid-config.ts"), content: "after" };
+await recordRead(validatorBefore, validatorAfter, "s-validator", invalidConfigArgs.filePath, "validator-read-invalid");
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-invalid-config" }, { args: invalidConfigArgs });
 writeFileSync(invalidConfigArgs.filePath, "after");
 const invalidConfigOutput = { title: "edit", output: "edited", metadata: {} };

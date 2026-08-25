@@ -16,6 +16,7 @@ import { resolve } from "node:path";
 import { join } from "node:path";
 import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
+import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason, type ReadObservation } from "./policies/stale-write.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -612,6 +613,15 @@ async function guardToolCallImpl(
 			}
 		}
 		if (context?.sessionID && context.callID) {
+			if (toolName === "edit" || toolName === "write") {
+				for (const path of editTargets(input, currentRoot)) {
+					const staleReason = staleWriteReason(path, context.sessionID);
+					if (staleReason) {
+						logBlock(`[workflow-guard] ${staleReason}`);
+						return staleReason;
+					}
+				}
+			}
 			const claimReason = claimFiles(editTargets(input, currentRoot), context.sessionID, context.callID);
 			if (claimReason) {
 				logBlock(`[workflow-guard] ${claimReason}`);
@@ -1059,6 +1069,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	} catch {}
 
 	const pendingPostEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
+	const pendingReadObservations = new Map<string, ReadObservation>();
 	const postEditKey = (sessionID: string, callID: string) => `${sessionID}\0${callID}`;
 
 	return {
@@ -1454,6 +1465,13 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					await emitBlockFeedback(reason);
 					throw new Error(`[workflow-guard] ${reason}`);
 				}
+				if (input.tool === "read") {
+					const target = editTargets(args, toolWorktree)[0];
+					if (target) {
+						const observation = beginReadObservation(target);
+						if (observation) pendingReadObservations.set(postEditKey(input.sessionID, input.callID), observation);
+					}
+				}
 				if (EDIT_TOOL_NAMES.has(input.tool)) {
 					const snapshots = editTargets(args, toolWorktree).map(snapshotFile);
 					if (snapshots.length) pendingPostEditSnapshots.set(postEditKey(input.sessionID, input.callID), { root: toolWorktree, snapshots });
@@ -1463,6 +1481,12 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 
 		"tool.execute.after": async (input, output) => {
 			releaseFileClaims(input.sessionID, input.callID);
+			if (input.tool === "read") {
+				const readKey = postEditKey(input.sessionID, input.callID);
+				const observation = pendingReadObservations.get(readKey);
+				pendingReadObservations.delete(readKey);
+				if (observation) recordSuccessfulRead(observation, input.sessionID);
+			}
 			const key = postEditKey(input.sessionID, input.callID);
 			const pending = pendingPostEditSnapshots.get(key);
 			pendingPostEditSnapshots.delete(key);
@@ -1628,6 +1652,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				const sessionID = (event.properties as { sessionID?: unknown })?.sessionID;
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
+					clearReadFingerprints(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
 				}
 			}
@@ -1643,6 +1668,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				const sessionID = (event.properties as { info?: { id?: unknown } })?.info?.id;
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
+					clearReadFingerprints(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}
 			}

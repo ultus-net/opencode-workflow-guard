@@ -8,7 +8,7 @@ interface FileClaim {
 
 const claims = new Map<string, FileClaim>();
 
-function canonicalPath(path: string, seen = new Set<string>()): string {
+export function canonicalPath(path: string, seen = new Set<string>()): string {
 	const resolved = resolve(path);
 	if (seen.has(resolved)) return resolved;
 	seen.add(resolved);
