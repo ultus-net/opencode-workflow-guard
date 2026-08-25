@@ -42,7 +42,7 @@ See `docs/testing.md` for the full coverage matrix.
 ## Adding a Guard Policy
 
 1. Add the check logic as a new module in `src/policies/` (or extend the
-   matching existing policy module), then wire it into the orchestrator's
+   matching existing policy module), then wire it into the policy dispatcher's
    `guardToolCallImpl` in `src/workflow-guard.ts`.
 2. Add regression tests in `test/test.mts` (look for existing policy blocks).
 3. Document the policy in `docs/policies.md` and update the policy table in

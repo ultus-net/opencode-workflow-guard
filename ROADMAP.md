@@ -1,6 +1,6 @@
 # Roadmap
 
-Proposed additions are limited to deterministic mechanisms that add coverage beyond the current workflow guard.
+Proposed additions are limited to deterministic mechanisms that add coverage beyond the current workflow guard. Workflow Guard remains a policy and enforcement layer: core features may constrain, observe, record, explain, or preserve bounded context, but must not turn the plugin into an agent harness that plans, prioritizes, delegates, or autonomously sequences work.
 
 ## Research Record and Repeat Protocol
 

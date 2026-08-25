@@ -56,7 +56,7 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 
 - **Symptoms:** A subagent spawned via `task` fails to edit files.
 - **Root Cause:** OpenCode disables `todowrite` for subagents by default.
-- **Solution:** The guard automatically walks up the `parentID` session hierarchy so subagents inherit the orchestrator session's active tasks. Ensure the parent session has active tasks before delegating work to subagents.
+- **Solution:** The guard automatically walks up the `parentID` session hierarchy so subagents inherit the parent session's active tasks. Ensure the parent session has active tasks before a subagent attempts guarded mutations.
 
 ---
 

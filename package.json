@@ -1,7 +1,7 @@
 {
   "name": "opencode-workflow-guard",
   "version": "1.8.0",
-  "description": "OpenCode plugin enforcing workflow discipline through deterministic tool.execute.before hooks",
+  "description": "Deterministic workflow and safety policy enforcement for OpenCode",
   "license": "MIT",
   "type": "module",
   "main": "src/workflow-guard.ts",
