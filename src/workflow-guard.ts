@@ -95,11 +95,11 @@ export {
 // ── Shared shell/env utilities ───────────────────────────────────────────────
 import {
 	extractRecordTargetPath,
-	dynamicShellSyntaxIn,
 	getCleanEnv,
 	showBlockToast,
 	isSensitiveEnvKey,
 } from "./lib/utils.ts";
+import { dynamicShellSyntaxIn } from "./lib/shell.ts";
 
 export { getCleanEnv, dynamicShellSyntaxIn };
 

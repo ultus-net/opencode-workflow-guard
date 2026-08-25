@@ -1,4 +1,5 @@
-import { asRecord, shellWords, splitShellSegments } from "../lib/utils.ts";
+import { shellWords, splitShellSegments } from "../lib/shell.ts";
+import { asRecord } from "../lib/utils.ts";
 
 export interface LivePattern {
 	re: RegExp;

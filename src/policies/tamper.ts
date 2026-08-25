@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
-import { decodeShellEscapes } from "../lib/utils.ts";
+import { decodeShellEscapes } from "../lib/shell.ts";
 
 export const PROTECTED_PATH_REASON =
 	"Blocked: modifying Open" +

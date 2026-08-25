@@ -9,7 +9,7 @@ import {
 import {
 	unwrapShellWords,
 	splitShellSegments,
-} from "../lib/utils.ts";
+} from "../lib/shell.ts";
 
 export const PROTECTED_BRANCHES = new Set(["main", "master"]);
 
