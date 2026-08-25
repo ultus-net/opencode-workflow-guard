@@ -19,16 +19,23 @@ export async function fetchSessionTodos(sessionID: string): Promise<TodoItem[] |
 }
 
 export async function fetchParentSessionID(sessionID: string): Promise<string | undefined> {
+	const result = await fetchParentSession(sessionID);
+	return result.ok ? result.parentID : undefined;
+}
+
+export async function fetchParentSession(sessionID: string): Promise<{ ok: true; parentID?: string } | { ok: false }> {
 	const client = getSdkClient();
 	const session = client?.session;
 	const get = session?.get;
-	if (typeof get !== "function") return undefined;
+	if (typeof get !== "function") return { ok: false };
 	try {
 		const result = await get.call(session, { path: { id: sessionID } });
-		const parent = (result as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
-		return typeof parent === "string" && parent ? parent : undefined;
+		const data = (result as { data?: { parentID?: unknown } } | undefined)?.data;
+		if (!data) return { ok: false };
+		const parent = data.parentID;
+		return { ok: true, parentID: typeof parent === "string" && parent ? parent : undefined };
 	} catch {
-		return undefined;
+		return { ok: false };
 	}
 }
 

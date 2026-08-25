@@ -293,7 +293,11 @@ export function getSubagentMutationBudget(root: string): number {
 }
 
 export function isLearningEnabled(root: string): boolean {
-	return process.env.WORKFLOW_GUARD_LEARNING === "1";
+	return process.env.WORKFLOW_GUARD_LEARNING === "1" || getProjectConfig(root).learning === true;
+}
+
+export function isProjectMemoryEnabled(root: string): boolean {
+	return getProjectConfig(root).projectMemory !== false;
 }
 
 export function getLearningInterventionBudget(root: string): number {

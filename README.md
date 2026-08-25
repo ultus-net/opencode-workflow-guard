@@ -25,7 +25,7 @@ Add to your project's `opencode.json` or global `~/.config/opencode/opencode.jso
 
 *Requires OpenCode >= 1.18.* See [docs/installation.md](docs/installation.md) for full setup options and TUI companion badge configuration.
 
-For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json` as well. Do not use `opencode-workflow-guard/ui`; npm parses that unscoped slash form as GitHub shorthand rather than a package export, which can trigger Git credential prompts. The package exposes OpenCode's native `./server` and `./tui` entrypoints so the package root is sufficient in both configs.
+For the optional TUI badge, configure `"opencode-workflow-guard/tui"` in `tui.json`. The package root is the server plugin; TUI plugin specs are resolved as written and must use the exported `./tui` entrypoint. Do not place the TUI module under the server `plugins/` directory.
 
 ### 2. Verification
 
@@ -43,7 +43,7 @@ WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # Also run model-driven OpenCode 
 The plugin enforces **24 deterministic policy rules** across four main pillars:
 
 * **Branch & History Protection:** Enforces feature-branch workflows (blocks edits/commits on `main`/`master`), hard-blocks direct or forced pushes to protected branches, enforces mergeability pre-flight checks, and requires PR changelogs / changesets.
-* **Task & Verification Discipline:** Gates file mutations on active `todowrite` tasks with subagent inheritance, blocks silent task deletion, enforces fresh test verification evidence before task completion, and journals completion claims vs. verification mismatches.
+* **Task & Verification Discipline:** Gates file mutations on active `todowrite` tasks with subagent inheritance, blocks concurrent direct edits to the same canonical file across sessions, requires same-session fresh reads before `edit`/`write` can replace existing files, blocks silent task deletion, enforces fresh test verification evidence before task completion, and journals completion claims vs. verification mismatches.
 * **Secrets & Workspace Confinement:** Confines edit tools and recognized shell/git mutations within the workspace root (including symlink and `../` escape checks), scrubs sensitive environment variables in agent subshells, and redacts `.env` reads with safe schema masks. Arbitrary executables are not OS-sandboxed; use containers or filesystem isolation when hard confinement is required.
 * **Destructive CLI & Environment Safety:** Intercepts destructive cloud/database/infrastructure commands, stops script laundering and interpreter evasion, blocks TTY hangs (`vim`, `nano`, `sudo`), and guards against dangerous package manager flags.
 
@@ -86,13 +86,13 @@ For complete policy specifications and override rules, see [docs/policies.md](do
 
 ### Experimental Socratic Learning
 
-Learning mode is opt-in and advisory: it never blocks tool calls or weakens deterministic guardrails. Enable it by setting `WORKFLOW_GUARD_LEARNING=1` in the user environment before OpenCode starts. Project configuration cannot enable learning or expose the global profile on its own. `maxLearningInterventions` defaults to 3 per session and can be set to `0` in `.opencode/workflow-guard.json[c]` to suppress checkpoints.
+Learning mode is opt-in and advisory: it never blocks tool calls or weakens deterministic guardrails. Enable it with `learning: true` in `.opencode/workflow-guard.json[c]` or through `/guard-options`; `WORKFLOW_GUARD_LEARNING=1` in the user environment also enables it regardless of project configuration. `maxLearningInterventions` defaults to 3 per session and can be set to `0` to suppress checkpoints.
 
 The learner profile is global to the local user and follows the XDG data convention: `$XDG_DATA_HOME/opencode/workflow-guard/learner-profile.json`, or `~/.local/share/opencode/workflow-guard/learner-profile.json` when `XDG_DATA_HOME` is unset. It stores distilled concept evidence, session/project provenance, and progression (`exposed` through `critique`), not conversation transcripts or numeric grades. Unobserved concepts remain unknown rather than being labeled knowledge gaps. Back up or delete this file independently from project repositories as desired.
 
 ### Project Memory
 
-Project memory keeps durable working knowledge between sessions without treating conversation history as project truth. Facts, decisions, constraints, and lessons are stored in a local SQLite/FTS5 index under `$XDG_DATA_HOME/opencode/workflow-guard/project-memory/`, or `~/.local/share/opencode/workflow-guard/project-memory/` when `XDG_DATA_HOME` is unset. Git repositories are identified from their common Git directory, so linked worktrees share the same local project index.
+Project memory keeps durable working knowledge between sessions without treating conversation history as project truth. It is enabled by default and can be disabled with `projectMemory: false` or through `/guard-options`. Facts, decisions, constraints, and lessons are stored in a local SQLite/FTS5 index under `$XDG_DATA_HOME/opencode/workflow-guard/project-memory/`, or `~/.local/share/opencode/workflow-guard/project-memory/` when `XDG_DATA_HOME` is unset. Git repositories are identified from their common Git directory, so linked worktrees share the same local project index.
 
 The local index is private working memory. Nothing from it is committed automatically. `project_memory_export` promotes only the explicitly selected current record IDs to `.opencode/memory/project-memory.jsonl`, a human-readable portable representation that another clone can import. The plugin adds `.opencode/memory/` to the clone-local `.git/info/exclude` by default; teams that deliberately want to version promoted knowledge can remove that exclusion or force-add the JSONL file. SQLite databases themselves should not be committed.
 

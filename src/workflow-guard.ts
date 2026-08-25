@@ -15,6 +15,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { join } from "node:path";
 import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
+import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
+import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason, type ReadObservation } from "./policies/stale-write.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -49,12 +51,14 @@ import {
 	sessionMutationTimestamps,
 	sessionVerifyResults,
 	loadProjectConfig,
+	getProjectConfig,
 	reloadProjectConfig,
 	stripJsonComments,
 	isReviewRequired,
 	isDocumentationRequired,
 	getSubagentMutationBudget,
 	isLearningEnabled,
+	isProjectMemoryEnabled,
 	getLearningInterventionBudget,
 	recordReviewResult,
 	getLastReviewResult,
@@ -203,6 +207,7 @@ import {
 	validateTodoLifecycle,
 	fetchSessionTodos,
 	fetchParentSessionID,
+	fetchParentSession,
 	effectiveTodos,
 	effectiveTodoOwnerSessionID,
 	hasActiveTodo,
@@ -210,8 +215,15 @@ import {
 import {
 	clearContinuationState,
 	continueUnfinishedSession,
+	isGeneratedContinuationMessage,
 	recordUserMessage,
 } from "./policies/continuation.ts";
+import {
+	createRecoveryCheckpoint,
+	finalizeRecoveryCheckpoint,
+	nextRecoveryRun,
+	restoreRecoveryCheckpoint,
+} from "./lib/checkpoint.ts";
 import { discoverPlanningSources } from "./policies/planning.ts";
 export { discoverPlanningSources };
 
@@ -338,7 +350,7 @@ export function isReadOnlyRole(agent?: string): boolean {
 async function guardToolCallImpl(
 	toolName: string,
 	input: unknown,
-	context?: { sessionID?: string; worktree?: string; directory?: string; agent?: string },
+	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
 ): Promise<string | undefined> {
 	const currentRoot = getWorkspaceRoot();
 
@@ -608,6 +620,22 @@ async function guardToolCallImpl(
 					logBlock(`[workflow-guard] ${reason}`);
 					return reason;
 				}
+			}
+		}
+		if (context?.sessionID && context.callID) {
+			if (toolName === "edit" || toolName === "write") {
+				for (const path of editTargets(input, currentRoot)) {
+					const staleReason = staleWriteReason(path, context.sessionID);
+					if (staleReason) {
+						logBlock(`[workflow-guard] ${staleReason}`);
+						return staleReason;
+					}
+				}
+			}
+			const claimReason = claimFiles(editTargets(input, currentRoot), context.sessionID, context.callID);
+			if (claimReason) {
+				logBlock(`[workflow-guard] ${claimReason}`);
+				return claimReason;
 			}
 		}
 		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
@@ -976,7 +1004,7 @@ async function guardToolCallImpl(
 export async function guardToolCall(
 	toolName: string,
 	input: unknown,
-	context?: { sessionID?: string; worktree?: string; directory?: string; agent?: string },
+	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
 ): Promise<string | undefined> {
 	const customRoot = context?.worktree || context?.directory;
 	const runImpl = () => guardToolCallImpl(toolName, input, context);
@@ -1028,10 +1056,12 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	setSdkClient(ctx.client);
 	reloadProjectConfig(effectiveRoot);
 	const learningEnabled = isLearningEnabled(effectiveRoot);
+	const projectMemoryEnabled = isProjectMemoryEnabled(effectiveRoot);
 	const learningInterventions = new Map<string, number>();
 	const portableMemoryPath = join(effectiveRoot, ".opencode", "memory", "project-memory.jsonl");
 	let projectMemory: ReturnType<typeof openProjectMemory> | undefined;
 	try {
+		if (!projectMemoryEnabled) throw new Error("Project memory disabled");
 		projectMemory = openProjectMemory(getProjectMemoryIdentity(effectiveRoot));
 		ensureProjectMemoryExcluded(effectiveRoot);
 		importProjectKnowledge(projectMemory, portableMemoryPath, (content) => secretIn(content) !== undefined);
@@ -1051,10 +1081,28 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	} catch {}
 
 	const pendingPostEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
+	const pendingReadObservations = new Map<string, ReadObservation>();
+	const activeRecoveryRuns = new Map<string, number>();
 	const postEditKey = (sessionID: string, callID: string) => `${sessionID}\0${callID}`;
 
 	return {
 		tool: {
+			...(getProjectConfig(effectiveRoot).recoveryCheckpoints === true ? {
+				guard_recovery_restore: tool({
+					description: "Restore this root session's workspace to its pre-run recovery checkpoint. Refuses if the run has not gone idle or if the workspace changed after that boundary.",
+					args: { run: tool.schema.number() },
+					execute: async (args, toolContext) => {
+						if (!Number.isInteger(args.run) || args.run < 1) return "[workflow-guard] Recovery rejected: run must be a positive integer.";
+						const parent = await fetchParentSession(toolContext.sessionID);
+						if (!parent.ok) return "[workflow-guard] Recovery rejected: could not confirm this is a root session.";
+						if (parent.parentID) return "[workflow-guard] Recovery rejected: only root sessions can restore their checkpoints.";
+						const result = restoreRecoveryCheckpoint(effectiveRoot, toolContext.sessionID, args.run);
+						return result.ok
+							? `[workflow-guard] Restored recovery checkpoint for run ${args.run}.`
+							: `[workflow-guard] Recovery rejected: ${result.error}`;
+					},
+				}),
+			} : {}),
 			guard_next_tasks: tool({
 				description:
 					"Load durable repository task context when deciding what to work on next. Prefers TODO.md; if absent, discovers conventional roadmap, plan, tasks, backlog, and docs/plans Markdown files.",
@@ -1066,7 +1114,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 						: JSON.stringify({ sources: [], message: "No TODO, roadmap, plan, tasks, or backlog Markdown files found." });
 				},
 			}),
-			project_memory_search: tool({
+			...(projectMemoryEnabled ? { project_memory_search: tool({
 				description: "Search current durable knowledge for this project. Returns concise typed records with provenance; superseded records are excluded.",
 				args: { query: tool.schema.string() },
 				execute: async (args) => projectMemory ? JSON.stringify(args.query.length <= 500 ? searchProjectMemory(projectMemory, args.query, 8) : [], null, 2) : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
@@ -1110,7 +1158,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				description: "Import the fixed repo-local .opencode/memory/project-memory.jsonl file into this project's local working-memory index.",
 				args: {},
 				execute: async () => projectMemory ? `[workflow-guard] Imported ${importProjectKnowledge(projectMemory, portableMemoryPath, (content) => secretIn(content) !== undefined)} new project-memory record(s).` : "[workflow-guard] Project memory unavailable; core guard enforcement remains active.",
-			}),
+			}) } : {}),
 			...(learningEnabled ? {
 				learning_profile: tool({
 					description: "Inspect the local evidence-based learner profile so teaching can build on demonstrated knowledge without assuming unobserved concepts are gaps.",
@@ -1438,12 +1486,20 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					(input as { args?: unknown }).args;
 				const reason = await guardToolCall(input.tool, args, {
 					sessionID: input.sessionID,
+					callID: input.callID,
 					worktree: toolWorktree,
 					agent: toolAgent,
 				});
 				if (reason !== undefined) {
 					await emitBlockFeedback(reason);
 					throw new Error(`[workflow-guard] ${reason}`);
+				}
+				if (input.tool === "read") {
+					const target = editTargets(args, toolWorktree)[0];
+					if (target) {
+						const observation = beginReadObservation(target);
+						if (observation) pendingReadObservations.set(postEditKey(input.sessionID, input.callID), observation);
+					}
 				}
 				if (EDIT_TOOL_NAMES.has(input.tool)) {
 					const snapshots = editTargets(args, toolWorktree).map(snapshotFile);
@@ -1453,6 +1509,13 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		},
 
 		"tool.execute.after": async (input, output) => {
+			releaseFileClaims(input.sessionID, input.callID);
+			if (input.tool === "read") {
+				const readKey = postEditKey(input.sessionID, input.callID);
+				const observation = pendingReadObservations.get(readKey);
+				pendingReadObservations.delete(readKey);
+				if (observation) recordSuccessfulRead(observation, input.sessionID);
+			}
 			const key = postEditKey(input.sessionID, input.callID);
 			const pending = pendingPostEditSnapshots.get(key);
 			pendingPostEditSnapshots.delete(key);
@@ -1611,12 +1674,29 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				"\n\nWorkflow Guard lifecycle: each todowrite call replaces the complete task list. Preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled; do not omit active tasks when adding new work. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply.";
 		},
 
+		"chat.message": async (input) => {
+			if (getProjectConfig(effectiveRoot).recoveryCheckpoints !== true) return;
+			if (isGeneratedContinuationMessage(input.sessionID, input.messageID)) return;
+			const parent = await runWithRuntimeState(effectiveRoot, ctx.client, () => fetchParentSession(input.sessionID));
+			if (!parent.ok || parent.parentID) return;
+			const run = nextRecoveryRun(effectiveRoot, input.sessionID);
+			const checkpoint = createRecoveryCheckpoint(effectiveRoot, input.sessionID, run);
+			if (checkpoint) activeRecoveryRuns.set(input.sessionID, run);
+		},
+
 		event: async ({
 			event,
 		}: { event: { type?: string; properties?: unknown } }) => {
 			if (event?.type === "session.idle") {
 				const sessionID = (event.properties as { sessionID?: unknown })?.sessionID;
 				if (typeof sessionID === "string") {
+					releaseFileClaims(sessionID);
+					clearReadFingerprints(sessionID);
+					const recoveryRun = activeRecoveryRuns.get(sessionID);
+					if (recoveryRun !== undefined) {
+						finalizeRecoveryCheckpoint(effectiveRoot, sessionID, recoveryRun);
+						activeRecoveryRuns.delete(sessionID);
+					}
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
 				}
 			}
@@ -1631,6 +1711,9 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			if (event?.type === "session.deleted") {
 				const sessionID = (event.properties as { info?: { id?: unknown } })?.info?.id;
 				if (typeof sessionID === "string") {
+					releaseFileClaims(sessionID);
+					clearReadFingerprints(sessionID);
+					activeRecoveryRuns.delete(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}
 			}

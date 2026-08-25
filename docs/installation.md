@@ -46,19 +46,37 @@ Files in your plugin directory are automatically loaded by the OpenCode server p
 
 To enable the dynamic prompt-bar badge - `[Workflow Guard: Active]` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
-Reference the same package name in `~/.config/opencode/tui.json`:
+Reference the TUI package entrypoint in `~/.config/opencode/tui.json`:
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "opencode-workflow-guard"
+    "opencode-workflow-guard/tui"
   ]
 }
 ```
 
-The package exports OpenCode's conventional `./server` and `./tui` entrypoints, so OpenCode selects the correct module for each runtime automatically. Do not configure `opencode-workflow-guard/ui`: npm interprets an unscoped `name/path` spec as GitHub shorthand, which can invoke Git and its configured credential helper instead of loading the package export.
+The package root exports the server plugin, while `opencode-workflow-guard/tui` exports the TUI companion. TUI plugin specs are resolved as written, so using the package root in `tui.json` loads the server module rather than the companion. Do not place `workflow-guard-ui.ts` under `plugins/`; the server loader rejects TUI-only modules.
 
 The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime `dependency` of this package, so npm installs it automatically alongside `opencode-workflow-guard` - no extra install is needed.
+
+## Recovery Checkpoints
+
+Durable recovery checkpoints are opt-in per project. Enable them in `.opencode/workflow-guard.json` (JSONC is also supported):
+
+```json
+{
+  "recoveryCheckpoints": true
+}
+```
+
+For each genuine user run in a root session, Workflow Guard captures the pre-run tracked and untracked workspace state in private Git objects. The objects are kept reachable under `refs/workflow-guard/checkpoints/` and do not add entries to the user's stash list. Subagent runs and Workflow Guard's synthetic continuation messages do not create or replace checkpoints.
+
+When the root session reaches idle, the checkpoint records the resulting workspace fingerprint. The `guard_recovery_restore` tool can then restore a selected run, but only for that same root session and only while the workspace still exactly matches the recorded idle boundary. Any intervening workspace change makes recovery refuse rather than overwrite newer work. Recovery checkpoints require an existing Git commit and deliberately fail open if a snapshot cannot be created.
+
+With the optional TUI companion installed, open the command palette and choose **Workflow Guard: Project Options** (or run `/guard-options`) to toggle recovery checkpoints, project memory, or learner mode for the current project. The command writes the existing Workflow Guard project config location, defaulting to `.opencode/workflow-guard.json`; restart OpenCode after changing a setting so the server plugin can expose the matching tools.
+
+OpenCode's model/provider request timeout is separate from Workflow Guard. In OpenCode 1.18+, configure it under the selected provider's `options.timeout` in project `opencode.json[c]`; the default is 300000 ms (5 minutes), and `false` disables the provider request timeout. Workflow Guard does not impose a whole-session wall-clock limit.
 
 ---
 
@@ -84,7 +102,7 @@ For defense in depth, pair `opencode-workflow-guard` with OpenCode's native perm
 
 ## Experimental Learning Mode
 
-Socratic learning is disabled by default. Enable its agent-facing tools by setting `WORKFLOW_GUARD_LEARNING=1` in your user environment before OpenCode starts. Repository configuration deliberately cannot opt a user into exposing their global learning profile.
+Socratic learning is disabled by default. Enable its agent-facing tools with the `learning: true` project option (including through `/guard-options`), or set `WORKFLOW_GUARD_LEARNING=1` in your user environment before OpenCode starts to enable it regardless of the project setting.
 
 To customize the per-session intervention budget, add:
 
@@ -102,7 +120,7 @@ The global learner profile is stored at `$XDG_DATA_HOME/opencode/workflow-guard/
 
 ## Project Memory
 
-Project memory is enabled automatically and requires no additional dependency or service. Its authoritative working index is a local SQLite database under `$XDG_DATA_HOME/opencode/workflow-guard/project-memory/`, falling back to `~/.local/share/opencode/workflow-guard/project-memory/`. Repositories use their Git common directory as the local identity where available, so linked worktrees share an index.
+Project memory is enabled by default and requires no additional dependency or service. Set `projectMemory: false` (or toggle it through `/guard-options`) to disable its initialization and tools for a project. Its authoritative working index is a local SQLite database under `$XDG_DATA_HOME/opencode/workflow-guard/project-memory/`, falling back to `~/.local/share/opencode/workflow-guard/project-memory/`. Repositories use their Git common directory as the local identity where available, so linked worktrees share an index.
 
 The plugin exposes `project_memory_search`, `project_memory_record`, `project_memory_export`, and `project_memory_import`. Recording is intended only for durable facts, decisions, constraints, and lessons; recognized secret content is rejected. Superseded records remain historical data but are excluded from normal retrieval.
 

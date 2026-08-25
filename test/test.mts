@@ -74,7 +74,8 @@ import {
 } from "../src/workflow-guard.ts";
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
-import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
+import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint } from "../src/lib/checkpoint.ts";
+import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
 let fail = 0;
@@ -568,6 +569,193 @@ try {
 }
 check("hook passes allowed call through", noThrow);
 
+// Concurrent direct edits claim canonical file paths for the duration of a
+// tool call. A second session must not race the same file, including through a
+// symlink alias, while unrelated files remain independent.
+const claimsDir = mkdtempSync(join(tmpdir(), "wg-claims-"));
+writeFileSync(join(claimsDir, "shared.ts"), "before");
+writeFileSync(join(claimsDir, "other.ts"), "before");
+symlinkSync(join(claimsDir, "shared.ts"), join(claimsDir, "shared-link.ts"));
+symlinkSync(join(claimsDir, "future.ts"), join(claimsDir, "future-link.ts"));
+const claimsHooks = await pluginFn({
+	directory: claimsDir,
+	client: fakeClient as any,
+	project: {} as any,
+	worktree: claimsDir,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+todo("s-claim-a", item("edit shared file", "in_progress"));
+todo("s-claim-b", item("edit shared file", "in_progress"));
+const claimsBefore = claimsHooks["tool.execute.before"];
+const claimsAfter = claimsHooks["tool.execute.after"];
+const recordRead = async (before: typeof claimsBefore, after: typeof claimsAfter, sessionID: string, filePath: string, callID: string) => {
+	await before?.({ tool: "read", sessionID, callID }, { args: { filePath } });
+	await after?.({ tool: "read", sessionID, callID, args: { filePath } }, { title: "read", output: "read", metadata: {} });
+};
+await recordRead(claimsBefore, claimsAfter, "s-claim-a", join(claimsDir, "shared.ts"), "claim-read-a");
+await recordRead(claimsBefore, claimsAfter, "s-claim-b", join(claimsDir, "shared.ts"), "claim-read-b-shared");
+await recordRead(claimsBefore, claimsAfter, "s-claim-b", join(claimsDir, "other.ts"), "claim-read-b-other");
+await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-a" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "a" } });
+let claimConflict = false;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-b" }, { args: { filePath: join(claimsDir, "shared-link.ts"), content: "b" } });
+} catch (error) {
+	claimConflict = String(error).includes("claimed by another active session");
+}
+check("concurrent file claims block another session through a symlink alias", claimConflict);
+let unrelatedAllowed = true;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-other" }, { args: { filePath: join(claimsDir, "other.ts"), content: "b" } });
+} catch {
+	unrelatedAllowed = false;
+}
+check("concurrent file claims do not block unrelated files", unrelatedAllowed);
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-other", args: {} }, { title: "edit", output: "edited", metadata: {} });
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-a", args: {} }, { title: "edit", output: "edited", metadata: {} });
+let releasedAllowed = true;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-after-release" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "b" } });
+} catch {
+	releasedAllowed = false;
+}
+check("concurrent file claim releases after the owning tool call", releasedAllowed);
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-after-release", args: {} }, { title: "edit", output: "edited", metadata: {} });
+
+await claimsBefore?.({ tool: "write", sessionID: "s-claim-a", callID: "claim-dangling" }, { args: { filePath: join(claimsDir, "future.ts"), content: "a" } });
+let danglingConflict = false;
+try {
+	await claimsBefore?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-dangling-alias" }, { args: { filePath: join(claimsDir, "future-link.ts"), content: "b" } });
+} catch (error) {
+	danglingConflict = String(error).includes("claimed by another active session");
+}
+check("concurrent file claims canonicalize dangling final symlinks", danglingConflict);
+await claimsHooks.event?.({ event: { type: "session.idle", properties: { sessionID: "s-claim-a" } } } as any);
+let idleCleanupAllowed = true;
+try {
+	await claimsBefore?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-after-idle" }, { args: { filePath: join(claimsDir, "future.ts"), content: "b" } });
+} catch {
+	idleCleanupAllowed = false;
+}
+check("session idle clears stale direct-edit claims", idleCleanupAllowed);
+await claimsAfter?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-after-idle", args: {} }, { title: "write", output: "written", metadata: {} });
+
+await recordRead(claimsBefore, claimsAfter, "s-claim-a", join(claimsDir, "shared.ts"), "claim-read-after-idle");
+await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-patch-owner" }, { args: { filePath: join(claimsDir, "shared.ts"), content: "a" } });
+let patchConflict = false;
+try {
+	await claimsBefore?.({ tool: "apply_patch", sessionID: "s-claim-b", callID: "claim-patch" }, { args: { patchText: "*** Begin Patch\n*** Update File: other.ts\n-old\n+new\n*** Update File: shared.ts\n-old\n+new\n*** End Patch" } });
+} catch (error) {
+	patchConflict = String(error).includes("claimed by another active session");
+}
+check("apply_patch claims all targets atomically when one target conflicts", patchConflict);
+todo("s-claim-c", item("edit unclaimed file", "in_progress"));
+await recordRead(claimsBefore, claimsAfter, "s-claim-c", join(claimsDir, "other.ts"), "claim-read-c-other");
+let partialPatchClaim = false;
+try {
+	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-c", callID: "claim-patch-other" }, { args: { filePath: join(claimsDir, "other.ts"), content: "c" } });
+} catch {
+	partialPatchClaim = true;
+}
+check("blocked multi-target patch leaves no partial claims", !partialPatchClaim);
+
+// Existing files must be read by the same session before edit/write, and the
+// bytes plus filesystem identity must still match when the mutation starts.
+const staleDir = mkdtempSync(join(tmpdir(), "wg-stale-write-"));
+writeFileSync(join(staleDir, "target.ts"), "observed");
+symlinkSync(join(staleDir, "target.ts"), join(staleDir, "target-link.ts"));
+const staleHooks = await pluginFn({
+	directory: staleDir,
+	client: fakeClient as any,
+	project: {} as any,
+	worktree: staleDir,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+const staleBefore = staleHooks["tool.execute.before"];
+const staleAfter = staleHooks["tool.execute.after"];
+for (const sessionID of ["s-stale", "s-stale-other"]) todo(sessionID, item("edit observed file", "in_progress"));
+let unreadBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale", callID: "unread" }, { args: { filePath: join(staleDir, "target.ts"), content: "next" } });
+} catch (error) {
+	unreadBlocked = String(error).toLowerCase().includes("re-read");
+}
+check("stale-write protection requires reading an existing file", unreadBlocked);
+await staleBefore?.({ tool: "read", sessionID: "s-stale", callID: "read-race" }, { args: { filePath: join(staleDir, "target.ts") } });
+writeFileSync(join(staleDir, "target.ts"), "changed during read");
+await staleAfter?.({ tool: "read", sessionID: "s-stale", callID: "read-race", args: { filePath: join(staleDir, "target.ts") } }, { title: "target.ts", output: "observed", metadata: {} });
+let racedReadBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale", callID: "after-read-race" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch (error) {
+	racedReadBlocked = String(error).toLowerCase().includes("re-read");
+}
+check("stale-write protection does not authorize bytes changed during a read", racedReadBlocked);
+writeFileSync(join(staleDir, "target.ts"), "observed");
+await staleBefore?.({ tool: "read", sessionID: "s-stale", callID: "read-1" }, { args: { filePath: join(staleDir, "target-link.ts") } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale", callID: "read-1", args: { filePath: join(staleDir, "target-link.ts") } }, { title: "target-link.ts", output: "observed", metadata: {} });
+let unchangedAllowed = true;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale", callID: "fresh" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch {
+	unchangedAllowed = false;
+}
+check("stale-write protection accepts an unchanged file read through a symlink", unchangedAllowed);
+await staleAfter?.({ tool: "edit", sessionID: "s-stale", callID: "fresh", args: {} }, { title: "edit", output: "edited", metadata: {} });
+writeFileSync(join(staleDir, "target.ts"), "changed elsewhere");
+let changedBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale", callID: "stale-content" }, { args: { filePath: join(staleDir, "target-link.ts"), content: "next" } });
+} catch (error) {
+	changedBlocked = String(error).includes("changed since this session read it");
+}
+check("stale-write protection blocks changed content through a symlink alias", changedBlocked);
+writeFileSync(join(staleDir, "target.ts"), "observed");
+await staleBefore?.({ tool: "read", sessionID: "s-stale", callID: "read-2" }, { args: { filePath: join(staleDir, "target.ts") } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale", callID: "read-2", args: { filePath: join(staleDir, "target.ts") } }, { title: "target.ts", output: "observed", metadata: {} });
+rmSync(join(staleDir, "target.ts"));
+writeFileSync(join(staleDir, "target.ts"), "observed");
+let replacementBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale", callID: "stale-replacement" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch (error) {
+	replacementBlocked = String(error).includes("changed since this session read it");
+}
+check("stale-write protection detects delete and recreate with identical bytes", replacementBlocked);
+let otherSessionBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale-other", callID: "other-session" }, { args: { filePath: join(staleDir, "target.ts"), oldString: "observed", newString: "next" } });
+} catch (error) {
+	otherSessionBlocked = String(error).toLowerCase().includes("re-read");
+}
+check("stale-write fingerprints are scoped to the reading session", otherSessionBlocked);
+let newFileAllowed = true;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale", callID: "new-file" }, { args: { filePath: join(staleDir, "new.ts"), content: "new" } });
+} catch {
+	newFileAllowed = false;
+}
+check("stale-write protection allows creating a new file without a prior read", newFileAllowed);
+await staleAfter?.({ tool: "write", sessionID: "s-stale", callID: "new-file", args: {} }, { title: "write", output: "written", metadata: {} });
+const staleAlternateRoot = mkdtempSync(join(tmpdir(), "wg-stale-root-"));
+writeFileSync(join(staleAlternateRoot, "relative.ts"), "observed");
+todo("s-stale-root", item("edit relative file", "in_progress"));
+await staleBefore?.({ tool: "read", sessionID: "s-stale-root", callID: "read-relative", worktree: staleAlternateRoot } as any, { args: { filePath: "relative.ts" } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale-root", callID: "read-relative", args: { filePath: "relative.ts" } }, { title: "relative.ts", output: "observed", metadata: {} });
+let alternateRootAllowed = true;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: "s-stale-root", callID: "edit-relative", worktree: staleAlternateRoot } as any, { args: { filePath: "relative.ts", oldString: "observed", newString: "next" } });
+} catch {
+	alternateRootAllowed = false;
+}
+check("stale-write read observations retain the invocation worktree", alternateRootAllowed);
+await staleAfter?.({ tool: "edit", sessionID: "s-stale-root", callID: "edit-relative", args: {} }, { title: "edit", output: "edited", metadata: {} });
+rmSync(staleAlternateRoot, { recursive: true, force: true });
+rmSync(staleDir, { recursive: true, force: true });
+
 // Targeted post-edit validation runs only after a matching mutation actually
 // changes the file. Validator commands never receive the filename as shell text.
 const validatorDir = mkdtempSync(join(tmpdir(), "wg-validator-"));
@@ -596,6 +784,9 @@ const validatorBefore = validatorHooks["tool.execute.before"];
 const validatorAfter = validatorHooks["tool.execute.after"];
 check("plugin returns tool.execute.after hook for post-edit validation", typeof validatorAfter === "function");
 todo("s-validator", item("validate edits", "in_progress"));
+for (const path of ["target.ts", "unchanged.ts", "semi;colon.ts"]) {
+	await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, path), `validator-read-${path}`);
+}
 const validatorArgs = { filePath: join(validatorDir, "target.ts"), content: "after" };
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-1" }, { args: validatorArgs });
 writeFileSync(validatorArgs.filePath, "after");
@@ -617,6 +808,7 @@ await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "valida
 check("filename shell metacharacters do not bypass targeted validation", metacharOutput.output.includes("validator failed"));
 
 writeFileSync(join(validatorDir, "timeout.ts"), "before");
+await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, "timeout.ts"), "validator-read-timeout");
 const timeoutArgs = { filePath: join(validatorDir, "timeout.ts"), content: "after" };
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-4" }, { args: timeoutArgs });
 writeFileSync(timeoutArgs.filePath, "after");
@@ -644,6 +836,8 @@ check("apply_patch validates changed targets containing spaces", spacedPatchOutp
 
 writeFileSync(join(validatorDir, "concurrent-a.ts"), "before");
 writeFileSync(join(validatorDir, "concurrent-b.ts"), "before");
+await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, "concurrent-a.ts"), "validator-read-concurrent-a");
+await recordRead(validatorBefore, validatorAfter, "s-validator", join(validatorDir, "concurrent-b.ts"), "validator-read-concurrent-b");
 const concurrentA = { filePath: join(validatorDir, "concurrent-a.ts"), content: "after" };
 const concurrentB = { filePath: join(validatorDir, "concurrent-b.ts"), content: "after" };
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "concurrent-a" }, { args: concurrentA });
@@ -660,6 +854,7 @@ const alternateValidatorDir = mkdtempSync(join(tmpdir(), "wg-validator-root-"));
 writeFileSync(join(alternateValidatorDir, "root.ts"), "before");
 writeFileSync(join(alternateValidatorDir, "workflow-guard.json"), JSON.stringify({ postEditValidators: [{ pattern: "*.ts", command: "node -e \"console.error(process.cwd()); process.exit(1)\"" }] }));
 const rootArgs = { filePath: join(alternateValidatorDir, "root.ts"), content: "after" };
+await recordRead(validatorBefore, validatorAfter, "s-validator", rootArgs.filePath, "validator-read-root");
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-root" }, { args: rootArgs, worktree: alternateValidatorDir } as any);
 writeFileSync(rootArgs.filePath, "after");
 const rootOutput = { title: "edit", output: "edited", metadata: {} };
@@ -673,6 +868,7 @@ writeFileSync(
 );
 writeFileSync(join(validatorDir, "invalid-config.ts"), "before");
 const invalidConfigArgs = { filePath: join(validatorDir, "invalid-config.ts"), content: "after" };
+await recordRead(validatorBefore, validatorAfter, "s-validator", invalidConfigArgs.filePath, "validator-read-invalid");
 await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-invalid-config" }, { args: invalidConfigArgs });
 writeFileSync(invalidConfigArgs.filePath, "after");
 const invalidConfigOutput = { title: "edit", output: "edited", metadata: {} };
@@ -746,8 +942,18 @@ check("command.executed event is audited", evtAuditAfter > evtAuditBefore);
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
 let registeredOrder: number | undefined;
+let registeredTuiCommands: Array<{ name: string; run?: Function }> = [];
+let tuiDialogSelectProps: any;
+const tuiCommandOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-command-options-"));
 const fakeTuiApi = {
 	theme: { current: { success: "#00ff00" } },
+	state: { path: { worktree: tuiCommandOptionsDir, directory: tuiCommandOptionsDir } },
+	keymap: { registerLayer: ({ commands }: { commands: Array<{ name: string; run?: Function }> }) => { registeredTuiCommands = commands; } },
+	ui: {
+		DialogSelect: (props: any) => { tuiDialogSelectProps = props; return {} as any; },
+		dialog: { replace: (render: Function) => render(), clear() {} },
+		toast() {},
+	},
 	slots: {
 		register: ({ order, slots }: { order?: number; slots: Record<string, Function> }) => {
 			registeredOrder = order;
@@ -759,6 +965,43 @@ await WorkflowGuardTui(fakeTuiApi as any, undefined, {} as any);
 check("tui plugin registers with order", registeredOrder === 1);
 check("tui plugin registers session_prompt_right slot", typeof registeredSlots.session_prompt_right === "function");
 check("tui plugin registers home_prompt_right slot", typeof registeredSlots.home_prompt_right === "function");
+check("tui plugin registers project-options command through keymap", registeredTuiCommands.some((command) => command.name === "workflow-guard.project-options"));
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+tuiDialogSelectProps?.onSelect?.({ value: "recoveryCheckpoints" });
+check("tui project-options command persists selected recovery setting", readRecoveryCheckpointsOption(tuiCommandOptionsDir) === true);
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+tuiDialogSelectProps?.onSelect?.({ value: "projectMemory" });
+check("tui project-options command can disable project memory", readProjectOption(tuiCommandOptionsDir, "projectMemory") === false);
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+tuiDialogSelectProps?.onSelect?.({ value: "learning" });
+check("tui project-options command can enable learner mode", readProjectOption(tuiCommandOptionsDir, "learning") === true);
+rmSync(tuiCommandOptionsDir, { recursive: true, force: true });
+const tuiOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-options-"));
+check("recovery checkpoint project option defaults off", readRecoveryCheckpointsOption(tuiOptionsDir) === false);
+mkdirSync(join(tuiOptionsDir, ".opencode"), { recursive: true });
+writeFileSync(join(tuiOptionsDir, ".opencode", "workflow-guard.jsonc"), "{\n  // keep this comment\n  \"requireReview\": true,\n}\n");
+const tuiOptionsPath = writeRecoveryCheckpointsOption(tuiOptionsDir, true);
+const tuiOptionsRaw = readFileSync(tuiOptionsPath, "utf8");
+check("recovery checkpoint project option uses existing JSONC", tuiOptionsPath === join(tuiOptionsDir, ".opencode", "workflow-guard.jsonc") && readRecoveryCheckpointsOption(tuiOptionsDir) === true);
+check("recovery checkpoint project option preserves JSONC comments, trailing commas, and settings", tuiOptionsRaw.includes("// keep this comment") && tuiOptionsRaw.includes('"requireReview": true,') && tuiOptionsRaw.includes('"recoveryCheckpoints": true'));
+writeFileSync(join(tuiOptionsDir, ".opencode", "workflow-guard.json"), "{\n  \"recoveryCheckpoints\": false\n}\n");
+check("recovery checkpoint project option matches server JSON precedence", readRecoveryCheckpointsOption(tuiOptionsDir) === false && writeRecoveryCheckpointsOption(tuiOptionsDir, true) === join(tuiOptionsDir, ".opencode", "workflow-guard.json"));
+const malformedOptions = join(tuiOptionsDir, ".opencode", "workflow-guard.json");
+writeFileSync(malformedOptions, "{ invalid jsonc\n");
+let malformedRejected = false;
+try { writeRecoveryCheckpointsOption(tuiOptionsDir, true); } catch { malformedRejected = true; }
+check("recovery checkpoint project option refuses malformed JSONC without rewriting", malformedRejected && readFileSync(malformedOptions, "utf8") === "{ invalid jsonc\n");
+rmSync(join(tuiOptionsDir, ".opencode"), { recursive: true, force: true });
+const defaultOptionsPath = writeRecoveryCheckpointsOption(tuiOptionsDir, true);
+check("recovery checkpoint project option creates default .opencode JSON", defaultOptionsPath === join(tuiOptionsDir, ".opencode", "workflow-guard.json") && existsSync(defaultOptionsPath));
+const outsideTuiOptions = mkdtempSync(join(tmpdir(), "wg-tui-options-outside-"));
+rmSync(join(tuiOptionsDir, ".opencode"), { recursive: true, force: true });
+symlinkSync(outsideTuiOptions, join(tuiOptionsDir, ".opencode"), "dir");
+let tuiSymlinkRejected = false;
+try { writeRecoveryCheckpointsOption(tuiOptionsDir, true); } catch { tuiSymlinkRejected = true; }
+check("recovery checkpoint project option refuses symlink escape", tuiSymlinkRejected && !existsSync(join(outsideTuiOptions, "workflow-guard.json")));
+rmSync(outsideTuiOptions, { recursive: true, force: true });
+rmSync(tuiOptionsDir, { recursive: true, force: true });
 
 // ── Adversarial tests & hardened invariants ──
 console.log("- Adversarial tests & hardened invariants -");
@@ -1734,6 +1977,105 @@ check("shell tool blocks global npm install", blocked(await shell("npm i -g tsx"
 check("shell tool blocks direct npm publish", blocked(await shell("npm publish --access public")));
 check("shell tool allows regular npm install", !(await shell("npm install lodash")));
 
+// Durable Recovery Checkpoints
+console.log("- Durable Recovery Checkpoints -");
+const checkpointDir = mkdtempSync(join(tmpdir(), "wg-checkpoint-"));
+spawnSync("git", ["init", "-q", checkpointDir]);
+spawnSync("git", ["-C", checkpointDir, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", checkpointDir, "config", "user.name", "Test"]);
+writeFileSync(join(checkpointDir, "tracked.txt"), "baseline\n");
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+spawnSync("git", ["-C", checkpointDir, "commit", "-qm", "baseline"]);
+writeFileSync(join(checkpointDir, "tracked.txt"), "user change\n");
+writeFileSync(join(checkpointDir, "untracked.txt"), "user untracked\n");
+const checkpoint = createRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint captures a private reachable Git object", Boolean(checkpoint?.ref));
+const stashListAfterCheckpoint = spawnSync("git", ["-C", checkpointDir, "stash", "list"], { encoding: "utf8" }).stdout.trim();
+check("recovery checkpoint does not pollute the user's stash list", stashListAfterCheckpoint === "");
+writeFileSync(join(checkpointDir, "tracked.txt"), "agent change\n");
+writeFileSync(join(checkpointDir, "untracked.txt"), "agent changed untracked\n");
+finalizeRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+const checkpointMetadataLock = join(checkpointDir, ".git", "workflow-guard", "recovery-checkpoints.json.lock");
+writeFileSync(checkpointMetadataLock, "concurrent session");
+const refsBeforeLockedCreate = spawnSync("git", ["-C", checkpointDir, "for-each-ref", "--format=%(refname)", "refs/workflow-guard/checkpoints/"], { encoding: "utf8" }).stdout;
+const lockedCreate = createRecoveryCheckpoint(checkpointDir, "locked-concurrent-session", 1);
+const refsAfterLockedCreate = spawnSync("git", ["-C", checkpointDir, "for-each-ref", "--format=%(refname)", "refs/workflow-guard/checkpoints/"], { encoding: "utf8" }).stdout;
+check("recovery checkpoint registration cannot publish while restore lock is held", !lockedCreate && refsAfterLockedCreate === refsBeforeLockedCreate && listRecoveryCheckpoints(checkpointDir, "locked-concurrent-session").length === 0);
+const lockedRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint refuses restore while session registration is locked", !lockedRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "agent change\n");
+rmSync(checkpointMetadataLock);
+const restoredCheckpoint = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint restores tracked workspace state", restoredCheckpoint.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "user change\n");
+check("recovery checkpoint restores pre-run untracked content", readFileSync(join(checkpointDir, "untracked.txt"), "utf8") === "user untracked\n");
+
+const cleanCheckpointDir = mkdtempSync(join(tmpdir(), "workflow-guard-clean-checkpoint-"));
+spawnSync("git", ["init", "-q", cleanCheckpointDir]);
+spawnSync("git", ["-C", cleanCheckpointDir, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", cleanCheckpointDir, "config", "user.name", "Test"]);
+writeFileSync(join(cleanCheckpointDir, "tracked.txt"), "baseline\n");
+spawnSync("git", ["-C", cleanCheckpointDir, "add", "tracked.txt"]);
+spawnSync("git", ["-C", cleanCheckpointDir, "commit", "-qm", "baseline"]);
+createRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
+writeFileSync(join(cleanCheckpointDir, "created-during-run.txt"), "agent output\n");
+finalizeRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
+const cleanCheckpointRestore = restoreRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
+check("recovery checkpoint removes untracked files created from a clean checkpoint", cleanCheckpointRestore.ok && !existsSync(join(cleanCheckpointDir, "created-during-run.txt")));
+writeFileSync(join(checkpointDir, "tracked.txt"), "later user edit\n");
+const interferenceRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint refuses intervening workspace changes", !interferenceRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "later user edit\n");
+
+// A clean commit can leave the index/worktree identical while moving HEAD. Recovery
+// must not rewind that newer branch history.
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+spawnSync("git", ["-C", checkpointDir, "commit", "-qm", "later user commit"]);
+const committedHead = spawnSync("git", ["-C", checkpointDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+const committedCheckpoint = createRecoveryCheckpoint(checkpointDir, "commit-boundary-session", 1);
+finalizeRecoveryCheckpoint(checkpointDir, "commit-boundary-session", 1);
+spawnSync("git", ["-C", checkpointDir, "commit", "--allow-empty", "-qm", "commit after recovery boundary"]);
+const headAfterBoundary = spawnSync("git", ["-C", checkpointDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+const headMoveRestore = restoreRecoveryCheckpoint(checkpointDir, "commit-boundary-session", 1);
+check("recovery checkpoint refuses HEAD movement after the idle boundary", Boolean(committedCheckpoint) && !headMoveRestore.ok && headAfterBoundary !== committedHead && spawnSync("git", ["-C", checkpointDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim() === headAfterBoundary);
+
+// The checkpoint is a workspace snapshot, including which tracked changes were staged.
+writeFileSync(join(checkpointDir, "tracked.txt"), "staged before run\n");
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+createRecoveryCheckpoint(checkpointDir, "staged-session", 1);
+writeFileSync(join(checkpointDir, "tracked.txt"), "agent changed staged file\n");
+finalizeRecoveryCheckpoint(checkpointDir, "staged-session", 1);
+const stagedRestore = restoreRecoveryCheckpoint(checkpointDir, "staged-session", 1);
+const stagedStatus = spawnSync("git", ["-C", checkpointDir, "status", "--porcelain", "tracked.txt"], { encoding: "utf8" }).stdout;
+check("recovery checkpoint restores staged state", stagedRestore.ok && stagedStatus.startsWith("M ") && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "staged before run\n");
+
+// A second session that was already running when this run started is still
+// concurrent and must make restoration unsafe.
+createRecoveryCheckpoint(checkpointDir, "overlap-session-a", 1);
+createRecoveryCheckpoint(checkpointDir, "overlap-session-b", 1);
+finalizeRecoveryCheckpoint(checkpointDir, "overlap-session-b", 1);
+finalizeRecoveryCheckpoint(checkpointDir, "overlap-session-a", 1);
+const overlapRestore = restoreRecoveryCheckpoint(checkpointDir, "overlap-session-b", 1);
+check("recovery checkpoint refuses overlapping session recovery", !overlapRestore.ok);
+rmSync(checkpointDir, { recursive: true, force: true });
+
+const checkpointWorktreeRepo = mkdtempSync(join(tmpdir(), "wg-checkpoint-wt-"));
+const checkpointLinkedWorktree = mkdtempSync(join(tmpdir(), "wg-checkpoint-wt-linked-"));
+rmSync(checkpointLinkedWorktree, { recursive: true, force: true });
+spawnSync("git", ["init", "-q", checkpointWorktreeRepo]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "config", "user.name", "Test"]);
+writeFileSync(join(checkpointWorktreeRepo, "tracked.txt"), "baseline\n");
+spawnSync("git", ["-C", checkpointWorktreeRepo, "add", "tracked.txt"]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "commit", "-qm", "baseline"]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "worktree", "add", "-q", "-b", "checkpoint-linked", checkpointLinkedWorktree]);
+createRecoveryCheckpoint(checkpointWorktreeRepo, "main-worktree-session", 1);
+finalizeRecoveryCheckpoint(checkpointWorktreeRepo, "main-worktree-session", 1);
+createRecoveryCheckpoint(checkpointWorktreeRepo, "newer-root-session", 1);
+const newerSessionRestore = restoreRecoveryCheckpoint(checkpointWorktreeRepo, "main-worktree-session", 1);
+check("recovery checkpoint refuses a newer active root session", !newerSessionRestore.ok);
+createRecoveryCheckpoint(checkpointLinkedWorktree, "linked-worktree-session", 1);
+check("linked worktrees retain independent recovery metadata", listRecoveryCheckpoints(checkpointWorktreeRepo, "main-worktree-session").length === 1 && listRecoveryCheckpoints(checkpointLinkedWorktree, "linked-worktree-session").length === 1);
+rmSync(checkpointLinkedWorktree, { recursive: true, force: true });
+rmSync(checkpointWorktreeRepo, { recursive: true, force: true });
+
 // 18. Native Git Worktree Lifecycle Tools
 console.log("- Native Git Worktree Lifecycle Tools -");
 const worktreeStorage = mkdtempSync(join(tmpdir(), "wg-wt-storage-"));
@@ -1837,7 +2179,7 @@ check(
 	!createGitWorktree("release/prod", "HEAD", worktreeBaseRepo).success,
 );
 rmSync(join(worktreeBaseRepo, ".opencode"), { recursive: true, force: true });
-reloadProjectConfig(prevRoot);
+reloadProjectConfig(worktreeBaseRepo);
 
 // Tool-level checks: registration, todo gate, protected-branch rejection.
 check("plugin registers guard_worktree_create tool", typeof customPlugin.tool?.guard_worktree_create?.execute === "function");
@@ -1880,6 +2222,44 @@ rmSync(worktreeBaseRepo, { recursive: true, force: true });
 delete process.env.WORKFLOW_GUARD_WORKTREE_DIR;
 rmSync(worktreeStorage, { recursive: true, force: true });
 setWorkspaceRoot(prevRoot);
+
+const checkpointHookDir = mkdtempSync(join(tmpdir(), "wg-checkpoint-hook-"));
+spawnSync("git", ["init", "-q", checkpointHookDir]);
+spawnSync("git", ["-C", checkpointHookDir, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", checkpointHookDir, "config", "user.name", "Test"]);
+writeFileSync(join(checkpointHookDir, "tracked.txt"), "baseline\n");
+writeFileSync(join(checkpointHookDir, "workflow-guard.json"), JSON.stringify({ recoveryCheckpoints: true }));
+spawnSync("git", ["-C", checkpointHookDir, "add", "tracked.txt", "workflow-guard.json"]);
+spawnSync("git", ["-C", checkpointHookDir, "commit", "-qm", "baseline"]);
+const checkpointHookParents = new Map<string, string>();
+const checkpointHookPrompts: Array<{ sessionID: string; messageID: string }> = [];
+const checkpointHookTodos = new Map<string, Array<{ content: string; status: string }>>();
+const checkpointHookClient = {
+	session: {
+		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: checkpointHookParents.get(path.id) } }),
+		todo: async ({ path }: { path: { id: string } }) => ({ data: checkpointHookTodos.get(path.id) ?? [] }),
+		promptAsync: async ({ path, body }: { path: { id: string }; body: { messageID: string } }) => {
+			checkpointHookPrompts.push({ sessionID: path.id, messageID: body.messageID });
+		},
+	},
+};
+const checkpointHooks = await WorkflowGuard({ directory: checkpointHookDir, worktree: checkpointHookDir, client: checkpointHookClient as any } as any);
+writeFileSync(join(checkpointHookDir, "tracked.txt"), "before genuine run\n");
+await checkpointHooks["chat.message"]?.({ sessionID: "checkpoint-root", messageID: "user-1" } as any, {} as any);
+check("genuine root user run creates one recovery checkpoint", listRecoveryCheckpoints(checkpointHookDir, "checkpoint-root").length === 1);
+checkpointHookTodos.set("checkpoint-root", [{ content: "continue", status: "pending" }]);
+writeFileSync(join(checkpointHookDir, "tracked.txt"), "agent result\n");
+await checkpointHooks.event?.({ event: { type: "session.idle", properties: { sessionID: "checkpoint-root" } } } as any);
+const generatedCheckpointMessage = checkpointHookPrompts.find((entry) => entry.sessionID === "checkpoint-root")?.messageID;
+check("idle finalizes recovery checkpoint before continuation", Boolean(listRecoveryCheckpoints(checkpointHookDir, "checkpoint-root")[0]?.endFingerprint && generatedCheckpointMessage));
+await checkpointHooks["chat.message"]?.({ sessionID: "checkpoint-root", messageID: generatedCheckpointMessage } as any, {} as any);
+check("synthetic continuation does not replace recovery checkpoint", listRecoveryCheckpoints(checkpointHookDir, "checkpoint-root").length === 1);
+checkpointHookParents.set("checkpoint-child", "checkpoint-root");
+await checkpointHooks["chat.message"]?.({ sessionID: "checkpoint-child", messageID: "child-user" } as any, {} as any);
+check("subagent message does not create recovery checkpoint", listRecoveryCheckpoints(checkpointHookDir, "checkpoint-child").length === 0);
+rmSync(checkpointHookDir, { recursive: true, force: true });
+setWorkspaceRoot(root);
+reloadProjectConfig(root);
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);
@@ -2111,6 +2491,7 @@ let toastHandler: ((event: any) => void) | undefined;
 const fakeTuiBadgeApi = {
 	theme: { current: { success: "green", warning: "yellow", error: "red" } },
 	route: { current: { name: "session", params: { sessionID: "s-badge" } } },
+	keymap: { registerLayer() {} },
 	event: {
 		on(type: string, handler: (event: any) => void) {
 			if (type === "tui.toast.show") toastHandler = handler;
@@ -2281,6 +2662,13 @@ const prevDataHome = process.env.XDG_DATA_HOME;
 delete process.env.WORKFLOW_GUARD_LEARNING;
 const learningDisabledPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
 check("repository cannot expose learning tools without user opt-in", !(learningDisabledPlugin.tool as any)?.learning_profile);
+const projectOptionRoot = mkdtempSync(join(tmpdir(), "wg-feature-options-"));
+mkdirSync(join(projectOptionRoot, ".opencode"), { recursive: true });
+writeFileSync(join(projectOptionRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ learning: true, projectMemory: false }));
+const projectOptionPlugin = await WorkflowGuard({ directory: projectOptionRoot, worktree: projectOptionRoot, client: fakeClient as any } as any);
+check("project option can explicitly enable learner mode", !!projectOptionPlugin.tool?.learning_profile);
+check("project option can disable project-memory tools", !(projectOptionPlugin.tool as any)?.project_memory_search);
+rmSync(projectOptionRoot, { recursive: true, force: true });
 process.env.WORKFLOW_GUARD_LEARNING = "1";
 process.env.XDG_DATA_HOME = join(root, "learning-data");
 const learningPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
