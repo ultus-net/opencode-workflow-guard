@@ -2,6 +2,8 @@
 
 Proposed additions are limited to deterministic mechanisms that add coverage beyond the current workflow guard.
 
+The preferred product shape remains one cohesive OpenCode plugin/package rather than a collection of separate services. Capabilities should be independently configurable where practical so the same installation can stay lightweight for interactive pair programming or enable stronger controls for unattended agents without changing the underlying enforcement model.
+
 ## Research Record and Repeat Protocol
 
 This roadmap came from a broad coding-agent ecosystem research pass completed on August 25, 2026. The work was not limited to familiar projects or feature summaries: candidate agents were selected using direct GitHub popularity and recent-activity metadata, OpenRouter weekly rankings were used only as a separate model/ecosystem-adoption signal, and the results were deduplicated against agents already reviewed. The pass covered Gemini CLI, OpenHands, Goose, Aider, Continue, Crush, Qwen Code, and Kilo, while retaining prior research on OpenCode, Codex, Cline, and Roo Code for comparison.
@@ -70,6 +72,20 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 - Implemented: `docs/managed-deployment.md` documents deployment alongside OpenCode's administrator-controlled managed settings on Linux, macOS, and Windows, using host-managed permissions/provider policy while retaining workflow invariants in the plugin.
 - Implemented: startup app logs report whether file-based managed configuration is detected at the platform's standard location while explicitly stating that OpenCode's V1 API does not verify plugin provenance.
 - Treat Codex's `allow_managed_hooks_only` as the reference governance model, not as a capability OpenCode currently has: managed configuration precedence does not itself prove that untrusted project plugins cannot run.
+
+## Interactive and Unattended Operation
+
+Keep Workflow Guard usable as the same enforcement plugin whether OpenCode is driven interactively through the TUI or unattended through a standalone server, SDK client, CI job, or future external harness. The caller owns orchestration; Workflow Guard owns deterministic policy decisions.
+
+- Add explicit feature-level configuration so optional capabilities can be enabled or disabled without splitting the package or weakening unrelated guardrails. Prefer one coherent configuration surface and clear dependency rules between features.
+- Audit server/headless operation so core enforcement never depends on the TUI companion, an attached terminal, or a human responding to an interactive prompt. The TUI remains an optional configuration and observability surface.
+- Define deterministic unattended behavior for actions that would otherwise require human approval. Prefer explicit policy and fail-safe outcomes over hanging indefinitely or silently approving an operation.
+- Expose stable, machine-readable policy outcomes for external controllers, including enough distinction for `blocked`, `needs approval`, `verification failed`, and other actionable states without requiring log-message parsing.
+- Harden session/job isolation for long-running shared servers. Concurrency claims, verification/review evidence, recovery state, project configuration, and overrides must remain scoped to the intended workspace and session lineage.
+- Treat process-wide environment overrides such as `WORKFLOW_GUARD_ALLOW_LIVE=1` as especially sensitive in persistent server deployments; investigate narrower explicit configuration where OpenCode's plugin API can support it safely.
+- Expand install/load coverage with a standalone-server/headless test path that proves policy hooks, configuration, auditing, and failure behavior work without the TUI.
+- Keep bounded `session.idle` continuation limited to already-owned unfinished work. Do not evolve it into the unattended orchestration loop; SDK/server clients and external harnesses should own retries, task selection, sequencing, and terminal workflow state.
+- Document the security boundary clearly: Workflow Guard is application-level policy enforcement and defense in depth, not an OS sandbox. Consequential unattended deployments should additionally constrain filesystem, credentials, processes, and network access with containers, VMs, or equivalent host isolation.
 
 ## Deferred: Hard Completion Gate
 
