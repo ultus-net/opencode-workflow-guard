@@ -76,16 +76,8 @@ export async function effectiveTodoOwnerSessionID(
 	sessionID: string | undefined,
 ): Promise<string | undefined> {
 	if (!sessionID) return undefined;
-	const seen = new Set<string>();
-	let current: string | undefined = sessionID;
-	while (current && !seen.has(current)) {
-		seen.add(current);
-		const todos = await fetchSessionTodos(current);
-		if (todos === undefined) return sessionID;
-		if (todos.length > 0) return current;
-		current = await fetchParentSessionID(current);
-	}
-	return sessionID;
+	const effective = await effectiveTodosWithOwner(sessionID);
+	return effective?.ownerSessionID ?? sessionID;
 }
 
 export function hasActiveTodo(todos: TodoItem[]): boolean {
