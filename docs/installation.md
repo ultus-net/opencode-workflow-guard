@@ -60,6 +60,20 @@ The package exports OpenCode's conventional `./server` and `./tui` entrypoints, 
 
 The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime `dependency` of this package, so npm installs it automatically alongside `opencode-workflow-guard` - no extra install is needed.
 
+## Recovery Checkpoints
+
+Durable recovery checkpoints are opt-in per project. Enable them in `.opencode/workflow-guard.json` (JSONC is also supported):
+
+```json
+{
+  "recoveryCheckpoints": true
+}
+```
+
+For each genuine user run in a root session, Workflow Guard captures the pre-run tracked and untracked workspace state in private Git objects. The objects are kept reachable under `refs/workflow-guard/checkpoints/` and do not add entries to the user's stash list. Subagent runs and Workflow Guard's synthetic continuation messages do not create or replace checkpoints.
+
+When the root session reaches idle, the checkpoint records the resulting workspace fingerprint. The `guard_recovery_restore` tool can then restore a selected run, but only for that same root session and only while the workspace still exactly matches the recorded idle boundary. Any intervening workspace change makes recovery refuse rather than overwrite newer work. Recovery checkpoints require an existing Git commit and deliberately fail open if a snapshot cannot be created.
+
 ---
 
 ## Recommended Companion Configuration

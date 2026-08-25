@@ -30,6 +30,7 @@ export interface ProjectConfig {
 	}>;
 	requireReview?: boolean;
 	requireDocumentation?: boolean;
+	recoveryCheckpoints?: boolean;
 	maxSubagentMutations?: number;
 	maxLearningInterventions?: number;
 }

@@ -51,6 +51,7 @@ import {
 	sessionMutationTimestamps,
 	sessionVerifyResults,
 	loadProjectConfig,
+	getProjectConfig,
 	reloadProjectConfig,
 	stripJsonComments,
 	isReviewRequired,
@@ -205,6 +206,7 @@ import {
 	validateTodoLifecycle,
 	fetchSessionTodos,
 	fetchParentSessionID,
+	fetchParentSession,
 	effectiveTodos,
 	effectiveTodoOwnerSessionID,
 	hasActiveTodo,
@@ -212,8 +214,15 @@ import {
 import {
 	clearContinuationState,
 	continueUnfinishedSession,
+	isGeneratedContinuationMessage,
 	recordUserMessage,
 } from "./policies/continuation.ts";
+import {
+	createRecoveryCheckpoint,
+	finalizeRecoveryCheckpoint,
+	nextRecoveryRun,
+	restoreRecoveryCheckpoint,
+} from "./lib/checkpoint.ts";
 import { discoverPlanningSources } from "./policies/planning.ts";
 export { discoverPlanningSources };
 
@@ -1070,10 +1079,27 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 
 	const pendingPostEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
 	const pendingReadObservations = new Map<string, ReadObservation>();
+	const activeRecoveryRuns = new Map<string, number>();
 	const postEditKey = (sessionID: string, callID: string) => `${sessionID}\0${callID}`;
 
 	return {
 		tool: {
+			...(getProjectConfig(effectiveRoot).recoveryCheckpoints === true ? {
+				guard_recovery_restore: tool({
+					description: "Restore this root session's workspace to its pre-run recovery checkpoint. Refuses if the run has not gone idle or if the workspace changed after that boundary.",
+					args: { run: tool.schema.number() },
+					execute: async (args, toolContext) => {
+						if (!Number.isInteger(args.run) || args.run < 1) return "[workflow-guard] Recovery rejected: run must be a positive integer.";
+						const parent = await fetchParentSession(toolContext.sessionID);
+						if (!parent.ok) return "[workflow-guard] Recovery rejected: could not confirm this is a root session.";
+						if (parent.parentID) return "[workflow-guard] Recovery rejected: only root sessions can restore their checkpoints.";
+						const result = restoreRecoveryCheckpoint(effectiveRoot, toolContext.sessionID, args.run);
+						return result.ok
+							? `[workflow-guard] Restored recovery checkpoint for run ${args.run}.`
+							: `[workflow-guard] Recovery rejected: ${result.error}`;
+					},
+				}),
+			} : {}),
 			guard_next_tasks: tool({
 				description:
 					"Load durable repository task context when deciding what to work on next. Prefers TODO.md; if absent, discovers conventional roadmap, plan, tasks, backlog, and docs/plans Markdown files.",
@@ -1645,6 +1671,16 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				"\n\nWorkflow Guard lifecycle: each todowrite call replaces the complete task list. Preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled; do not omit active tasks when adding new work. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply.";
 		},
 
+		"chat.message": async (input) => {
+			if (getProjectConfig(effectiveRoot).recoveryCheckpoints !== true) return;
+			if (isGeneratedContinuationMessage(input.sessionID, input.messageID)) return;
+			const parent = await runWithRuntimeState(effectiveRoot, ctx.client, () => fetchParentSession(input.sessionID));
+			if (!parent.ok || parent.parentID) return;
+			const run = nextRecoveryRun(effectiveRoot, input.sessionID);
+			const checkpoint = createRecoveryCheckpoint(effectiveRoot, input.sessionID, run);
+			if (checkpoint) activeRecoveryRuns.set(input.sessionID, run);
+		},
+
 		event: async ({
 			event,
 		}: { event: { type?: string; properties?: unknown } }) => {
@@ -1653,6 +1689,11 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
+					const recoveryRun = activeRecoveryRuns.get(sessionID);
+					if (recoveryRun !== undefined) {
+						finalizeRecoveryCheckpoint(effectiveRoot, sessionID, recoveryRun);
+						activeRecoveryRuns.delete(sessionID);
+					}
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
 				}
 			}
@@ -1669,6 +1710,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				if (typeof sessionID === "string") {
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
+					activeRecoveryRuns.delete(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}
 			}

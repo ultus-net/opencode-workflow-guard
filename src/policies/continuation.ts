@@ -74,6 +74,11 @@ export function recordUserMessage(sessionID: string, messageID?: string): void {
 	state.counts.delete(sessionID);
 }
 
+export function isGeneratedContinuationMessage(sessionID: string, messageID?: string): boolean {
+	if (!messageID) return false;
+	return getState()?.generatedMessageIDs.get(sessionID)?.has(messageID) === true;
+}
+
 export function clearContinuationState(sessionID: string): void {
 	const state = getState();
 	if (!state) return;

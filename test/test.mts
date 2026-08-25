@@ -74,6 +74,7 @@ import {
 } from "../src/workflow-guard.ts";
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
+import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
@@ -1929,6 +1930,105 @@ check("shell tool blocks global npm install", blocked(await shell("npm i -g tsx"
 check("shell tool blocks direct npm publish", blocked(await shell("npm publish --access public")));
 check("shell tool allows regular npm install", !(await shell("npm install lodash")));
 
+// Durable Recovery Checkpoints
+console.log("- Durable Recovery Checkpoints -");
+const checkpointDir = mkdtempSync(join(tmpdir(), "wg-checkpoint-"));
+spawnSync("git", ["init", "-q", checkpointDir]);
+spawnSync("git", ["-C", checkpointDir, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", checkpointDir, "config", "user.name", "Test"]);
+writeFileSync(join(checkpointDir, "tracked.txt"), "baseline\n");
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+spawnSync("git", ["-C", checkpointDir, "commit", "-qm", "baseline"]);
+writeFileSync(join(checkpointDir, "tracked.txt"), "user change\n");
+writeFileSync(join(checkpointDir, "untracked.txt"), "user untracked\n");
+const checkpoint = createRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint captures a private reachable Git object", Boolean(checkpoint?.ref));
+const stashListAfterCheckpoint = spawnSync("git", ["-C", checkpointDir, "stash", "list"], { encoding: "utf8" }).stdout.trim();
+check("recovery checkpoint does not pollute the user's stash list", stashListAfterCheckpoint === "");
+writeFileSync(join(checkpointDir, "tracked.txt"), "agent change\n");
+writeFileSync(join(checkpointDir, "untracked.txt"), "agent changed untracked\n");
+finalizeRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+const checkpointMetadataLock = join(checkpointDir, ".git", "workflow-guard", "recovery-checkpoints.json.lock");
+writeFileSync(checkpointMetadataLock, "concurrent session");
+const refsBeforeLockedCreate = spawnSync("git", ["-C", checkpointDir, "for-each-ref", "--format=%(refname)", "refs/workflow-guard/checkpoints/"], { encoding: "utf8" }).stdout;
+const lockedCreate = createRecoveryCheckpoint(checkpointDir, "locked-concurrent-session", 1);
+const refsAfterLockedCreate = spawnSync("git", ["-C", checkpointDir, "for-each-ref", "--format=%(refname)", "refs/workflow-guard/checkpoints/"], { encoding: "utf8" }).stdout;
+check("recovery checkpoint registration cannot publish while restore lock is held", !lockedCreate && refsAfterLockedCreate === refsBeforeLockedCreate && listRecoveryCheckpoints(checkpointDir, "locked-concurrent-session").length === 0);
+const lockedRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint refuses restore while session registration is locked", !lockedRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "agent change\n");
+rmSync(checkpointMetadataLock);
+const restoredCheckpoint = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint restores tracked workspace state", restoredCheckpoint.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "user change\n");
+check("recovery checkpoint restores pre-run untracked content", readFileSync(join(checkpointDir, "untracked.txt"), "utf8") === "user untracked\n");
+
+const cleanCheckpointDir = mkdtempSync(join(tmpdir(), "workflow-guard-clean-checkpoint-"));
+spawnSync("git", ["init", "-q", cleanCheckpointDir]);
+spawnSync("git", ["-C", cleanCheckpointDir, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", cleanCheckpointDir, "config", "user.name", "Test"]);
+writeFileSync(join(cleanCheckpointDir, "tracked.txt"), "baseline\n");
+spawnSync("git", ["-C", cleanCheckpointDir, "add", "tracked.txt"]);
+spawnSync("git", ["-C", cleanCheckpointDir, "commit", "-qm", "baseline"]);
+createRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
+writeFileSync(join(cleanCheckpointDir, "created-during-run.txt"), "agent output\n");
+finalizeRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
+const cleanCheckpointRestore = restoreRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
+check("recovery checkpoint removes untracked files created from a clean checkpoint", cleanCheckpointRestore.ok && !existsSync(join(cleanCheckpointDir, "created-during-run.txt")));
+writeFileSync(join(checkpointDir, "tracked.txt"), "later user edit\n");
+const interferenceRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
+check("recovery checkpoint refuses intervening workspace changes", !interferenceRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "later user edit\n");
+
+// A clean commit can leave the index/worktree identical while moving HEAD. Recovery
+// must not rewind that newer branch history.
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+spawnSync("git", ["-C", checkpointDir, "commit", "-qm", "later user commit"]);
+const committedHead = spawnSync("git", ["-C", checkpointDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+const committedCheckpoint = createRecoveryCheckpoint(checkpointDir, "commit-boundary-session", 1);
+finalizeRecoveryCheckpoint(checkpointDir, "commit-boundary-session", 1);
+spawnSync("git", ["-C", checkpointDir, "commit", "--allow-empty", "-qm", "commit after recovery boundary"]);
+const headAfterBoundary = spawnSync("git", ["-C", checkpointDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim();
+const headMoveRestore = restoreRecoveryCheckpoint(checkpointDir, "commit-boundary-session", 1);
+check("recovery checkpoint refuses HEAD movement after the idle boundary", Boolean(committedCheckpoint) && !headMoveRestore.ok && headAfterBoundary !== committedHead && spawnSync("git", ["-C", checkpointDir, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout.trim() === headAfterBoundary);
+
+// The checkpoint is a workspace snapshot, including which tracked changes were staged.
+writeFileSync(join(checkpointDir, "tracked.txt"), "staged before run\n");
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+createRecoveryCheckpoint(checkpointDir, "staged-session", 1);
+writeFileSync(join(checkpointDir, "tracked.txt"), "agent changed staged file\n");
+finalizeRecoveryCheckpoint(checkpointDir, "staged-session", 1);
+const stagedRestore = restoreRecoveryCheckpoint(checkpointDir, "staged-session", 1);
+const stagedStatus = spawnSync("git", ["-C", checkpointDir, "status", "--porcelain", "tracked.txt"], { encoding: "utf8" }).stdout;
+check("recovery checkpoint restores staged state", stagedRestore.ok && stagedStatus.startsWith("M ") && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "staged before run\n");
+
+// A second session that was already running when this run started is still
+// concurrent and must make restoration unsafe.
+createRecoveryCheckpoint(checkpointDir, "overlap-session-a", 1);
+createRecoveryCheckpoint(checkpointDir, "overlap-session-b", 1);
+finalizeRecoveryCheckpoint(checkpointDir, "overlap-session-b", 1);
+finalizeRecoveryCheckpoint(checkpointDir, "overlap-session-a", 1);
+const overlapRestore = restoreRecoveryCheckpoint(checkpointDir, "overlap-session-b", 1);
+check("recovery checkpoint refuses overlapping session recovery", !overlapRestore.ok);
+rmSync(checkpointDir, { recursive: true, force: true });
+
+const checkpointWorktreeRepo = mkdtempSync(join(tmpdir(), "wg-checkpoint-wt-"));
+const checkpointLinkedWorktree = mkdtempSync(join(tmpdir(), "wg-checkpoint-wt-linked-"));
+rmSync(checkpointLinkedWorktree, { recursive: true, force: true });
+spawnSync("git", ["init", "-q", checkpointWorktreeRepo]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "config", "user.name", "Test"]);
+writeFileSync(join(checkpointWorktreeRepo, "tracked.txt"), "baseline\n");
+spawnSync("git", ["-C", checkpointWorktreeRepo, "add", "tracked.txt"]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "commit", "-qm", "baseline"]);
+spawnSync("git", ["-C", checkpointWorktreeRepo, "worktree", "add", "-q", "-b", "checkpoint-linked", checkpointLinkedWorktree]);
+createRecoveryCheckpoint(checkpointWorktreeRepo, "main-worktree-session", 1);
+finalizeRecoveryCheckpoint(checkpointWorktreeRepo, "main-worktree-session", 1);
+createRecoveryCheckpoint(checkpointWorktreeRepo, "newer-root-session", 1);
+const newerSessionRestore = restoreRecoveryCheckpoint(checkpointWorktreeRepo, "main-worktree-session", 1);
+check("recovery checkpoint refuses a newer active root session", !newerSessionRestore.ok);
+createRecoveryCheckpoint(checkpointLinkedWorktree, "linked-worktree-session", 1);
+check("linked worktrees retain independent recovery metadata", listRecoveryCheckpoints(checkpointWorktreeRepo, "main-worktree-session").length === 1 && listRecoveryCheckpoints(checkpointLinkedWorktree, "linked-worktree-session").length === 1);
+rmSync(checkpointLinkedWorktree, { recursive: true, force: true });
+rmSync(checkpointWorktreeRepo, { recursive: true, force: true });
+
 // 18. Native Git Worktree Lifecycle Tools
 console.log("- Native Git Worktree Lifecycle Tools -");
 const worktreeStorage = mkdtempSync(join(tmpdir(), "wg-wt-storage-"));
@@ -2026,13 +2126,13 @@ writeFileSync(
 	join(worktreeBaseRepo, ".opencode", "workflow-guard.json"),
 	JSON.stringify({ protectedBranches: ["release/prod"] }),
 );
-reloadProjectConfig(worktreeBaseRepo);
+reloadProjectConfig(prevRoot);
 check(
 	"createGitWorktree rejects custom protected branch from config",
 	!createGitWorktree("release/prod", "HEAD", worktreeBaseRepo).success,
 );
 rmSync(join(worktreeBaseRepo, ".opencode"), { recursive: true, force: true });
-reloadProjectConfig(prevRoot);
+reloadProjectConfig(worktreeBaseRepo);
 
 // Tool-level checks: registration, todo gate, protected-branch rejection.
 check("plugin registers guard_worktree_create tool", typeof customPlugin.tool?.guard_worktree_create?.execute === "function");
@@ -2075,6 +2175,44 @@ rmSync(worktreeBaseRepo, { recursive: true, force: true });
 delete process.env.WORKFLOW_GUARD_WORKTREE_DIR;
 rmSync(worktreeStorage, { recursive: true, force: true });
 setWorkspaceRoot(prevRoot);
+
+const checkpointHookDir = mkdtempSync(join(tmpdir(), "wg-checkpoint-hook-"));
+spawnSync("git", ["init", "-q", checkpointHookDir]);
+spawnSync("git", ["-C", checkpointHookDir, "config", "user.email", "test@example.com"]);
+spawnSync("git", ["-C", checkpointHookDir, "config", "user.name", "Test"]);
+writeFileSync(join(checkpointHookDir, "tracked.txt"), "baseline\n");
+writeFileSync(join(checkpointHookDir, "workflow-guard.json"), JSON.stringify({ recoveryCheckpoints: true }));
+spawnSync("git", ["-C", checkpointHookDir, "add", "tracked.txt", "workflow-guard.json"]);
+spawnSync("git", ["-C", checkpointHookDir, "commit", "-qm", "baseline"]);
+const checkpointHookParents = new Map<string, string>();
+const checkpointHookPrompts: Array<{ sessionID: string; messageID: string }> = [];
+const checkpointHookTodos = new Map<string, Array<{ content: string; status: string }>>();
+const checkpointHookClient = {
+	session: {
+		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: checkpointHookParents.get(path.id) } }),
+		todo: async ({ path }: { path: { id: string } }) => ({ data: checkpointHookTodos.get(path.id) ?? [] }),
+		promptAsync: async ({ path, body }: { path: { id: string }; body: { messageID: string } }) => {
+			checkpointHookPrompts.push({ sessionID: path.id, messageID: body.messageID });
+		},
+	},
+};
+const checkpointHooks = await WorkflowGuard({ directory: checkpointHookDir, worktree: checkpointHookDir, client: checkpointHookClient as any } as any);
+writeFileSync(join(checkpointHookDir, "tracked.txt"), "before genuine run\n");
+await checkpointHooks["chat.message"]?.({ sessionID: "checkpoint-root", messageID: "user-1" } as any, {} as any);
+check("genuine root user run creates one recovery checkpoint", listRecoveryCheckpoints(checkpointHookDir, "checkpoint-root").length === 1);
+checkpointHookTodos.set("checkpoint-root", [{ content: "continue", status: "pending" }]);
+writeFileSync(join(checkpointHookDir, "tracked.txt"), "agent result\n");
+await checkpointHooks.event?.({ event: { type: "session.idle", properties: { sessionID: "checkpoint-root" } } } as any);
+const generatedCheckpointMessage = checkpointHookPrompts.find((entry) => entry.sessionID === "checkpoint-root")?.messageID;
+check("idle finalizes recovery checkpoint before continuation", Boolean(listRecoveryCheckpoints(checkpointHookDir, "checkpoint-root")[0]?.endFingerprint && generatedCheckpointMessage));
+await checkpointHooks["chat.message"]?.({ sessionID: "checkpoint-root", messageID: generatedCheckpointMessage } as any, {} as any);
+check("synthetic continuation does not replace recovery checkpoint", listRecoveryCheckpoints(checkpointHookDir, "checkpoint-root").length === 1);
+checkpointHookParents.set("checkpoint-child", "checkpoint-root");
+await checkpointHooks["chat.message"]?.({ sessionID: "checkpoint-child", messageID: "child-user" } as any, {} as any);
+check("subagent message does not create recovery checkpoint", listRecoveryCheckpoints(checkpointHookDir, "checkpoint-child").length === 0);
+rmSync(checkpointHookDir, { recursive: true, force: true });
+setWorkspaceRoot(root);
+reloadProjectConfig(root);
 
 rmSync(docRepo, { recursive: true, force: true });
 setWorkspaceRoot(root);
