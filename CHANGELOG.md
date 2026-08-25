@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.1
+
+### Patch Changes
+
+- f6278b0: Fix TUI setup to use OpenCode's package-root resolution, migrate legacy TUI specs, and update the active badge and stale-cache guidance.
+
 ## 1.7.0
 
 ### Minor Changes
