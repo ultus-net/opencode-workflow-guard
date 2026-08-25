@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.8.0
+
+### Minor Changes
+
+- 6ff6e86: Add an idempotent `opencode-workflow-guard setup` CLI that registers both the server plugin and TUI companion in their respective OpenCode global configuration files, using the package spec OpenCode expects for TUI entrypoint resolution.
+
+### Patch Changes
+
+- 6ff6e86: Document OpenCode's supported plugin install and upgrade command with explicit package versions so upgrades do not remain on a previously cached `@latest` release.
+- 6ff6e86: Correlate explicit OpenCode tool outcomes in local audit telemetry and report three consecutive equivalent tool failures without persisting raw error text.
+
 ## 1.7.2
 
 ### Patch Changes
