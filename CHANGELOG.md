@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.1
+
+### Patch Changes
+
+- e0d04f7: Resume owning sessions that become idle with unfinished todos while preserving native question waits and subagent handoffs, and add `guard_next_tasks` to discover durable TODO, roadmap, and plan context.
+- d9b4863: Accept multiline ANSI-C quoted PR descriptions when checking for required changelog sections.
+- e0d04f7: Prefer OpenCode's project worktree when identifying the guarded repository so broad host workspace roots do not hide the current Git branch.
+
 ## 1.5.0
 
 ### Minor Changes
