@@ -101,10 +101,15 @@ function normalizedKubectlCommands(command: string): string {
 	return normalized.join(" ; ");
 }
 
+function normalizedShellCommands(command: string): string {
+	return splitShellSegments(command).map((segment) => shellWords(segment).join(" ")).join(" ; ");
+}
+
 export function liveMutationIn(command: string): string | undefined {
-	const optionNormalized = `${normalizedKubectlCommands(command)} ; ${command.replace(/\b(terraform|tofu)\s+(?:(?:-chdir(?:=\S+|\s+\S+)|-(?:no-color|version))\s+)*/g, "$1 ")}`;
+	const shellNormalized = normalizedShellCommands(command);
+	const optionNormalized = `${normalizedKubectlCommands(command)} ; ${shellNormalized.replace(/\b(terraform|tofu)\s+(?:(?:-chdir(?:=\S+|\s+\S+)|-(?:no-color|version))\s+)*/g, "$1 ")}`;
 	for (const { re, what } of LIVE_MUTATION_PATTERNS) {
-		if (re.test(command) || re.test(optionNormalized)) {
+		if (re.test(command) || re.test(shellNormalized) || re.test(optionNormalized)) {
 			return what;
 		}
 	}

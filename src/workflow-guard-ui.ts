@@ -1,4 +1,5 @@
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
+import type { BaseRenderable } from "@opentui/core";
 import type { JSX } from "@opentui/solid";
 import { createElement, insert, setProp } from "@opentui/solid";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -29,10 +30,10 @@ function text(props: Record<string, unknown>, children: Child[]) {
 	return element("text", props, children);
 }
 
-const BADGE_ACTIVE = "[Workflow Guard: Active]";
+const BADGE_ACTIVE = "Workflow Guard 🛡️";
 let lastBlockedReason: string | undefined;
 const sessionBlockedReasons = new Map<string, string>();
-const badgeNodes = new Map<string, unknown>();
+const badgeNodes = new Map<string, BaseRenderable>();
 
 export function readProjectOption(root: string, option: "recoveryCheckpoints" | "projectMemory" | "learning"): boolean {
 	const path = projectConfigPath(root);
@@ -125,9 +126,9 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 	});
 
 	try {
-		api.event?.on?.("tui.toast.show" as any, (e: any) => {
-			const title = e?.properties?.title ?? e?.title;
-			const msg = e?.properties?.message ?? e?.message;
+		api.event.on("tui.toast.show", (e) => {
+			const title = e.properties.title;
+			const msg = e.properties.message;
 			if (title === "Workflow Guard Blocked" && typeof msg === "string") {
 				lastBlockedReason = msg;
 				const route = api.route.current;
@@ -140,8 +141,8 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 				const node = badgeNodes.get(key);
 				if (node) {
 					const badge = formatBadge(sessionID);
-					setProp(node as any, "content", badge.text);
-					setProp(node as any, "fg", badge.isBlocked ? api.theme.current.warning : api.theme.current.success);
+					setProp(node, "content", badge.text);
+					setProp(node, "fg", badge.isBlocked ? api.theme.current.warning : api.theme.current.success);
 				}
 			}
 		});
@@ -154,7 +155,7 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 				const theme = api.theme.current;
 				const badge = formatBadge();
 				const node = text({ fg: badge.isBlocked ? theme.warning : theme.success }, [badge.text]);
-				badgeNodes.set("home", node);
+				badgeNodes.set("home", node as unknown as BaseRenderable);
 				return node;
 			},
 			session_prompt_right() {
@@ -166,7 +167,7 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 						: undefined;
 				const badge = formatBadge(sessionID);
 				const node = text({ fg: badge.isBlocked ? theme.warning : theme.success }, [badge.text]);
-				if (sessionID) badgeNodes.set(sessionID, node);
+				if (sessionID) badgeNodes.set(sessionID, node as unknown as BaseRenderable);
 				return node;
 			},
 		},

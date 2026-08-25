@@ -15,7 +15,18 @@
 
 ### 1. From npm (Recommended)
 
-Add the package to your project's `opencode.json` (or global `~/.config/opencode/opencode.json`):
+Install the current published version with OpenCode's plugin command:
+
+```bash
+VERSION=$(npm view opencode-workflow-guard version)
+opencode plugin "opencode-workflow-guard@$VERSION" --global --force
+```
+
+OpenCode documents `opencode plugin <module>` as the command to install a plugin and update its config, `--global` as global installation, and `--force` as replacing an existing plugin version. Workflow Guard exposes both server and TUI targets, so OpenCode detects both and updates their global configuration files. Restart OpenCode after installation because configuration is loaded at startup. See the [OpenCode plugin CLI documentation](https://opencode.ai/docs/cli/#plugin).
+
+Use the same two commands to upgrade after a Workflow Guard release. Keep the explicit version in OpenCode's configuration rather than relying on a bare package name or `@latest`: OpenCode caches npm plugins, and an already-populated `@latest` cache key may continue resolving to the version that originally populated it. An explicit new version creates a new package-cache key without manually deleting OpenCode's cache.
+
+If you only want the server guard without the TUI companion, add the package to your project's `opencode.json` (or global `~/.config/opencode/opencode.json`):
 
 ```json
 {
@@ -26,7 +37,7 @@ Add the package to your project's `opencode.json` (or global `~/.config/opencode
 }
 ```
 
-OpenCode automatically installs the plugin and its dependencies with Bun at startup (cached in `~/.cache/opencode/node_modules/`). No manual file copies needed.
+OpenCode automatically installs configured npm plugins and their dependencies at startup. The npm package contains both server and TUI entrypoints, but OpenCode activates them from separate configuration files. See [OpenCode's npm plugin documentation](https://opencode.ai/docs/plugins/#from-npm) and [plugin installation behavior](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
 
 ---
 
@@ -44,19 +55,19 @@ Files in your plugin directory are automatically loaded by the OpenCode server p
 
 ### 3. TUI Visual Indicator (Prompt Box Badge)
 
-To enable the dynamic prompt-bar badge - `[Workflow Guard: Active]` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
+To enable the dynamic prompt-bar badge - `Workflow Guard 🛡️` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
-Reference the TUI package entrypoint in `~/.config/opencode/tui.json`:
+The recommended `opencode plugin "opencode-workflow-guard@$VERSION" --global --force` command configures this automatically. For manual installation, use the same explicit package version in `~/.config/opencode/tui.json`:
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "opencode-workflow-guard/tui"
+    "opencode-workflow-guard@1.7.2"
   ]
 }
 ```
 
-The package root exports the server plugin, while `opencode-workflow-guard/tui` exports the TUI companion. TUI plugin specs are resolved as written, so using the package root in `tui.json` loads the server module rather than the companion. Do not place `workflow-guard-ui.ts` under `plugins/`; the server loader rejects TUI-only modules.
+The version above is illustrative; replace it with the version you intend to install. The package exposes separate server and TUI entrypoints. In `tui.json`, configure the package spec; OpenCode resolves its exported `./tui` entrypoint automatically. Do not place `workflow-guard-ui.ts` under `plugins/`; the server loader rejects TUI-only modules.
 
 The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime `dependency` of this package, so npm installs it automatically alongside `opencode-workflow-guard` - no extra install is needed.
 

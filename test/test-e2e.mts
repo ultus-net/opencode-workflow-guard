@@ -1,7 +1,8 @@
-import { mkdtempSync, rmSync, existsSync, readFileSync, copyFileSync, cpSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, copyFileSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parse as parseJsonc } from "jsonc-parser";
 
 let pass = 0;
 let fail = 0;
@@ -48,6 +49,59 @@ check(
 check("npm package exposes OpenCode server entrypoint", installedPackageJson.exports?.["./server"] === "./src/workflow-guard.ts");
 check("npm package exposes OpenCode TUI entrypoint", installedPackageJson.exports?.["./tui"] === "./src/workflow-guard-ui.ts");
 check("npm package does not expose ambiguous /ui entrypoint", installedPackageJson.exports?.["./ui"] === undefined);
+check("npm package exposes setup CLI", installedPackageJson.bin?.["opencode-workflow-guard"] === "./bin/opencode-workflow-guard.mjs");
+
+const setupHome = join(testDir, "setup-home");
+const setupConfigDir = join(setupHome, ".config", "opencode");
+mkdirSync(setupConfigDir, { recursive: true });
+writeFileSync(join(setupConfigDir, "opencode.jsonc"), `{
+  // Keep existing user settings intact.
+  "model": "test/provider",
+  "plugin": [
+    "existing-plugin", // Keep this plugin comment.
+  ],
+}\n`);
+writeFileSync(join(setupConfigDir, "tui.json"), `{ "plugin": ["opencode-workflow-guard/tui", ["opencode-workflow-guard/tui@1.5.0", { "legacy": true }]] }\n`);
+const setupEnv = { ...process.env, HOME: setupHome, XDG_CONFIG_HOME: join(setupHome, ".config") };
+const setupCli = join(testDir, "node_modules", ".bin", process.platform === "win32" ? "opencode-workflow-guard.cmd" : "opencode-workflow-guard");
+const firstSetup = spawnSync(setupCli, ["setup"], { encoding: "utf8", env: setupEnv });
+const secondSetup = spawnSync(setupCli, ["setup"], { encoding: "utf8", env: setupEnv });
+const setupServerSource = readFileSync(join(setupConfigDir, "opencode.jsonc"), "utf8");
+const setupServer = parseJsonc(setupServerSource);
+const setupTui = JSON.parse(readFileSync(join(setupConfigDir, "tui.json"), "utf8"));
+check("setup CLI succeeds and is idempotent", firstSetup.status === 0 && secondSetup.status === 0);
+check("setup CLI registers cache-safe versioned server plugin once", setupServer.plugin?.filter((entry: unknown) => entry === `opencode-workflow-guard@${installedPackageJson.version}`).length === 1);
+check("setup CLI registers cache-safe versioned TUI plugin once", setupTui.plugin?.filter((entry: unknown) => entry === `opencode-workflow-guard@${installedPackageJson.version}`).length === 1);
+check("setup CLI replaces legacy TUI subpath specs", !setupTui.plugin?.some((entry: unknown) => (typeof entry === "string" && entry.startsWith("opencode-workflow-guard/tui")) || (Array.isArray(entry) && typeof entry[0] === "string" && entry[0].startsWith("opencode-workflow-guard/tui"))));
+check("setup CLI preserves existing JSONC settings and comments", setupServer.model === "test/provider" && setupServer.plugin?.includes("existing-plugin") && setupServerSource.includes("Keep existing user settings intact.") && setupServerSource.includes("Keep this plugin comment."));
+
+const pinnedHome = join(testDir, "pinned-setup-home");
+const pinnedConfigDir = join(pinnedHome, ".config", "opencode");
+mkdirSync(pinnedConfigDir, { recursive: true });
+writeFileSync(join(pinnedConfigDir, "opencode.json"), `{ "plugin": ["opencode-workflow-guard@1.7.2"] }\n`);
+writeFileSync(join(pinnedConfigDir, "tui.json"), `{ "plugin": [["opencode-workflow-guard@1.7.2", { "option": true }]] }\n`);
+const pinnedSetup = spawnSync(setupCli, ["setup"], { encoding: "utf8", env: { ...process.env, HOME: pinnedHome, XDG_CONFIG_HOME: join(pinnedHome, ".config") } });
+const pinnedServer = JSON.parse(readFileSync(join(pinnedConfigDir, "opencode.json"), "utf8"));
+const pinnedTui = JSON.parse(readFileSync(join(pinnedConfigDir, "tui.json"), "utf8"));
+check("setup CLI recognizes documented version-pinned plugin specs", pinnedSetup.status === 0 && pinnedServer.plugin?.length === 1 && pinnedServer.plugin[0] === "opencode-workflow-guard@1.7.2" && pinnedTui.plugin?.length === 1 && pinnedTui.plugin[0]?.[0] === "opencode-workflow-guard@1.7.2");
+
+const invalidHome = join(testDir, "invalid-setup-home");
+const invalidConfigDir = join(invalidHome, ".config", "opencode");
+mkdirSync(invalidConfigDir, { recursive: true });
+const invalidServerPath = join(invalidConfigDir, "opencode.json");
+writeFileSync(invalidServerPath, `{ "plugin": ["existing-plugin"] }\n`);
+writeFileSync(join(invalidConfigDir, "tui.jsonc"), `{ "plugin": [\n`);
+const invalidServerBefore = readFileSync(invalidServerPath, "utf8");
+const invalidSetup = spawnSync(setupCli, ["setup"], { encoding: "utf8", env: { ...process.env, HOME: invalidHome, XDG_CONFIG_HOME: join(invalidHome, ".config") } });
+check("setup CLI validates both configs before writing either", invalidSetup.status !== 0 && readFileSync(invalidServerPath, "utf8") === invalidServerBefore);
+
+const ambiguousHome = join(testDir, "ambiguous-setup-home");
+const ambiguousConfigDir = join(ambiguousHome, ".config", "opencode");
+mkdirSync(ambiguousConfigDir, { recursive: true });
+writeFileSync(join(ambiguousConfigDir, "opencode.json"), `{ "plugin": [] }\n`);
+writeFileSync(join(ambiguousConfigDir, "opencode.jsonc"), `{ "plugin": [] }\n`);
+const ambiguousSetup = spawnSync(setupCli, ["setup"], { encoding: "utf8", env: { ...process.env, HOME: ambiguousHome, XDG_CONFIG_HOME: join(ambiguousHome, ".config") } });
+check("setup CLI refuses ambiguous json/jsonc configs", ambiguousSetup.status !== 0 && ambiguousSetup.stderr.includes("Cannot choose between"));
 
 // Verify the export map resolves both entrypoints. OpenCode loads the package's
 // raw TypeScript entrypoints with its own module loader at runtime, while plain

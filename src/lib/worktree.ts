@@ -106,8 +106,8 @@ export function createGitWorktree(
 		}
 
 		return { success: true, worktreePath: targetPath };
-	} catch (e: any) {
-		return { success: false, error: e?.message ?? String(e) };
+	} catch (e: unknown) {
+		return { success: false, error: e instanceof Error ? e.message : String(e) };
 	}
 }
 
@@ -210,7 +210,7 @@ export function cleanupGitWorktree(
 		}
 
 		return { success: true };
-	} catch (e: any) {
-		return { success: false, error: e?.message ?? String(e) };
+	} catch (e: unknown) {
+		return { success: false, error: e instanceof Error ? e.message : String(e) };
 	}
 }

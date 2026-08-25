@@ -5,6 +5,9 @@
   "license": "MIT",
   "type": "module",
   "main": "src/workflow-guard.ts",
+  "bin": {
+    "opencode-workflow-guard": "./bin/opencode-workflow-guard.mjs"
+  },
   "exports": {
     ".": "./src/workflow-guard.ts",
     "./server": "./src/workflow-guard.ts",
@@ -18,6 +21,7 @@
     "url": "git+https://github.com/ultus-net/opencode-workflow-guard.git"
   },
   "files": [
+    "bin/",
     "src/",
     "README.md",
     "LICENSE",

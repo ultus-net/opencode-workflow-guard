@@ -65,3 +65,20 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 - **Symptoms:** A CLI command is rejected with a live-system mutation warning.
 - **Root Cause:** Policy 4 blocks destructive cloud, database, and infrastructure operations.
 - **Solution:** To intentionally run a live command, set `WORKFLOW_GUARD_ALLOW_LIVE=1` in the environment before launching OpenCode. There is no in-command override; an agent cannot grant this permission to itself.
+
+---
+
+### 9. TUI plugin is missing or remains on an older release
+
+- **Symptoms:** Workflow Guard does not appear in the TUI, or npm reports a newer Workflow Guard release while OpenCode still runs an older one.
+- **Root Cause:** OpenCode caches npm plugins. A bare package name is resolved as `@latest`, but an already-populated package cache can continue using the version that originally populated that cache key. Running `npm update` in `~/.config/opencode` does not update this OpenCode-managed plugin installation.
+- **Solution:** Use OpenCode's documented plugin installer with the explicit version you want. `--force` replaces the configured plugin version, and the explicit version gives OpenCode a new package-cache key:
+
+```bash
+VERSION=$(npm view opencode-workflow-guard version)
+opencode plugin "opencode-workflow-guard@$VERSION" --global --force
+```
+
+OpenCode documents `opencode plugin <module>` as installing a plugin and updating its config, with `--global` for global config and `--force` to replace an existing plugin version: https://opencode.ai/docs/cli/#plugin. Its plugin documentation also describes npm plugins as OpenCode-managed, cached installations: https://opencode.ai/docs/plugins/#how-plugins-are-installed.
+
+After the command reports `Detected server + tui targets`, confirm it reports replacements/additions for both the OpenCode and TUI config files, then restart OpenCode. Manual cache deletion should not be necessary.

@@ -203,10 +203,10 @@ export async function runVerify(
 				env: getCleanEnv(),
 				stdio: ["ignore", "pipe", "pipe"],
 			});
-		} catch (err: any) {
+		} catch (err: unknown) {
 			return resolve({
 				passed: false,
-				output: `(spawn failed: ${err?.message ?? "unknown error"})`,
+				output: `(spawn failed: ${err instanceof Error ? err.message : "unknown error"})`,
 				durationMs: Date.now() - start,
 			});
 		}

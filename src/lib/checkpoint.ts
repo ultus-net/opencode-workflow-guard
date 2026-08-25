@@ -88,11 +88,50 @@ function withStoreLock<T>(workspace: string, action: () => T): T {
 	const path = metadataPath(workspace);
 	mkdirSync(dirname(path), { recursive: true });
 	const lockPath = `${path}.lock`;
+	const reclaimPath = `${lockPath}.reclaim`;
 	let lock: number;
 	try {
 		lock = openSync(lockPath, "wx", 0o600);
 	} catch {
-		throw new Error("Recovery checkpoint metadata is busy; refusing an unsafe concurrent update.");
+		let reclaim: number;
+		try {
+			reclaim = openSync(reclaimPath, "wx", 0o600);
+		} catch {
+			let staleReclaim = false;
+			try {
+				const owner = Number(readFileSync(reclaimPath, "utf8").trim());
+				if (Number.isInteger(owner) && owner > 0) {
+					try { process.kill(owner, 0); } catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ESRCH") staleReclaim = true;
+					}
+				}
+			} catch {}
+			if (!staleReclaim) throw new Error("Recovery checkpoint metadata is busy; refusing an unsafe concurrent update.");
+			try {
+				unlinkSync(reclaimPath);
+				reclaim = openSync(reclaimPath, "wx", 0o600);
+			} catch {
+				throw new Error("Recovery checkpoint metadata is busy; refusing an unsafe concurrent update.");
+			}
+		}
+		try {
+			writeFileSync(reclaim, String(process.pid));
+			let stale = false;
+			try {
+				const owner = Number(readFileSync(lockPath, "utf8").trim());
+				if (Number.isInteger(owner) && owner > 0) {
+					try { process.kill(owner, 0); } catch (error) {
+						if ((error as NodeJS.ErrnoException).code === "ESRCH") stale = true;
+					}
+				}
+			} catch {}
+			if (!stale) throw new Error("Recovery checkpoint metadata is busy; refusing an unsafe concurrent update.");
+			unlinkSync(lockPath);
+			lock = openSync(lockPath, "wx", 0o600);
+		} finally {
+			closeSync(reclaim);
+			try { unlinkSync(reclaimPath); } catch {}
+		}
 	}
 	try {
 		writeFileSync(lock, String(process.pid));

@@ -199,7 +199,7 @@ export function shellMutationIn(segment: string): ShellMutation | undefined {
 	return undefined;
 }
 
-const SIMPLE_MUTATION_COMMANDS = new Set(["touch", "mkdir", "rm", "unlink", "rmdir", "truncate"]);
+const SIMPLE_MUTATION_COMMANDS = new Set(["touch", "mkdir", "rm", "unlink", "rmdir", "truncate", "chmod", "chown", "chgrp"]);
 const TRANSFER_COMMANDS = new Set(["cp", "mv", "ln"]);
 
 export function simpleFilesystemMutations(segment: string): ShellMutation[] {

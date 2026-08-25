@@ -9,6 +9,16 @@ export function extractInterpreterPayload(segment: string): string[] {
 	if (inlineMatch?.[1] || inlineMatch?.[2]) {
 		payloads.push(inlineMatch[1] ?? inlineMatch[2] ?? "");
 	}
+	const heredocHeader = segment.match(
+		/\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\b[^\n]*<<(-?)\s*(?:'([^'\n]+)'|"([^"\n]+)"|([^\s'";|&()<>\n]+))[^\n]*\n/i,
+	);
+	if (heredocHeader) {
+		const delimiter = heredocHeader[2] ?? heredocHeader[3] ?? heredocHeader[4];
+		const bodyStart = (heredocHeader.index ?? 0) + heredocHeader[0].length;
+		const lines = segment.slice(bodyStart).split("\n");
+		const terminator = lines.findIndex((line) => (heredocHeader[1] ? line.replace(/^\t+/, "") : line) === delimiter);
+		if (terminator >= 0) payloads.push(lines.slice(0, terminator).join("\n"));
+	}
 	const psMatch = segment.match(
 		/\b(?:powershell|pwsh)\s+(?:-[a-zA-Z]*enc[a-zA-Z]*\s+)([A-Za-z0-9+/=]+)/i,
 	);
@@ -50,6 +60,8 @@ export function secretPathInPayload(payload: string): string | undefined {
 }
 
 const WRITE_TARGET_PATTERNS: RegExp[] = [
+	/\b(?:File|IO)\.(?:write|binwrite|delete|unlink|rename)\s*\(\s*["']([^"']+)["']/g,
+	/\bFile\.open\s*\(\s*["']([^"']+)["']\s*,\s*["'][^"']*[wa+][^"']*["']/g,
 	/\b(?:writeFileSync|writeFile|appendFile|appendFileSync|createWriteStream|unlink|unlinkSync|rmSync|rmdirSync|mkdirSync|renameSync|copyFileSync|cpSync|truncateSync)\s*\(\s*["']([^"']+)["']/g,
 	/\b(?:renameSync|copyFileSync|cpSync)\s*\(\s*["'][^"']+["']\s*,\s*["']([^"']+)["']/g,
 	/\b(?:os\.remove|os\.unlink|os\.rmdir|os\.mkdir|os\.makedirs|os\.rename|shutil\.rmtree|shutil\.copy|shutil\.copy2|shutil\.move)\s*\(\s*["']([^"']+)["']/g,
