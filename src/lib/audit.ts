@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, openSync, readSync, closeSync, statSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,11 @@ const AUDIT_DIR = join(
 );
 const AUDIT_FILE = join(AUDIT_DIR, "workflow-guard.jsonl");
 const VERIFY_CACHE_FILE = join(AUDIT_DIR, "last-verify.json");
+const VERIFY_HISTORY_FILE = join(AUDIT_DIR, "verify-history.jsonl");
+const MAX_AUDIT_BYTES = 4 * 1024 * 1024;
+const RETAIN_AUDIT_BYTES = 2 * 1024 * 1024;
+const MAX_VERIFY_HISTORY_BYTES = 1024 * 1024;
+const RETAIN_VERIFY_HISTORY_BYTES = 512 * 1024;
 
 export function getAuditFilePath(): string {
 	return AUDIT_FILE;
@@ -19,6 +24,48 @@ export function getAuditFilePath(): string {
 
 export function getVerifyCacheFilePath(): string {
 	return VERIFY_CACHE_FILE;
+}
+
+export function getVerifyHistoryFilePath(): string {
+	return VERIFY_HISTORY_FILE;
+}
+
+function appendBoundedJsonl(path: string, value: unknown, maxBytes: number, retainBytes: number): void {
+	appendFileSync(path, JSON.stringify(value) + "\n", "utf8");
+	const stat = statSync(path);
+	if (stat.size <= maxBytes) return;
+	const fd = openSync(path, "r");
+	const size = Math.min(retainBytes, stat.size);
+	const buffer = Buffer.alloc(size);
+	try {
+		readSync(fd, buffer, 0, size, stat.size - size);
+	} finally {
+		closeSync(fd);
+	}
+	const text = buffer.toString("utf8");
+	const firstNewline = text.indexOf("\n");
+	const retained = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
+	const temp = `${path}.${process.pid}.tmp`;
+	writeFileSync(temp, retained, "utf8");
+	renameSync(temp, path);
+}
+
+export function persistVerifyHistory(verifyData: NonNullable<VerifyResult>): void {
+	try {
+		mkdirSync(AUDIT_DIR, { recursive: true });
+		appendBoundedJsonl(VERIFY_HISTORY_FILE, verifyData, MAX_VERIFY_HISTORY_BYTES, RETAIN_VERIFY_HISTORY_BYTES);
+	} catch {}
+}
+
+export function getRecentVerifyHistory(limit = 10): NonNullable<VerifyResult>[] {
+	try {
+		if (!existsSync(VERIFY_HISTORY_FILE)) return [];
+		return readFileSync(VERIFY_HISTORY_FILE, "utf8").trim().split("\n").slice(-Math.max(0, limit)).reverse().flatMap((line) => {
+			try { return [JSON.parse(line) as NonNullable<VerifyResult>]; } catch { return []; }
+		});
+	} catch {
+		return [];
+	}
 }
 
 /**
@@ -88,7 +135,7 @@ export function getRecentAuditEntries(limit = 10): AuditEntry[] {
 export function audit(entry: AuditEntry): void {
 	try {
 		mkdirSync(AUDIT_DIR, { recursive: true });
-		appendFileSync(AUDIT_FILE, JSON.stringify(entry) + "\n", "utf8");
+		appendBoundedJsonl(AUDIT_FILE, entry, MAX_AUDIT_BYTES, RETAIN_AUDIT_BYTES);
 	} catch {
 		// Logging must never break the guard.
 	}

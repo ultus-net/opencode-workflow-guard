@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -29,6 +29,7 @@ import {
 	dynamicShellSyntaxIn,
 	getAuditFilePath,
 	getRecentAuditEntries,
+	getRecentVerifyHistory,
 	summarizeInput,
 	extractReviewFollowups,
 	buildReviewRubric,
@@ -80,6 +81,7 @@ import {
 } from "../src/workflow-guard.ts";
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
+import { audit } from "../src/lib/audit.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 
@@ -920,6 +922,8 @@ check(
 	"audit trail records shell decisions",
 	auditSizeAfter > auditSizeBefore,
 );
+for (let i = 0; i < 5; i++) audit({ ts: new Date().toISOString(), tool: "retention-probe", decision: "allow", reason: "x".repeat(1024 * 1024) });
+check("audit trail compacts after exceeding retention cap", statSync(getAuditFilePath()).size < 4 * 1024 * 1024);
 
 // ── New: secret-content scan ──
 console.log("- Secret-content scan -");
@@ -1913,6 +1917,9 @@ const testVerifyCache = {
 persistVerifyCache(testVerifyCache);
 const loadedCache = loadVerifyCache();
 check("persistVerifyCache and loadVerifyCache roundtrip successfully", loadedCache?.command === "npm test" && loadedCache?.passed === true);
+recordVerifyResult("npm test -- failing-history-probe", { passed: false, output: "history failure" }, "s-history");
+check("durable verification history retains failed runs", getRecentVerifyHistory(5).some((entry) => entry.command === "npm test -- failing-history-probe" && entry.passed === false));
+check("failed verification history does not replace passing cache", loadVerifyCache()?.passed === true);
 
 // Durable verification evidence is workspace-bound: a passing run from
 // workspace A must never satisfy finalization in workspace B, even when
@@ -2071,6 +2078,9 @@ writeFileSync(join(cleanCheckpointDir, "created-during-run.txt"), "agent output\
 finalizeRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
 const cleanCheckpointRestore = restoreRecoveryCheckpoint(cleanCheckpointDir, "clean-checkpoint-session", 1);
 check("recovery checkpoint removes untracked files created from a clean checkpoint", cleanCheckpointRestore.ok && !existsSync(join(cleanCheckpointDir, "created-during-run.txt")));
+for (let i = 0; i < 101; i++) createRecoveryCheckpoint(cleanCheckpointDir, `retention-session-${i}`, 1);
+const retainedCheckpointCount = Array.from({ length: 101 }, (_, i) => listRecoveryCheckpoints(cleanCheckpointDir, `retention-session-${i}`).length).reduce((sum, count) => sum + count, 0);
+check("recovery checkpoint metadata retains at most 100 entries", retainedCheckpointCount === 100 && listRecoveryCheckpoints(cleanCheckpointDir, "retention-session-0").length === 0 && listRecoveryCheckpoints(cleanCheckpointDir, "retention-session-100").length === 1);
 writeFileSync(join(checkpointDir, "tracked.txt"), "later user edit\n");
 const interferenceRestore = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
 check("recovery checkpoint refuses intervening workspace changes", !interferenceRestore.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "later user edit\n");

@@ -166,7 +166,7 @@ import {
 	summarizeInput,
 } from "./lib/audit.ts";
 
-export { getAuditFilePath, getVerifyCacheFilePath, persistVerifyCache, loadVerifyCache, getRecentAuditEntries };
+export { getAuditFilePath, getVerifyCacheFilePath, getVerifyHistoryFilePath, persistVerifyCache, loadVerifyCache, getRecentAuditEntries, getRecentVerifyHistory } from "./lib/audit.ts";
 export { summarizeInput };
 
 export function extractReviewFollowups(summary: string): Array<{ severity: "P2" | "P3"; summary: string }> {

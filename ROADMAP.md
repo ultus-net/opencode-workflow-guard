@@ -46,8 +46,8 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 - Implemented: audit decisions are durable local JSONL records, and completed after-hook observations carry session/call correlation and execution duration. Raw command and patch bodies are not persisted; they are represented by byte count and SHA-256 fingerprint so repeated inputs can be correlated without retaining credentials or source payloads.
 - Implemented: P2/P3 review findings are durable per-project local SQLite follow-ups with explicit open/resolved state and are surfaced to agents during context compaction. Review summaries containing P2/P3 findings are recorded automatically when the secondary review is accepted.
-- Add bounded retention/rotation for audit JSONL and recovery checkpoint metadata so long-lived installations do not grow indefinitely.
-- Add durable verification-result history, including failed runs, rather than retaining only the latest passing cache entry.
+- Implemented: audit JSONL and verification-history JSONL are size-bounded, and recovery metadata retains the newest 100 checkpoints while pruning the corresponding private Git refs.
+- Implemented: every verification result, including failed runs, is appended to bounded durable local history while the latest passing cache remains available for restart recovery.
 - Evaluate supported tool-result/failure lifecycle signals in future OpenCode APIs so success and failure can be correlated with the existing decision/after-hook records. The current `tool.execute.after` API has no success discriminator, so telemetry deliberately does not label these observations as successes.
 
 ## Repeated Tool-Failure Detection

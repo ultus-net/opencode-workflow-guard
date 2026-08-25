@@ -21,6 +21,8 @@ interface CheckpointStore {
 	checkpoints: RecoveryCheckpoint[];
 }
 
+const MAX_RECOVERY_CHECKPOINTS = 100;
+
 const gitIdentityEnv = {
 	GIT_AUTHOR_NAME: "OpenCode Workflow Guard",
 	GIT_AUTHOR_EMAIL: "workflow-guard@localhost",
@@ -95,6 +97,17 @@ function updateStore<T>(workspace: string, update: (store: CheckpointStore) => T
 		saveStore(workspace, store);
 		return result;
 	});
+}
+
+function pruneCheckpoints(workspace: string, store: CheckpointStore): void {
+	if (store.checkpoints.length <= MAX_RECOVERY_CHECKPOINTS) return;
+	const sorted = [...store.checkpoints].sort((a, b) => a.createdAt - b.createdAt);
+	const remove = sorted.slice(0, sorted.length - MAX_RECOVERY_CHECKPOINTS);
+	const removed = new Set(remove.map((entry) => `${entry.sessionID}\0${entry.run}`));
+	for (const entry of remove) {
+		try { git(workspace, ["update-ref", "-d", privateRef(entry.sessionID, entry.run)]); } catch {}
+	}
+	store.checkpoints = store.checkpoints.filter((entry) => !removed.has(`${entry.sessionID}\0${entry.run}`));
 }
 
 function recoveryBoundaryFingerprint(workspace: string): string | undefined {
@@ -172,6 +185,7 @@ export function createRecoveryCheckpoint(workspace: string, sessionID: string, r
 			git(root, ["update-ref", privateRef(sessionID, run), ref]);
 			const checkpoint: RecoveryCheckpoint = { sessionID, run, ref, kind, createdAt: Date.now() };
 			store.checkpoints.push(checkpoint);
+			pruneCheckpoints(root, store);
 			saveStore(root, store);
 			return checkpoint;
 		});
