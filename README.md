@@ -12,10 +12,11 @@ OpenCode plugin enforcing workflow discipline, agent focus, and deterministic sa
 
 ### 1. Installation
 
-Run the setup command to register both the server guard and TUI companion globally:
+Install the current published version globally with OpenCode's plugin installer:
 
 ```bash
-npx opencode-workflow-guard setup
+VERSION=$(npm view opencode-workflow-guard version)
+opencode plugin "opencode-workflow-guard@$VERSION" --global --force
 ```
 
 For server-only setup, add the package to your project's `opencode.json` or global `~/.config/opencode/opencode.json`:
@@ -29,7 +30,7 @@ For server-only setup, add the package to your project's `opencode.json` or glob
 }
 ```
 
-*Requires OpenCode >= 1.18.* Restart OpenCode after setup. See [docs/installation.md](docs/installation.md) for full setup options.
+*Requires OpenCode >= 1.18.* OpenCode detects the package's server and TUI targets and updates both global configs. Use the same command after a release to upgrade; the explicit version gives OpenCode a fresh package-cache key. Restart OpenCode after installation. See [docs/installation.md](docs/installation.md) for details and links to the OpenCode plugin documentation.
 
 For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json`. OpenCode resolves the package's exported `./tui` entrypoint automatically for TUI plugins. Do not place the TUI module under the server `plugins/` directory.
 
