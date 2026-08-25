@@ -48,7 +48,7 @@ jobs:
       - run: npm test
 
   # ───── Heavier checks ─────
-  # Install a pinned OpenCode CLI so package and provider-free loader checks run.
+  # Install the latest OpenCode CLI so package and provider-free loader checks run.
   # Model-driven probes are opt-in because external providers are not a CI invariant.
   e2e:
     name: E2E (plugin load / opencode)
@@ -60,7 +60,7 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      - run: npm install --global opencode-ai@1.18.21
+      - run: npm install --global opencode-ai@latest
       - run: npm run test:install
 
   # ───── Supply-chain gate ─────
@@ -109,7 +109,7 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      - run: npm install --global opencode-ai@1.18.21
+      - run: npm install --global opencode-ai@latest
       - name: Smoke test guard loading
         run: |
           TMP=$(mktemp -d)

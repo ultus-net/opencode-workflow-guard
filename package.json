@@ -44,13 +44,13 @@
     "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.18.21",
-    "@opentui/solid": "^0.5.6",
-    "jsonc-parser": "^3.3.1"
+    "@opencode-ai/plugin": "latest",
+    "@opentui/solid": "latest",
+    "jsonc-parser": "latest"
   },
   "devDependencies": {
-    "@changesets/cli": "^3.0.1",
-    "@types/node": "^26.2.0",
-    "typescript": "^7.0.2"
+    "@changesets/cli": "latest",
+    "@types/node": "latest",
+    "typescript": "latest"
   }
 }
