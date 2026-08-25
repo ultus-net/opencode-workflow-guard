@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.2
+
+### Patch Changes
+
+- e729258: Track latest npm releases for direct dependencies and OpenCode CI installs instead of capping updates with version ranges.
+
 ## 1.7.1
 
 ### Patch Changes
