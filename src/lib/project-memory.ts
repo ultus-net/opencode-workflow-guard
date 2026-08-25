@@ -39,9 +39,9 @@ export function ensureProjectMemoryExcluded(root: string): boolean {
 export function isProjectMemoryFresh(memory: ProjectMemoryRecord, root: string): boolean {
 	if (!memory.commit || memory.paths.length === 0) return true;
 	if (!/^[0-9a-f]{7,64}$/i.test(memory.commit)) return false;
-	const result = spawnSync("git", ["-C", root, "diff", "--quiet", memory.commit, "--", ...memory.paths], { encoding: "utf8" });
+	const result = spawnSync("git", ["-C", root, "diff", "--quiet", memory.commit, "--", ...memory.paths], { encoding: "utf8", timeout: 2_000 });
 	if (result.status !== 0) return false;
-	const untracked = spawnSync("git", ["-C", root, "ls-files", "--others", "--exclude-standard", "--", ...memory.paths], { encoding: "utf8" });
+	const untracked = spawnSync("git", ["-C", root, "ls-files", "--others", "--exclude-standard", "--", ...memory.paths], { encoding: "utf8", timeout: 2_000 });
 	return untracked.status === 0 && !untracked.stdout.trim();
 }
 

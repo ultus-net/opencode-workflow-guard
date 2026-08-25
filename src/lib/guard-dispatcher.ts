@@ -273,7 +273,7 @@ export async function guardToolCallImpl(
 				return claimReason;
 			}
 		}
-		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
+		recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
 		return undefined;
 	}
 
@@ -354,7 +354,7 @@ export async function guardToolCallImpl(
 				if (onProtectedBranch(currentRoot)) return branchGuardReason();
 				const todos = await effectiveTodos(context?.sessionID);
 				if (todos !== undefined && !hasActiveTodo(todos)) return "Blocked: inline interpreter file mutation with no active todo item.";
-				recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
+				recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
 			}
 			if (!allowLive) {
 				const liveCheck = liveMutationIn(normalizeGitCommands(normalize(payload)));
@@ -472,7 +472,7 @@ export async function guardToolCallImpl(
 				}
 			}
 		}
-		if (hasGitMutation) recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID));
+		if (hasGitMutation) recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
 	}
 	return undefined;
 }

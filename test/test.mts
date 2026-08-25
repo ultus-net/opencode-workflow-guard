@@ -1362,6 +1362,9 @@ const reviewRes = getLastReviewResult();
 check("recordReviewResult records passed reviewer and summary", reviewRes?.passed === true && reviewRes?.reviewer === "reviewer-subagent");
 await call("edit", { filePath: join(root, "after-review.ts"), content: "changed" }, { sessionID: "s-active" });
 check("new mutation invalidates prior review approval", getLastReviewResult() === undefined);
+recordReviewResult("reviewer-subagent", "Child review passed all axes.", true, "s-reviewed-child");
+recordMutation("s-reviewed-parent", "s-reviewed-child");
+check("actor mutation invalidates child-targeted global review", getLastReviewResult() === undefined);
 
 const fingerprintRepo = mkdtempSync(join(tmpdir(), "wg-review-fingerprint-"));
 spawnSync("git", ["init", "-b", "feature/review"], { cwd: fingerprintRepo });
@@ -1773,6 +1776,12 @@ const mut3 = await call("edit", { filePath: join(root, "b3.ts"), content: "3" },
 check("subagent mutation 1 allowed within budget", !blocked(mut1));
 check("subagent mutation 2 allowed within budget", !blocked(mut2));
 check("subagent mutation 3 blocked after budget exceeded", blocked(mut3));
+fakeParents.set("s-inherited-budget", "s-inherited-budget-parent");
+todo("s-inherited-budget-parent", item("parent-owned work", "in_progress"));
+const inheritedMut1 = await call("edit", { filePath: join(root, "ib1.ts"), content: "1" }, { sessionID: "s-inherited-budget" });
+const inheritedMut2 = await call("edit", { filePath: join(root, "ib2.ts"), content: "2" }, { sessionID: "s-inherited-budget" });
+const inheritedMut3 = await call("edit", { filePath: join(root, "ib3.ts"), content: "3" }, { sessionID: "s-inherited-budget" });
+check("inherited-todo subagent remains subject to mutation budget", !blocked(inheritedMut1) && !blocked(inheritedMut2) && blocked(inheritedMut3));
 delete process.env.WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS;
 
 // 13. Merged Branch & Conflict Pre-Flight Guards (Policies 19 & 20)
@@ -1942,6 +1951,21 @@ check("compaction context includes Operational Guard State header", compactText.
 check("compaction context includes Git Branch status", compactText.includes("Git Branch:"));
 check("compaction context includes Test Verification status", compactText.includes("Test Verification:"));
 check("compaction context includes Secondary Review status", compactText.includes("Secondary Review:"));
+const unrelatedCompactingContext: { context: string[] } = { context: [] };
+if (typeof compactSubagentFn === "function") {
+	await compactSubagentFn({ sessionID: "s-unrelated" } as any, unrelatedCompactingContext as any);
+}
+const unrelatedCompactText = unrelatedCompactingContext.context[0] ?? "";
+check("compaction does not leak verification across unrelated sessions", !unrelatedCompactText.includes("Test Verification:"));
+check("compaction does not leak review across unrelated sessions", !unrelatedCompactText.includes("Secondary Review:"));
+recordMutation("s-sub-agent-child");
+const mutatedChildCompactingContext: { context: string[] } = { context: [] };
+if (typeof compactSubagentFn === "function") {
+	await compactSubagentFn({ sessionID: "s-sub-agent-child" } as any, mutatedChildCompactingContext as any);
+}
+const mutatedChildCompactText = mutatedChildCompactingContext.context[0] ?? "";
+check("child mutation invalidates inherited compaction verification", !mutatedChildCompactText.includes("Test Verification:"));
+check("child mutation invalidates inherited compaction review", !mutatedChildCompactText.includes("Secondary Review:"));
 
 // Feature 5: Durable verification cache
 const testVerifyCache = {
