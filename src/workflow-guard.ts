@@ -89,7 +89,9 @@ import {
 	asRecord,
 	extractCommands,
 	normalize,
+	shellWrappersChangeCwd,
 	splitShellSegments,
+	unwrapShellCommand,
 	getCleanEnv,
 	showBlockToast,
 	SENSITIVE_ENV_KEYS,
@@ -892,11 +894,19 @@ async function guardToolCallImpl(
 			}
 
 			const branchChangelog = branchHasChangelogChange(currentRoot);
-			const prSegments = splitShellSegments(raw)
-				.filter((segment) => hasPrCreateInvocation(segment));
+			let shellCwdKnown = true;
+			const prSegments: Array<{ segment: string; invocationRoot: string | null }> = [];
+			for (const segment of splitShellSegments(raw)) {
+				const unwrapped = unwrapShellCommand(segment);
+				if (/(?:^|\s)(?:(?:builtin|command)\s+)?(?:cd|pushd|popd)(?:\s|$)/.test(unwrapped)) shellCwdKnown = false;
+				if (hasPrCreateInvocation(segment)) {
+					const wrapperChangesCwd = shellWrappersChangeCwd(segment);
+					prSegments.push({ segment, invocationRoot: shellCwdKnown && !wrapperChangesCwd ? currentRoot : null });
+				}
+			}
 			const hasChangelog =
 				branchChangelog ||
-				prSegments.every((segment) => prBodyIncludesChangelog(segment));
+				prSegments.every(({ segment, invocationRoot }) => prBodyIncludesChangelog(segment, invocationRoot));
 			if (!hasChangelog) {
 				preflightFailures.push(`Changelog is required; update a CHANGELOG file or include a 'Changelog:' section in the PR description (${descFlag}).`);
 			}
