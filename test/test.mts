@@ -30,6 +30,7 @@ import {
 	getAuditFilePath,
 	getRecentAuditEntries,
 	getRecentVerifyHistory,
+	managedConfigDiagnostic,
 	summarizeInput,
 	extractReviewFollowups,
 	buildReviewRubric,
@@ -559,6 +560,7 @@ const hooks = await pluginFn({
 	$: undefined as any,
 });
 check("plugin returns tool.execute.before hook", typeof hooks["tool.execute.before"] === "function");
+check("managed startup diagnostic avoids provenance claims", managedConfigDiagnostic("win32", {}).includes("not verified") && managedConfigDiagnostic("win32", {}).includes("location is unknown"));
 // Real opencode hook contract: args arrive on the SECOND parameter.
 const invoke = (tool: string, args: unknown, sessionID = "s-hook") =>
 	hooks["tool.execute.before"]?.({ tool, sessionID, callID: "c" }, { args });

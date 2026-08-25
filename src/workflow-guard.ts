@@ -177,6 +177,18 @@ export function extractReviewFollowups(summary: string): Array<{ severity: "P2" 
 		.map((finding) => ({ severity: finding.severity, summary: finding.line }));
 }
 
+export function managedConfigDiagnostic(platform = process.platform, env: NodeJS.ProcessEnv = process.env): string {
+	const directory = platform === "darwin"
+		? "/Library/Application Support/opencode"
+		: platform === "win32"
+			? env.ProgramData ? join(env.ProgramData, "opencode") : undefined
+			: platform === "linux" ? "/etc/opencode" : undefined;
+	const detected = directory !== undefined && ["opencode.json", "opencode.jsonc"].some((name) => existsSync(join(directory, name)));
+	return directory
+		? `managed config ${detected ? "detected" : "not detected"} at ${directory}; plugin provenance is not verified by the OpenCode V1 API`
+		: "managed config location is unknown on this platform; plugin provenance is not verified by the OpenCode V1 API";
+}
+
 // ── Verification engine ──────────────────────────────────────────────────────
 import {
 	detectVerifyCommand,
@@ -1097,7 +1109,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			body: {
 				service: "workflow-guard",
 				level: "info",
-				message: `Workflow Guard plugin initialized for ${effectiveRoot}`,
+				message: `Workflow Guard plugin initialized for ${effectiveRoot}; ${managedConfigDiagnostic()}`,
 			},
 		});
 	} catch {}

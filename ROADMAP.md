@@ -67,9 +67,8 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Managed Deployment Hardening
 
-- Document an enterprise deployment profile that installs workflow-guard alongside OpenCode's administrator-controlled managed settings (`/etc/opencode/` on Linux, the corresponding managed locations on macOS/Windows).
-- Use managed OpenCode settings for controls the host already enforces well, such as permissions and provider policy, while keeping workflow invariants in the plugin rather than creating a second configuration-precedence system.
-- Evaluate a startup diagnostic that reports whether the expected guard and managed policy are active. Keep this diagnostic observational unless OpenCode exposes a supported way to establish plugin provenance/trust.
+- Implemented: `docs/managed-deployment.md` documents deployment alongside OpenCode's administrator-controlled managed settings on Linux, macOS, and Windows, using host-managed permissions/provider policy while retaining workflow invariants in the plugin.
+- Implemented: startup app logs report whether file-based managed configuration is detected at the platform's standard location while explicitly stating that OpenCode's V1 API does not verify plugin provenance.
 - Treat Codex's `allow_managed_hooks_only` as the reference governance model, not as a capability OpenCode currently has: managed configuration precedence does not itself prove that untrusted project plugins cannot run.
 
 ## Deferred: Hard Completion Gate
