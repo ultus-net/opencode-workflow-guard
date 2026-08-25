@@ -31,7 +31,7 @@ For server-only setup, add the package to your project's `opencode.json` or glob
 
 *Requires OpenCode >= 1.18.* Restart OpenCode after setup. See [docs/installation.md](docs/installation.md) for full setup options.
 
-For the optional TUI badge, configure `"opencode-workflow-guard/tui"` in `tui.json`. The package root is the server plugin; TUI plugin specs are resolved as written and must use the exported `./tui` entrypoint. Do not place the TUI module under the server `plugins/` directory.
+For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json`. OpenCode resolves the package's exported `./tui` entrypoint automatically for TUI plugins. Do not place the TUI module under the server `plugins/` directory.
 
 ### 2. Verification
 

@@ -6,7 +6,8 @@ import { join } from "node:path";
 import { parse, modify, applyEdits } from "jsonc-parser";
 
 const SERVER_SPEC = "opencode-workflow-guard";
-const TUI_SPEC = "opencode-workflow-guard/tui";
+const TUI_SPEC = "opencode-workflow-guard";
+const LEGACY_TUI_SPEC = "opencode-workflow-guard/tui";
 
 function configHome() {
 	return process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -18,7 +19,7 @@ function existingConfig(base, name) {
 	return existsSync(json) ? json : existsSync(jsonc) ? jsonc : json;
 }
 
-function preparePluginUpdate(path, schema, spec) {
+function preparePluginUpdate(path, schema, spec, legacySpec) {
 	const source = existsSync(path) ? readFileSync(path, "utf8") : `{
   "$schema": "${schema}"
 }\n`;
@@ -31,8 +32,17 @@ function preparePluginUpdate(path, schema, spec) {
 		throw new Error(`Cannot update ${path}: "plugin" must be an array`);
 	}
 	const plugins = config.plugin ?? [];
-	if (plugins.some((entry) => entry === spec || (Array.isArray(entry) && entry[0] === spec))) return undefined;
-	return applyEdits(source, modify(source, ["plugin", plugins.length], spec, {
+	const matches = (entry, target) => entry === target || (Array.isArray(entry) && entry[0] === target);
+	if (!legacySpec) {
+		if (plugins.some((entry) => matches(entry, spec))) return undefined;
+		return applyEdits(source, modify(source, ["plugin", plugins.length], spec, {
+			formattingOptions: { insertSpaces: true, tabSize: 2 },
+		}));
+	}
+	const updatedPlugins = plugins.filter((entry) => !matches(entry, legacySpec));
+	if (!updatedPlugins.some((entry) => matches(entry, spec))) updatedPlugins.push(spec);
+	if (updatedPlugins.length === plugins.length && updatedPlugins.every((entry, index) => entry === plugins[index])) return undefined;
+	return applyEdits(source, modify(source, ["plugin"], updatedPlugins, {
 		formattingOptions: { insertSpaces: true, tabSize: 2 },
 	}));
 }
@@ -46,7 +56,7 @@ if (process.argv[2] !== "setup" || process.argv.length > 3) {
 		const serverPath = existingConfig(base, "opencode");
 		const tuiPath = existingConfig(base, "tui");
 		const serverUpdate = preparePluginUpdate(serverPath, "https://opencode.ai/config.json", SERVER_SPEC);
-		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC);
+		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC, LEGACY_TUI_SPEC);
 		mkdirSync(base, { recursive: true });
 		if (serverUpdate !== undefined) writeFileSync(serverPath, serverUpdate);
 		if (tuiUpdate !== undefined) writeFileSync(tuiPath, tuiUpdate);

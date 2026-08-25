@@ -2639,7 +2639,7 @@ await WorkflowGuardTui(fakeTuiBadgeApi as any, undefined, {} as any);
 
 setLastBlockedReasonForTesting(undefined);
 const activeBadge = formatBadge();
-check("TUI badge renders Active text when no block", activeBadge.text.includes("Workflow Guard: Active") && !activeBadge.isBlocked);
+check("TUI badge renders shield label when no block", activeBadge.text === "Workflow Guard 🛡️" && !activeBadge.isBlocked);
 
 setLastBlockedReasonForTesting("[workflow-guard] blocked edit: on protected branch main");
 const blockedBadge = formatBadge();

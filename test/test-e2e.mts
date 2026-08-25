@@ -61,6 +61,7 @@ writeFileSync(join(setupConfigDir, "opencode.jsonc"), `{
     "existing-plugin", // Keep this plugin comment.
   ],
 }\n`);
+writeFileSync(join(setupConfigDir, "tui.json"), `{ "plugin": ["opencode-workflow-guard/tui", ["opencode-workflow-guard/tui", { "legacy": true }]] }\n`);
 const setupEnv = { ...process.env, HOME: setupHome, XDG_CONFIG_HOME: join(setupHome, ".config") };
 const setupCli = join(testDir, "node_modules", ".bin", process.platform === "win32" ? "opencode-workflow-guard.cmd" : "opencode-workflow-guard");
 const firstSetup = spawnSync(setupCli, ["setup"], { encoding: "utf8", env: setupEnv });
@@ -70,7 +71,8 @@ const setupServer = parseJsonc(setupServerSource);
 const setupTui = JSON.parse(readFileSync(join(setupConfigDir, "tui.json"), "utf8"));
 check("setup CLI succeeds and is idempotent", firstSetup.status === 0 && secondSetup.status === 0);
 check("setup CLI registers server plugin once", setupServer.plugin?.filter((entry: unknown) => entry === "opencode-workflow-guard").length === 1);
-check("setup CLI registers TUI plugin once", setupTui.plugin?.filter((entry: unknown) => entry === "opencode-workflow-guard/tui").length === 1);
+check("setup CLI registers TUI plugin once", setupTui.plugin?.filter((entry: unknown) => entry === "opencode-workflow-guard").length === 1);
+check("setup CLI replaces legacy TUI subpath specs", !setupTui.plugin?.some((entry: unknown) => entry === "opencode-workflow-guard/tui" || (Array.isArray(entry) && entry[0] === "opencode-workflow-guard/tui")));
 check("setup CLI preserves existing JSONC settings and comments", setupServer.model === "test/provider" && setupServer.plugin?.includes("existing-plugin") && setupServerSource.includes("Keep existing user settings intact.") && setupServerSource.includes("Keep this plugin comment."));
 
 const invalidHome = join(testDir, "invalid-setup-home");
