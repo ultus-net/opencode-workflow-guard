@@ -29,11 +29,18 @@ const gitIdentityEnv = {
 };
 
 function git(workspace: string, args: string[], env: NodeJS.ProcessEnv = {}): string {
+	if (gitForTesting) return gitForTesting(workspace, args, env);
 	return execFileSync("git", ["-C", workspace, ...args], {
 		encoding: "utf8",
 		stdio: ["ignore", "pipe", "pipe"],
 		env: { ...getCleanGitEnv(), ...gitIdentityEnv, ...env },
 	}).trim();
+}
+
+let gitForTesting: ((workspace: string, args: string[], env?: NodeJS.ProcessEnv) => string) | undefined;
+
+export function setCheckpointGitForTesting(runner?: typeof gitForTesting): void {
+	gitForTesting = runner;
 }
 
 function gitDir(workspace: string): string {
@@ -245,6 +252,7 @@ export function restoreRecoveryCheckpoint(
 				if (transactionRef) git(root, ["update-ref", "-d", transactionRef]);
 				return { ok: true };
 			} catch (error) {
+				let rollbackError: unknown;
 				if (originalHead) {
 					try {
 						git(root, ["reset", "--hard", originalHead]);
@@ -258,9 +266,13 @@ export function restoreRecoveryCheckpoint(
 							} catch {}
 							git(root, ["update-ref", "-d", transactionRef]);
 						}
-					} catch {}
+					} catch (error) {
+						rollbackError = error;
+					}
 				}
-				return { ok: false, error: error instanceof Error ? error.message : String(error) };
+				const primary = error instanceof Error ? error.message : String(error);
+				const rollback = rollbackError instanceof Error ? rollbackError.message : rollbackError === undefined ? undefined : String(rollbackError);
+				return { ok: false, error: rollback ? `${primary} Recovery rollback also failed: ${rollback}` : primary };
 			}
 		});
 	} catch (error) {

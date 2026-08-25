@@ -40,7 +40,7 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ### Recovery Follow-up
 
-- P2: surface a secondary rollback failure from checkpoint restoration and add fault-injection coverage for that path. The recovery ref is retained today, so the issue is diagnosability rather than known data loss. Keep this item open until the failure is surfaced and the regression test passes.
+- Implemented: checkpoint restoration preserves the primary restore error and surfaces a secondary compensating-rollback failure in the returned diagnostic. Fault-injection coverage exercises the dual-failure path while the recovery ref remains retained for manual recovery.
 
 ## Local Operational Telemetry
 

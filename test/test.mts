@@ -80,7 +80,7 @@ import {
 } from "../src/workflow-guard.ts";
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
-import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint } from "../src/lib/checkpoint.ts";
+import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
@@ -2038,6 +2038,26 @@ rmSync(checkpointMetadataLock);
 const restoredCheckpoint = restoreRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
 check("recovery checkpoint restores tracked workspace state", restoredCheckpoint.ok && readFileSync(join(checkpointDir, "tracked.txt"), "utf8") === "user change\n");
 check("recovery checkpoint restores pre-run untracked content", readFileSync(join(checkpointDir, "untracked.txt"), "utf8") === "user untracked\n");
+
+writeFileSync(join(checkpointDir, "tracked.txt"), "rollback baseline\n");
+spawnSync("git", ["-C", checkpointDir, "add", "tracked.txt"]);
+createRecoveryCheckpoint(checkpointDir, "rollback-failure-session", 1);
+writeFileSync(join(checkpointDir, "tracked.txt"), "rollback agent change\n");
+finalizeRecoveryCheckpoint(checkpointDir, "rollback-failure-session", 1);
+let injectedRestoreApply = false;
+setCheckpointGitForTesting((workspace, args) => {
+	if (args[0] === "stash" && args[1] === "apply") {
+		injectedRestoreApply = true;
+		throw new Error("injected restore failure");
+	}
+	if (injectedRestoreApply && args[0] === "reset" && args[1] === "--hard") throw new Error("injected rollback failure");
+	const result = spawnSync("git", ["-C", workspace, ...args], { encoding: "utf8" });
+	if (result.status !== 0) throw new Error(result.stderr.trim() || `git ${args[0]} failed`);
+	return result.stdout.trim();
+});
+const rollbackFailure = restoreRecoveryCheckpoint(checkpointDir, "rollback-failure-session", 1);
+setCheckpointGitForTesting();
+check("recovery checkpoint surfaces secondary rollback failure", !rollbackFailure.ok && rollbackFailure.error?.includes("injected restore failure") && rollbackFailure.error.includes("Recovery rollback also failed: injected rollback failure"));
 
 const cleanCheckpointDir = mkdtempSync(join(tmpdir(), "workflow-guard-clean-checkpoint-"));
 spawnSync("git", ["init", "-q", cleanCheckpointDir]);
