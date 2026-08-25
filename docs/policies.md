@@ -26,7 +26,7 @@
 - `gh pr create` and `az repos pr create` are blocked unless:
   - The branch diff modifies a `CHANGELOG` file, OR
   - The branch diff adds/modifies a `.changeset/*.md` fragment file (Changesets workflow), OR
-  - The PR description (`--body`, `--description`, or `--body-file`/`-F`) contains a `Changelog:` section.
+  - The PR description (`--body`, `--description`, or `--body-file`/`-F`) contains a `Changelog:` section. Multiline Bash ANSI-C `\n`/`\r` quoting is supported for inline descriptions.
 - **Lockfile Synchronization Gate:** Whenever package manifests (`package.json`, `Cargo.toml`, `go.mod`) are modified, PR creation is blocked until their corresponding lockfiles (`package-lock.json`/`bun.lock`/`pnpm-lock.yaml`/`yarn.lock`, `Cargo.lock`, `go.sum`) are updated.
 - When multiple PR prerequisites fail at once, the guard reports all detected preflight failures together so they can be resolved before retrying PR creation.
 

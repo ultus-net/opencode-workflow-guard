@@ -38,9 +38,7 @@ export function decodeShellEscapes(text: string): string {
 		// Unicode escapes: \uHHHH
 		.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)))
 		// Octal escapes: \0OO or \OOO (e.g. \162 -> 'r')
-		.replace(/\\([0-3][0-7]{2})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)))
-		// Single character escapes: \c -> c (e.g. \r\m -> rm)
-		.replace(/\\(.)/g, "$1");
+		.replace(/\\([0-3][0-7]{2})/g, (_, oct) => String.fromCharCode(parseInt(oct, 8)));
 }
 
 export function shellWords(command: string): string[] {
@@ -82,20 +80,93 @@ export function shellWords(command: string): string[] {
 	return words;
 }
 
+function envSplitWords(value: string): string[] {
+	const words: string[] = [];
+	let word = "";
+	let quote: "'" | '"' | undefined;
+	let started = false;
+	const push = () => {
+		if (started) words.push(word);
+		word = "";
+		started = false;
+	};
+	for (let i = 0; i < value.length; i += 1) {
+		const char = value[i]!;
+		if (char === "'" || char === '"') {
+			if (!quote) quote = char;
+			else if (quote === char) quote = undefined;
+			else word += char;
+			started = true;
+			continue;
+		}
+		if (char === "\\" && i + 1 < value.length) {
+			const next = value[++i]!;
+			if (quote === "'" && next !== "'" && next !== "\\") {
+				word += `\\${next}`;
+				started = true;
+				continue;
+			}
+			if (next === "c" && !quote) break;
+			if (next === "_" && quote !== "'") {
+				if (quote === '"') {
+					word += " ";
+					started = true;
+				} else push();
+				continue;
+			}
+			const escapes: Record<string, string> = { f: "\f", n: "\n", r: "\r", t: "\t", v: "\v", "#": "#", "$": "$", '"': '"', "'": "'", "\\": "\\" };
+			word += escapes[next] ?? next;
+			started = true;
+			continue;
+		}
+		if (!quote && /[\s\f\v]/.test(char)) {
+			push();
+			continue;
+		}
+		if (!quote && char === "#" && !started) break;
+		if (char === "$" && quote !== "'" && value[i + 1] === "{") {
+			const end = value.indexOf("}", i + 2);
+			if (end >= 0) {
+				const name = value.slice(i + 2, end);
+				word += process.env[name] ?? "";
+				started = true;
+				i = end;
+				continue;
+			}
+		}
+		word += char;
+		started = true;
+	}
+	push();
+	return words;
+}
+
 export function splitShellSegments(command: string): string[] {
 	const segments: string[] = [];
 	let current = "";
-	let quote: "'" | '"' | undefined;
+	let quote: "'" | '"' | "ansi" | undefined;
 	let escaped = false;
-	for (const char of command) {
+	for (let i = 0; i < command.length; i += 1) {
+		const char = command[i]!;
 		if (escaped) {
 			current += char;
 			escaped = false;
 			continue;
 		}
+		if (!quote && char === "$" && command[i + 1] === "'") {
+			current += "$'";
+			quote = "ansi";
+			i += 1;
+			continue;
+		}
 		if (char === "\\" && quote !== "'") {
 			current += char;
 			escaped = true;
+			continue;
+		}
+		if (quote === "ansi" && char === "'") {
+			quote = undefined;
+			current += char;
 			continue;
 		}
 		if (char === "'" || char === '"') {
@@ -115,7 +186,7 @@ export function splitShellSegments(command: string): string[] {
 	return segments;
 }
 
-export function unwrapShellWords(command: string): string[] {
+function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: boolean } {
 	let cleanCmd = decodeShellEscapes(command.trim());
 	// Strip outer grouping parentheses/braces if present e.g. ( git commit ) or { git commit; }
 	while (
@@ -128,6 +199,7 @@ export function unwrapShellWords(command: string): string[] {
 
 	const words = shellWords(cleanCmd);
 	let i = 0;
+	let changesCwd = false;
 	while (i < words.length) {
 		const rawWord = words[i]!;
 		const word = rawWord.replace(/^[\({]+/, "").replace(/[\)};]+$/, "");
@@ -198,6 +270,7 @@ export function unwrapShellWords(command: string): string[] {
 			]);
 			while (i < words.length && words[i]!.startsWith("-")) {
 				const option = words[i++]!;
+				if (option === "-D" || (option.startsWith("-D") && option !== "-D") || option === "--chdir" || option.startsWith("--chdir=")) changesCwd = true;
 				if (valueOptions.has(option) && i < words.length) i++;
 			}
 			continue;
@@ -207,6 +280,7 @@ export function unwrapShellWords(command: string): string[] {
 			const valueOptions = new Set([
 				"-u",
 				"--unset",
+				"--argv0",
 				"-C",
 				"--chdir",
 				"-S",
@@ -214,12 +288,54 @@ export function unwrapShellWords(command: string): string[] {
 			]);
 			while (i < words.length) {
 				const w = words[i]!;
+				if (w === "--") {
+					i++;
+					break;
+				}
 				if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+					i++;
+					continue;
+				}
+				let splitValue: string | undefined;
+				let consumed = 0;
+				const clustered = /^-[iv0]*([SC])(.*)$/.exec(w);
+				if (clustered?.[1] === "C") {
+					changesCwd = true;
+					i++;
+					if (!clustered[2] && i < words.length) i++;
+					continue;
+				}
+				if (clustered?.[1] === "S") {
+					if (clustered[2]) splitValue = clustered[2];
+					else if (i + 1 < words.length) {
+						splitValue = words[i + 1]!;
+						consumed = 1;
+					}
+				}
+				else if (w.startsWith("-S") && w !== "-S") splitValue = w.slice(2);
+				else if (w.startsWith("--split-string=")) splitValue = w.slice("--split-string=".length);
+				else if ((w === "-S" || w === "--split-string") && i + 1 < words.length) {
+					splitValue = words[i + 1]!;
+					consumed = 1;
+				}
+				if (splitValue !== undefined) {
+					words.splice(i, consumed + 1, ...envSplitWords(splitValue));
+					continue;
+				}
+				const clusteredValue = /^-[iv0]*([ua])(.*)$/.exec(w);
+				if (clusteredValue) {
+					i++;
+					if (!clusteredValue[2] && i < words.length) i++;
+					continue;
+				}
+				if (w.startsWith("-C") && w !== "-C") {
+					changesCwd = true;
 					i++;
 					continue;
 				}
 				if (!w.startsWith("-")) break;
 				i++;
+				if (w === "-C" || w === "--chdir" || w.startsWith("--chdir=")) changesCwd = true;
 				if (valueOptions.has(w) && i < words.length) i++;
 			}
 			continue;
@@ -230,10 +346,18 @@ export function unwrapShellWords(command: string): string[] {
 		}
 		break;
 	}
-	return words
+	return { words: words
 		.slice(i)
 		.map((w) => w.replace(/^[\({]+/, "").replace(/[\)};]+$/, ""))
-		.filter(Boolean);
+		.filter(Boolean), changesCwd };
+}
+
+export function unwrapShellWords(command: string): string[] {
+	return unwrapShellWordsImpl(command).words;
+}
+
+export function shellWrappersChangeCwd(command: string): boolean {
+	return unwrapShellWordsImpl(command).changesCwd;
 }
 
 export function unwrapShellCommand(command: string): string {

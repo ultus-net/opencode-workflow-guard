@@ -1,8 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
-import { splitShellSegments, unwrapShellCommand } from "../lib/utils.ts";
+import { splitShellSegments, unwrapShellCommand, unwrapShellWords } from "../lib/utils.ts";
 
 export const CHANGELOG_SECTION_RE = /^\s*(?:#{1,6}\s*)?changelog\s*(?::|$)/im;
 
@@ -19,6 +19,84 @@ export function hasPrCreateInvocation(command: string): boolean {
 
 // Accepts either a CHANGELOG file modification or a .changeset/*.md file.
 const CHANGELOG_OR_CHANGESET_RE = /(?:changelog|\.changeset\/[^/]+\.md$)/i;
+
+function decodeAnsiCLineBreaks(value: string): string {
+	let decoded = "";
+	for (let i = 0; i < value.length; i += 1) {
+		if (value[i] !== "\\" || i + 1 >= value.length) {
+			decoded += value[i];
+			continue;
+		}
+		const next = value[++i];
+		if (next === "n") decoded += "\n";
+		else if (next === "r") decoded += "\r";
+		else if (next === "\\") decoded += "\\";
+		else decoded += `\\${next}`;
+	}
+	return decoded;
+}
+
+function preserveAnsiCLineBreaks(command: string): string {
+	return command.replace(/\$'((?:\\.|[^'])*)'/g, (_match, value: string) => {
+		const decoded = decodeAnsiCLineBreaks(value).replace(/'/g, "'\\''");
+		return `'${decoded}'`;
+	});
+}
+
+function prShellWords(command: string): string[] {
+	const words: string[] = [];
+	let word = "";
+	let quote: "'" | '"' | "ansi" | undefined;
+	let started = false;
+	for (let i = 0; i < command.length; i += 1) {
+		const char = command[i]!;
+		if (!quote && char === "$" && command[i + 1] === "'") {
+			quote = "ansi";
+			started = true;
+			i += 1;
+			continue;
+		}
+		if (quote === "ansi") {
+			if (char === "'") {
+				quote = undefined;
+				continue;
+			}
+			if (char === "\\" && i + 1 < command.length) {
+				let escape = char + command[++i];
+				word += decodeAnsiCLineBreaks(escape);
+				continue;
+			}
+			word += char;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			if (!quote) quote = char;
+			else if (quote === char) quote = undefined;
+			else word += char;
+			started = true;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			const next = command[++i];
+			if (next !== "\n") {
+				if (quote === '"' && next && !['$', '`', '"', '\\'].includes(next)) word += "\\";
+				word += next ?? "\\";
+			}
+			started = true;
+			continue;
+		}
+		if (!quote && /\s/.test(char)) {
+			if (started) words.push(word);
+			word = "";
+			started = false;
+			continue;
+		}
+		word += char;
+		started = true;
+	}
+	if (started) words.push(word);
+	return words;
+}
 
 export function branchHasChangelogChange(root: string): boolean {
 	try {
@@ -54,23 +132,44 @@ export function branchHasChangelogChange(root: string): boolean {
 	}
 }
 
-export function prBodyIncludesChangelog(command: string): boolean {
-	const bodyMatch = command.match(
-		/(?:--body|--description|-d|-b)(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s|;&]+))/,
-	);
-	const body = bodyMatch?.[1] ?? bodyMatch?.[2] ?? bodyMatch?.[3] ?? "";
-	if (CHANGELOG_SECTION_RE.test(body)) {
-		return true;
+export function prBodyIncludesChangelog(command: string, invocationRoot: string | null = getWorkspaceRoot()): boolean {
+	const parsedWords = prShellWords(command);
+	const envIndex = parsedWords.indexOf("env");
+	const usesEnvSplitString = envIndex >= 0 && parsedWords.slice(envIndex + 1).some((word) =>
+		word === "-S" || word.startsWith("-S") || word === "--split-string" || word.startsWith("--split-string="));
+	const commandWords = usesEnvSplitString
+		? unwrapShellWords(preserveAnsiCLineBreaks(command))
+		: parsedWords;
+	const cliIndex = commandWords.findIndex((word) => word === "gh" || word === "az");
+	const words = cliIndex >= 0 ? commandWords.slice(cliIndex) : [];
+	let body = "";
+	let bodyFile: string | undefined;
+	const valueOptions = new Set([
+		"--assignee", "--base", "--head", "--head-repo", "--label", "--milestone",
+		"--project", "--recover", "--reviewer", "--template", "--title",
+		"--bypass-policy-reason", "--labels", "--merge-commit-message", "--org",
+		"--repository", "--required-reviewer-ids", "--reviewer-ids", "--source-branch",
+		"--target-branch", "--work-items", "-a", "-B", "-H", "-l", "-m", "-p", "-r", "-T", "-t",
+	]);
+	for (let i = 0; i < words.length; i += 1) {
+		const word = words[i]!;
+		if (["--description", "-d"].includes(word)) {
+			const lines: string[] = [];
+			while (i + 1 < words.length && !words[i + 1]!.startsWith("-")) lines.push(words[++i]!);
+			body = lines.join("\n");
+		}
+		else if (["--body", "-b"].includes(word)) body = words[++i] ?? "";
+		else if (/^(?:--body|--description)=/.test(word)) body = word.slice(word.indexOf("=") + 1);
+		else if (["--body-file", "--description-file", "-F"].includes(word)) bodyFile = words[++i];
+		else if (/^(?:--body-file|--description-file)=/.test(word)) bodyFile = word.slice(word.indexOf("=") + 1);
+		else if (valueOptions.has(word)) i += 1;
 	}
-	const bodyFileMatch = command.match(
-		/(?:--body-file|--description-file|-F)(?:=|\s+)(?:"([^"]*)"|'([^']*)'|([^\s|;&]+))/,
-	);
-	const bodyFile =
-		bodyFileMatch?.[1] ?? bodyFileMatch?.[2] ?? bodyFileMatch?.[3];
+	if (CHANGELOG_SECTION_RE.test(body)) return true;
 	if (bodyFile) {
 		try {
+			if (!isAbsolute(bodyFile) && invocationRoot === null) return false;
 			return CHANGELOG_SECTION_RE.test(
-				readFileSync(resolve(getWorkspaceRoot(), bodyFile), "utf8"),
+				readFileSync(isAbsolute(bodyFile) ? bodyFile : resolve(invocationRoot!, bodyFile), "utf8"),
 			);
 		} catch {
 			return false;

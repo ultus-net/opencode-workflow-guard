@@ -72,6 +72,7 @@ import {
 	isProjectMemoryFresh,
 	default as defaultExport,
 } from "../src/workflow-guard.ts";
+import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
@@ -204,6 +205,60 @@ check("shell wrapper cannot hide gh pr create", blocked(await shell("env gh pr c
 check("env option cannot hide gh pr create", blocked(await shell("env -u GH_TOKEN gh pr create --title t --body 'no release notes here'")));
 check("gh pr create accepts --body= changelog form", !(await shell("gh pr create --title t --body='Changelog: fixed'")));
 check("gh pr create preserves multiline Changelog section", !(await shell("gh pr create --title t --body 'Summary\n\nChangelog:\n- fixed'")));
+check("gh pr create accepts ANSI-C quoted multiline Changelog section", !(await shell("gh pr create --title t --body $'Summary\\n\\nChangelog:\\n- fixed'")));
+check("gh pr create accepts ANSI-C quoted --body= form", !(await shell("gh pr create --title t --body=$'Summary\\n\\nChangelog:\\n- fixed'")));
+check("ANSI-C escaped backslash cannot fake a Changelog section", blocked(await shell("gh pr create --title t --body $'Summary\\\\nChangelog: fake'")));
+check("az repos pr create accepts ANSI-C quoted Changelog description", !(await shell("az repos pr create --title t --description $'Summary\\n\\nChangelog:\\n- fixed'")));
+check("quoted title cannot inject a fake ANSI-C --body option", blocked(await shell("gh pr create --title \"decoy --body=$'Summary\\nChangelog: fake'\" --body 'no release notes'")));
+check("quoted Azure title cannot inject a fake --description option", blocked(await shell("az repos pr create --title \"decoy --description=$'Summary\\nChangelog: fake'\" --description 'no release notes'")));
+check("shell line continuation cannot fake a GitHub Changelog section", blocked(await shell("gh pr create --body Summary\\\nChangelog:fake")));
+check("shell line continuation cannot fake an Azure Changelog section", blocked(await shell("az repos pr create --description Summary\\\nChangelog:fake")));
+check("double-quoted backslash cannot fake a GitHub Changelog section", blocked(await shell('gh pr create --body "Summary\n\\Changelog: fake"')));
+check("double-quoted backslash cannot fake an Azure Changelog section", blocked(await shell('az repos pr create --description "Summary\n\\Changelog: fake"')));
+check("ANSI-C escaped quote cannot merge GitHub PR invocations", blocked(await shell("gh pr create --body $'no\\'x' && gh pr create --body 'Changelog: fake'")));
+check("ANSI-C escaped quote cannot merge Azure PR invocations", blocked(await shell("az repos pr create --description $'no\\'x' && az repos pr create --description 'Changelog: fake'")));
+check("GitHub title value cannot replace the real body", blocked(await shell("gh pr create --body 'no notes' --title '--body=Changelog: fake'")));
+check("Azure title value cannot replace the real description", blocked(await shell("az repos pr create --description 'no notes' --title '--description=Changelog: fake'")));
+check("ANSI-C GitHub title value cannot replace the real body", blocked(await shell("gh pr create --body 'no notes' --title $'--body=Summary\\nChangelog: fake'")));
+check("Azure description accepts multiple line values", !(await shell("az repos pr create --description 'Summary' 'Changelog: fixed'")));
+const bodyFileRoot = mkdtempSync(join(tmpdir(), "wg-pr-body-file-"));
+mkdirSync(join(bodyFileRoot, "subdir"));
+writeFileSync(join(bodyFileRoot, "body.md"), "Changelog: root only\n");
+writeFileSync(join(bodyFileRoot, "subdir", "body.md"), "no release notes\n");
+setWorkspaceRoot(bodyFileRoot);
+check("relative PR body file fails closed when invocation cwd is unknown", !prBodyIncludesChangelog("gh pr create -F body.md", null));
+check("builtin cd cannot reuse a relative PR body file from the old cwd", blocked(await shell("builtin cd subdir && gh pr create -F body.md")));
+check("pushd cannot reuse a relative PR body file from the old cwd", blocked(await shell("pushd subdir && gh pr create -F body.md")));
+check("env -C cannot reuse a GitHub body file from the old cwd", blocked(await shell("env -C subdir gh pr create -F body.md")));
+check("env --chdir cannot reuse an Azure description file from the old cwd", blocked(await shell("env --chdir=subdir az repos pr create --description-file body.md")));
+check("command env -C cannot reuse a GitHub body file from the old cwd", blocked(await shell("command env -C subdir gh pr create -F body.md")));
+check("assignment env -C cannot reuse an Azure description file from the old cwd", blocked(await shell("MODE=test env -C subdir az repos pr create --description-file body.md")));
+check("attached env -C cannot reuse a GitHub body file from the old cwd", blocked(await shell("env -Csubdir gh pr create -F body.md")));
+check("attached sudo -D cannot reuse a GitHub body file from the old cwd", blocked(await shell("sudo -Dsubdir gh pr create -F body.md")));
+check("env -S cannot hide GitHub PR creation", blocked(await shell("env -S 'gh pr create --title test'")));
+check("env --split-string cannot hide Azure PR creation", blocked(await shell("env --split-string='az repos pr create --title test'")));
+check("env -S reprocesses split cwd options before GitHub PR creation", blocked(await shell("env -S '-Csubdir gh pr create --title test'")));
+check("env -S GNU separator escapes cannot hide GitHub PR creation", blocked(await shell("env -S 'gh\\_pr\\_create --body no'")));
+check("env -S GNU separator escapes cannot hide Azure PR creation", blocked(await shell("env -S 'az\\_repos\\_pr\\_create --description no'")));
+check("clustered env -iS cannot hide GitHub PR creation", blocked(await shell("env -iS'gh pr create --body no'")));
+check("clustered env -vC cannot reuse a GitHub body file from the old cwd", blocked(await shell("env -vCsubdir gh pr create -F body.md")));
+check("clustered env -iu with detached value cannot hide GitHub PR creation", blocked(await shell("env -iu PATH gh pr create --body no")));
+check("clustered env -iu with attached value cannot hide Azure PR creation", blocked(await shell("env -iuPATH az repos pr create --description no")));
+check("env --argv0 with detached value cannot hide GitHub PR creation", blocked(await shell("env --argv0 fake gh pr create --body no")));
+check("env --argv0 with attached value cannot hide Azure PR creation", blocked(await shell("env --argv0=fake az repos pr create --description no")));
+check("env --argv0 value cannot fake a GitHub changelog body", blocked(await shell("env --argv0 --body=Changelog:fake gh pr create --title t")));
+check("env --argv0 value cannot fake an Azure changelog description", blocked(await shell("env --argv0 --description=Changelog:fake az repos pr create --title t")));
+check("env -S GNU comment escape cannot hide GitHub PR creation", blocked(await shell("env -S 'gh\\_pr\\_create --body no\\c --body Changelog:fake'")));
+check("nested env -S cannot hide GitHub PR creation", blocked(await shell("env -S '-S gh\\_pr\\_create --body no'")));
+check("env -S option terminator still exposes GitHub PR creation", blocked(await shell("env -S '-- gh pr create --body no'")));
+check("env -S preserves prior cwd changes for relative GitHub body files", blocked(await shell("env -Csubdir -S 'gh pr create' -F body.md")));
+check("shell control flow cd cannot reuse a GitHub body file from the old cwd", blocked(await shell("if true; then cd subdir; fi; gh pr create -F body.md")));
+check("env -S exposes an inline GitHub changelog body", !(await shell("env -S 'gh pr create --body Changelog:fixed'")));
+check("env -S preserves ANSI-C GitHub changelog line breaks", !(await shell("env -S 'gh pr create' --body $'Summary\\nChangelog: fixed'")));
+check("env -S preserves ANSI-C Azure changelog line breaks", !(await shell("env -S 'az repos pr create' --description $'Summary\\nChangelog: fixed'")));
+check("incidental -S argument preserves ANSI-C GitHub body parsing", !(await shell("gh pr create --title=-S --body $'Summary\\nChangelog: fixed'")));
+setWorkspaceRoot(root);
+rmSync(bodyFileRoot, { recursive: true, force: true });
 check("each chained PR create requires its own changelog", blocked(await shell("gh pr create --title one --body 'Changelog: first' && gh pr create --title two --body 'no release notes'")));
 
 // Changeset support: branches modifying .changeset/*.md satisfy Policy 3
