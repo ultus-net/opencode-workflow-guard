@@ -131,7 +131,7 @@ export {
 	exportProjectKnowledge,
 	importProjectKnowledge,
 } from "./lib/project-memory.ts";
-import { ensureProjectMemoryExcluded, getProjectMemoryIdentity, getRecentProjectMemory, importProjectKnowledge, isProjectMemoryFresh, listReviewFollowups, openProjectMemory } from "./lib/project-memory.ts";
+import { ensureProjectMemoryExcluded, getProjectMemoryIdentity, getRecentProjectMemory, importProjectKnowledge, isProjectMemoryFreshAsync, listReviewFollowups, openProjectMemory } from "./lib/project-memory.ts";
 
 // ── Audit & durable verification cache ───────────────────────────────────────
 import {
@@ -416,15 +416,19 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 
 		"tool.execute.after": async (input, output) => {
 			const startedAt = toolLifecycle.finish(input.sessionID, input.callID);
-			audit({
-				ts: new Date().toISOString(),
-				sessionID: input.sessionID,
-				callID: input.callID,
-				tool: input.tool,
-				decision: "allow",
-				phase: "outcome",
-				durationMs: startedAt === undefined ? undefined : Date.now() - startedAt,
-			});
+			const outcome = toolOutcomes.recordFallbackCompleted(input.sessionID, input.callID, input.tool, startedAt === undefined ? undefined : Date.now() - startedAt);
+			if (outcome) {
+				audit({
+					ts: new Date().toISOString(),
+					sessionID: outcome.sessionID,
+					callID: outcome.callID,
+					tool: outcome.tool,
+					decision: "allow",
+					phase: "outcome",
+					durationMs: outcome.durationMs,
+					reason: outcome.status,
+				});
+			}
 			releaseFileClaims(input.sessionID, input.callID);
 			if (input.tool === "read") {
 				const observation = toolLifecycle.takeReadObservation(input.sessionID, input.callID);
@@ -503,8 +507,10 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				contextBlocks.push(stateLines.join("\n"));
 				let projectKnowledge: ReturnType<typeof getRecentProjectMemory> = [];
 				try {
-					projectKnowledge = (projectMemory ? getRecentProjectMemory(projectMemory, 8) : [])
-						.filter((memory) => memory.source !== "portable" && isProjectMemoryFresh(memory, effectiveRoot));
+					const candidates = (projectMemory ? getRecentProjectMemory(projectMemory, 8) : [])
+						.filter((memory) => memory.source !== "portable");
+					const freshness = await Promise.all(candidates.map((memory) => isProjectMemoryFreshAsync(memory, effectiveRoot)));
+					projectKnowledge = candidates.filter((_, index) => freshness[index]);
 				} catch {}
 				if (projectKnowledge.length > 0) {
 					const lines = projectKnowledge.map((memory) => `- [${memory.kind}:${memory.id.slice(0, 8)}] ${memory.content.slice(0, 300)}`);

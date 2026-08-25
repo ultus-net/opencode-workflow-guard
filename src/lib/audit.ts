@@ -1,7 +1,8 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, statSync, readFileSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { AuditEntry, VerifyResult } from "./types.ts";
 import { asRecord } from "./utils.ts";
 
@@ -17,6 +18,37 @@ const MAX_AUDIT_BYTES = 4 * 1024 * 1024;
 const RETAIN_AUDIT_BYTES = 2 * 1024 * 1024;
 const MAX_VERIFY_HISTORY_BYTES = 1024 * 1024;
 const RETAIN_VERIFY_HISTORY_BYTES = 512 * 1024;
+let verifiedHistoryState: { size: number; mtimeMs: number; ctimeMs: number; ino: number | bigint } | undefined;
+const lockDatabases = new Map<string, DatabaseSync>();
+
+function getVerifyHistoryState(): typeof verifiedHistoryState {
+	const stat = statSync(VERIFY_HISTORY_FILE);
+	return { size: stat.size, mtimeMs: stat.mtimeMs, ctimeMs: stat.ctimeMs, ino: stat.ino };
+}
+
+function sameVerifyHistoryState(a: typeof verifiedHistoryState, b: typeof verifiedHistoryState): boolean {
+	return a?.size === b?.size && a?.mtimeMs === b?.mtimeMs && a?.ctimeMs === b?.ctimeMs && a?.ino === b?.ino;
+}
+
+function withFileLock<T>(path: string, action: () => T): T {
+	let db = lockDatabases.get(path);
+	if (!db) {
+		const lockPath = `${path}.lock.sqlite`;
+		db = new DatabaseSync(lockPath);
+		db.exec("PRAGMA busy_timeout = 5000");
+		chmodSync(lockPath, 0o600);
+		lockDatabases.set(path, db);
+	}
+	db.exec("BEGIN IMMEDIATE");
+	try {
+		const result = action();
+		db.exec("COMMIT");
+		return result;
+	} catch (error) {
+		try { db.exec("ROLLBACK"); } catch {}
+		throw error;
+	}
+}
 
 export function getAuditFilePath(): string {
 	return AUDIT_FILE;
@@ -30,7 +62,7 @@ export function getVerifyHistoryFilePath(): string {
 	return VERIFY_HISTORY_FILE;
 }
 
-function appendBoundedJsonl(path: string, value: unknown, maxBytes: number, retainBytes: number): void {
+function appendBoundedJsonlUnlocked(path: string, value: unknown, maxBytes: number, retainBytes: number): void {
 	appendFileSync(path, JSON.stringify(value) + "\n", { encoding: "utf8", mode: 0o600 });
 	chmodSync(path, 0o600);
 	const stat = statSync(path);
@@ -46,31 +78,43 @@ function appendBoundedJsonl(path: string, value: unknown, maxBytes: number, reta
 	const text = buffer.toString("utf8");
 	const firstNewline = text.indexOf("\n");
 	const retained = firstNewline >= 0 ? text.slice(firstNewline + 1) : "";
-	const temp = `${path}.${process.pid}.tmp`;
+	const temp = `${path}.${process.pid}.${randomUUID()}.tmp`;
 	writeFileSync(temp, retained, { encoding: "utf8", mode: 0o600 });
 	renameSync(temp, path);
+}
+
+function appendBoundedJsonl(path: string, value: unknown, maxBytes: number, retainBytes: number): void {
+	withFileLock(path, () => appendBoundedJsonlUnlocked(path, value, maxBytes, retainBytes));
+}
+
+function verifyHistoryNeedsSanitation(): boolean {
+	if (!existsSync(VERIFY_HISTORY_FILE)) return false;
+	const state = getVerifyHistoryState();
+	if (sameVerifyHistoryState(verifiedHistoryState, state)) return false;
+	return readFileSync(VERIFY_HISTORY_FILE, "utf8").split("\n").some((line) => {
+		if (!line.trim()) return false;
+		try {
+			const value = JSON.parse(line) as { command?: unknown; output?: unknown };
+			return typeof value.command !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.command) || typeof value.output !== "string" || !/^sha256:[0-9a-f]{64}$/.test(value.output);
+		} catch {
+			return true;
+		}
+	});
 }
 
 export function persistVerifyHistory(verifyData: NonNullable<VerifyResult>): void {
 	try {
 		mkdirSync(AUDIT_DIR, { recursive: true });
-		if (existsSync(VERIFY_HISTORY_FILE)) {
-			const legacy = readFileSync(VERIFY_HISTORY_FILE, "utf8").split("\n").some((line) => {
-				if (!line.trim()) return false;
-				try {
-					const value = JSON.parse(line) as { command?: unknown; output?: unknown };
-					return typeof value.command !== "string" || !value.command.startsWith("sha256:") || typeof value.output !== "string" || !value.output.startsWith("sha256:");
-				} catch {
-					return true;
-				}
-			});
-			if (legacy) writeFileSync(VERIFY_HISTORY_FILE, "", { encoding: "utf8", mode: 0o600 });
-		}
-		appendBoundedJsonl(VERIFY_HISTORY_FILE, {
-			...verifyData,
-			command: `sha256:${createHash("sha256").update(verifyData.command).digest("hex")}`,
-			output: `sha256:${createHash("sha256").update(verifyData.output).digest("hex")}`,
-		}, MAX_VERIFY_HISTORY_BYTES, RETAIN_VERIFY_HISTORY_BYTES);
+		withFileLock(VERIFY_HISTORY_FILE, () => {
+			if (verifyHistoryNeedsSanitation()) writeFileSync(VERIFY_HISTORY_FILE, "", { encoding: "utf8", mode: 0o600 });
+			appendBoundedJsonlUnlocked(VERIFY_HISTORY_FILE, {
+				...verifyData,
+				command: `sha256:${createHash("sha256").update(verifyData.command).digest("hex")}`,
+				output: `sha256:${createHash("sha256").update(verifyData.output).digest("hex")}`,
+			}, MAX_VERIFY_HISTORY_BYTES, RETAIN_VERIFY_HISTORY_BYTES);
+			const state = getVerifyHistoryState();
+			verifiedHistoryState = verifyHistoryNeedsSanitation() ? undefined : state;
+		});
 	} catch {}
 }
 
