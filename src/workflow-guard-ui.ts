@@ -29,7 +29,7 @@ function text(props: Record<string, unknown>, children: Child[]) {
 	return element("text", props, children);
 }
 
-const BADGE_ACTIVE = "[Workflow Guard: Active]";
+const BADGE_ACTIVE = "Workflow Guard 🛡️";
 let lastBlockedReason: string | undefined;
 const sessionBlockedReasons = new Map<string, string>();
 const badgeNodes = new Map<string, unknown>();

@@ -21,7 +21,7 @@ Run the setup command to register both the server guard and the TUI companion gl
 npx opencode-workflow-guard setup
 ```
 
-The command preserves existing JSON/JSONC configuration and idempotently adds `opencode-workflow-guard` and `opencode-workflow-guard/tui` to their respective global configs under `$XDG_CONFIG_HOME/opencode` (falling back to `~/.config/opencode`). Restart OpenCode after setup because configuration is loaded at startup.
+The command preserves existing JSON/JSONC configuration and idempotently adds `opencode-workflow-guard` to both the server and TUI global configs under `$XDG_CONFIG_HOME/opencode` (falling back to `~/.config/opencode`). Restart OpenCode after setup because configuration is loaded at startup.
 
 If you only want the server guard without the TUI companion, add the package to your project's `opencode.json` (or global `~/.config/opencode/opencode.json`):
 
@@ -34,7 +34,7 @@ If you only want the server guard without the TUI companion, add the package to 
 }
 ```
 
-OpenCode automatically installs npm plugins and their dependencies with Bun at startup (cached in `~/.cache/opencode/node_modules/`). The npm package contains both server and TUI entrypoints, but OpenCode activates them from separate configuration files, which is why the setup command registers both.
+OpenCode automatically installs npm plugins and their dependencies with Bun at startup (cached under `~/.cache/opencode/packages/`). The npm package contains both server and TUI entrypoints, but OpenCode activates them from separate configuration files, which is why the setup command registers both.
 
 ---
 
@@ -52,19 +52,19 @@ Files in your plugin directory are automatically loaded by the OpenCode server p
 
 ### 3. TUI Visual Indicator (Prompt Box Badge)
 
-To enable the dynamic prompt-bar badge - `[Workflow Guard: Active]` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
+To enable the dynamic prompt-bar badge - `Workflow Guard 🛡️` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
 
 The recommended `npx opencode-workflow-guard setup` command configures this automatically. For manual installation, reference the TUI package entrypoint in `~/.config/opencode/tui.json`:
 ```json
 {
   "$schema": "https://opencode.ai/tui.json",
   "plugin": [
-    "opencode-workflow-guard/tui"
+    "opencode-workflow-guard"
   ]
 }
 ```
 
-The package root exports the server plugin, while `opencode-workflow-guard/tui` exports the TUI companion. TUI plugin specs are resolved as written, so using the package root in `tui.json` loads the server module rather than the companion. Do not place `workflow-guard-ui.ts` under `plugins/`; the server loader rejects TUI-only modules.
+The package exposes separate server and TUI entrypoints. In `tui.json`, configure the package name; OpenCode resolves its exported `./tui` entrypoint automatically. Do not place `workflow-guard-ui.ts` under `plugins/`; the server loader rejects TUI-only modules.
 
 The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime `dependency` of this package, so npm installs it automatically alongside `opencode-workflow-guard` - no extra install is needed.
 
