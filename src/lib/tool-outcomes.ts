@@ -24,7 +24,6 @@ export interface ToolOutcome {
 export class ToolOutcomeTracker {
 	private readonly terminalCalls = new Map<string, Set<string>>();
 	private readonly failures = new Map<string, { signature: string; count: number }>();
-	private static readonly maxTerminalCallsPerSession = 1024;
 
 	record(part: ToolOutcomePart): ToolOutcome | undefined {
 		if (part.type !== "tool" || typeof part.sessionID !== "string" || typeof part.callID !== "string" || typeof part.tool !== "string") return undefined;
@@ -37,13 +36,10 @@ export class ToolOutcomeTracker {
 		}
 		if (terminalCalls.has(part.callID)) return undefined;
 		terminalCalls.add(part.callID);
-		if (terminalCalls.size > ToolOutcomeTracker.maxTerminalCallsPerSession) {
-			terminalCalls.delete(terminalCalls.values().next().value!);
-		}
 
 		const start = part.state?.time?.start;
 		const end = part.state?.time?.end;
-		const durationMs = typeof start === "number" && typeof end === "number" ? Math.max(0, end - start) : undefined;
+		const durationMs = typeof start === "number" && Number.isFinite(start) && typeof end === "number" && Number.isFinite(end) ? Math.max(0, end - start) : undefined;
 		if (status === "completed") {
 			this.failures.delete(part.sessionID);
 			return { sessionID: part.sessionID, callID: part.callID, tool: part.tool, status, durationMs };

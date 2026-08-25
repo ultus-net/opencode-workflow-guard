@@ -308,6 +308,7 @@ check("block tofu destroy", blocked(await shell("tofu destroy")));
 check("block pulumi destroy", blocked(await shell("pulumi destroy")));
 check("block az group delete", blocked(await shell("az group delete -g rg-prod")));
 check("block aws ec2 terminate-instances", blocked(await shell("aws ec2 terminate-instances --instance-ids i-1")));
+check("block quote-concatenated AWS termination", blocked(await shell("a''ws ec2 terminate-instances --instance-ids i-123")));
 check("block psql drop table", blocked(await shell("psql -c 'DROP TABLE users'")));
 check("block remote curl DELETE", blocked(await shell("curl -X DELETE https://api.example.com/thing/1")));
 check("allow localhost curl DELETE", !(await shell("curl -X DELETE http://localhost:8080/thing")));
@@ -329,6 +330,7 @@ check("block rm -f on / path", blocked(await shell("rm -f /etc/hosts")));
 check("block git clean -fdx", blocked(await shell("git clean -fdx")));
 check("block git clean -f", blocked(await shell("git clean -f")));
 check("block docker rm", blocked(await shell("docker rm abc123")));
+check("block quote-concatenated docker rm", blocked(await shell("d''ocker rm prod-container")));
 check("block docker container prune", blocked(await shell("docker container prune -f")));
 check("block docker system prune", blocked(await shell("docker system prune")));
 check("block docker volume rm", blocked(await shell("docker volume rm data")));
@@ -404,6 +406,12 @@ setWorkspaceRoot(repo); // point the guard at the repo
 check("on main: edit blocked (branch reason, todos active)", ((await call("edit", { filePath: join(repo, "a.ts"), content: "x" }, { sessionID: "s-active" })) ?? "").includes("protected branch"));
 check("on main: git commit blocked", blocked(await shell("git commit -m test")));
 check("on main: git merge blocked", blocked(await shell("git merge feature/x")));
+	check("on main: git checkout path mutation blocked", blocked(await shell("git checkout -- tracked.txt")));
+	check("on main: git checkout path mutation without separator blocked", blocked(await shell("git checkout tracked.txt")));
+	check("on main: git checkout -B reset blocked", blocked(await shell("git checkout -B main HEAD~1")));
+	check("on main: git add blocked", blocked(await shell("git add tracked.txt")));
+	check("on main: git tag blocked", blocked(await shell("git tag release-test")));
+	check("on main: git tag --list allowed", !blocked(await shell("git tag --list")));
 check("on main: git switch -c allowed (branch creation)", !(await shell("git switch -c feat/x")));
 check("on main: git status allowed", !(await shell("git status")));
 todo("s-main-plan");
@@ -456,7 +464,9 @@ const shellAwsKey = "AKIA" + "0123ABCDEFG45678";
 check("literal secret in shell redirect is blocked", blocked(await call("bash", { command: `echo ${shellAwsKey} > src/key.txt` }, { sessionID: "s-active" })));
 check("touch checks every target for workspace escape", blocked(await call("bash", { command: "touch /tmp/wg-outside-touch local-touch" }, { sessionID: "s-active" })));
 check("mkdir checks every target for workspace escape", blocked(await call("bash", { command: "mkdir /tmp/wg-outside-dir local-dir" }, { sessionID: "s-active" })));
-check("rm checks every target for workspace escape", blocked(await call("bash", { command: "rm /tmp/wg-outside-file local-file" }, { sessionID: "s-active" })));
+	check("rm checks every target for workspace escape", blocked(await call("bash", { command: "rm /tmp/wg-outside-file local-file" }, { sessionID: "s-active" })));
+	check("chmod outside workspace is blocked", blocked(await call("bash", { command: "chmod 600 /tmp/wg-outside-file" }, { sessionID: "s-active" })));
+	check("chown needs active todos", blocked(await call("bash", { command: "chown user local-file" }, { sessionID: "s-empty" })));
 check("truncate outside workspace is blocked", blocked(await call("bash", { command: "truncate -s 0 /tmp/wg-outside-file" }, { sessionID: "s-active" })));
 check("dd output outside workspace is blocked", blocked(await call("bash", { command: "dd if=/dev/zero of=/tmp/wg-outside-file bs=1 count=1" }, { sessionID: "s-active" })));
 check("dd cannot hide an outside redirect", blocked(await call("bash", { command: "dd if=/dev/zero of=local bs=1 count=1 > /tmp/wg-outside-redirect" }, { sessionID: "s-active" })));
@@ -968,9 +978,10 @@ check("command.executed event is audited", evtAuditAfter > evtAuditBefore);
 
 const toolOutcomeAuditBefore = getRecentAuditEntries(20);
 if (typeof cmdEvt.event === "function") {
-	await cmdEvt.event({ event: { type: "message.part.updated", properties: { part: { type: "tool", sessionID: "s-outcome", callID: "outcome-ok", tool: "bash", state: { status: "completed", input: { command: "true" }, output: "", title: "bash", metadata: {}, time: { start: 1, end: 2 } } } } } } as any);
+	await cmdEvt.event({ event: { type: "message.part.updated", properties: { part: { id: "part-outcome-ok", messageID: "message-outcome", type: "tool", sessionID: "s-outcome", callID: "outcome-ok", tool: "bash", state: { status: "completed", input: { command: "true" }, output: "", title: "bash", metadata: {}, time: { start: 1, end: 2 } } } } } });
 	for (let i = 1; i <= 3; i++) {
-		await cmdEvt.event({ event: { type: "message.part.updated", properties: { part: { type: "tool", sessionID: "s-outcome", callID: `outcome-fail-${i}`, tool: "bash", state: { status: "error", input: { command: `attempt-${i}` }, error: "connection refused at localhost", time: { start: i, end: i + 1 } } } } } } as any);
+		await cmdEvt.event({ event: { type: "message.part.updated", properties: { part: { id: `part-outcome-fail-${i}`, messageID: "message-outcome", type: "tool", sessionID: "s-outcome", callID: `outcome-fail-${i}`, tool: "bash", state: { status: "error", input: { command: `attempt-${i}` }, error: "connection refused at localhost", time: { start: i, end: i + 1 } } } } } });
+		if (i === 2) await cmdEvt.event({ event: { type: "session.idle", properties: { sessionID: "s-outcome" } } });
 	}
 }
 const toolOutcomeAudit = getRecentAuditEntries(20).slice(0, 5);
@@ -987,7 +998,8 @@ outcomeTracker.record(failedPart("different", "different failure"));
 check("distinct failures reset equivalent failure tracking", outcomeTracker.record(failedPart("after-different", "same failure"))?.repeatedFailureCount === 1);
 const boundedTracker = new ToolOutcomeTracker();
 for (let i = 0; i <= 1024; i++) boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: `call-${i}`, tool: "bash", state: { status: "completed" } });
-check("terminal call deduplication is bounded per session", boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: "call-0", tool: "bash", state: { status: "completed" } })?.status === "completed");
+check("terminal call deduplication remains stable for long sessions", boundedTracker.record({ type: "tool", sessionID: "s-bounded", callID: "call-0", tool: "bash", state: { status: "completed" } }) === undefined);
+check("invalid tool timing is omitted", new ToolOutcomeTracker().record({ type: "tool", sessionID: "s-timing", callID: "timing", tool: "bash", state: { status: "completed", time: { start: Number.NaN, end: Number.POSITIVE_INFINITY } } })?.durationMs === undefined);
 
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
@@ -1483,6 +1495,8 @@ setWorkspaceRoot(root);
 
 check("inline node writeFileSync needs active todos", blocked(await call("bash", { command: "node -e \"require('fs').writeFileSync('inline-node.txt', 'x')\"" }, { sessionID: "s-empty" })));
 check("inline node writeFileSync is blocked for read-only role", blocked(await call("bash", { command: "node -e \"require('fs').writeFileSync('inline-node.txt', 'x')\"" }, { sessionID: "s-active", agent: "reviewer" })));
+check("inline ruby File.write is blocked for read-only role", blocked(await call("bash", { command: "ruby -e \"File.write('inline-ruby.txt', 'x')\"" }, { sessionID: "s-active", agent: "reviewer" })));
+check("inline ruby File.write outside workspace is blocked", blocked(await call("bash", { command: "ruby -e \"File.write('/tmp/workflow-guard-ruby', 'x')\"" }, { sessionID: "s-active" })));
 const inlineNodeRepo = mkdtempSync(join(tmpdir(), "wg-inline-node-main-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: inlineNodeRepo });
 setWorkspaceRoot(inlineNodeRepo);
@@ -1507,7 +1521,14 @@ check("python -c benign script is allowed", !(await shell('python3 -c "print(\'h
 
 // Policy 18 secret-read and boundary-escape regression checks
 check("extractInterpreterPayload extracts bash -c", extractInterpreterPayload('bash -c "echo hi"').length > 0);
+check("extractInterpreterPayload extracts python heredoc", extractInterpreterPayload("python3 - <<'PY'\nprint('hello')\nPY").includes("print('hello')"));
+check("extractInterpreterPayload accepts shell-valid punctuation in heredoc delimiters", extractInterpreterPayload("python3 - <<'PY-END'\nprint('hello')\nPY-END").includes("print('hello')"));
+check("extractInterpreterPayload accepts tab-indented <<- heredoc terminators", extractInterpreterPayload("python3 - <<-'PY'\nprint('hello')\n\t\tPY").includes("print('hello')"));
+check("extractInterpreterPayload stops unquoted heredoc delimiters at shell operators", extractInterpreterPayload("python3 - <<PY;\nprint('hello')\nPY").includes("print('hello')"));
 check("python -c reading .env is blocked", blocked(await shell('python3 -c "print(open(\'.env\').read())"')));
+check("python heredoc reading .env is blocked", blocked(await shell("python3 - <<'PY'\nprint(open('.env').read())\nPY")));
+check("python heredoc outside workspace write is blocked", blocked(await shell("python3 - <<'PY'\nopen('/tmp/wg-heredoc-outside', 'w').write('x')\nPY")));
+check("python benign heredoc is allowed", !(await shell("python3 - <<'PY'\nprint('hello')\nPY")));
 check("python -c reading .env.example (safe fixture) is allowed", !(await shell('python3 -c "print(open(\'.env.example\').read())"')));
 check("bash -c reading id_rsa is blocked", blocked(await shell("bash -c 'cat ~/.ssh/id_rsa'")));
 check("bash -c benign cat is allowed", !(await shell("bash -c 'cat src/index.ts'")));
@@ -2099,6 +2120,10 @@ writeFileSync(join(checkpointDir, "tracked.txt"), "agent change\n");
 writeFileSync(join(checkpointDir, "untracked.txt"), "agent changed untracked\n");
 finalizeRecoveryCheckpoint(checkpointDir, "checkpoint-session", 1);
 const checkpointMetadataLock = join(checkpointDir, ".git", "workflow-guard", "recovery-checkpoints.json.lock");
+writeFileSync(checkpointMetadataLock, "2147483647");
+writeFileSync(`${checkpointMetadataLock}.reclaim`, "2147483647");
+finalizeRecoveryCheckpoint(checkpointDir, "missing-stale-lock-session", 1);
+check("recovery checkpoint reclaims locks owned by a dead process", !existsSync(checkpointMetadataLock) && !existsSync(`${checkpointMetadataLock}.reclaim`));
 writeFileSync(checkpointMetadataLock, "concurrent session");
 const refsBeforeLockedCreate = spawnSync("git", ["-C", checkpointDir, "for-each-ref", "--format=%(refname)", "refs/workflow-guard/checkpoints/"], { encoding: "utf8" }).stdout;
 const lockedCreate = createRecoveryCheckpoint(checkpointDir, "locked-concurrent-session", 1);

@@ -19,13 +19,13 @@ import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
 import { guardToolCallImpl, isReadOnlyRole } from "./lib/guard-dispatcher.ts";
 import { createCustomTools } from "./lib/custom-tools.ts";
+import type { TodoSdkClient } from "./lib/types.ts";
 export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
 export { extractReviewFollowups } from "./lib/custom-tools.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
 	TodoItem,
-	TodoSdkClient,
 	ProjectConfig,
 	VerifyResult,
 	ReviewResult,
@@ -36,6 +36,7 @@ export type {
 	LearningEvidence,
 	LearningOpportunity,
 } from "./lib/types.ts";
+export type { TodoSdkClient };
 
 // ── State & runtime context ──────────────────────────────────────────────────
 import {
@@ -281,7 +282,7 @@ export { checkInteractiveTtyCommand, checkPackageHygiene, sendDesktopNotificatio
 
 function logObservation(client: unknown, message: string): void {
 	try {
-		void (client as any)?.app?.log?.({
+		void (client as TodoSdkClient | undefined)?.app?.log?.({
 			body: { service: "workflow-guard", level: "info", message },
 		});
 	} catch {}
@@ -359,7 +360,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	}
 
 	try {
-		await (ctx.client as any)?.app?.log?.({
+		await ctx.client.app.log({
 			body: {
 				service: "workflow-guard",
 				level: "info",
@@ -529,7 +530,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					}
 					if (scrubbed.length > 0) {
 						try {
-							await (getSdkClient() as any)?.app?.log?.({
+							await getSdkClient()?.app?.log?.({
 								body: {
 									service: "workflow-guard",
 									level: "warn",
@@ -638,7 +639,6 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 			if (event?.type === "session.idle") {
 				const sessionID = (event.properties as { sessionID?: unknown })?.sessionID;
 				if (typeof sessionID === "string") {
-					toolOutcomes.clearSession(sessionID);
 					releaseFileClaims(sessionID);
 					clearReadFingerprints(sessionID);
 					toolLifecycle.clearSession(sessionID);

@@ -56,8 +56,10 @@ export class ToolInvocationLifecycle {
 
 	clearSession(sessionID: string): void {
 		const prefix = `${sessionID}\0`;
-		for (const key of this.startedAt.keys()) {
-			if (key.startsWith(prefix)) this.startedAt.delete(key);
+		for (const map of [this.startedAt, this.readObservations, this.postEditSnapshots]) {
+			for (const key of map.keys()) {
+				if (key.startsWith(prefix)) map.delete(key);
+			}
 		}
 	}
 }

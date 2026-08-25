@@ -123,7 +123,7 @@ export function normalizeGitCommands(command: string): string {
 }
 
 export const GIT_WRITE_RE =
-	/\bgit\s+(commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+branch\s+(?:[^|;&]*\s)?-[dDM]\b/;
+	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?-[dDM]\b/;
 
 export function currentGitBranch(root: string): string | undefined {
 	const result = spawnSync("git", ["branch", "--show-current"], {

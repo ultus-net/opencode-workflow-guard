@@ -53,7 +53,7 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 ## Repeated Tool-Failure Detection
 
 - Implemented: terminal tool-part errors are fingerprinted in memory from tool identity and error text, so three consecutive equivalent failures in one active session emit actionable recovery feedback even when the invocations themselves differ. The raw error is neither audited nor retained beyond the one-way fingerprint.
-- A successful tool outcome or a distinct failure resets the consecutive-failure sequence, and session idle clears tracking state. Duplicate terminal updates for the same call ID are ignored.
+- A successful tool outcome or a distinct failure resets the consecutive-failure sequence. Session idle preserves this session-level tracking, while session deletion clears it. Duplicate terminal updates for the same call ID are ignored.
 - Detection is observational and does not prevent legitimate iterative debugging.
 - Do not duplicate OpenCode's built-in `doom_loop` permission, which already covers three consecutive identical tool calls; this proposal is only about repeated equivalent failures whose invocations are not identical.
 

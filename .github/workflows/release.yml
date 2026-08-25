@@ -31,6 +31,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm run test:install
 
       # Fail fast before the registry does: OIDC trusted publishing requires
       # repository.url to match the sigstore provenance claim, and npm pack is

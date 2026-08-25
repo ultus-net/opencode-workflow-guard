@@ -4,6 +4,9 @@ export interface TodoItem {
 }
 
 export interface TodoSdkClient {
+	app?: {
+		log?: (opts: { body: { service: string; level: "debug" | "info" | "warn" | "error"; message: string } }) => Promise<unknown>;
+	};
 	session?: {
 		todo?: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
 		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown } }>;

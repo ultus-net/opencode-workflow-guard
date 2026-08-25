@@ -90,7 +90,7 @@ export function isReadOnlyRole(agent?: string): boolean {
 
 function logBlock(message: string): void {
 	try {
-		void (getSdkClient() as any)?.app?.log?.({
+		void getSdkClient()?.app?.log?.({
 			body: {
 				service: "workflow-guard",
 				level: "warn",
@@ -140,7 +140,7 @@ export async function guardToolCallImpl(
 		const record = asRecord(input);
 		const rawTodos = record?.todos;
 		if (Array.isArray(rawTodos)) {
-			const newTodos = rawTodos as any[];
+			const newTodos = rawTodos;
 			const existingTodos = context?.sessionID ? await fetchSessionTodos(context.sessionID) : undefined;
 			const err = validateTodoLifecycle(newTodos, existingTodos);
 			if (err) {
@@ -341,7 +341,7 @@ export async function guardToolCallImpl(
 				return `Blocked: reading sensitive credential/secret file '${secretFile}' via shell is not permitted. Reference environment variables by name or inspect safe templates (e.g. .env.example) instead.`;
 			}
 		}
-		for (const payload of extractInterpreterPayload(command)) {
+		for (const payload of extractInterpreterPayload(raw)) {
 			const outsidePath = outsideWritePathInPayload(payload, currentRoot);
 			if (outsidePath) {
 				logBlock(`[workflow-guard] blocked interpreter payload writing outside workspace: ${outsidePath}`);
