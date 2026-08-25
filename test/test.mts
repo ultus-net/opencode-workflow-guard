@@ -2173,7 +2173,7 @@ writeFileSync(
 	join(worktreeBaseRepo, ".opencode", "workflow-guard.json"),
 	JSON.stringify({ protectedBranches: ["release/prod"] }),
 );
-reloadProjectConfig(prevRoot);
+reloadProjectConfig(worktreeBaseRepo);
 check(
 	"createGitWorktree rejects custom protected branch from config",
 	!createGitWorktree("release/prod", "HEAD", worktreeBaseRepo).success,
