@@ -23,6 +23,11 @@ export interface TodoSdkClient {
 export interface ProjectConfig {
 	protectedBranches?: string[];
 	verifyCommand?: string;
+	postEditValidators?: Array<{
+		pattern: string;
+		command: string;
+		timeoutMs?: number;
+	}>;
 	requireReview?: boolean;
 	requireDocumentation?: boolean;
 	maxSubagentMutations?: number;

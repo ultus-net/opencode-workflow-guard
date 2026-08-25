@@ -14,6 +14,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { join } from "node:path";
+import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -1049,6 +1050,9 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		});
 	} catch {}
 
+	const pendingPostEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
+	const postEditKey = (sessionID: string, callID: string) => `${sessionID}\0${callID}`;
+
 	return {
 		tool: {
 			guard_next_tasks: tool({
@@ -1441,6 +1445,22 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					await emitBlockFeedback(reason);
 					throw new Error(`[workflow-guard] ${reason}`);
 				}
+				if (EDIT_TOOL_NAMES.has(input.tool)) {
+					const snapshots = editTargets(args, toolWorktree).map(snapshotFile);
+					if (snapshots.length) pendingPostEditSnapshots.set(postEditKey(input.sessionID, input.callID), { root: toolWorktree, snapshots });
+				}
+			});
+		},
+
+		"tool.execute.after": async (input, output) => {
+			const key = postEditKey(input.sessionID, input.callID);
+			const pending = pendingPostEditSnapshots.get(key);
+			pendingPostEditSnapshots.delete(key);
+			if (!pending) return;
+			await runWithRuntimeState(pending.root, ctx.client, async () => {
+				const reports = await Promise.all(pending.snapshots.map((before) => runPostEditValidators(pending.root, before)));
+				const report = reports.filter((value): value is string => Boolean(value)).join("\n\n");
+				if (report) output.output = `${output.output}\n\n${report}`;
 			});
 		},
 

@@ -73,6 +73,7 @@ import {
 	default as defaultExport,
 } from "../src/workflow-guard.ts";
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
+import { terminateProcessTree } from "../src/lib/verify.ts";
 import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
@@ -566,6 +567,120 @@ try {
 	noThrow = false;
 }
 check("hook passes allowed call through", noThrow);
+
+// Targeted post-edit validation runs only after a matching mutation actually
+// changes the file. Validator commands never receive the filename as shell text.
+const validatorDir = mkdtempSync(join(tmpdir(), "wg-validator-"));
+writeFileSync(join(validatorDir, "target.ts"), "before");
+writeFileSync(join(validatorDir, "unchanged.ts"), "same");
+writeFileSync(join(validatorDir, "semi;colon.ts"), "before");
+writeFileSync(
+	join(validatorDir, "workflow-guard.json"),
+	JSON.stringify({
+		postEditValidators: [
+			{ pattern: "**/*.ts", command: "node -e \"console.error('validator failed'); process.exit(1)\"" },
+			{ pattern: "timeout.ts", command: "node -e \"setTimeout(() => {}, 1000)\"", timeoutMs: 25 },
+		],
+	}),
+);
+const validatorHooks = await pluginFn({
+	directory: validatorDir,
+	client: fakeClient as any,
+	project: {} as any,
+	worktree: validatorDir,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+const validatorBefore = validatorHooks["tool.execute.before"];
+const validatorAfter = validatorHooks["tool.execute.after"];
+check("plugin returns tool.execute.after hook for post-edit validation", typeof validatorAfter === "function");
+todo("s-validator", item("validate edits", "in_progress"));
+const validatorArgs = { filePath: join(validatorDir, "target.ts"), content: "after" };
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-1" }, { args: validatorArgs });
+writeFileSync(validatorArgs.filePath, "after");
+const validatorOutput = { title: "edit", output: "edited", metadata: {} };
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "validator-1", args: validatorArgs }, validatorOutput);
+check("matching changed edit reports validator failure", validatorOutput.output.includes("validator failed"));
+
+const unchangedArgs = { filePath: join(validatorDir, "unchanged.ts"), content: "same" };
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-2" }, { args: unchangedArgs });
+const unchangedOutput = { title: "edit", output: "edited", metadata: {} };
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "validator-2", args: unchangedArgs }, unchangedOutput);
+check("unchanged edit does not report validator failure", !unchangedOutput.output.includes("validator failed"));
+
+const metacharArgs = { filePath: join(validatorDir, "semi;colon.ts"), content: "after" };
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-3" }, { args: metacharArgs });
+writeFileSync(metacharArgs.filePath, "after");
+const metacharOutput = { title: "edit", output: "edited", metadata: {} };
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "validator-3", args: metacharArgs }, metacharOutput);
+check("filename shell metacharacters do not bypass targeted validation", metacharOutput.output.includes("validator failed"));
+
+writeFileSync(join(validatorDir, "timeout.ts"), "before");
+const timeoutArgs = { filePath: join(validatorDir, "timeout.ts"), content: "after" };
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-4" }, { args: timeoutArgs });
+writeFileSync(timeoutArgs.filePath, "after");
+const timeoutOutput = { title: "edit", output: "edited", metadata: {} };
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "validator-4", args: timeoutArgs }, timeoutOutput);
+check("post-edit validator timeout is bounded and reported", timeoutOutput.output.includes("timed out"));
+
+writeFileSync(join(validatorDir, "patched-a.ts"), "before");
+writeFileSync(join(validatorDir, "patched-b.ts"), "before");
+writeFileSync(join(validatorDir, "patched space.ts"), "before");
+const patchArgs = { patchText: "*** Begin Patch\n*** Update File: patched-a.ts\n-old\n+new\n*** Update File: patched-b.ts\n-old\n+new\n*** End Patch" };
+await validatorBefore?.({ tool: "apply_patch", sessionID: "s-validator", callID: "validator-patch" }, { args: patchArgs });
+writeFileSync(join(validatorDir, "patched-a.ts"), "after");
+writeFileSync(join(validatorDir, "patched-b.ts"), "after");
+const patchOutput = { title: "patch", output: "patched", metadata: {} };
+await validatorAfter?.({ tool: "apply_patch", sessionID: "s-validator", callID: "validator-patch", args: patchArgs }, patchOutput);
+check("apply_patch validates every changed target", (patchOutput.output.match(/Post-edit validator failed for/g) ?? []).length === 2);
+
+const spacedPatchArgs = { patchText: "*** Begin Patch\n*** Update File: patched space.ts\n-old\n+new\n*** End Patch" };
+await validatorBefore?.({ tool: "apply_patch", sessionID: "s-validator", callID: "validator-spaced-patch" }, { args: spacedPatchArgs });
+writeFileSync(join(validatorDir, "patched space.ts"), "after");
+const spacedPatchOutput = { title: "patch", output: "patched", metadata: {} };
+await validatorAfter?.({ tool: "apply_patch", sessionID: "s-validator", callID: "validator-spaced-patch", args: spacedPatchArgs }, spacedPatchOutput);
+check("apply_patch validates changed targets containing spaces", spacedPatchOutput.output.includes("Post-edit validator failed for patched space.ts"));
+
+writeFileSync(join(validatorDir, "concurrent-a.ts"), "before");
+writeFileSync(join(validatorDir, "concurrent-b.ts"), "before");
+const concurrentA = { filePath: join(validatorDir, "concurrent-a.ts"), content: "after" };
+const concurrentB = { filePath: join(validatorDir, "concurrent-b.ts"), content: "after" };
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "concurrent-a" }, { args: concurrentA });
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "concurrent-b" }, { args: concurrentB });
+writeFileSync(concurrentA.filePath, "after");
+writeFileSync(concurrentB.filePath, "after");
+const concurrentBOutput = { title: "edit", output: "edited", metadata: {} };
+const concurrentAOutput = { title: "edit", output: "edited", metadata: {} };
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "concurrent-b", args: concurrentB }, concurrentBOutput);
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "concurrent-a", args: concurrentA }, concurrentAOutput);
+check("interleaved edits retain independent validator state", concurrentAOutput.output.includes("concurrent-a.ts") && concurrentBOutput.output.includes("concurrent-b.ts"));
+
+const alternateValidatorDir = mkdtempSync(join(tmpdir(), "wg-validator-root-"));
+writeFileSync(join(alternateValidatorDir, "root.ts"), "before");
+writeFileSync(join(alternateValidatorDir, "workflow-guard.json"), JSON.stringify({ postEditValidators: [{ pattern: "*.ts", command: "node -e \"console.error(process.cwd()); process.exit(1)\"" }] }));
+const rootArgs = { filePath: join(alternateValidatorDir, "root.ts"), content: "after" };
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-root" }, { args: rootArgs, worktree: alternateValidatorDir } as any);
+writeFileSync(rootArgs.filePath, "after");
+const rootOutput = { title: "edit", output: "edited", metadata: {} };
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "validator-root", args: rootArgs }, rootOutput);
+check("post-edit validation retains the before-hook workspace root", rootOutput.output.includes(alternateValidatorDir));
+rmSync(alternateValidatorDir, { recursive: true, force: true });
+
+writeFileSync(
+	join(validatorDir, "workflow-guard.json"),
+	JSON.stringify({ postEditValidators: [{ pattern: "**/*.{ts,tsx}", command: "node -e \"process.exit(0)\"", timeoutMs: -1 }] }),
+);
+writeFileSync(join(validatorDir, "invalid-config.ts"), "before");
+const invalidConfigArgs = { filePath: join(validatorDir, "invalid-config.ts"), content: "after" };
+await validatorBefore?.({ tool: "edit", sessionID: "s-validator", callID: "validator-invalid-config" }, { args: invalidConfigArgs });
+writeFileSync(invalidConfigArgs.filePath, "after");
+const invalidConfigOutput = { title: "edit", output: "edited", metadata: {} };
+await validatorAfter?.({ tool: "edit", sessionID: "s-validator", callID: "validator-invalid-config", args: invalidConfigArgs }, invalidConfigOutput);
+check("invalid post-edit validator configuration is reported", invalidConfigOutput.output.includes("Invalid postEditValidators configuration"));
+rmSync(validatorDir, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
 let todoThrew = false;
 try {
 	await invoke("write", { filePath: join(root, "a.ts"), content: "x" }, "s-empty");
@@ -762,6 +877,25 @@ check(
 	"runVerify terminates timed-out verification commands safely",
 	!verifyTimeout.passed && verifyTimeout.output.includes("timed out"),
 );
+const timeoutMarker = join(root, "timeout-child-marker");
+rmSync(timeoutMarker, { force: true });
+await runVerify(`node -e "setTimeout(() => require('fs').writeFileSync('${timeoutMarker}', 'orphan'), 300)"`, root, 50);
+await new Promise((resolve) => setTimeout(resolve, 450));
+check("runVerify timeout terminates descendant processes", !existsSync(timeoutMarker));
+const pipelineTimeoutMarker = join(root, "timeout-pipeline-child-marker");
+rmSync(pipelineTimeoutMarker, { force: true });
+await runVerify(`node -e "setTimeout(() => require('fs').writeFileSync('${pipelineTimeoutMarker}', 'orphan'), 300)" | cat`, root, 50);
+await new Promise((resolve) => setTimeout(resolve, 450));
+check("runVerify timeout terminates descendants behind shell pipelines", !existsSync(pipelineTimeoutMarker));
+let windowsCleanupFinished = false;
+const windowsCleanup = terminateProcessTree(1234, () => {}, "win32", async (pid) => {
+	check("Windows timeout cleanup receives the child pid", pid === 1234);
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	windowsCleanupFinished = true;
+});
+check("Windows timeout cleanup waits for process-tree termination", !windowsCleanupFinished);
+await windowsCleanup;
+check("Windows timeout cleanup resolves after process-tree termination", windowsCleanupFinished);
 
 process.env.AWS_SECRET = "secret";
 process.env.OPENAI_API_KEY = "secret2";

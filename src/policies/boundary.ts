@@ -91,7 +91,7 @@ export function isPathOutsideWorkspace(targetPath: string, root: string): boolea
 export function extractPatchPaths(patchText: string): string[] {
 	const paths: string[] = [];
 	const markerRe =
-		/^\*\*\*\s+(?:Add File|Update File|Delete File|Move to|Move from):\s*(\S+)/gm;
+		/^\*\*\*\s+(?:Add File|Update File|Delete File|Move to|Move from):\s*(.+?)\s*$/gm;
 	let match: RegExpExecArray | null;
 	while ((match = markerRe.exec(patchText)) !== null) {
 		if (match[1]) paths.push(match[1]);

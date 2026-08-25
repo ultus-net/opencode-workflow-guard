@@ -184,11 +184,13 @@ export async function runVerify(
 	return new Promise((resolve) => {
 		let output = "";
 		let timer: NodeJS.Timeout | undefined;
+		let timedOut = false;
 		let child: ReturnType<typeof spawn>;
 		try {
 			child = spawn(command, {
 				cwd: root,
 				shell: true,
+				detached: process.platform !== "win32",
 				env: getCleanEnv(),
 				stdio: ["ignore", "pipe", "pipe"],
 			});
@@ -201,13 +203,13 @@ export async function runVerify(
 		}
 
 		timer = setTimeout(() => {
-			try {
-				child.kill("SIGKILL");
-			} catch {}
-			resolve({
-				passed: false,
-				output: output + `\n(Verification timed out after ${Math.round(timeoutMs / 1000)}s)`,
-				durationMs: Date.now() - start,
+			timedOut = true;
+			void terminateProcessTree(child.pid, () => child.kill("SIGKILL")).finally(() => {
+				resolve({
+					passed: false,
+					output: output + `\n(Verification timed out after ${Math.round(timeoutMs / 1000)}s)`,
+					durationMs: Date.now() - start,
+				});
 			});
 		}, timeoutMs);
 
@@ -221,11 +223,61 @@ export async function runVerify(
 		});
 		child.on("close", (code) => {
 			if (timer) clearTimeout(timer);
+			if (timedOut) return;
 			resolve({ passed: code === 0, output, durationMs: Date.now() - start });
 		});
 		child.on("error", (err) => {
 			if (timer) clearTimeout(timer);
+			if (timedOut) return;
 			resolve({ passed: false, output: `(spawn failed: ${err.message})`, durationMs: Date.now() - start });
 		});
 	});
+}
+
+type WindowsTreeKiller = (pid: number) => Promise<void>;
+
+function killWindowsProcessTree(pid: number): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		let killer: ReturnType<typeof spawn> | undefined;
+		const finish = (err?: Error) => {
+			if (!settled) {
+				settled = true;
+				clearTimeout(cleanupTimer);
+				err ? reject(err) : resolve();
+			}
+		};
+		const cleanupTimer = setTimeout(() => {
+			try { killer?.kill("SIGKILL"); } catch {}
+			finish(new Error("taskkill timed out"));
+		}, 5_000);
+		try {
+			killer = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore" });
+			killer.once("close", (code) => finish(code === 0 ? undefined : new Error(`taskkill exited ${code}`)));
+			killer.once("error", (err) => finish(err));
+		} catch (err) {
+			finish(err instanceof Error ? err : new Error("taskkill failed"));
+		}
+	});
+}
+
+export async function terminateProcessTree(
+	pid: number | undefined,
+	fallbackKill: () => void,
+	platform: NodeJS.Platform = process.platform,
+	windowsTreeKiller: WindowsTreeKiller = killWindowsProcessTree,
+): Promise<void> {
+	try {
+		if (platform === "win32" && pid) {
+			await windowsTreeKiller(pid);
+		} else if (pid) {
+			process.kill(-pid, "SIGKILL");
+		} else {
+			fallbackKill();
+		}
+	} catch {
+		try {
+			fallbackKill();
+		} catch {}
+	}
 }
