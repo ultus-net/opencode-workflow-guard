@@ -285,7 +285,7 @@ export function getSubagentMutationBudget(root: string): number {
 	if (typeof cfg.maxSubagentMutations === "number" && cfg.maxSubagentMutations > 0) {
 		return cfg.maxSubagentMutations;
 	}
-	return 50;
+	return 100;
 }
 
 export function isLearningEnabled(root: string): boolean {

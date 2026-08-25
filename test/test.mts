@@ -204,6 +204,8 @@ check("allow push to main-backup (ref-like path)", !(await shell("git push origi
 console.log("- Policy 3: PR changelog (GitHub & Azure DevOps) -");
 check("block gh pr create without changelog", blocked(await shell("gh pr create --title t --body 'no changes here'")));
 check("allow gh pr create with Changelog: body", !(await shell("gh pr create --title t --body 'Changelog: fixed stuff'")));
+check("allow gh pr create with Summary release information", !(await shell("gh pr create --title t --body '## Summary\n- Fix stale tool outcome tracking'")));
+check("allow gh pr create with Release notes", !(await shell("gh pr create --title t --body '## Release notes\n- Raise the subagent mutation budget'")));
 const bodyFile = join(root, "pr-body.md");
 writeFileSync(bodyFile, "## Changelog\n- fix\n");
 check("allow gh pr create with -F body-file containing changelog", !(await shell(`gh pr create -F ${bodyFile}`)));
@@ -1577,7 +1579,7 @@ check(
 	"PR preflight reports review and changelog failures together",
 	typeof combinedPrPreflight === "string" &&
 		combinedPrPreflight.includes("Passing secondary review approval is required") &&
-		combinedPrPreflight.includes("Changelog is required"),
+		combinedPrPreflight.includes("Release information is required"),
 );
 check(
 	"PR creation blocked when requireReview is true and no review recorded",
@@ -1755,6 +1757,7 @@ const roShellBlock = await call(
 check("read-only advisor agent blocked from shell file mutation", blocked(roShellBlock));
 
 // Subagent Mutation Budget
+check("default subagent mutation budget is 100", getSubagentMutationBudget(root) === 100);
 process.env.WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS = "2";
 fakeParents.set("s-budget-subagent", "s-active");
 todo("s-budget-subagent", item("budgeted work", "in_progress"));

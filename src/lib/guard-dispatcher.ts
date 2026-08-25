@@ -432,7 +432,7 @@ export async function guardToolCallImpl(
 				}
 			}
 			const hasChangelog = branchChangelog || prSegments.every(({ segment, invocationRoot }) => prBodyIncludesChangelog(segment, invocationRoot));
-			if (!hasChangelog) preflightFailures.push(`Changelog is required; update a CHANGELOG file or include a 'Changelog:' section in the PR description (${descFlag}).`);
+			if (!hasChangelog) preflightFailures.push(`Release information is required; update a CHANGELOG/changeset file or include a Summary, Changes, Release notes, or Changelog section in the PR description (${descFlag}).`);
 			const lockCheck = checkLockfileSync(currentRoot);
 			if (lockCheck.isOutOfSync) preflightFailures.push(lockCheck.reason ?? "Dependency lockfile is out of sync with its manifest.");
 			if (preflightFailures.length > 0) {
