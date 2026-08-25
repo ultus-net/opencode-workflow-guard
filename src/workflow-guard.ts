@@ -92,6 +92,7 @@ export {
 // ── Shared shell/env utilities ───────────────────────────────────────────────
 import {
 	asRecord,
+	dynamicShellSyntaxIn,
 	extractCommands,
 	normalize,
 	shellWrappersChangeCwd,
@@ -103,7 +104,7 @@ import {
 	SENSITIVE_ENV_RE,
 } from "./lib/utils.ts";
 
-export { getCleanEnv };
+export { getCleanEnv, dynamicShellSyntaxIn };
 
 // ── Adaptive learning engine ─────────────────────────────────────────────────
 import {
@@ -682,6 +683,8 @@ async function guardToolCallImpl(
 
 	const commands = extractCommands(input);
 	for (const raw of commands) {
+		const dynamicSyntax = dynamicShellSyntaxIn(raw);
+		if (dynamicSyntax) return `Blocked: command contains ${dynamicSyntax} that cannot be safely classified without executing shell expansion.`;
 		const command = normalize(raw);
 
 		// ── Policy 22: non-interactive shell & TTY hang guard ──

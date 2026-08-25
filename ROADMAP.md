@@ -59,7 +59,8 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Dynamic Shell Expansion Hardening
 
-- Add adversarial coverage for executable-producing shell syntax that literal command normalization cannot faithfully classify, especially command substitution (`$()` and backticks), process substitution, IFS-based construction, carriage returns, Unicode whitespace, malformed quote/token boundaries, and relevant Zsh expansion forms.
+- Implemented: shell execution and configured verification fail closed on quote-aware detection of command/process substitution, IFS-based token construction, ambiguous carriage-return/Unicode whitespace, and malformed quote/escape boundaries that literal command normalization cannot faithfully classify.
+- Adversarial coverage includes `$()` and backticks, process substitution, IFS construction, carriage returns, Unicode whitespace, malformed quote/token boundaries, and quoted inert literals.
 - Use Claude Code's Bash security parser and regression corpus as a reference for syntax classes, not as a parser to transplant. Prefer deterministic fail-closed handling at hard policy boundaries when expansion would require executing shell semantics to discover the effective command.
 - Preserve the current sequential hard-policy checks: an allow decision from a narrower rule must never bypass later destructive-command, secret, tamper, workspace, or Git checks.
 - Keep configured verification exit codes literal. Do not import interactive command semantics that reinterpret nonzero statuses for tools such as `grep`, `rg`, `diff`, or `test`.

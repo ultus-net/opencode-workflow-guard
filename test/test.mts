@@ -26,6 +26,7 @@ import {
 	loadVerifyCache,
 	isEnvFilePath,
 	generateMaskedEnvSchema,
+	dynamicShellSyntaxIn,
 	getAuditFilePath,
 	getRecentAuditEntries,
 	summarizeInput,
@@ -1126,6 +1127,14 @@ check(
 );
 
 const verifyTimeout = await runVerify("sleep 5", root, 100);
+const verifyDynamic = await runVerify("printf $(printf dangerous)", root);
+check("runVerify blocks dynamic shell expansion", !verifyDynamic.passed && verifyDynamic.output.includes("dynamic command/process substitution"));
+check("dynamic shell syntax detects command substitution", dynamicShellSyntaxIn("echo $(dangerous)") !== undefined && dynamicShellSyntaxIn("echo `dangerous`") !== undefined);
+check("dynamic shell syntax detects process substitution", dynamicShellSyntaxIn("diff <(safe) <(unsafe)") !== undefined);
+check("dynamic shell syntax detects IFS construction", dynamicShellSyntaxIn("git${IFS}push origin main") !== undefined && dynamicShellSyntaxIn("git${IFS:- }push") !== undefined);
+check("dynamic shell syntax detects ambiguous whitespace", dynamicShellSyntaxIn("git\rpush") !== undefined && dynamicShellSyntaxIn("git\u00a0push") !== undefined);
+check("dynamic shell syntax detects malformed quote boundaries", dynamicShellSyntaxIn("echo 'unterminated") !== undefined && dynamicShellSyntaxIn("echo trailing\\") !== undefined);
+check("dynamic shell syntax preserves quoted literals", dynamicShellSyntaxIn("printf '%s' '$(literal) `literal` <(literal) $IFS'") === undefined);
 check(
 	"runVerify terminates timed-out verification commands safely",
 	!verifyTimeout.passed && verifyTimeout.output.includes("timed out"),

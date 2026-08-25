@@ -2,7 +2,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { getCleanEnv, normalize } from "./utils.ts";
+import { dynamicShellSyntaxIn, getCleanEnv, normalize } from "./utils.ts";
 import { getProjectConfig } from "./state.ts";
 import { normalizeGitCommands } from "../policies/git.ts";
 import { liveMutationIn } from "../policies/destructive.ts";
@@ -163,6 +163,14 @@ export async function runVerify(
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 
 	if (!allowLive) {
+		const dynamicSyntax = dynamicShellSyntaxIn(command);
+		if (dynamicSyntax) {
+			return {
+				passed: false,
+				output: `Verification command blocked: contains ${dynamicSyntax}`,
+				durationMs: 0,
+			};
+		}
 		const normalized = normalizeGitCommands(normalize(command));
 		const liveCheck = liveMutationIn(normalized);
 		if (liveCheck) {
