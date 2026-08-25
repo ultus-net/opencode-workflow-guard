@@ -16,15 +16,14 @@ import {
 	sessionVerifyResults,
 } from "./state.ts";
 import {
-	asRecord,
 	dynamicShellSyntaxIn,
 	extractCommands,
-	extractTargetPath,
 	normalize,
 	shellWrappersChangeCwd,
 	splitShellSegments,
 	unwrapShellCommand,
-} from "./utils.ts";
+} from "./shell.ts";
+import { asRecord, extractTargetPath } from "./utils.ts";
 import {
 	detectVerifyCommand,
 	getCurrentGitCommitHash,

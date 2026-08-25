@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import { basename, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
-import { shellWords, unwrapShellCommand } from "../lib/utils.ts";
+import { shellWords, unwrapShellCommand } from "../lib/shell.ts";
 
 export const SAFE_ENV_FIXTURE_RE =
 	/\.env\.(example|sample|template|dist|schema)(\.[\w-]+)*$/i;

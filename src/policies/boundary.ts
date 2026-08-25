@@ -7,7 +7,7 @@ import {
 	getWorkspaceRootReal,
 	recordMutation,
 } from "../lib/state.ts";
-import { shellWords, unwrapShellCommand } from "../lib/utils.ts";
+import { shellWords, unwrapShellCommand } from "../lib/shell.ts";
 import { isProtectedPath, PROTECTED_PATH_REASON } from "./tamper.ts";
 import { isSecretPath, secretIn } from "./secrets.ts";
 import { onProtectedBranch, branchGuardReason } from "./git.ts";

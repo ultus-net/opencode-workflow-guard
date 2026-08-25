@@ -2,7 +2,7 @@ import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
-import { splitShellSegments, unwrapShellCommand, unwrapShellWords } from "../lib/utils.ts";
+import { splitShellSegments, unwrapShellCommand, unwrapShellWords } from "../lib/shell.ts";
 
 export const CHANGELOG_SECTION_RE = /^\s*(?:#{1,6}\s*)?changelog\s*(?::|$)/im;
 

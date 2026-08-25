@@ -22,10 +22,10 @@ import {
 	getWorkspaceRoot,
 	isDocumentationRequired,
 	isReviewRequired,
-	loadProjectConfig,
 	recordMutation,
 	recordReviewResult,
 } from "./state.ts";
+import { loadProjectConfig } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
 import { createGitWorktree, cleanupGitWorktree } from "./worktree.ts";
