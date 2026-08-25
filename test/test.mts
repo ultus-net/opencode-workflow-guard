@@ -1029,13 +1029,15 @@ check("tui plugin registers session_prompt_right slot", typeof registeredSlots.s
 check("tui plugin registers home_prompt_right slot", typeof registeredSlots.home_prompt_right === "function");
 check("tui plugin registers project-options command through keymap", registeredTuiCommands.some((command) => command.name === "workflow-guard.project-options"));
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
-tuiDialogSelectProps?.onSelect?.({ value: "recoveryCheckpoints" });
+const recoveryOption = tuiDialogSelectProps?.options?.find((option: any) => option.value === "recoveryCheckpoints");
+check("tui project-options menu binds actions to selectable options", typeof recoveryOption?.onSelect === "function");
+recoveryOption?.onSelect?.();
 check("tui project-options command persists selected recovery setting", readRecoveryCheckpointsOption(tuiCommandOptionsDir) === true);
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
-tuiDialogSelectProps?.onSelect?.({ value: "projectMemory" });
+tuiDialogSelectProps?.options?.find((option: any) => option.value === "projectMemory")?.onSelect?.();
 check("tui project-options command can disable project memory", readProjectOption(tuiCommandOptionsDir, "projectMemory") === false);
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
-tuiDialogSelectProps?.onSelect?.({ value: "learning" });
+tuiDialogSelectProps?.options?.find((option: any) => option.value === "learning")?.onSelect?.();
 check("tui project-options command can enable learner mode", readProjectOption(tuiCommandOptionsDir, "learning") === true);
 rmSync(tuiCommandOptionsDir, { recursive: true, force: true });
 const tuiOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-options-"));

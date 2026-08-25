@@ -104,21 +104,20 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 				const recovery = readProjectOption(root, "recoveryCheckpoints");
 				const memory = readProjectOption(root, "projectMemory");
 				const learning = readProjectOption(root, "learning");
+				const toggle = (key: "recoveryCheckpoints" | "projectMemory" | "learning") => {
+					const enabled = !readProjectOption(root, key);
+					const path = writeProjectOption(root, key, enabled);
+					api.ui.dialog.clear();
+					api.ui.toast({ variant: "success", title: "Workflow Guard", message: `Saved ${key} ${enabled ? "on" : "off"} in ${path}. Restart OpenCode to apply.` });
+				};
 				api.ui.dialog.replace(() => api.ui.DialogSelect({
 					title: "Workflow Guard Project Options",
 					current: undefined,
 					options: [
-						{ title: `Recovery checkpoints: ${recovery ? "On" : "Off"}`, value: "recoveryCheckpoints", description: "Toggle durable pre-run Git checkpoints" },
-						{ title: `Project memory: ${memory ? "On" : "Off"}`, value: "projectMemory", description: "Toggle durable local project memory" },
-						{ title: `Learner mode: ${learning ? "On" : "Off"}`, value: "learning", description: "Toggle evidence-based learning tools" },
+						{ title: `Recovery checkpoints: ${recovery ? "On" : "Off"}`, value: "recoveryCheckpoints", description: "Toggle durable pre-run Git checkpoints", onSelect: () => toggle("recoveryCheckpoints") },
+						{ title: `Project memory: ${memory ? "On" : "Off"}`, value: "projectMemory", description: "Toggle durable local project memory", onSelect: () => toggle("projectMemory") },
+						{ title: `Learner mode: ${learning ? "On" : "Off"}`, value: "learning", description: "Toggle evidence-based learning tools", onSelect: () => toggle("learning") },
 					],
-					onSelect: (option) => {
-						const key = option.value as "recoveryCheckpoints" | "projectMemory" | "learning";
-						const enabled = !readProjectOption(root, key);
-						const path = writeProjectOption(root, key, enabled);
-						api.ui.dialog.clear();
-						api.ui.toast({ variant: "success", title: "Workflow Guard", message: `Saved ${key} ${enabled ? "on" : "off"} in ${path}. Restart OpenCode to apply.` });
-					},
 				}));
 			},
 		}],
