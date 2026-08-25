@@ -43,6 +43,13 @@ const installResult = spawnSync("npm", ["install", "--ignore-scripts", tarballPa
 const packageEntry = join(testDir, "node_modules", "opencode-workflow-guard", "src", "workflow-guard.ts");
 const installedPackageJson = JSON.parse(readFileSync(join(testDir, "node_modules", "opencode-workflow-guard", "package.json"), "utf8"));
 check(
+	"npm package keeps direct dependencies on latest",
+	Object.keys(installedPackageJson.dependencies ?? {}).length > 0 &&
+		Object.values(installedPackageJson.dependencies).every((spec) => spec === "latest") &&
+		Object.keys(installedPackageJson.devDependencies ?? {}).length > 0 &&
+		Object.values(installedPackageJson.devDependencies).every((spec) => spec === "latest"),
+);
+check(
 	"npm tarball installs modular plugin entrypoint",
 	packResult.status === 0 && installResult.status === 0 && existsSync(packageEntry),
 );

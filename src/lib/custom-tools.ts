@@ -183,7 +183,7 @@ export function createCustomTools(options: {
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree creation with no active todo item. Break the request down with todowrite first, then create worktrees.";
 				const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot; const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", toolRoot); if (!res.success) return `[workflow-guard] Failed to create worktree: ${res.error}`;
-				recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID); return `[workflow-guard] Worktree created successfully at: ${res.worktreePath}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
+				recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID); return `[workflow-guard] Worktree created successfully at: ${res.worktreePath}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
 			},
 		}),
 		guard_worktree_cleanup: tool({
@@ -191,7 +191,7 @@ export function createCustomTools(options: {
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree cleanup with no active todo item. Break the request down with todowrite first, then clean up worktrees.";
 				const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot; const res = cleanupGitWorktree(args.worktreePath, toolRoot); if (!res.success) return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
-				recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID); return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
+				recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID); return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
 			},
 		}),
 	};

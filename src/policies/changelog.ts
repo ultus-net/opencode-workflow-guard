@@ -4,7 +4,7 @@ import { isAbsolute, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
 import { splitShellSegments, unwrapShellCommand, unwrapShellWords } from "../lib/shell.ts";
 
-export const CHANGELOG_SECTION_RE = /^\s*(?:#{1,6}\s*)?changelog\s*(?::|$)/im;
+export const CHANGELOG_SECTION_RE = /^\s*(?:#{1,6}\s*)?(?:changelog|changes|release notes?|summary)\s*(?::\s*\S.+|:?\s*\r?\n\s*(?![\\#])\S.+)/im;
 
 export function hasPrCreateInvocation(command: string): boolean {
 	return splitShellSegments(command)

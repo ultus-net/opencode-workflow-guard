@@ -384,7 +384,7 @@ export async function guardShellMutation(
 		}
 	}
 	if (hasMutation) {
-		recordMutation(await effectiveTodoOwnerSessionID(sessionID));
+		recordMutation(await effectiveTodoOwnerSessionID(sessionID), sessionID);
 	}
 	return undefined;
 }

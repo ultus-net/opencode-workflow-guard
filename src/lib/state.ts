@@ -79,16 +79,16 @@ export const sessionVerifyResults = new Map<string, NonNullable<VerifyResult>>()
 export let lastReview: ReviewResult | undefined;
 export const sessionReviews = new Map<string, ReviewResult>();
 
-export function recordMutation(sessionID?: string): void {
+export function recordMutation(sessionID?: string, actorSessionID?: string): void {
 	lastMutationTimestamp = Date.now();
 	mutationCount++;
-	if (sessionID) {
-		sessionMutationTimestamps.set(sessionID, lastMutationTimestamp);
-		sessionMutationCounts.set(sessionID, (sessionMutationCounts.get(sessionID) ?? 0) + 1);
-		sessionVerifyResults.delete(sessionID);
+	for (const id of new Set([sessionID, actorSessionID].filter((value): value is string => Boolean(value)))) {
+		sessionMutationTimestamps.set(id, lastMutationTimestamp);
+		sessionMutationCounts.set(id, (sessionMutationCounts.get(id) ?? 0) + 1);
+		sessionVerifyResults.delete(id);
+		sessionReviews.delete(id);
 	}
-	if (sessionID) sessionReviews.delete(sessionID);
-	if (!lastReview?.targetSessionID || lastReview.targetSessionID === sessionID) {
+	if (!lastReview?.targetSessionID || lastReview.targetSessionID === sessionID || lastReview.targetSessionID === actorSessionID) {
 		lastReview = undefined;
 	}
 }
@@ -98,6 +98,10 @@ export function getMutationCount(sessionID?: string): number {
 		return sessionMutationCounts.get(sessionID) ?? 0;
 	}
 	return mutationCount;
+}
+
+export function getSessionMutationCount(sessionID: string): number {
+	return sessionMutationCounts.get(sessionID) ?? 0;
 }
 
 export function getLastMutationTimestamp(): number {
@@ -202,7 +206,7 @@ export function getSubagentMutationBudget(root: string): number {
 	if (typeof cfg.maxSubagentMutations === "number" && cfg.maxSubagentMutations > 0) {
 		return cfg.maxSubagentMutations;
 	}
-	return 50;
+	return 100;
 }
 
 export function isLearningEnabled(root: string): boolean {

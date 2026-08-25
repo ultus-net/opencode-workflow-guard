@@ -31,7 +31,6 @@ function matchesPackageSpec(entry, spec) {
 	const value = Array.isArray(entry) ? entry[0] : entry;
 	return typeof value === "string" && (value === spec || value.startsWith(`${spec}@`));
 }
-
 function preparePluginUpdate(path, schema, spec, legacySpec) {
 	const source = existsSync(path) ? readFileSync(path, "utf8") : `{
   "$schema": "${schema}"

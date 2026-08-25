@@ -1,5 +1,42 @@
 # Changelog
 
+## 1.7.2
+
+### Patch Changes
+
+- e729258: Track latest npm releases for direct dependencies and OpenCode CI installs instead of capping updates with version ranges.
+
+## 1.7.1
+
+### Patch Changes
+
+- f6278b0: Fix TUI setup to use OpenCode's package-root resolution, migrate legacy TUI specs, and update the active badge and stale-cache guidance.
+
+## 1.7.0
+
+### Minor Changes
+
+- 9478f2a: Add an idempotent `opencode-workflow-guard setup` CLI that registers both the server plugin and TUI companion in their respective OpenCode global configuration files. PR preflight checks now honor an explicit shell workdir so changesets in isolated worktrees are detected correctly.
+
+## 1.6.0
+
+### Minor Changes
+
+- cbfbb41: Block concurrent direct edits from separate sessions when they target the same canonical file.
+- a4a6f2f: Add opt-in durable per-run recovery checkpoints with conservative same-session restoration.
+- 1cb9cee: Persist P2/P3 review follow-ups locally across sessions and add privacy-safe, call-correlated tool timing telemetry.
+- 8ed5bb4: Document administrator-managed OpenCode deployment and report observational managed-configuration status at plugin startup.
+- e169510: Require a fresh same-session read before edit or write can replace an existing file.
+- f72040c: Add configurable targeted post-edit validators for fast advisory feedback after matching files change.
+- b6ca048: Add a TUI project-options command for toggling durable recovery checkpoints, project memory, and learner mode, correct TUI installation to use the `/tui` package entrypoint, and document OpenCode provider timeout ownership.
+
+### Patch Changes
+
+- d7df6fe: Refactor workflow guard internals into focused shared services without changing guard behavior or the public API.
+- 52d3f6c: Raise the default subagent mutation budget to 100 and accept conventional release-information headings in PR descriptions without requiring the literal word `Changelog`.
+- 4b6eac1: Extract shell utilities and project configuration storage into focused modules, and reuse the shared todo-owner traversal.
+- 5fe6361: Correlate explicit OpenCode tool outcomes in local audit telemetry and report three consecutive equivalent tool failures without persisting raw error text.
+
 ## 1.5.1
 
 ### Patch Changes
