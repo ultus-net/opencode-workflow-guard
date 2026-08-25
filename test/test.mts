@@ -67,6 +67,7 @@ import {
 	exportProjectKnowledge,
 	importProjectKnowledge,
 	getProjectMemoryIdentity,
+	discoverPlanningSources,
 	ensureProjectMemoryExcluded,
 	isProjectMemoryFresh,
 	default as defaultExport,
@@ -1129,6 +1130,37 @@ const customPlugin = await (defaultExport?.server ?? WorkflowGuard)({
 	$: undefined as any,
 });
 
+const sdkProjectRoot = mkdtempSync(join(tmpdir(), "wg-sdk-project-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: sdkProjectRoot });
+const projectRootPlugin = await (defaultExport?.server ?? WorkflowGuard)({
+	directory: "/",
+	worktree: "/",
+	client: fakeClient as any,
+	project: { worktree: sdkProjectRoot } as any,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+const projectRootStatus = JSON.parse(String(await projectRootPlugin.tool?.guard_status?.execute({}, {} as any)));
+check("plugin prefers SDK project worktree over host workspace root", projectRootStatus.workspaceRoot === sdkProjectRoot && projectRootStatus.branch === "main");
+
+const sdkActiveWorktree = mkdtempSync(join(tmpdir(), "wg-sdk-active-worktree-"));
+spawnSync("git", ["init", "-b", "feature/isolated"], { cwd: sdkActiveWorktree });
+const activeWorktreePlugin = await (defaultExport?.server ?? WorkflowGuard)({
+	directory: sdkActiveWorktree,
+	worktree: sdkActiveWorktree,
+	client: fakeClient as any,
+	project: { worktree: sdkProjectRoot } as any,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+const activeWorktreeStatus = JSON.parse(String(await activeWorktreePlugin.tool?.guard_status?.execute({}, {} as any)));
+check("plugin keeps active worktree confinement over canonical project root", activeWorktreeStatus.workspaceRoot === sdkActiveWorktree && activeWorktreeStatus.branch === "feature/isolated");
+rmSync(sdkActiveWorktree, { recursive: true, force: true });
+rmSync(sdkProjectRoot, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
 check("plugin registers guard_status tool", typeof customPlugin.tool?.guard_status?.execute === "function");
 check("plugin registers guard_audit tool", typeof customPlugin.tool?.guard_audit?.execute === "function");
 check("plugin registers guard_why tool", typeof customPlugin.tool?.guard_why?.execute === "function");
@@ -1758,6 +1790,132 @@ try {
 }
 check("plugin instances keep SDK client state isolated", !activeInstanceBlocked && emptyInstanceBlocked);
 
+// Unfinished top-level work is resumed on session idle. Native question and
+// permission waits do not emit session.idle, and inherited subagent work is a
+// handoff rather than ownership, so only the owning session is resumed.
+const continuationPrompts: string[] = [];
+const continuationMessageIDs = new Map<string, string[]>();
+const continuationClient = {
+	session: {
+		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: fakeParents.get(path.id) } }),
+		promptAsync: async ({ path, body }: { path: { id: string }; body: { messageID: string } }) => {
+			continuationPrompts.push(path.id);
+			continuationMessageIDs.set(path.id, [...(continuationMessageIDs.get(path.id) ?? []), body.messageID]);
+		},
+	},
+};
+const continuationPlugin = await WorkflowGuard({ directory: root, worktree: root, client: continuationClient as any } as any);
+todo("s-resume", item("finish work", "pending"));
+await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume" } } } as any);
+check("session idle auto-continues unfinished owned todos", continuationPrompts.join(",") === "s-resume");
+
+todo("s-resume-done", item("finished", "completed"));
+await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-done" } } } as any);
+check("session idle does not continue completed todos", !continuationPrompts.includes("s-resume-done"));
+
+todo("s-resume-parent", item("parent work", "pending"));
+todo("s-resume-child");
+fakeParents.set("s-resume-child", "s-resume-parent");
+await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-child" } } } as any);
+check("session idle allows subagent handoff for inherited todos", !continuationPrompts.includes("s-resume-child"));
+
+let childTodoReads = 0;
+const unstableOwnerClient = {
+	session: {
+		todo: async ({ path }: { path: { id: string } }) => {
+			if (path.id === "s-resume-unstable-child" && ++childTodoReads > 1) throw new Error("transient lookup failure");
+			return { data: fakeTodos.get(path.id) ?? [] };
+		},
+		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: fakeParents.get(path.id) } }),
+		promptAsync: async () => { throw new Error("inherited child must not continue"); },
+	},
+};
+todo("s-resume-unstable-parent", item("parent work", "pending"));
+todo("s-resume-unstable-child");
+fakeParents.set("s-resume-unstable-child", "s-resume-unstable-parent");
+const unstableOwnerPlugin = await WorkflowGuard({ directory: root, worktree: root, client: unstableOwnerClient as any } as any);
+await unstableOwnerPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-unstable-child" } } } as any);
+check("continuation determines inherited ownership from one todo traversal", childTodoReads === 1);
+
+todo("s-resume-cap", item("stubborn work", "pending"));
+for (let i = 0; i < 4; i++) {
+	await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-cap" } } } as any);
+	if (i < 3) {
+		const messageID = continuationMessageIDs.get("s-resume-cap")?.[i];
+		await continuationPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: messageID, role: "user", sessionID: "s-resume-cap" } } } } as any);
+	}
+}
+check("automatic continuation is bounded without user input", continuationPrompts.filter((id) => id === "s-resume-cap").length === 3);
+await continuationPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: "genuine-user-message", role: "user", sessionID: "s-resume-cap" } } } } as any);
+await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-cap" } } } as any);
+check("genuine user message resets continuation budget", continuationPrompts.filter((id) => id === "s-resume-cap").length === 4);
+
+todo("s-resume-message-order", item("ordered work", "pending"));
+await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-message-order" } } } as any);
+const generatedMessageID = continuationMessageIDs.get("s-resume-message-order")?.[0];
+await continuationPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: "racing-genuine-user", role: "user", sessionID: "s-resume-message-order" } } } } as any);
+await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-message-order" } } } as any);
+await continuationPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: generatedMessageID, role: "user", sessionID: "s-resume-message-order" } } } } as any);
+for (let i = 0; i < 3; i++) {
+	await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-message-order" } } } as any);
+}
+check("generated message IDs cannot consume racing genuine user input", continuationPrompts.filter((id) => id === "s-resume-message-order").length === 4);
+
+let releaseConcurrentPrompt!: () => void;
+let markConcurrentPromptStarted!: () => void;
+const concurrentPromptStarted = new Promise<void>((resolve) => { markConcurrentPromptStarted = resolve; });
+const concurrentPromptRelease = new Promise<void>((resolve) => { releaseConcurrentPrompt = resolve; });
+let concurrentPromptCount = 0;
+const concurrentClient = {
+	session: {
+		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: fakeParents.get(path.id) } }),
+		promptAsync: async () => {
+			concurrentPromptCount++;
+			markConcurrentPromptStarted();
+			await concurrentPromptRelease;
+		},
+	},
+};
+const concurrentPlugin = await WorkflowGuard({ directory: root, worktree: root, client: concurrentClient as any } as any);
+todo("s-resume-concurrent", item("finish concurrent work", "pending"));
+const firstIdle = concurrentPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-concurrent" } } } as any);
+await concurrentPromptStarted;
+const secondIdle = concurrentPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-concurrent" } } } as any);
+await new Promise((resolve) => setTimeout(resolve, 0));
+check("concurrent session idle events emit only one continuation prompt", concurrentPromptCount === 1);
+releaseConcurrentPrompt();
+await Promise.all([firstIdle, secondIdle]);
+
+const planningRoot = mkdtempSync(join(tmpdir(), "wg-planning-"));
+writeFileSync(join(planningRoot, "TODO.md"), "# Todo\n- primary\n");
+writeFileSync(join(planningRoot, "ROADMAP.md"), "# Roadmap\n- later\n");
+let planningSources = discoverPlanningSources(planningRoot);
+check("next-task discovery prefers TODO.md over roadmap files", planningSources.length === 1 && planningSources[0]?.path === "TODO.md");
+rmSync(join(planningRoot, "TODO.md"));
+mkdirSync(join(planningRoot, "docs", "plans"), { recursive: true });
+writeFileSync(join(planningRoot, "docs", "plans", "phase-2.md"), "# Phase 2\n- ship\n");
+planningSources = discoverPlanningSources(planningRoot);
+check("next-task discovery falls back to roadmap and plan files", planningSources.some((source) => source.path === "ROADMAP.md") && planningSources.some((source) => source.path === join("docs", "plans", "phase-2.md")));
+symlinkSync("/etc/passwd", join(planningRoot, "TODO.md"));
+planningSources = discoverPlanningSources(planningRoot);
+check("next-task discovery does not follow TODO.md symlinks", !planningSources.some((source) => source.path === "TODO.md"));
+rmSync(planningRoot, { recursive: true, force: true });
+
+const planningSymlinkRoot = mkdtempSync(join(tmpdir(), "wg-planning-root-"));
+const externalPlanningRoot = mkdtempSync(join(tmpdir(), "wg-planning-external-"));
+mkdirSync(join(externalPlanningRoot, "plans"));
+writeFileSync(join(externalPlanningRoot, "ROADMAP.md"), "# External roadmap\n- secret\n");
+writeFileSync(join(externalPlanningRoot, "plans", "external.md"), "# External plan\n- secret\n");
+symlinkSync(externalPlanningRoot, join(planningSymlinkRoot, "docs"));
+planningSources = discoverPlanningSources(planningSymlinkRoot);
+check("next-task discovery does not follow symlinked planning directories", planningSources.length === 0);
+rmSync(planningSymlinkRoot, { recursive: true, force: true });
+rmSync(externalPlanningRoot, { recursive: true, force: true });
+
+check("plugin registers guard_next_tasks tool", "guard_next_tasks" in ((continuationPlugin as any).tool ?? {}));
+
 // TUI badge: session-scoped, guard-originated toast sourcing.
 console.log("- TUI Companion Status Badge -");
 let toastHandler: ((event: any) => void) | undefined;
@@ -1840,6 +1998,16 @@ await (defaultExport as any).server?.({ directory: root, worktree: root, client:
 });
 const claimAuditAfter = getRecentAuditEntries(50).filter((e) => e.tool === "experimental.text.complete").length;
 check("claims-vs-evidence mismatch is journaled via the hook", claimAuditAfter > claimAuditBefore);
+
+appLogs.length = 0;
+recordVerifyResult("npm test", { passed: false, output: "1 failed" }, "s-claim-log");
+await loggingPlugin["experimental.text.complete"]?.(
+	{ sessionID: "s-claim-log", messageID: "m2", partID: "p2" } as any,
+	{ text: "All tests pass." } as any,
+);
+const claimLogAudit = getRecentAuditEntries(50).find((e) => e.tool === "experimental.text.complete" && e.sessionID === "s-claim-log");
+check("claims-vs-evidence mismatch is an info observation, not a block warning", appLogs.some((entry) => entry?.body?.level === "info" && String(entry?.body?.message).includes("completion claim mismatch")) && !appLogs.some((entry) => entry?.body?.level === "warn"));
+check("claims-vs-evidence observation remains an allowed audit event", claimLogAudit?.decision === "allow");
 
 // tool.definition enriches todowrite's description with the gate note
 const defPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);

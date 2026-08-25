@@ -10,7 +10,10 @@
 - **Pre-edit Gate:** All file-editing tools (`edit`, `write`, `apply_patch`) are blocked until the session has an active task list in OpenCode's native todo system (`todowrite`, persisted at `GET /session/:id/todo`).
 - **Flexible Task Execution:** Tasks can be completed in any order as work concludes without artificial sequential blockers, maintaining maximum pair-programming DX.
 - **No Silent Deletion:** Each `todowrite` update replaces the complete list. Active tasks must remain in subsequent updates until they are explicitly marked `completed` or `cancelled`.
+- **No Silent Early Exit:** When an owning session becomes `session.idle` with unfinished native todos, the guard asynchronously asks OpenCode to continue. Automatic continuations are capped at three consecutive attempts and the budget resets on genuine user input. Use OpenCode's native `question` tool when user feedback or a decision is required; question and permission interactions wait inside the active run rather than producing an idle completion.
 - **Subagent Inheritance & Role Confinement:** Subagents automatically inherit active tasks from their parent session via the `parentID` hierarchy. Subagents spawned with read-only roles (`reviewer`, `planner`, `advisor`, `critic`, `explorer`, `scout`, `evaluator`) are hard-confined: file mutations, lifecycle tools, and mutating shell commands are strictly blocked.
+- **Handoff Safety:** An idle subagent whose effective todos are inherited from its parent is not auto-continued. Inherited work belongs to the parent and can be handed back normally.
+- **Durable Next-Work Discovery:** `guard_next_tasks` prefers a repository-root `TODO.md`; when it is absent, it reads conventional `ROADMAP.md`, `PLAN.md`, `TASKS.md`, `BACKLOG.md`, their `docs/` counterparts, and Markdown files under `docs/plans/`. These files are planning context only and never replace OpenCode's native runtime todo state.
 - **Subagent Mutation Budget:** Subagent sessions are protected by a mutation safety budget (`maxSubagentMutations` in project config or `WORKFLOW_GUARD_MAX_SUBAGENT_MUTATIONS` env, default 50) to terminate runaway edit loops deterministically.
 
 ### 2. No Pushes to Protected Branches
@@ -142,7 +145,7 @@
 
 ### 24. Completion Claims vs Evidence (Observability)
 - When the assistant's final response text asserts completion or passing verification ("all tests pass", "work is done", "verified"), the guard compares the claim against recorded verification evidence for that session.
-- Mismatches (failing verification, stale evidence due to mutations after the verify run, or no evidence at all) are journaled to the audit trail and logged at warn level. This is **observability, not gating**: the response is never blocked, but a confident wrap-up cannot silently contradict a failing or absent verification state.
+- Mismatches (failing verification, stale evidence due to mutations after the verify run, or no evidence at all) are journaled to the audit trail and logged at info level. This is **observability, not gating**: the response is never blocked, but a confident wrap-up cannot silently contradict a failing or absent verification state.
 - Uses the `experimental.text.complete` hook; claim detection is a conservative phrase heuristic to avoid false positives on casual wording.
 
 ### Tool Description Honesty

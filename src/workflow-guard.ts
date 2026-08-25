@@ -204,6 +204,13 @@ import {
 	effectiveTodoOwnerSessionID,
 	hasActiveTodo,
 } from "./policies/todo.ts";
+import {
+	clearContinuationState,
+	continueUnfinishedSession,
+	recordUserMessage,
+} from "./policies/continuation.ts";
+import { discoverPlanningSources } from "./policies/planning.ts";
+export { discoverPlanningSources };
 
 export { validateTodoLifecycle };
 
@@ -297,6 +304,14 @@ function logBlock(message: string): void {
 				level: "warn",
 				message,
 			},
+		});
+	} catch {}
+}
+
+function logObservation(client: unknown, message: string): void {
+	try {
+		void (client as any)?.app?.log?.({
+			body: { service: "workflow-guard", level: "info", message },
 		});
 	} catch {}
 }
@@ -991,8 +1006,13 @@ async function emitBlockFeedback(message: string): Promise<void> {
 
 export const WorkflowGuard: Plugin = async (ctx) => {
 	// Honor worktree if present (e.g. opencode worktrees or devcontainers)
-	// so worktree plugins cannot punch through boundary gates.
-	const effectiveRoot = ctx.worktree || ctx.directory || process.cwd();
+	// so worktree plugins cannot punch through boundary gates. When the host
+	// reports the filesystem root, use the SDK's actual project worktree instead.
+	const hostRoot = ctx.worktree || ctx.directory || process.cwd();
+	const hostIsFilesystemRoot = resolve(hostRoot) === resolve(hostRoot, "..");
+	const effectiveRoot = hostIsFilesystemRoot && ctx.project?.worktree
+		? ctx.project.worktree
+		: hostRoot;
 	setWorkspaceRoot(effectiveRoot);
 	setSdkClient(ctx.client);
 	reloadProjectConfig(effectiveRoot);
@@ -1021,6 +1041,17 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 
 	return {
 		tool: {
+			guard_next_tasks: tool({
+				description:
+					"Load durable repository task context when deciding what to work on next. Prefers TODO.md; if absent, discovers conventional roadmap, plan, tasks, backlog, and docs/plans Markdown files.",
+				args: {},
+				execute: async () => {
+					const sources = discoverPlanningSources(effectiveRoot);
+					return sources.length > 0
+						? JSON.stringify({ sources }, null, 2)
+						: JSON.stringify({ sources: [], message: "No TODO, roadmap, plan, tasks, or backlog Markdown files found." });
+				},
+			}),
 			project_memory_search: tool({
 				description: "Search current durable knowledge for this project. Returns concise typed records with provenance; superseded records are excluded.",
 				args: { query: tool.schema.string() },
@@ -1526,7 +1557,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				const text = typeof output.text === "string" ? output.text : "";
 				const check = checkCompletionClaims(text, { sessionID });
 				if (check.claimsCompletion && check.evidenceState && check.evidenceState !== "fresh-pass") {
-					logBlock(`[workflow-guard] completion claim mismatch: ${check.reason}`);
+					logObservation(ctx.client, `[workflow-guard] completion claim mismatch: ${check.reason}`);
 					audit({
 						ts: new Date().toISOString(),
 						sessionID,
@@ -1553,6 +1584,26 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		event: async ({
 			event,
 		}: { event: { type?: string; properties?: unknown } }) => {
+			if (event?.type === "session.idle") {
+				const sessionID = (event.properties as { sessionID?: unknown })?.sessionID;
+				if (typeof sessionID === "string") {
+					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
+				}
+			}
+			if (event?.type === "message.updated") {
+				const info = (event.properties as { info?: { id?: unknown; role?: unknown; sessionID?: unknown } })?.info;
+				if (info?.role === "user" && typeof info.sessionID === "string") {
+					await runWithRuntimeState(effectiveRoot, ctx.client, () => {
+						recordUserMessage(info.sessionID as string, typeof info.id === "string" ? info.id : undefined);
+					});
+				}
+			}
+			if (event?.type === "session.deleted") {
+				const sessionID = (event.properties as { info?: { id?: unknown } })?.info?.id;
+				if (typeof sessionID === "string") {
+					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
+				}
+			}
 			if (
 				event?.type === "command.executed" ||
 				event?.type === "permission.updated" ||
