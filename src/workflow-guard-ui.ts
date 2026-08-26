@@ -31,9 +31,9 @@ function text(props: Record<string, unknown>, children: Child[]) {
 }
 
 const BADGE_ACTIVE = "Workflow Guard 🛡️";
+const BLOCKED_BADGE_DURATION_MS = 5_000;
 let lastBlockedReason: string | undefined;
 const sessionBlockedReasons = new Map<string, string>();
-const badgeNodes = new Map<string, BaseRenderable>();
 
 export function readProjectOption(root: string, option: "recoveryCheckpoints" | "projectMemory" | "learning"): boolean {
 	const path = projectConfigPath(root);
@@ -86,12 +86,15 @@ export function formatBadge(sessionID?: string): { text: string; isBlocked: bool
 	if (!reason) {
 		return { text: BADGE_ACTIVE, isBlocked: false };
 	}
-	const cleanReason = reason.replace(/^\[workflow-guard\]\s*/, "").replace(/^Blocked:\s*/, "");
+	const cleanReason = reason.replace(/^\[workflow-guard\]\s*/i, "").replace(/^Blocked(?::|\s+)\s*/i, "");
 	const shortReason = cleanReason.length > 30 ? cleanReason.slice(0, 27) + "..." : cleanReason;
 	return { text: `[Workflow Guard: Blocked: ${shortReason}]`, isBlocked: true };
 }
 
 export const WorkflowGuardTui: TuiPlugin = async (api) => {
+	const badgeNodes = new Map<string, BaseRenderable>();
+	const blockedBadgeTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 	api.keymap.registerLayer({
 		commands: [{
 			name: "workflow-guard.project-options",
@@ -125,18 +128,34 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 		bindings: [],
 	});
 
+	function scheduleBadgeReset(sessionID?: string): void {
+		const key = sessionID ?? "home";
+		const existing = blockedBadgeTimers.get(key);
+		if (existing) clearTimeout(existing);
+		blockedBadgeTimers.set(key, setTimeout(() => {
+			blockedBadgeTimers.delete(key);
+			if (sessionID) sessionBlockedReasons.delete(sessionID);
+			else lastBlockedReason = undefined;
+			const node = badgeNodes.get(key);
+			if (node) {
+				setProp(node, "content", BADGE_ACTIVE);
+				setProp(node, "fg", api.theme.current.success);
+			}
+		}, BLOCKED_BADGE_DURATION_MS));
+	}
+
 	try {
 		api.event.on("tui.toast.show", (e) => {
 			const title = e.properties.title;
 			const msg = e.properties.message;
 			if (title === "Workflow Guard Blocked" && typeof msg === "string") {
-				lastBlockedReason = msg;
 				const route = api.route.current;
 				const sessionID =
 					route.name === "session" && typeof route.params?.sessionID === "string"
 						? route.params.sessionID
 						: undefined;
 				if (sessionID) sessionBlockedReasons.set(sessionID, msg);
+				else lastBlockedReason = msg;
 				const key = sessionID ?? "home";
 				const node = badgeNodes.get(key);
 				if (node) {
@@ -144,6 +163,7 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 					setProp(node, "content", badge.text);
 					setProp(node, "fg", badge.isBlocked ? api.theme.current.warning : api.theme.current.success);
 				}
+				scheduleBadgeReset(sessionID);
 			}
 		});
 	} catch {}

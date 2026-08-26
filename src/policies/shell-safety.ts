@@ -129,7 +129,7 @@ export function escapeAppleScriptString(str: string): string {
 
 /**
  * Dispatches a native OS desktop notification (macOS osascript or Linux notify-send)
- * on important guard events (policy blocks, verification completion).
+ * for events that explicitly require the user's attention.
  * Non-blocking, fails gracefully.
  */
 export function sendDesktopNotification(title: string, message: string): void {

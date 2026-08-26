@@ -15,7 +15,7 @@ npm run typecheck   # or: npm run build
 ### 2. In-Memory Unit Tests
 Runs the comprehensive unit and adversarial tests covering all guard policies, lifecycle validation, subagent parent-chain resolution, privilege-isolated verification, and path/symlink boundary checks:
 ```bash
-npm test            # runs node test.mts (Node >= 22.18) or bun test.mts
+npm test            # runs test.mts with isolated XDG state/data (Node >= 22.18)
 ```
 
 ### 3. OpenCode Runtime & Install Tests

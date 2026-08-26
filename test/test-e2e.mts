@@ -169,7 +169,12 @@ spawnSync("git", ["init", "-b", "feat/install-verification"], { cwd: testDir });
 spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: testDir });
 spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
 
-const runtimeEnv: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: join(testDir, "runtime-config") };
+const runtimeEnv: NodeJS.ProcessEnv = {
+	...process.env,
+	XDG_CONFIG_HOME: join(testDir, "runtime-config"),
+	XDG_STATE_HOME: join(testDir, "runtime-state"),
+	XDG_DATA_HOME: join(testDir, "runtime-data"),
+};
 delete runtimeEnv.OPENCODE_PID;
 delete runtimeEnv.OPENCODE_PURE;
 const runOpenCode = (args: string[], timeout: number) =>
