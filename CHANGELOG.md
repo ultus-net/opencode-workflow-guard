@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.8.5
+
+### Patch Changes
+
+- d7d4f37: Allow project-memory coordination to tolerate longer bounded cross-process maintenance contention.
+- 1873a57: Apply the project-memory database busy timeout before switching journal mode so concurrent first opens can wait for ordinary SQLite contention.
+- 212baed: Avoid treating pager names in command arguments as interactive pager execution while preserving detection through shell wrappers.
+
 ## 1.8.4
 
 ### Patch Changes
