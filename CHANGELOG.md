@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.8.4
+
+### Patch Changes
+
+- 066b715: Bound local project-memory storage with opportunistic retention cleanup and least-recently-used inactive-project eviction.
+- 066b715: Tidy block feedback by removing duplicate desktop notifications, de-duplicating the TUI badge text, and restoring the normal shield badge after five seconds.
+
 ## 1.8.3
 
 ### Patch Changes
