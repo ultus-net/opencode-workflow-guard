@@ -1,4 +1,6 @@
 import { spawn } from "node:child_process";
+import { basename } from "node:path";
+import { splitShellSegments, unwrapShellWords } from "../lib/shell.ts";
 
 // AI agents frequently run dangerous package manager flags (e.g. npm audit fix --force,
 // npm install -g, pip install --force-reinstall, agent-driven publish) that introduce
@@ -49,11 +51,6 @@ const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice:
 		advice: "Use the edit, write, or apply_patch tools instead of interactive terminal editors.",
 	},
 	{
-		regex: /\b(?:less|more|most)\b/i,
-		name: "terminal pager",
-		advice: "Use cat, head, or grep with non-interactive pipes instead of interactive pagers.",
-	},
-	{
 		regex: /\bsudo\b/i,
 		name: "sudo with password prompt",
 		advice: "Avoid sudo in agent sessions; run commands directly or request user execution.",
@@ -86,6 +83,7 @@ const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice:
 ];
 
 const MONITOR_ADVICE = "Use ps aux, uptime, or batch flags (e.g. top -b -n 1) instead of interactive monitors.";
+const PAGER_ADVICE = "Use cat, head, or grep with non-interactive pipes instead of interactive pagers.";
 // Process monitoring tokens are matched on whitespace/segment boundaries so that
 // an unrelated word such as `desktop`, a hyphenated filename like `top-level-dir`,
 // or a quoted argument like `echo "top"` is not mistaken for the `top` command.
@@ -105,9 +103,29 @@ function checkProcessMonitorCommand(command: string): { isInteractive: boolean; 
 	return { isInteractive: false };
 }
 
+function containsPagerCommand(command: string, depth = 0): boolean {
+	if (depth >= 16) return false;
+	for (const segment of splitShellSegments(command)) {
+		const words = unwrapShellWords(segment);
+		while (words[0] === "--") words.shift();
+		const executable = basename(words[0] ?? "");
+		if (/^(?:less|more|most)$/i.test(executable)) return true;
+		if (executable === "eval" && words.length > 1 && containsPagerCommand(words.slice(1).join(" "), depth + 1)) return true;
+		if (executable === "busybox" && /^(?:less|more)$/i.test(words[1] ?? "")) return true;
+		if (/^(?:ba|z|da|k)?sh$/i.test(executable)) {
+			const commandFlag = words.findIndex((word, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(word));
+			if (commandFlag >= 0 && words[commandFlag + 1] && containsPagerCommand(words[commandFlag + 1]!, depth + 1)) return true;
+		}
+	}
+	return false;
+}
+
 export function checkInteractiveTtyCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
 	const monitor = checkProcessMonitorCommand(command);
 	if (monitor.isInteractive) return monitor;
+	if (containsPagerCommand(command)) {
+		return { isInteractive: true, name: "terminal pager", advice: PAGER_ADVICE };
+	}
 	for (const { regex, name, advice } of INTERACTIVE_COMMAND_PATTERNS) {
 		if (regex.test(command)) {
 			return { isInteractive: true, name, advice };
