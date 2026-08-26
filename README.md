@@ -33,7 +33,7 @@ For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json`.
 npm run typecheck    # Strict TypeScript check (0 errors)
 npm test             # Run 415+ unit and adversarial tests
 npm run test:all     # Typecheck + unit + install/load checks
-WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # Also run model-driven OpenCode policy probes
+WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # Also run policy probes with OpenCode's most recently selected model
 ```
 
 ---

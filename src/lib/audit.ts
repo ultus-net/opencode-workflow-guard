@@ -2,7 +2,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, readSync, c
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
+import { Database, type SqliteDatabase } from "./sqlite.ts";
 import type { AuditEntry, VerifyResult } from "./types.ts";
 import { asRecord } from "./utils.ts";
 
@@ -19,7 +19,7 @@ const RETAIN_AUDIT_BYTES = 2 * 1024 * 1024;
 const MAX_VERIFY_HISTORY_BYTES = 1024 * 1024;
 const RETAIN_VERIFY_HISTORY_BYTES = 512 * 1024;
 let verifiedHistoryState: { size: number; mtimeMs: number; ctimeMs: number; ino: number | bigint } | undefined;
-const lockDatabases = new Map<string, DatabaseSync>();
+const lockDatabases = new Map<string, SqliteDatabase>();
 
 function getVerifyHistoryState(): typeof verifiedHistoryState {
 	const stat = statSync(VERIFY_HISTORY_FILE);
@@ -34,7 +34,7 @@ function withFileLock<T>(path: string, action: () => T): T {
 	let db = lockDatabases.get(path);
 	if (!db) {
 		const lockPath = `${path}.lock.sqlite`;
-		db = new DatabaseSync(lockPath);
+		db = new Database(lockPath);
 		db.exec("PRAGMA busy_timeout = 5000");
 		chmodSync(lockPath, 0o600);
 		lockDatabases.set(path, db);

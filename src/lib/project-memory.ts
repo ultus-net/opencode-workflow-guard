@@ -2,14 +2,14 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { execFile, spawnSync } from "node:child_process";
-import { DatabaseSync } from "node:sqlite";
+import { Database, type SqliteDatabase } from "./sqlite.ts";
 import type { ProjectMemoryInput, ProjectMemoryKind, ProjectMemoryRecord, ProjectMemorySource, ReviewFollowup, ReviewFollowupInput } from "./types.ts";
 
 const KINDS = new Set<ProjectMemoryKind>(["fact", "decision", "constraint", "lesson"]);
 const SOURCES = new Set<ProjectMemorySource>(["user", "file", "git", "tool", "agent", "portable"]);
 
 export interface ProjectMemoryStore {
-	db: DatabaseSync;
+	db: SqliteDatabase;
 	projectId: string;
 	close(): void;
 }
@@ -66,7 +66,7 @@ export async function isProjectMemoryFreshAsync(memory: ProjectMemoryRecord, roo
 export function openProjectMemory(projectId: string, directory = getProjectMemoryDir()): ProjectMemoryStore {
 	if (!projectId || projectId.length > 200) throw new Error("Invalid project memory identity.");
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	const db = new DatabaseSync(join(directory, `${projectId.replace(/[^a-zA-Z0-9._-]/g, "_")}.sqlite`));
+	const db = new Database(join(directory, `${projectId.replace(/[^a-zA-Z0-9._-]/g, "_")}.sqlite`));
 	db.exec(`
 		PRAGMA journal_mode = WAL;
 		PRAGMA busy_timeout = 2000;

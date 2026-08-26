@@ -34,7 +34,7 @@ import {
 	snipVerifyOutput,
 } from "./verify.ts";
 import { detectShellMutation, extractPatchPaths, guardShellMutation, isPathOutsideWorkspace } from "../policies/boundary.ts";
-import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyIncludesChangelog } from "../policies/changelog.ts";
+import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyHasLiteralLineBreakEscapes, prBodyIncludesChangelog } from "../policies/changelog.ts";
 import { extractEditContent, liveMutationIn } from "../policies/destructive.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
 import { claimFiles } from "../policies/file-claims.ts";
@@ -413,6 +413,7 @@ export async function guardToolCallImpl(
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
 			const descFlag = isAz ? "--description" : "--body";
 			const preflightFailures: string[] = [];
+			if (prBodyHasLiteralLineBreakEscapes(raw)) preflightFailures.push(`PR description contains literal \\n/\\r escapes that will render as text; use real newlines, ANSI-C quoting ($'...\\n...'), or a body/description file instead.`);
 			const conflictCheck = checkMergeConflicts(prRoot);
 			if (conflictCheck.hasConflicts) preflightFailures.push(conflictCheck.reason ?? "Branch has merge conflicts with its base branch.");
 			const branch = currentGitBranch(prRoot);

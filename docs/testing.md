@@ -19,12 +19,12 @@ npm test            # runs node test.mts (Node >= 22.18) or bun test.mts
 ```
 
 ### 3. OpenCode Runtime & Install Tests
-Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies `src/workflow-guard.ts` plus `src/lib/` and `src/policies/` into `.opencode/plugins/` and verifies that OpenCode's real runtime loader discovers the plugin without a model provider. Model-driven `opencode run` hook probes are opt-in:
+Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies the server source into an isolated `.opencode/workflow-guard-source/` directory and exposes its `WorkflowGuard` plugin function through an explicitly registered `.opencode/plugins/` adapter. A provider-free config probe verifies OpenCode resolves that local plugin before the opt-in model-driven `opencode run` probes exercise its hooks:
 ```bash
 npm run test:install # package install + provider-free OpenCode loader check
-WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # also run model-driven policy probes
+WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # also run model-driven policy probes with OpenCode's most recently selected model
 ```
-Package and loader checks remain deterministic. If the configured model provider rejects a live prompt before guard behavior can run because credits, rate limits, capacity, or overload make the provider unavailable, that live case is reported as unavailable rather than as a guard failure. Other live-runtime failures still fail the suite.
+Package and loader checks remain deterministic. Live probes explicitly select the first entry in OpenCode's persisted recent-model state (`${XDG_STATE_HOME:-~/.local/state}/opencode/model.json`) instead of silently inheriting the configured default model. Set `WORKFLOW_GUARD_LIVE_MODEL=provider/model` to override that selection; provider credentials still come from the normal OpenCode environment. If the selected model provider rejects a live prompt before guard behavior can run because credits, rate limits, capacity, or overload make the provider unavailable, that live case is reported as unavailable rather than as a guard failure. Other live-runtime failures still fail the suite.
 
 ### 4. Full Verification Suite
 Runs typecheck, unit tests, and live runtime installation tests in sequence:

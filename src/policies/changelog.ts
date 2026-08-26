@@ -178,6 +178,21 @@ export function prBodyIncludesChangelog(command: string, invocationRoot: string 
 	return false;
 }
 
+export function prBodyHasLiteralLineBreakEscapes(command: string): boolean {
+	const words = prShellWords(command);
+	const cliIndex = words.findIndex((word) => word === "gh" || word === "az");
+	if (cliIndex < 0) return false;
+
+	for (let i = cliIndex; i < words.length; i += 1) {
+		const word = words[i]!;
+		let body: string | undefined;
+		if (["--body", "-b", "--description", "-d"].includes(word)) body = words[i + 1];
+		else if (/^(?:--body|--description)=/.test(word)) body = word.slice(word.indexOf("=") + 1);
+		if (body && /\\[nr](?:\\[nr]|(?=\s*[-*#]))/.test(body)) return true;
+	}
+	return false;
+}
+
 export function checkLockfileSync(root: string): { isOutOfSync: boolean; manifest?: string; lockfile?: string; reason?: string } {
 	try {
 		let modifiedFiles: string[] = [];
