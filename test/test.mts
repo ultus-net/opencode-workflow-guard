@@ -3005,18 +3005,28 @@ const contentionProjectId = "maintenance-contention";
 const contentionGo = join(memoryDir, "maintenance-contention.go");
 const contentionChildren = [0, 1].map((index) => {
 	const ready = join(memoryDir, `maintenance-contention.${index}.ready`);
+	const child = spawn(process.execPath, ["--input-type=module", "--eval", `import { existsSync, writeFileSync } from "node:fs"; import { openProjectMemory } from ${JSON.stringify(new URL("../src/lib/project-memory.ts", import.meta.url).href)}; writeFileSync(${JSON.stringify(ready)}, "ready"); while (!existsSync(${JSON.stringify(contentionGo)})) await new Promise((resolve) => setTimeout(resolve, 5)); const store = openProjectMemory(${JSON.stringify(contentionProjectId)}, ${JSON.stringify(memoryDir)}); store.close();`], { stdio: ["ignore", "ignore", "pipe"] });
+	let stderr = "";
+	child.stderr.setEncoding("utf8");
+	child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+	const exit = new Promise<number | null>((resolveChild, rejectChild) => {
+		child.once("exit", resolveChild);
+		child.once("error", rejectChild);
+	});
 	return {
 		ready,
-		child: spawn(process.execPath, ["--input-type=module", "--eval", `import { existsSync, writeFileSync } from "node:fs"; import { openProjectMemory } from ${JSON.stringify(new URL("../src/lib/project-memory.ts", import.meta.url).href)}; writeFileSync(${JSON.stringify(ready)}, "ready"); while (!existsSync(${JSON.stringify(contentionGo)})) await new Promise((resolve) => setTimeout(resolve, 5)); const store = openProjectMemory(${JSON.stringify(contentionProjectId)}, ${JSON.stringify(memoryDir)}); store.close();`], { stdio: "ignore" }),
+		child,
+		exit,
+		stderr: () => stderr.trim(),
 	};
 });
-for (let attempts = 0; attempts < 100 && contentionChildren.some(({ ready }) => !existsSync(ready)); attempts++) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+for (let attempts = 0; attempts < 100 && contentionChildren.some(({ ready, child }) => !existsSync(ready) && child.exitCode === null); attempts++) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+for (const { ready, child } of contentionChildren) if (!existsSync(ready) && child.exitCode === null) child.kill();
 writeFileSync(contentionGo, "go");
-const contentionExits = await Promise.all(contentionChildren.map(({ child }) => new Promise<number | null>((resolveChild, rejectChild) => {
-	child.once("exit", resolveChild);
-	child.once("error", rejectChild);
-})));
-check("project memory serializes cross-process open and daily maintenance", contentionChildren.every(({ ready }) => existsSync(ready)) && contentionExits.every((code) => code === 0) && existsSync(join(memoryDir, `${contentionProjectId}.sqlite.maintenance`)) && existsSync(join(memoryDir, ".coordination")));
+const contentionExits = await Promise.all(contentionChildren.map(({ exit }) => exit));
+const contentionErrors = contentionChildren.map(({ stderr }) => stderr()).filter(Boolean).join(" | ");
+const contentionSucceeded = contentionChildren.every(({ ready }) => existsSync(ready)) && contentionExits.every((code) => code === 0) && existsSync(join(memoryDir, `${contentionProjectId}.sqlite.maintenance`)) && existsSync(join(memoryDir, ".coordination"));
+check(`project memory serializes cross-process open and daily maintenance${!contentionSucceeded && contentionErrors ? `: ${contentionErrors}` : ""}`, contentionSucceeded);
 const crashedLockReady = join(memoryDir, "crashed-coordination.ready");
 const crashedLockHolder = spawn(process.execPath, ["--input-type=module", "--eval", `import { writeFileSync } from "node:fs"; import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(${JSON.stringify(join(memoryDir, ".coordination"))}); db.exec("BEGIN IMMEDIATE"); writeFileSync(${JSON.stringify(crashedLockReady)}, "ready"); setInterval(() => {}, 1000);`], { stdio: "ignore" });
 for (let attempts = 0; attempts < 100 && !existsSync(crashedLockReady); attempts++) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
