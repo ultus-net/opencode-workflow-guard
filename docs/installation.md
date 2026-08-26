@@ -41,15 +41,18 @@ OpenCode automatically installs configured npm plugins and their dependencies at
 
 ---
 
-### 2. Manual File Copy (Server Plugin)
+### 2. Manual Local-File Installation (Server Plugin)
 
-The server plugin is modular - copy the entrypoint **plus** its `lib/` and `policies/` directories into your OpenCode plugins folder (global `~/.config/opencode/plugins/` or project-level `.opencode/plugins/`):
+The npm package entrypoint uses OpenCode's V1 plugin module shape (`{ id, server }`). For a source checkout, keep the modular server source outside the auto-loaded `plugins/` directory and add a small adapter with the same module shape:
 
 ```bash
-cp -r src/workflow-guard.ts src/lib src/policies /path/to/opencode-plugins/
+mkdir -p .opencode/workflow-guard-source .opencode/plugins
+cp src/workflow-guard.ts .opencode/workflow-guard-source/
+cp -r src/lib src/policies .opencode/workflow-guard-source/
+printf '%s\n' 'import { WorkflowGuard } from "../workflow-guard-source/workflow-guard.ts";' 'export default { id: "workflow-guard-local", server: WorkflowGuard };' > .opencode/plugins/workflow-guard.ts
 ```
 
-Files in your plugin directory are automatically loaded by the OpenCode server process at startup.
+OpenCode automatically discovers the adapter from the project-level `.opencode/plugins/` directory at startup. For deterministic development and test fixtures, it can also be registered explicitly in `.opencode/opencode.json` as `"./plugins/workflow-guard.ts"`; OpenCode deduplicates the resulting file URL. npm installation is recommended for normal use; the local-file form is primarily useful when developing from a source checkout.
 
 ---
 

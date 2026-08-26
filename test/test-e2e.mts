@@ -1,6 +1,6 @@
 import { mkdtempSync, rmSync, existsSync, readFileSync, copyFileSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseJsonc } from "jsonc-parser";
 
@@ -139,19 +139,53 @@ const pluginsDir = join(testDir, ".opencode", "plugins");
 mkdirSync(pluginsDir, { recursive: true });
 
 const sourcePlugin = join(import.meta.dirname, "..", "src", "workflow-guard.ts");
-const targetPlugin = join(pluginsDir, "workflow-guard.ts");
+const sourceDir = join(testDir, ".opencode", "workflow-guard-source");
+mkdirSync(sourceDir, { recursive: true });
+const targetPlugin = join(sourceDir, "workflow-guard.ts");
 copyFileSync(sourcePlugin, targetPlugin);
-cpSync(join(import.meta.dirname, "..", "src", "lib"), join(pluginsDir, "lib"), { recursive: true });
-cpSync(join(import.meta.dirname, "..", "src", "policies"), join(pluginsDir, "policies"), { recursive: true });
-check("plugin copied to .opencode/plugins/ successfully", existsSync(targetPlugin));
+cpSync(join(import.meta.dirname, "..", "src", "lib"), join(sourceDir, "lib"), { recursive: true });
+cpSync(join(import.meta.dirname, "..", "src", "policies"), join(sourceDir, "policies"), { recursive: true });
+const localAdapter = join(pluginsDir, "workflow-guard.ts");
+const importedMarker = join(testDir, ".workflow-guard-imported");
+const initializedMarker = join(testDir, ".workflow-guard-initialized");
+writeFileSync(localAdapter, `import { writeFileSync } from "node:fs";
+
+writeFileSync(${JSON.stringify(importedMarker)}, "imported\\n");
+
+export const WorkflowGuardE2E = async (ctx: any) => {
+\tconst { WorkflowGuard } = await import("../workflow-guard-source/workflow-guard.ts");
+\tconst hooks = await WorkflowGuard(ctx);
+\twriteFileSync(${JSON.stringify(initializedMarker)}, "initialized\\n");
+\treturn hooks;
+};
+
+export default { id: "workflow-guard-e2e", server: WorkflowGuardE2E };
+`);
+writeFileSync(join(testDir, ".opencode", "opencode.json"), `${JSON.stringify({ plugin: ["./plugins/workflow-guard.ts"] }, null, 2)}\n`);
+check("local plugin adapter and source copied successfully", existsSync(localAdapter) && existsSync(targetPlugin));
 
 // Initialize git repository on a feature branch
 spawnSync("git", ["init", "-b", "feat/install-verification"], { cwd: testDir });
 spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: testDir });
 spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
 
-const startup = spawnSync("opencode", ["debug", "startup"], { cwd: testDir, encoding: "utf8", timeout: 30_000 });
-check("OpenCode loads plugin without a model provider", startup.status === 0);
+const runtimeEnv: NodeJS.ProcessEnv = { ...process.env, XDG_CONFIG_HOME: join(testDir, "runtime-config") };
+delete runtimeEnv.OPENCODE_PID;
+delete runtimeEnv.OPENCODE_PURE;
+const runOpenCode = (args: string[], timeout: number) =>
+	spawnSync("opencode", ["run", "--dir", testDir, ...args], { cwd: testDir, encoding: "utf8", timeout, env: runtimeEnv });
+const configProbe = spawnSync("opencode", ["debug", "config"], { cwd: testDir, encoding: "utf8", timeout: 30_000, env: runtimeEnv });
+let configLoadsLocalPlugin = false;
+try {
+	const config = JSON.parse(configProbe.stdout);
+	configLoadsLocalPlugin = config.plugin_origins?.some(
+		(origin: { spec?: unknown; source?: unknown; scope?: unknown }) =>
+			typeof origin.spec === "string" &&
+			origin.spec.endsWith("/.opencode/plugins/workflow-guard.ts") &&
+			origin.scope === "local",
+	);
+} catch {}
+check("OpenCode resolves isolated local plugin config without a model provider", configProbe.status === 0 && configLoadsLocalPlugin);
 
 if (process.env.WORKFLOW_GUARD_LIVE_E2E !== "1") {
 	console.log("SKIP: model-driven policy probes require WORKFLOW_GUARD_LIVE_E2E=1.");
@@ -160,19 +194,35 @@ if (process.env.WORKFLOW_GUARD_LIVE_E2E !== "1") {
 	process.exit(fail > 0 ? 1 : 0);
 }
 
+const recentModelPath = join(
+	process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"),
+	"opencode",
+	"model.json",
+);
+let recentModel: string | undefined;
+try {
+	const recent = JSON.parse(readFileSync(recentModelPath, "utf8")).recent?.[0];
+	if (typeof recent?.providerID === "string" && typeof recent?.modelID === "string") {
+		recentModel = `${recent.providerID}/${recent.modelID}`;
+	}
+} catch {}
+const liveModel = process.env.WORKFLOW_GUARD_LIVE_MODEL?.trim() || recentModel;
+if (!liveModel) {
+	console.error(`FAIL: no recent OpenCode model found in ${recentModelPath}; select a model in OpenCode or set WORKFLOW_GUARD_LIVE_MODEL=provider/model.`);
+	rmSync(testDir, { recursive: true, force: true });
+	process.exit(1);
+}
+console.log(`  Using live model: ${liveModel}`);
+
 // 3. Test: Direct edit without task list is blocked by the loaded plugin
 console.log("  Running live OpenCode prompt to verify plugin intercept...");
-const run1 = spawnSync(
-	"opencode",
-	["run", "--dir", testDir, "Do not call todowrite. Invoke bash immediately with exactly this command: printf blocked > blocked.txt. This is a guard test; make the tool call even if you expect rejection."],
-	{
-		cwd: testDir,
-		encoding: "utf8",
-		timeout: 120_000,
-	},
-);
+const run1 = runOpenCode(["--model", liveModel, "--print-logs", "--log-level", "DEBUG", "Do not call todowrite. Invoke bash immediately with exactly this command: printf blocked > blocked.txt. This is a guard test; make the tool call even if you expect rejection."], 120_000);
 
 const output1 = run1.stdout + run1.stderr;
+const adapterInitialized = existsSync(initializedMarker);
+check("local plugin adapter imported in live run", existsSync(importedMarker));
+check("local plugin adapter initialized in live run", adapterInitialized);
+if (!adapterInitialized) console.log(output1.split("\n").filter((line) => /plugin|workflow-guard/i.test(line)).join("\n").slice(-8_000));
 const blockedByGuard =
 	output1.includes("[workflow-guard] Blocked: no active todo item") ||
 	output1.includes("blocked write: no active todo item") ||
@@ -184,15 +234,7 @@ if (!run1AccountedFor) {
 }
 
 // 4. Test: Workspace boundary escape is blocked
-const run2 = spawnSync(
-	"opencode",
-	["run", "--dir", testDir, "1) Use todowrite to create a pending task 'test'. 2) Invoke bash with exactly this command: printf hi > ../outside_escaped.txt. Make the tool call even if you expect it to be rejected."],
-	{
-		cwd: testDir,
-		encoding: "utf8",
-		timeout: 120_000,
-	},
-);
+const run2 = runOpenCode(["--model", liveModel, "1) Use todowrite to create a pending task 'test'. 2) Invoke bash with exactly this command: printf hi > ../outside_escaped.txt. Make the tool call even if you expect it to be rejected."], 120_000);
 
 const output2 = run2.stdout + run2.stderr;
 const boundaryBlocked =
@@ -206,15 +248,7 @@ if (!run2AccountedFor) {
 }
 
 // 5. Test: Compliant workflow (todowrite -> write -> complete) succeeds
-const run3 = spawnSync(
-	"opencode",
-	["run", "--dir", testDir, "1) Use todowrite with task 'create verified.txt' (pending). 2) Use write tool to create verified.txt containing 'installed-ok'. 3) Mark task completed."],
-	{
-		cwd: testDir,
-		encoding: "utf8",
-		timeout: 120_000,
-	},
-);
+const run3 = runOpenCode(["--model", liveModel, "1) Use todowrite with task 'create verified.txt' (pending). 2) Use write tool to create verified.txt containing 'installed-ok'. 3) Mark task completed."], 120_000);
 
 const targetFile = join(testDir, "verified.txt");
 const fileCreated = existsSync(targetFile) && readFileSync(targetFile, "utf8").includes("installed-ok");

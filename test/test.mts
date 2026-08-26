@@ -294,6 +294,8 @@ spawnSync("git", ["add", "-A"], { cwd: changesetWorktree });
 spawnSync("git", ["commit", "-m", "add changeset"], { cwd: changesetWorktree });
 setWorkspaceRoot(changesetWorktree);
 check("branch with .changeset/*.md satisfies PR changelog check (no body needed)", !(await shell("gh pr create --title t --body 'clean pr description'")));
+check("branch changeset does not allow literal newline escapes in PR description", blocked(await shell("gh pr create --title t --body 'Summary\\n- fixed\\n\\nValidation\\n- tests passed'")));
+check("branch changeset does not allow literal newline escapes in Azure PR description", blocked(await shell("az repos pr create --title t --description 'Summary\\n- fixed\\n\\nValidation\\n- tests passed'")));
 setWorkspaceRoot(changesetRepo);
 check("linked shell workdir changeset satisfies PR changelog check", !(await call("bash", { command: "gh pr create --title t --body 'clean pr description'", workdir: changesetWorktree })));
 setWorkspaceRoot(root);
