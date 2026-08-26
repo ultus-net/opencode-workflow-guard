@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { execFile, spawnSync } from "node:child_process";
 import { Database, type SqliteDatabase } from "./sqlite.ts";
@@ -7,11 +7,25 @@ import type { ProjectMemoryInput, ProjectMemoryKind, ProjectMemoryRecord, Projec
 
 const KINDS = new Set<ProjectMemoryKind>(["fact", "decision", "constraint", "lesson"]);
 const SOURCES = new Set<ProjectMemorySource>(["user", "file", "git", "tool", "agent", "portable"]);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const OBSOLETE_RETENTION_MS = 90 * DAY_MS;
+const MAINTENANCE_INTERVAL_MS = DAY_MS;
+const STORAGE_LIMIT_BYTES = 100 * 1024 * 1024;
+const STORAGE_TARGET_BYTES = 80 * 1024 * 1024;
 
 export interface ProjectMemoryStore {
 	db: SqliteDatabase;
 	projectId: string;
+	path: string;
+	activeMarker?: string;
 	close(): void;
+}
+
+interface MaintenanceOptions {
+	force?: boolean;
+	now?: number;
+	storageLimitBytes?: number;
+	storageTargetBytes?: number;
 }
 
 export function getProjectMemoryDir(): string {
@@ -66,14 +80,20 @@ export async function isProjectMemoryFreshAsync(memory: ProjectMemoryRecord, roo
 export function openProjectMemory(projectId: string, directory = getProjectMemoryDir()): ProjectMemoryStore {
 	if (!projectId || projectId.length > 200) throw new Error("Invalid project memory identity.");
 	mkdirSync(directory, { recursive: true, mode: 0o700 });
-	const db = new Database(join(directory, `${projectId.replace(/[^a-zA-Z0-9._-]/g, "_")}.sqlite`));
-	db.exec(`
+	const path = join(directory, `${projectId.replace(/[^a-zA-Z0-9._-]/g, "_")}.sqlite`);
+	const activeMarker = `${path}.active.${process.pid}.${randomUUID()}`;
+	const releaseLock = acquireDatabaseLock(directory);
+	let db: SqliteDatabase | undefined;
+	try {
+		writeFileSync(activeMarker, "", { mode: 0o600 });
+		db = new Database(path);
+		db.exec(`
 		PRAGMA journal_mode = WAL;
 		PRAGMA busy_timeout = 2000;
 		CREATE TABLE IF NOT EXISTS memories (
 			id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL,
 			source TEXT NOT NULL, created_at INTEGER NOT NULL, session_id TEXT, commit_sha TEXT,
-			paths TEXT NOT NULL, supersedes TEXT, status TEXT NOT NULL DEFAULT 'current'
+			paths TEXT NOT NULL, supersedes TEXT, status TEXT NOT NULL DEFAULT 'current', superseded_at INTEGER
 		);
 		CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(id UNINDEXED, content);
 		CREATE TABLE IF NOT EXISTS review_followups (
@@ -81,8 +101,105 @@ export function openProjectMemory(projectId: string, directory = getProjectMemor
 			reviewer TEXT NOT NULL, created_at INTEGER NOT NULL, resolved_at INTEGER, session_id TEXT,
 			commit_sha TEXT, paths TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open'
 		);
-	`);
-	return { db, projectId, close: () => db.close() };
+		`);
+		const memoryColumns = db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>;
+		if (!memoryColumns.some((column) => column.name === "superseded_at")) {
+			db.exec("ALTER TABLE memories ADD COLUMN superseded_at INTEGER");
+			db.exec("UPDATE memories SET superseded_at = created_at WHERE status = 'superseded'");
+		}
+	} catch (error) {
+		try { db?.close(); } finally { rmSync(activeMarker, { force: true }); }
+		throw error;
+	} finally {
+		releaseLock();
+	}
+	if (!db) throw new Error("Project memory database failed to initialize.");
+	const store: ProjectMemoryStore = { db, projectId, path, activeMarker, close: () => { try { db.close(); } finally { rmSync(activeMarker, { force: true }); } } };
+	try { maintainProjectMemoryStorage(store, directory); } catch {}
+	return store;
+}
+
+function acquireDatabaseLock(directory: string): () => void {
+	const lock = new Database(join(directory, ".coordination"));
+	try {
+		lock.exec("PRAGMA busy_timeout = 2000; BEGIN IMMEDIATE");
+	} catch (error) {
+		lock.close();
+		throw error;
+	}
+	return () => { try { lock.exec("COMMIT"); } finally { lock.close(); } };
+}
+
+function databaseDiskUsage(path: string): number {
+	let size = 0;
+	for (const suffix of ["", "-wal", "-shm"]) try { size += statSync(path + suffix).size; } catch {}
+	return size;
+}
+
+function databaseIsActive(path: string, directory: string): boolean {
+	const prefix = `${path.slice(directory.length + 1)}.active.`;
+	let active = false;
+	for (const name of readdirSync(directory).filter((entry) => entry.startsWith(prefix))) {
+		const pid = Number(name.slice(prefix.length).split(".", 1)[0]);
+		if (!Number.isInteger(pid) || pid <= 0) { active = true; continue; }
+		try { process.kill(pid, 0); active = true; } catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") rmSync(join(directory, name), { force: true });
+			else active = true;
+		}
+	}
+	return active;
+}
+
+export function maintainProjectMemoryStorage(store: ProjectMemoryStore, directory = getProjectMemoryDir(), options: MaintenanceOptions = {}): void {
+	const now = options.now ?? Date.now();
+	const maintenanceMarker = `${store.path}.maintenance`;
+	const releaseMaintenanceLock = acquireDatabaseLock(directory);
+	try {
+		let lastMaintained = 0;
+		try { lastMaintained = statSync(maintenanceMarker).mtimeMs; } catch {}
+		if (!options.force && now - lastMaintained < MAINTENANCE_INTERVAL_MS) return;
+
+		const cutoff = now - OBSOLETE_RETENTION_MS;
+		store.db.exec("BEGIN IMMEDIATE");
+		try {
+			store.db.prepare("DELETE FROM memories_fts WHERE id IN (SELECT id FROM memories WHERE status = 'superseded' AND superseded_at < ?)").run(cutoff);
+			store.db.prepare("DELETE FROM memories WHERE status = 'superseded' AND superseded_at < ?").run(cutoff);
+			store.db.prepare("DELETE FROM review_followups WHERE status = 'resolved' AND resolved_at < ?").run(cutoff);
+			store.db.exec("COMMIT");
+		} catch (error) {
+			store.db.exec("ROLLBACK");
+			throw error;
+		}
+		store.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+		store.db.exec("PRAGMA optimize");
+		store.db.exec("VACUUM");
+		try { utimesSync(store.path, now / 1000, now / 1000); } catch {}
+		writeFileSync(maintenanceMarker, "", { mode: 0o600 });
+		try { utimesSync(maintenanceMarker, now / 1000, now / 1000); } catch {}
+	} finally {
+		releaseMaintenanceLock();
+	}
+
+	const limit = options.storageLimitBytes ?? STORAGE_LIMIT_BYTES;
+	const target = Math.min(limit, options.storageTargetBytes ?? STORAGE_TARGET_BYTES);
+	const candidates = readdirSync(directory)
+		.filter((name) => name.endsWith(".sqlite"))
+		.map((name) => join(directory, name))
+		.filter((path) => path !== store.path)
+		.flatMap((path) => { try { const stat = statSync(path); return [{ path, size: databaseDiskUsage(path), mtimeMs: stat.mtimeMs }]; } catch { return []; } });
+	let total = candidates.reduce((sum, item) => sum + item.size, databaseDiskUsage(store.path));
+	if (total <= limit) return;
+	for (const candidate of candidates.sort((a, b) => a.mtimeMs - b.mtimeMs)) {
+		const releaseCandidateLock = acquireDatabaseLock(directory);
+		try {
+			if (databaseIsActive(candidate.path, directory)) continue;
+			for (const suffix of ["", "-wal", "-shm", ".maintenance"]) rmSync(candidate.path + suffix, { force: true });
+		} finally {
+			releaseCandidateLock();
+		}
+		total -= candidate.size;
+		if (total <= target) break;
+	}
 }
 
 function followupRowToRecord(row: Record<string, unknown>): ReviewFollowup {
@@ -147,8 +264,8 @@ export function recordProjectMemory(store: ProjectMemoryStore, input: ProjectMem
 	const createdAt = Date.now();
 	store.db.exec("BEGIN IMMEDIATE");
 	try {
-		if (input.supersedes) store.db.prepare("UPDATE memories SET status = 'superseded' WHERE id = ? AND project_id = ?").run(input.supersedes, store.projectId);
-		store.db.prepare("INSERT INTO memories VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current')").run(
+		if (input.supersedes) store.db.prepare("UPDATE memories SET status = 'superseded', superseded_at = ? WHERE id = ? AND project_id = ?").run(createdAt, input.supersedes, store.projectId);
+		store.db.prepare("INSERT INTO memories (id, project_id, kind, content, source, created_at, session_id, commit_sha, paths, supersedes, status, superseded_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'current', NULL)").run(
 			id, store.projectId, input.kind, input.content.trim(), input.source, createdAt,
 			input.sessionID ?? null, input.commit ?? null, JSON.stringify(input.paths ?? []), input.supersedes ?? null,
 		);

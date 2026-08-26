@@ -1,7 +1,8 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
 import {
 	guardToolCall,
@@ -68,6 +69,7 @@ import {
 	selectLearningOpportunity,
 	updateLearnerProfile,
 	openProjectMemory,
+	maintainProjectMemoryStorage,
 	recordProjectMemory,
 	searchProjectMemory,
 	recordReviewFollowup,
@@ -544,15 +546,26 @@ if (typeof compactFn === "function") {
 }
 check("compaction hook injects active tasks into output.context", compactOutput.context.length > 0 && (compactOutput.context[0]?.includes("Active Tasks") ?? false));
 
-// Blocked tool call emits warning toast via tui.showToast
+// Blocked tool call emits one in-app warning via tui.showToast.
 toasts = [];
+const notificationProbeDir = mkdtempSync(join(tmpdir(), "wg-notify-probe-"));
+const notificationProbe = join(notificationProbeDir, "called");
+const notifySendProbe = join(notificationProbeDir, "notify-send");
+writeFileSync(notifySendProbe, `#!/bin/sh\ntouch ${JSON.stringify(notificationProbe)}\n`);
+chmodSync(notifySendProbe, 0o755);
+const previousPath = process.env.PATH;
+process.env.PATH = `${notificationProbeDir}:${previousPath ?? ""}`;
 const beforeFn = pluginWithToast["tool.execute.before"];
 if (typeof beforeFn === "function") {
 	try {
 		await beforeFn({ tool: "bash", sessionID: "s", callID: "c" }, { args: { command: "git push origin main" } });
 	} catch {}
 }
+process.env.PATH = previousPath;
 check("tool block emits warning toast via tui.showToast", toasts.length === 1 && (toasts[0] as any)?.body?.variant === "warning");
+await new Promise((resolve) => setTimeout(resolve, 100));
+check("tool block feedback does not dispatch a desktop notification", !existsSync(notificationProbe));
+rmSync(notificationProbeDir, { recursive: true, force: true });
 
 console.log("- Input shapes -");
 check("single string command", blocked(await call("bash", "git push origin main")));
@@ -2706,6 +2719,18 @@ check("plugin registers guard_next_tasks tool", "guard_next_tasks" in ((continua
 // TUI badge: session-scoped, guard-originated toast sourcing.
 console.log("- TUI Companion Status Badge -");
 let toastHandler: ((event: any) => void) | undefined;
+const realSetTimeout = globalThis.setTimeout;
+const realClearTimeout = globalThis.clearTimeout;
+let nextBadgeTimer = 1;
+const badgeTimers = new Map<number, () => void>();
+globalThis.setTimeout = ((callback: (...args: any[]) => void) => {
+	const id = nextBadgeTimer++;
+	badgeTimers.set(id, callback);
+	return id;
+}) as typeof setTimeout;
+globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
+	badgeTimers.delete(id as unknown as number);
+}) as typeof clearTimeout;
 const fakeTuiBadgeApi = {
 	theme: { current: { success: "green", warning: "yellow", error: "red" } },
 	route: { current: { name: "session", params: { sessionID: "s-badge" } } },
@@ -2724,9 +2749,10 @@ setLastBlockedReasonForTesting(undefined);
 const activeBadge = formatBadge();
 check("TUI badge renders shield label when no block", activeBadge.text === "Workflow Guard 🛡️" && !activeBadge.isBlocked);
 
-setLastBlockedReasonForTesting("[workflow-guard] blocked edit: on protected branch main");
+setLastBlockedReasonForTesting("[workflow-guard] Blocked todowrite: active task remains");
 const blockedBadge = formatBadge();
 check("TUI badge renders Blocked status when block occurs", blockedBadge.text.includes("Workflow Guard: Blocked:") && blockedBadge.isBlocked);
+check("TUI badge does not duplicate Blocked text", blockedBadge.text.startsWith("[Workflow Guard: Blocked: todowrite:") && !blockedBadge.text.includes("Blocked: Blocked"));
 setLastBlockedReasonForTesting(undefined);
 
 toastHandler?.({ properties: { title: "Other Plugin", message: "Blocked: unrelated" } });
@@ -2734,6 +2760,15 @@ check("TUI ignores unrelated blocked toasts", !formatBadge("s-badge").isBlocked)
 toastHandler?.({ properties: { title: "Workflow Guard Blocked", message: "Blocked: protected branch" } });
 check("TUI associates guard toast with current session", formatBadge("s-badge").isBlocked);
 check("TUI does not leak session block to another session", !formatBadge("s-other").isBlocked);
+check("TUI does not leak session block to home badge", !formatBadge().isBlocked);
+const firstBadgeTimer = [...badgeTimers.keys()][0];
+toastHandler?.({ properties: { title: "Workflow Guard Blocked", message: "Blocked: protected branch" } });
+const refreshedBadgeTimer = [...badgeTimers.keys()][0];
+check("TUI repeated block refreshes badge timeout", badgeTimers.size === 1 && refreshedBadgeTimer !== firstBadgeTimer && formatBadge("s-badge").isBlocked);
+badgeTimers.get(refreshedBadgeTimer!)?.();
+check("TUI blocked badge returns to shield after timeout", !formatBadge("s-badge").isBlocked);
+globalThis.setTimeout = realSetTimeout;
+globalThis.clearTimeout = realClearTimeout;
 setLastBlockedReasonForTesting(undefined);
 
 // ── Policy 24: Completion claims vs evidence (observability) ──
@@ -2916,7 +2951,56 @@ else process.env.XDG_DATA_HOME = prevDataHome;
 // Project memory: private working knowledge is indexed locally while only
 // explicitly promoted durable records cross the repository boundary.
 const memoryDir = join(root, "project-memory-data");
+mkdirSync(memoryDir);
+mkdirSync(join(memoryDir, "failed-open.sqlite"));
+try { openProjectMemory("failed-open", memoryDir); } catch {}
+check("project memory failed initialization removes its active marker", !readdirSync(memoryDir).some((name) => name.startsWith("failed-open.sqlite.active.")));
+rmSync(join(memoryDir, "failed-open.sqlite"), { recursive: true, force: true });
+const failedMigrationPath = join(memoryDir, "failed-migration.sqlite");
+const failedMigrationDb = new DatabaseSync(failedMigrationPath);
+failedMigrationDb.exec("CREATE TABLE memories (id TEXT PRIMARY KEY)");
+failedMigrationDb.close();
+try { openProjectMemory("failed-migration", memoryDir); } catch {}
+check("project memory post-open initialization failure removes its active marker", !readdirSync(memoryDir).some((name) => name.startsWith("failed-migration.sqlite.active.")));
+rmSync(failedMigrationPath, { force: true });
+const legacyMemoryPath = join(memoryDir, "legacy-project.sqlite");
+const legacyMemoryDb = new DatabaseSync(legacyMemoryPath);
+legacyMemoryDb.exec("CREATE TABLE memories (id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL, source TEXT NOT NULL, created_at INTEGER NOT NULL, session_id TEXT, commit_sha TEXT, paths TEXT NOT NULL, supersedes TEXT, status TEXT NOT NULL DEFAULT 'current')");
+legacyMemoryDb.prepare("INSERT INTO memories (id, project_id, kind, content, source, created_at, paths, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").run("legacy-superseded", "legacy-project", "fact", "Obsolete legacy memory.", "agent", Date.now() - 365 * 24 * 60 * 60 * 1000, "[]", "superseded");
+legacyMemoryDb.close();
+const migratedMemoryDb = openProjectMemory("legacy-project", memoryDir);
+maintainProjectMemoryStorage(migratedMemoryDb, memoryDir, { force: true });
+check("project memory migration prunes old legacy superseded records", migratedMemoryDb.db.prepare("SELECT 1 FROM memories WHERE id = ?").get("legacy-superseded") === undefined);
+migratedMemoryDb.close();
 const memoryDb = openProjectMemory("project-test", memoryDir);
+const contentionProjectId = "maintenance-contention";
+const contentionGo = join(memoryDir, "maintenance-contention.go");
+const contentionChildren = [0, 1].map((index) => {
+	const ready = join(memoryDir, `maintenance-contention.${index}.ready`);
+	return {
+		ready,
+		child: spawn(process.execPath, ["--input-type=module", "--eval", `import { existsSync, writeFileSync } from "node:fs"; import { openProjectMemory } from ${JSON.stringify(new URL("../src/lib/project-memory.ts", import.meta.url).href)}; writeFileSync(${JSON.stringify(ready)}, "ready"); while (!existsSync(${JSON.stringify(contentionGo)})) await new Promise((resolve) => setTimeout(resolve, 5)); const store = openProjectMemory(${JSON.stringify(contentionProjectId)}, ${JSON.stringify(memoryDir)}); store.close();`], { stdio: "ignore" }),
+	};
+});
+for (let attempts = 0; attempts < 100 && contentionChildren.some(({ ready }) => !existsSync(ready)); attempts++) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+writeFileSync(contentionGo, "go");
+const contentionExits = await Promise.all(contentionChildren.map(({ child }) => new Promise<number | null>((resolveChild, rejectChild) => {
+	child.once("exit", resolveChild);
+	child.once("error", rejectChild);
+})));
+check("project memory serializes cross-process open and daily maintenance", contentionChildren.every(({ ready }) => existsSync(ready)) && contentionExits.every((code) => code === 0) && existsSync(join(memoryDir, `${contentionProjectId}.sqlite.maintenance`)) && existsSync(join(memoryDir, ".coordination")));
+const crashedLockReady = join(memoryDir, "crashed-coordination.ready");
+const crashedLockHolder = spawn(process.execPath, ["--input-type=module", "--eval", `import { writeFileSync } from "node:fs"; import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(${JSON.stringify(join(memoryDir, ".coordination"))}); db.exec("BEGIN IMMEDIATE"); writeFileSync(${JSON.stringify(crashedLockReady)}, "ready"); setInterval(() => {}, 1000);`], { stdio: "ignore" });
+for (let attempts = 0; attempts < 100 && !existsSync(crashedLockReady); attempts++) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+check("project memory coordination lock holder starts", existsSync(crashedLockReady));
+crashedLockHolder.kill("SIGKILL");
+await new Promise<void>((resolveChild, rejectChild) => {
+	crashedLockHolder.once("exit", () => resolveChild());
+	crashedLockHolder.once("error", rejectChild);
+});
+const afterCrashStore = openProjectMemory("after-coordination-crash", memoryDir);
+afterCrashStore.close();
+check("project memory coordination lock is released by process death", existsSync(join(memoryDir, "after-coordination-crash.sqlite")));
 const decision = recordProjectMemory(memoryDb, {
 	kind: "decision",
 	content: "Use SQLite as the authoritative local project-memory index.",
@@ -2943,6 +3027,61 @@ recordProjectMemory(memoryDb, {
 	supersedes: decision.id,
 });
 check("superseded project knowledge is excluded from normal retrieval", searchProjectMemory(memoryDb, "authoritative local", 5).every((memory) => memory.id !== decision.id));
+memoryDb.db.prepare("UPDATE memories SET created_at = ?, superseded_at = ? WHERE id = ?").run(Date.now() - 365 * 24 * 60 * 60 * 1000, Date.now() - 91 * 24 * 60 * 60 * 1000, decision.id);
+memoryDb.db.prepare("UPDATE review_followups SET resolved_at = ? WHERE id = ?").run(Date.now() - 91 * 24 * 60 * 60 * 1000, followup.id);
+maintainProjectMemoryStorage(memoryDb, memoryDir, { force: true });
+check("project memory prunes obsolete records after retention window", memoryDb.db.prepare("SELECT 1 FROM memories WHERE id = ?").get(decision.id) === undefined);
+check("project memory removes pruned records from FTS", memoryDb.db.prepare("SELECT 1 FROM memories_fts WHERE id = ?").get(decision.id) === undefined);
+check("project memory prunes old resolved review follow-ups", listReviewFollowups(memoryDb, "resolved").every((item) => item.id !== followup.id));
+const currentDbSize = ["", "-wal", "-shm"].reduce((size, suffix) => size + (existsSync(memoryDb.path + suffix) ? statSync(memoryDb.path + suffix).size : 0), 0);
+const oldProjectDb = join(memoryDir, "old-project.sqlite");
+const recentProjectDb = join(memoryDir, "recent-project.sqlite");
+writeFileSync(oldProjectDb, "x".repeat(1024 * 1024));
+writeFileSync(recentProjectDb, "x".repeat(1024 * 1024));
+writeFileSync(`${recentProjectDb}-wal`, "x".repeat(1024 * 1024));
+const retentionNow = Date.now();
+utimesSync(oldProjectDb, (retentionNow - 2_000) / 1000, (retentionNow - 2_000) / 1000);
+utimesSync(recentProjectDb, (retentionNow - 1_000) / 1000, (retentionNow - 1_000) / 1000);
+maintainProjectMemoryStorage(memoryDb, memoryDir, { force: true, now: retentionNow, storageLimitBytes: currentDbSize + 2.5 * 1024 * 1024, storageTargetBytes: currentDbSize + 2.5 * 1024 * 1024 });
+check("project memory evicts least-recently-used databases above global ceiling", !existsSync(oldProjectDb) && existsSync(recentProjectDb));
+rmSync(recentProjectDb, { force: true });
+rmSync(`${recentProjectDb}-wal`, { force: true });
+const activeProjectDb = join(memoryDir, "active-project.sqlite");
+const inactiveProjectDb = join(memoryDir, "inactive-project.sqlite");
+writeFileSync(activeProjectDb, "x".repeat(80));
+writeFileSync(inactiveProjectDb, "x".repeat(80));
+writeFileSync(`${activeProjectDb}.active.${process.pid}.test`, "");
+utimesSync(activeProjectDb, (retentionNow - 2_000) / 1000, (retentionNow - 2_000) / 1000);
+utimesSync(inactiveProjectDb, (retentionNow - 1_000) / 1000, (retentionNow - 1_000) / 1000);
+maintainProjectMemoryStorage(memoryDb, memoryDir, { force: true, now: retentionNow, storageLimitBytes: 1, storageTargetBytes: currentDbSize });
+check("project memory never evicts a database active in another store", existsSync(activeProjectDb) && !existsSync(inactiveProjectDb));
+rmSync(activeProjectDb, { force: true });
+rmSync(`${activeProjectDb}.active.${process.pid}.test`, { force: true });
+const childProjectId = "child-active-project";
+const childProjectDb = join(memoryDir, `${childProjectId}.sqlite`);
+const childReady = join(memoryDir, "child-active.ready");
+const childRelease = join(memoryDir, "child-active.release");
+const projectMemoryModule = new URL("../src/lib/project-memory.ts", import.meta.url).href;
+const activeChild = spawn(process.execPath, ["--input-type=module", "--eval", `import { existsSync, writeFileSync } from "node:fs"; import { openProjectMemory } from ${JSON.stringify(projectMemoryModule)}; const store = openProjectMemory(${JSON.stringify(childProjectId)}, ${JSON.stringify(memoryDir)}); writeFileSync(${JSON.stringify(childReady)}, "ready"); const timer = setInterval(() => { if (existsSync(${JSON.stringify(childRelease)})) { clearInterval(timer); store.close(); } }, 10);`], { stdio: "ignore" });
+for (let attempts = 0; attempts < 100 && !existsSync(childReady); attempts++) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+check("project memory child process opens a coordinated active store", existsSync(childReady) && existsSync(childProjectDb));
+maintainProjectMemoryStorage(memoryDb, memoryDir, { force: true, now: retentionNow, storageLimitBytes: 1, storageTargetBytes: currentDbSize });
+check("project memory eviction preserves a database active in another process", existsSync(childProjectDb));
+writeFileSync(childRelease, "release");
+await new Promise<void>((resolveChild, rejectChild) => {
+	activeChild.once("exit", (code) => code === 0 ? resolveChild() : rejectChild(new Error(`project memory child exited ${code}`)));
+	activeChild.once("error", rejectChild);
+});
+rmSync(childReady, { force: true });
+rmSync(childRelease, { force: true });
+const oldCurrentMemory = recordProjectMemory(memoryDb, { kind: "fact", content: "Old facts remain current until explicitly superseded.", source: "user" }, "old-current-memory");
+memoryDb.db.prepare("UPDATE memories SET created_at = ? WHERE id = ?").run(retentionNow - 365 * 24 * 60 * 60 * 1000, oldCurrentMemory.id);
+recordProjectMemory(memoryDb, { kind: "fact", content: "Replacement fact.", source: "user", supersedes: oldCurrentMemory.id });
+maintainProjectMemoryStorage(memoryDb, memoryDir, { force: true, now: retentionNow });
+check("project memory retains newly superseded old records for the retention window", memoryDb.db.prepare("SELECT 1 FROM memories WHERE id = ?").get(oldCurrentMemory.id) !== undefined);
+memoryDb.db.prepare("UPDATE memories SET superseded_at = ? WHERE id = ?").run(retentionNow - 91 * 24 * 60 * 60 * 1000, oldCurrentMemory.id);
+maintainProjectMemoryStorage(memoryDb, memoryDir, { now: retentionNow + 1_000 });
+check("project memory maintenance is throttled to once per day", memoryDb.db.prepare("SELECT 1 FROM memories WHERE id = ?").get(oldCurrentMemory.id) !== undefined);
 const privateFact = recordProjectMemory(memoryDb, { kind: "fact", content: "A transient local observation.", source: "agent" });
 const portableConstraint = recordProjectMemory(memoryDb, { kind: "constraint", content: "Project memory committed to Git must be human-readable.", source: "user" });
 const portablePath = join(root, ".opencode", "memory", "project-memory.jsonl");
@@ -3023,4 +3162,4 @@ else process.env.XDG_DATA_HOME = prevDataHome;
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
 console.log(`\n${pass} passed, ${fail} failed`);
-process.exit(fail ? 1 : 0);
+process.exitCode = fail ? 1 : 0;

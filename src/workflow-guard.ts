@@ -122,6 +122,7 @@ export {
 	ensureProjectMemoryExcluded,
 	isProjectMemoryFresh,
 	openProjectMemory,
+	maintainProjectMemoryStorage,
 	recordProjectMemory,
 	searchProjectMemory,
 	getRecentProjectMemory,
@@ -270,7 +271,6 @@ export { branchHasDocumentationChange };
 import {
 	checkInteractiveTtyCommand,
 	checkPackageHygiene,
-	sendDesktopNotification,
 	escapeAppleScriptString,
 } from "./policies/shell-safety.ts";
 
@@ -278,7 +278,8 @@ import { checkCompletionClaims } from "./policies/completion.ts";
 
 export { checkCompletionClaims };
 
-export { checkInteractiveTtyCommand, checkPackageHygiene, sendDesktopNotification, escapeAppleScriptString };
+export { sendDesktopNotification } from "./policies/shell-safety.ts";
+export { checkInteractiveTtyCommand, checkPackageHygiene, escapeAppleScriptString };
 
 function logObservation(client: unknown, message: string): void {
 	try {
@@ -322,9 +323,6 @@ export async function guardToolCall(
 }
 
 async function emitBlockFeedback(message: string): Promise<void> {
-	try {
-		sendDesktopNotification("Workflow Guard Blocked", message);
-	} catch {}
 	await showBlockToast(message);
 }
 
