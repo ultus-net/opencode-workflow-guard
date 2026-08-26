@@ -138,7 +138,7 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
 - Only **README.md** (root or package level) and files under **`docs/`** count as documentation updates; arbitrary markdown (e.g. `.changeset/*.md` fragments or `CHANGELOG.md`) does not satisfy this gate.
 
 ### 22. Non-Interactive Shell & TTY Hang Guard
-- Blocks commands that spawn interactive text editors (`nano`, `vim`, `emacs`), interactive pagers (`less`, `more`), interactive monitors (`top`, `htop`), interactive rebase/patch prompts (`git rebase -i`, `git add -p`), `sudo`, or package managers missing non-interactive confirmation flags (`npm init` without `-y`, `apt-get` without `-y`).
+- Blocks commands that spawn interactive text editors (`nano`, `vim`, `emacs`), interactive pagers (`less`, `more`) including through common shell wrappers, interactive monitors (`top`, `htop`), interactive rebase/patch prompts (`git rebase -i`, `git add -p`), `sudo`, or package managers missing non-interactive confirmation flags (`npm init` without `-y`, `apt-get` without `-y`). Pager names appearing only in command arguments are not treated as pager execution.
 - Prevents subshell agents from hanging indefinitely waiting for user stdin in background execution.
 - **Desktop Notifications:** Emits native OS notifications (Linux `notify-send`, macOS `osascript`) when a policy blocks a command or when verification runs finish, keeping developers informed when their terminal is backgrounded. Configurable via `WORKFLOW_GUARD_NOTIFY=0`.
 

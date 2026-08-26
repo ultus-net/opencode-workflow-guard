@@ -2109,9 +2109,11 @@ check("checkInteractiveTtyCommand detects command option before pager", checkInt
 check("checkInteractiveTtyCommand detects exec options before pager", checkInteractiveTtyCommand("exec -a pager less file.txt").isInteractive);
 check("checkInteractiveTtyCommand detects path-qualified pager", checkInteractiveTtyCommand("/usr/bin/less file.txt").isInteractive);
 check("checkInteractiveTtyCommand detects relative path pager", checkInteractiveTtyCommand("./most file.txt").isInteractive);
-check("checkInteractiveTtyCommand detects pager in shell command string", checkInteractiveTtyCommand("sh -c 'less file.txt'").isInteractive);
-check("checkInteractiveTtyCommand detects pager in shell combined flags", checkInteractiveTtyCommand("bash -lc 'more file.txt'").isInteractive);
-check("checkInteractiveTtyCommand detects chained pager", checkInteractiveTtyCommand("printf output; more file.txt").isInteractive);
+	check("checkInteractiveTtyCommand detects pager in shell command string", checkInteractiveTtyCommand("sh -c 'less file.txt'").isInteractive);
+	check("checkInteractiveTtyCommand detects pager in shell combined flags", checkInteractiveTtyCommand("bash -lc 'more file.txt'").isInteractive);
+	check("checkInteractiveTtyCommand detects pager through eval", checkInteractiveTtyCommand("eval 'less file.txt'").isInteractive);
+	check("checkInteractiveTtyCommand detects busybox pager applet", checkInteractiveTtyCommand("busybox less file.txt").isInteractive);
+	check("checkInteractiveTtyCommand detects chained pager", checkInteractiveTtyCommand("printf output; more file.txt").isInteractive);
 check("checkInteractiveTtyCommand permits pager word in argument", !checkInteractiveTtyCommand('printf "%s\\n" "show more results"').isInteractive);
 check("checkInteractiveTtyCommand permits Azure PR create with JSON output", !checkInteractiveTtyCommand('az repos pr create --repository order-processing --description "Summary: show more relevant results. Release notes: Retuned scoring." --output json').isInteractive);
 check("checkInteractiveTtyCommand permits Azure PR create with empty pager env", !checkInteractiveTtyCommand('AZURE_CORE_PAGER= az repos pr create --repository order-processing --description "Summary: show more relevant results. Release notes: Retuned scoring." --output json').isInteractive);

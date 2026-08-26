@@ -257,7 +257,7 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 			}
 			continue;
 		}
-		if (word === "eval" || word === "nohup") {
+		if (word === "nohup") {
 			i++;
 			continue;
 		}

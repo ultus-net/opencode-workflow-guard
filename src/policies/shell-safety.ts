@@ -110,6 +110,8 @@ function containsPagerCommand(command: string, depth = 0): boolean {
 		while (words[0] === "--") words.shift();
 		const executable = basename(words[0] ?? "");
 		if (/^(?:less|more|most)$/i.test(executable)) return true;
+		if (executable === "eval" && words.length > 1 && containsPagerCommand(words.slice(1).join(" "), depth + 1)) return true;
+		if (executable === "busybox" && /^(?:less|more)$/i.test(words[1] ?? "")) return true;
 		if (/^(?:ba|z|da|k)?sh$/i.test(executable)) {
 			const commandFlag = words.findIndex((word, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(word));
 			if (commandFlag >= 0 && words[commandFlag + 1] && containsPagerCommand(words[commandFlag + 1]!, depth + 1)) return true;
