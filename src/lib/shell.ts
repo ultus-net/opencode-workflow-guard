@@ -242,7 +242,22 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 			continue;
 		}
 
-		if (word === "command" || word === "exec" || word === "eval" || word === "nohup") {
+		if (word === "command") {
+			i++;
+			while (i < words.length && words[i] === "-p") i++;
+			if (words[i] === "--") i++;
+			continue;
+		}
+		if (word === "exec") {
+			i++;
+			while (i < words.length && words[i]!.startsWith("-")) {
+				const option = words[i++]!;
+				if (option === "--") break;
+				if (option === "-a" && i < words.length) i++;
+			}
+			continue;
+		}
+		if (word === "eval" || word === "nohup") {
 			i++;
 			continue;
 		}
