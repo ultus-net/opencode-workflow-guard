@@ -2987,6 +2987,20 @@ maintainProjectMemoryStorage(migratedMemoryDb, memoryDir, { force: true });
 check("project memory migration prunes old legacy superseded records", migratedMemoryDb.db.prepare("SELECT 1 FROM memories WHERE id = ?").get("legacy-superseded") === undefined);
 migratedMemoryDb.close();
 const memoryDb = openProjectMemory("project-test", memoryDir);
+const delayedLockReady = join(memoryDir, "delayed-coordination.ready");
+const delayedLockHolder = spawn(process.execPath, ["--input-type=module", "--eval", `import { writeFileSync } from "node:fs"; import { DatabaseSync } from "node:sqlite"; const db = new DatabaseSync(${JSON.stringify(join(memoryDir, ".coordination"))}); db.exec("BEGIN IMMEDIATE"); writeFileSync(${JSON.stringify(delayedLockReady)}, "ready"); await new Promise((resolve) => setTimeout(resolve, 2500)); db.exec("COMMIT"); db.close();`], { stdio: "ignore" });
+while (!existsSync(delayedLockReady) && delayedLockHolder.exitCode === null) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+let delayedOpenSucceeded = false;
+if (existsSync(delayedLockReady)) try {
+	const delayedStore = openProjectMemory("delayed-coordination", memoryDir);
+	delayedStore.close();
+	delayedOpenSucceeded = true;
+} catch {}
+if (delayedLockHolder.exitCode === null) await new Promise<void>((resolveChild, rejectChild) => {
+	delayedLockHolder.once("exit", () => resolveChild());
+	delayedLockHolder.once("error", rejectChild);
+});
+check("project memory open tolerates bounded coordination contention", existsSync(delayedLockReady) && delayedOpenSucceeded);
 const contentionProjectId = "maintenance-contention";
 const contentionGo = join(memoryDir, "maintenance-contention.go");
 const contentionChildren = [0, 1].map((index) => {
