@@ -122,7 +122,7 @@ export function openProjectMemory(projectId: string, directory = getProjectMemor
 function acquireDatabaseLock(directory: string): () => void {
 	const lock = new Database(join(directory, ".coordination"));
 	try {
-		lock.exec("PRAGMA busy_timeout = 2000; BEGIN IMMEDIATE");
+		lock.exec("PRAGMA busy_timeout = 10000; BEGIN IMMEDIATE");
 	} catch (error) {
 		lock.close();
 		throw error;
