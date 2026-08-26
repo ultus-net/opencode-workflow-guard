@@ -3020,7 +3020,8 @@ const contentionChildren = [0, 1].map((index) => {
 		stderr: () => stderr.trim(),
 	};
 });
-while (contentionChildren.some(({ ready, child }) => !existsSync(ready) && child.exitCode === null)) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+for (let attempts = 0; attempts < 100 && contentionChildren.some(({ ready, child }) => !existsSync(ready) && child.exitCode === null); attempts++) await new Promise((resolveReady) => setTimeout(resolveReady, 10));
+for (const { ready, child } of contentionChildren) if (!existsSync(ready) && child.exitCode === null) child.kill();
 writeFileSync(contentionGo, "go");
 const contentionExits = await Promise.all(contentionChildren.map(({ exit }) => exit));
 const contentionErrors = contentionChildren.map(({ stderr }) => stderr()).filter(Boolean).join(" | ");

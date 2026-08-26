@@ -88,8 +88,8 @@ export function openProjectMemory(projectId: string, directory = getProjectMemor
 		writeFileSync(activeMarker, "", { mode: 0o600 });
 		db = new Database(path);
 		db.exec(`
-		PRAGMA journal_mode = WAL;
 		PRAGMA busy_timeout = 2000;
+		PRAGMA journal_mode = WAL;
 		CREATE TABLE IF NOT EXISTS memories (
 			id TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, content TEXT NOT NULL,
 			source TEXT NOT NULL, created_at INTEGER NOT NULL, session_id TEXT, commit_sha TEXT,
