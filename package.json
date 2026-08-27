@@ -22,7 +22,10 @@
   },
   "files": [
     "bin/",
+    "docs/",
     "src/",
+    "test/",
+    "tsconfig.json",
     "README.md",
     "LICENSE",
     "ACKNOWLEDGEMENTS.md"
