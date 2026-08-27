@@ -97,14 +97,39 @@ export function validateTodoLifecycle(
 			return s === "pending" || s === "in_progress";
 		});
 		if (activeExisting.length > 0) {
+			const activeNew = newTodos.filter((t) => ACTIVE_TODO_STATUSES.has(String(t.status ?? "")));
+			const reviewObligation = /\b(?:secondary\s+review|re-?review|reviewer|(?:run|perform|request|obtain|complete)\s+(?:an?\s+)?review)\b/i;
+			const remediationAction = /\b(?:address|fix|resolve|remediate)\b/i;
+			const reviewReference = /\b(?:secondary\s+review|re-?review|reviewer|review)\b/i;
+			const remediationSubject = /\b(?:findings?|feedback|comments?|issues?)\b/i;
+			const isReviewObligation = (content: string) => reviewObligation.test(content) && !(remediationAction.test(content) && reviewReference.test(content) && remediationSubject.test(content));
 			const newContentCounts = new Map<string, number>();
 			for (const todo of newTodos) {
 				const content = String(todo.content ?? "").trim();
 				newContentCounts.set(content, (newContentCounts.get(content) ?? 0) + 1);
 			}
+			const retainedReviewCounts = new Map<string, number>();
+			for (const todo of activeNew) {
+				const content = String(todo.content ?? "").trim();
+				retainedReviewCounts.set(content, (retainedReviewCounts.get(content) ?? 0) + 1);
+			}
+			let retainedReviewObligations = 0;
+			for (const todo of activeExisting) {
+				const content = String(todo.content ?? "").trim();
+				const remaining = retainedReviewCounts.get(content) ?? 0;
+				if (remaining > 0 && isReviewObligation(content)) {
+					retainedReviewCounts.set(content, remaining - 1);
+					retainedReviewObligations++;
+				}
+			}
+			let replacementReviewObligations = activeNew.filter((t) => isReviewObligation(String(t.content ?? ""))).length - retainedReviewObligations;
 			const missing = activeExisting.find((todo) => {
 				const content = String(todo.content ?? "").trim();
 				const remaining = newContentCounts.get(content) ?? 0;
+				if (remaining === 0 && isReviewObligation(content) && replacementReviewObligations > 0) {
+					replacementReviewObligations--;
+					return false;
+				}
 				if (remaining === 0) return true;
 				newContentCounts.set(content, remaining - 1);
 				return false;
