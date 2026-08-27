@@ -30,5 +30,6 @@
 - The `tool.definition` hook is used only to keep tool descriptions honest (currently: `todowrite`'s finalization-gate note). Do not use it to inject instructions — that would reintroduce prompt rules.
 
 ## PR And Release Gates
+- Scope PRs by subsystem or cohesive behavioral concern, not by individual `TODO.md` entries. Multiple planning entries that implement one coherent behavior belong in the same PR when that produces the clearer review boundary.
 - Releases are managed by Changesets: add a `.changeset/*.md` entry (run `npm run changeset`) for user-facing changes. `@changesets/action` opens/updates the version PR, and merging it publishes to npm with OIDC Trusted Publishing and creates the GitHub Release.
 - Keep README/policy/troubleshooting docs synchronized when policy behavior changes. The plugin can enforce documentation updates when configured, and CI/review treats policy docs as part of the behavior contract.
