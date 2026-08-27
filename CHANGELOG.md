@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.1
+
+### Patch Changes
+
+- 25fbea6: Include tests, documentation, and TypeScript configuration in the published npm artifact.
+
 ## 1.9.0
 
 ### Minor Changes
