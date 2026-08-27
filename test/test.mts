@@ -5,6 +5,7 @@ import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
 import { getRalphMaxIterations, runWithRuntimeState } from "../src/lib/state.ts";
+import { isGeneratedContinuationMessage } from "../src/policies/continuation.ts";
 import {
 	guardToolCall,
 	guardToolDecision,
@@ -2968,6 +2969,16 @@ for (let i = 0; i < 3; i++) {
 	await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-message-order" } } } as any);
 }
 check("generated message IDs cannot consume racing genuine user input", continuationPrompts.filter((id) => id === "s-resume-message-order").length === 4);
+
+todo("s-resume-generated-id-bound", item("bounded synthetic ids", "pending"));
+for (let i = 0; i < 101; i++) {
+	await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-generated-id-bound" } } } as any);
+	await continuationPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: `genuine-reset-${i}`, role: "user", sessionID: "s-resume-generated-id-bound" } } } } as any);
+}
+const boundedGeneratedIDs = continuationMessageIDs.get("s-resume-generated-id-bound") ?? [];
+const oldestGeneratedIDRetained = runWithRuntimeState(continuationRoot, continuationClient as any, () => isGeneratedContinuationMessage("s-resume-generated-id-bound", boundedGeneratedIDs[0]));
+const newestGeneratedIDRetained = runWithRuntimeState(continuationRoot, continuationClient as any, () => isGeneratedContinuationMessage("s-resume-generated-id-bound", boundedGeneratedIDs[100]));
+check("generated continuation message tracking stays bounded while retaining recent IDs", boundedGeneratedIDs.length === 101 && !oldestGeneratedIDRetained && newestGeneratedIDRetained);
 
 let releaseConcurrentPrompt!: () => void;
 let markConcurrentPromptStarted!: () => void;

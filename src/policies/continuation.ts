@@ -4,6 +4,7 @@ import { projectRootKey } from "../lib/project-config.ts";
 import { effectiveTodosWithOwner, hasActiveTodo } from "./todo.ts";
 
 const MAX_CONSECUTIVE_CONTINUATIONS = 3;
+const MAX_GENERATED_MESSAGE_IDS = 100;
 const TITLE_SETTLE_MS = 250;
 const TITLE_SETTLE_ATTEMPTS = 8;
 const DEFAULT_SESSION_TITLE = /^(?:New session - |Child session - )\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
@@ -76,6 +77,10 @@ export async function continueUnfinishedSession(sessionID: string, settleTitle =
 		state.counts.set(sessionID, count + 1);
 		if (ralph) state.ralphOutcomes.set(sessionID, "running");
 		const generatedIDs = state.generatedMessageIDs.get(sessionID) ?? new Set<string>();
+		if (generatedIDs.size >= MAX_GENERATED_MESSAGE_IDS) {
+			const oldestID = generatedIDs.values().next().value;
+			if (oldestID) generatedIDs.delete(oldestID);
+		}
 		generatedIDs.add(messageID);
 		state.generatedMessageIDs.set(sessionID, generatedIDs);
 		try {
