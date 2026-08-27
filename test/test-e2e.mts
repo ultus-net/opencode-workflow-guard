@@ -41,6 +41,7 @@ const installResult = spawnSync("npm", ["install", "--ignore-scripts", tarballPa
 	encoding: "utf8",
 });
 const packageEntry = join(testDir, "node_modules", "opencode-workflow-guard", "src", "workflow-guard.ts");
+const installedPackageDir = join(testDir, "node_modules", "opencode-workflow-guard");
 const installedPackageJson = JSON.parse(readFileSync(join(testDir, "node_modules", "opencode-workflow-guard", "package.json"), "utf8"));
 check(
 	"npm package keeps direct dependencies on latest",
@@ -57,6 +58,13 @@ check("npm package exposes OpenCode server entrypoint", installedPackageJson.exp
 check("npm package exposes OpenCode TUI entrypoint", installedPackageJson.exports?.["./tui"] === "./src/workflow-guard-ui.ts");
 check("npm package does not expose ambiguous /ui entrypoint", installedPackageJson.exports?.["./ui"] === undefined);
 check("npm package exposes setup CLI", installedPackageJson.bin?.["opencode-workflow-guard"] === "./bin/opencode-workflow-guard.mjs");
+check(
+	"npm package includes documented development and test files",
+	existsSync(join(installedPackageDir, "test", "run-test.mjs")) &&
+		existsSync(join(installedPackageDir, "test", "test-e2e.mts")) &&
+		existsSync(join(installedPackageDir, "tsconfig.json")) &&
+		existsSync(join(installedPackageDir, "docs", "testing.md")),
+);
 
 const setupHome = join(testDir, "setup-home");
 const setupConfigDir = join(setupHome, ".config", "opencode");
