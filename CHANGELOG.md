@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.9.0
+
+### Minor Changes
+
+- dcac5fe: Add structured policy decisions, provenance-bound accountability evidence, machine-readable guard status/why tools, opt-in operation profiles, and disabled-by-default bounded Ralph continuation while preserving existing human-facing guard behavior.
+
 ## 1.8.7
 
 ### Patch Changes
