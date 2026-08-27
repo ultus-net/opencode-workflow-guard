@@ -650,7 +650,8 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 					if (recoveryRun !== undefined) {
 						finalizeRecoveryCheckpoint(effectiveRoot, sessionID, recoveryRun);
 					}
-					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID));
+					const settleTitle = getProjectConfig(effectiveRoot).titleSettleWorkaround === true;
+					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID, settleTitle));
 				}
 			}
 			if (event?.type === "message.updated") {

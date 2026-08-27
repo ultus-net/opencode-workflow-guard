@@ -9,7 +9,7 @@ export interface TodoSdkClient {
 	};
 	session?: {
 		todo?: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
-		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown } }>;
+		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown; title?: unknown } }>;
 		promptAsync?: (opts: {
 			path: { id: string };
 			body: { messageID?: string; parts: Array<{ type: "text"; text: string; synthetic?: boolean }> };
@@ -36,6 +36,7 @@ export interface ProjectConfig {
 	recoveryCheckpoints?: boolean;
 	projectMemory?: boolean;
 	learning?: boolean;
+	titleSettleWorkaround?: boolean;
 	maxSubagentMutations?: number;
 	maxLearningInterventions?: number;
 }
@@ -83,6 +84,7 @@ export interface AuditEntry {
 			durationMs?: number;
 		};
 		allowLive?: boolean;
+		reviewVerdict?: "approved" | "changes_requested" | "rejected";
 	};
 }
 

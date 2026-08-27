@@ -30,7 +30,7 @@ import { detectVerifyCommand, getCurrentGitCommitHash } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
 import { createGitWorktree, cleanupGitWorktree } from "./worktree.ts";
 import { restoreRecoveryCheckpoint } from "./checkpoint.ts";
-import { getRecentAuditEntries } from "./audit.ts";
+import { audit, getRecentAuditEntries } from "./audit.ts";
 import { guardToolCallImpl } from "./guard-dispatcher.ts";
 import { discoverPlanningSources } from "../policies/planning.ts";
 import { secretIn } from "../policies/secrets.ts";
@@ -154,14 +154,16 @@ export function createCustomTools(options: {
 			description: "Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric.",
 			args: { reviewer: tool.schema.string().describe("Identifier/name of the reviewer subagent"), summary: tool.schema.string().describe("Review findings summary across the 5 core review axes"), passed: tool.schema.boolean().describe("True if change is approved, false if changes requested") },
 			execute: async (args, toolContext) => {
+				const auditVerdict = (verdict: "approved" | "changes_requested" | "rejected", reason: string) => audit({ ts: new Date().toISOString(), sessionID: toolContext.sessionID, tool: "record_review.verdict", decision: verdict === "rejected" ? "block" : "allow", phase: "event", reason, evidence: { reviewVerdict: verdict } });
 				const parentSessionID = await fetchParentSessionID(toolContext.sessionID);
-				if (!parentSessionID) return "[workflow-guard] Review rejected: record_review must be called from a secondary/subagent session.";
+				if (!parentSessionID) { auditVerdict("rejected", "missing_parent_session"); return "[workflow-guard] Review rejected: record_review must be called from a secondary/subagent session."; }
 				const axesRefs = ["test integrity", "task completeness", "cleanliness", "security", "platform"];
 				const referenced = axesRefs.filter((axis) => args.summary.toLowerCase().includes(axis));
-				if (referenced.length < 3) return `[workflow-guard] Review rejected: summary must reference the review axes (found ${referenced.length}/5). Call guard_review_rubric to get the rubric, evaluate each axis, and include findings per axis in the summary.`;
-				if (args.passed && /(?:^|\s)(?:\[p[01]\]|p[01]\s*:\s*(?:blocker|defect|vulnerability|error|bug|issue)|p[01]\s+blocker)/i.test(args.summary)) return "[workflow-guard] Review rejected: cannot record approval when P0 or P1 blockers are flagged in findings. Resolve all P0/P1 issues before approving or record review with passed=false.";
+				if (referenced.length < 3) { auditVerdict("rejected", "insufficient_rubric_axes"); return `[workflow-guard] Review rejected: summary must reference the review axes (found ${referenced.length}/5). Call guard_review_rubric to get the rubric, evaluate each axis, and include findings per axis in the summary.`; }
+				if (args.passed && /(?:^|\s)(?:\[p[01]\]|p[01]\s*:\s*(?:blocker|defect|vulnerability|error|bug|issue)|p[01]\s+blocker)/i.test(args.summary)) { auditVerdict("rejected", "approval_contains_blocker"); return "[workflow-guard] Review rejected: cannot record approval when P0 or P1 blockers are flagged in findings. Resolve all P0/P1 issues before approving or record review with passed=false."; }
 				recordReviewResult(args.reviewer, args.summary, args.passed, parentSessionID, toolContext.worktree || toolContext.directory);
 				if (followupStore && !secretIn(args.summary)) for (const finding of extractReviewFollowups(args.summary)) recordReviewFollowup(followupStore, { severity: finding.severity, summary: finding.summary, reviewer: args.reviewer, sessionID: toolContext.sessionID, commit: getCurrentGitCommitHash(effectiveRoot) });
+				auditVerdict(args.passed ? "approved" : "changes_requested", args.passed ? "approved" : "changes_requested");
 				return args.passed ? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.` : `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
 			},
 		}),

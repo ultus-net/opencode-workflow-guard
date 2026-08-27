@@ -167,6 +167,21 @@ check("todowrite allows flexible out-of-order completion", !(await call("todowri
 todo("s-lifecycle", item("task 1", "completed"), item("task 2", "in_progress"), item("task 3", "pending"));
 check("todowrite allows updating active tasks to completed/cancelled", !(await call("todowrite", { todos: [item("task 1", "completed"), item("task 2", "completed"), item("task 3", "cancelled")] }, { sessionID: "s-lifecycle" })));
 check("todowrite blocks silently dropping task 2 without completion", blocked(await call("todowrite", { todos: [item("task 1", "completed"), item("task 3", "pending")] }, { sessionID: "s-lifecycle" })));
+todo("s-review-remediation", item("Run full verification and secondary review", "in_progress"));
+check("todowrite allows review remediation to replace an active review task when review remains active", !(await call("todowrite", { todos: [item("Address review findings", "in_progress"), item("Re-run verification and secondary review", "pending")] }, { sessionID: "s-review-remediation" })));
+check("todowrite still blocks dropping an active review obligation during remediation", blocked(await call("todowrite", { todos: [item("Address review findings", "in_progress")] }, { sessionID: "s-review-remediation" })));
+check("todowrite does not treat secondary review findings remediation as a review obligation", blocked(await call("todowrite", { todos: [item("Address secondary review findings", "in_progress")] }, { sessionID: "s-review-remediation" })));
+check("todowrite does not treat reviewer findings remediation as a review obligation", blocked(await call("todowrite", { todos: [item("Address reviewer findings", "in_progress")] }, { sessionID: "s-review-remediation" })));
+check("todowrite does not treat findings from secondary review remediation as a review obligation", blocked(await call("todowrite", { todos: [item("Address findings from secondary review", "in_progress")] }, { sessionID: "s-review-remediation" })));
+check("todowrite does not treat feedback from reviewer remediation as a review obligation", blocked(await call("todowrite", { todos: [item("Resolve feedback from reviewer", "in_progress")] }, { sessionID: "s-review-remediation" })));
+check("todowrite does not treat secondary review findings with a trailing remediation verb as a review obligation", blocked(await call("todowrite", { todos: [item("Secondary review findings to resolve", "in_progress")] }, { sessionID: "s-review-remediation" })));
+check("todowrite does not treat reviewer feedback with a trailing remediation verb as a review obligation", blocked(await call("todowrite", { todos: [item("Reviewer feedback to address", "in_progress")] }, { sessionID: "s-review-remediation" })));
+todo("s-review-remediation-active", item("Address review findings", "in_progress"), item("Run secondary review", "pending"));
+check("todowrite cannot silently drop remediation work while retaining review execution", blocked(await call("todowrite", { todos: [item("Run secondary review", "pending")] }, { sessionID: "s-review-remediation-active" })));
+todo("s-review-multiplicity", item("Run security secondary review", "in_progress"), item("Run architecture secondary review", "pending"));
+check("todowrite cannot collapse multiple review obligations into one replacement", blocked(await call("todowrite", { todos: [item("Run secondary review", "in_progress")] }, { sessionID: "s-review-multiplicity" })));
+check("todowrite allows one replacement per existing review obligation", !(await call("todowrite", { todos: [item("Run security re-review", "in_progress"), item("Run architecture re-review", "pending")] }, { sessionID: "s-review-multiplicity" })));
+check("todowrite allows completing one review while replacing another one-for-one", !(await call("todowrite", { todos: [item("Run security secondary review", "completed"), item("Run architecture re-review", "pending")] }, { sessionID: "s-review-multiplicity" })));
 todo("s-duplicate-lifecycle", item("same task", "pending"), item("same task", "pending"));
 check("todowrite cannot silently drop one of two duplicate active tasks", blocked(await call("todowrite", { todos: [item("same task", "pending")] }, { sessionID: "s-duplicate-lifecycle" })));
 // Fresh list allowed once all previous tasks are finished
@@ -1099,6 +1114,9 @@ check("tui project-options command can disable project memory", readProjectOptio
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
 tuiDialogSelectProps?.onSelect?.({ value: "learning" });
 check("tui project-options command can enable learner mode", readProjectOption(tuiCommandOptionsDir, "learning") === true);
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+tuiDialogSelectProps?.onSelect?.({ value: "titleSettleWorkaround" });
+check("tui project-options command can enable title settle workaround", readProjectOption(tuiCommandOptionsDir, "titleSettleWorkaround") === true);
 rmSync(tuiCommandOptionsDir, { recursive: true, force: true });
 const tuiOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-options-"));
 check("recovery checkpoint project option defaults off", readRecoveryCheckpointsOption(tuiOptionsDir) === false);
@@ -1757,6 +1775,14 @@ const reviewToolResult = await customPlugin.tool?.record_review?.execute(
 	{ sessionID: "s-reviewer-tool", agent: "reviewer", worktree: root, directory: root } as any,
 );
 check("record_review tool execution succeeds", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+
+fakeParents.set("s-reviewer-changes", "s-active");
+const changesReviewResult = await customPlugin.tool?.record_review?.execute(
+	{ reviewer: "subagent-changes", summary: "Test integrity: gap found. Task completeness: needs work. Cleanliness: ok. Security: ok. Platform: ok.", passed: false },
+	{ sessionID: "s-reviewer-changes", agent: "reviewer", worktree: root, directory: root } as any,
+);
+const changesReviewAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "record_review.verdict" && entry.sessionID === "s-reviewer-changes");
+check("record_review audit distinguishes changes-requested verdict without persisting summary", typeof changesReviewResult === "string" && changesReviewResult.includes("CHANGES REQUESTED") && changesReviewAudit?.reason === "changes_requested" && !JSON.stringify(changesReviewAudit).includes("gap found"));
 
 fakeParents.set("s-reviewer-followups", "s-active");
 await customPlugin.tool?.record_review?.execute(
@@ -2607,10 +2633,17 @@ check("plugin instances keep SDK client state isolated", !activeInstanceBlocked 
 const continuationPrompts: string[] = [];
 const continuationMessageIDs = new Map<string, string[]>();
 const continuationParts = new Map<string, Array<{ type: "text"; text: string; synthetic?: boolean }>>();
+const continuationTitles = new Map<string, string>([["s-resume", "New session - 2026-08-27T12:00:00.000Z"]]);
+const continuationTitleReads = new Map<string, number>();
 const continuationClient = {
 	session: {
 		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
-		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: fakeParents.get(path.id) } }),
+		get: async ({ path }: { path: { id: string } }) => {
+			const reads = (continuationTitleReads.get(path.id) ?? 0) + 1;
+			continuationTitleReads.set(path.id, reads);
+			if (path.id === "s-resume" && reads === 2) continuationTitles.set(path.id, "Native generated title");
+			return { data: { parentID: fakeParents.get(path.id), title: continuationTitles.get(path.id) } };
+		},
 		promptAsync: async ({ path, body }: { path: { id: string }; body: { messageID: string; parts: Array<{ type: "text"; text: string; synthetic?: boolean }> } }) => {
 			continuationPrompts.push(path.id);
 			continuationMessageIDs.set(path.id, [...(continuationMessageIDs.get(path.id) ?? []), body.messageID]);
@@ -2618,11 +2651,30 @@ const continuationClient = {
 		},
 	},
 };
-const continuationPlugin = await WorkflowGuard({ directory: root, worktree: root, client: continuationClient as any } as any);
+const continuationRoot = mkdtempSync(join(tmpdir(), "wg-title-settle-"));
+mkdirSync(join(continuationRoot, ".opencode"));
+writeFileSync(join(continuationRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ titleSettleWorkaround: true }));
+const continuationPlugin = await WorkflowGuard({ directory: continuationRoot, worktree: continuationRoot, client: continuationClient as any } as any);
 todo("s-resume", item("finish work", "pending"));
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume" } } } as any);
 check("session idle auto-continues unfinished owned todos", continuationPrompts.join(",") === "s-resume");
-check("automatic continuation is synthetic so it does not suppress session title generation", continuationParts.get("s-resume")?.every((part) => part.synthetic === true) === true);
+check("automatic continuation remains synthetic", continuationParts.get("s-resume")?.every((part) => part.synthetic === true) === true);
+check("title settle workaround waits for OpenCode's native generated title before continuing", continuationTitleReads.get("s-resume") === 2 && continuationTitles.get("s-resume") === "Native generated title");
+
+let defaultOffTitleReads = 0;
+let defaultOffPrompts = 0;
+const defaultOffRoot = mkdtempSync(join(tmpdir(), "wg-title-settle-off-"));
+const defaultOffPlugin = await WorkflowGuard({ directory: defaultOffRoot, worktree: defaultOffRoot, client: {
+	session: {
+		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+		get: async () => { defaultOffTitleReads++; return { data: { title: "New session - 2026-08-27T12:00:00.000Z" } }; },
+		promptAsync: async () => { defaultOffPrompts++; },
+	},
+} as any } as any);
+todo("s-resume-default-off", item("finish without title wait", "pending"));
+await defaultOffPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-default-off" } } } as any);
+check("title settle workaround defaults off without suppressing continuation", defaultOffTitleReads === 0 && defaultOffPrompts === 1);
+rmSync(defaultOffRoot, { recursive: true, force: true });
 
 todo("s-resume-done", item("finished", "completed"));
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-done" } } } as any);
@@ -2681,10 +2733,11 @@ let markConcurrentPromptStarted!: () => void;
 const concurrentPromptStarted = new Promise<void>((resolve) => { markConcurrentPromptStarted = resolve; });
 const concurrentPromptRelease = new Promise<void>((resolve) => { releaseConcurrentPrompt = resolve; });
 let concurrentPromptCount = 0;
+let concurrentTitleReads = 0;
 const concurrentClient = {
 	session: {
 		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
-		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: fakeParents.get(path.id) } }),
+		get: async ({ path }: { path: { id: string } }) => { concurrentTitleReads++; return { data: { parentID: fakeParents.get(path.id) } }; },
 		promptAsync: async () => {
 			concurrentPromptCount++;
 			markConcurrentPromptStarted();
@@ -2692,15 +2745,16 @@ const concurrentClient = {
 		},
 	},
 };
-const concurrentPlugin = await WorkflowGuard({ directory: root, worktree: root, client: concurrentClient as any } as any);
+const concurrentPlugin = await WorkflowGuard({ directory: continuationRoot, worktree: continuationRoot, client: concurrentClient as any } as any);
 todo("s-resume-concurrent", item("finish concurrent work", "pending"));
 const firstIdle = concurrentPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-concurrent" } } } as any);
 await concurrentPromptStarted;
 const secondIdle = concurrentPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-concurrent" } } } as any);
 await new Promise((resolve) => setTimeout(resolve, 0));
-check("concurrent session idle events emit only one continuation prompt", concurrentPromptCount === 1);
+check("title settle workaround keeps concurrent session idle events to one continuation prompt", concurrentPromptCount === 1 && concurrentTitleReads === 1);
 releaseConcurrentPrompt();
 await Promise.all([firstIdle, secondIdle]);
+rmSync(continuationRoot, { recursive: true, force: true });
 
 const planningRoot = mkdtempSync(join(tmpdir(), "wg-planning-"));
 writeFileSync(join(planningRoot, "TODO.md"), "# Todo\n- primary\n");

@@ -35,7 +35,9 @@ const BLOCKED_BADGE_DURATION_MS = 5_000;
 let lastBlockedReason: string | undefined;
 const sessionBlockedReasons = new Map<string, string>();
 
-export function readProjectOption(root: string, option: "recoveryCheckpoints" | "projectMemory" | "learning"): boolean {
+type ProjectToggle = "recoveryCheckpoints" | "projectMemory" | "learning" | "titleSettleWorkaround";
+
+export function readProjectOption(root: string, option: ProjectToggle): boolean {
 	const path = projectConfigPath(root);
 	if (!existsSync(path)) return option === "projectMemory";
 	const errors: ParseError[] = [];
@@ -44,7 +46,7 @@ export function readProjectOption(root: string, option: "recoveryCheckpoints" | 
 	return option === "projectMemory" ? config?.projectMemory !== false : config?.[option] === true;
 }
 
-function writeProjectOption(root: string, option: "recoveryCheckpoints" | "projectMemory" | "learning", enabled: boolean): string {
+function writeProjectOption(root: string, option: ProjectToggle, enabled: boolean): string {
 	const path = projectConfigPath(root);
 	const raw = existsSync(path) ? readFileSync(path, "utf8") : "{}\n";
 	const errors: ParseError[] = [];
@@ -107,6 +109,7 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 				const recovery = readProjectOption(root, "recoveryCheckpoints");
 				const memory = readProjectOption(root, "projectMemory");
 				const learning = readProjectOption(root, "learning");
+				const titleSettle = readProjectOption(root, "titleSettleWorkaround");
 				api.ui.dialog.replace(() => api.ui.DialogSelect({
 					title: "Workflow Guard Project Options",
 					current: undefined,
@@ -114,9 +117,10 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 						{ title: `Recovery checkpoints: ${recovery ? "On" : "Off"}`, value: "recoveryCheckpoints", description: "Toggle durable pre-run Git checkpoints" },
 						{ title: `Project memory: ${memory ? "On" : "Off"}`, value: "projectMemory", description: "Toggle durable local project memory" },
 						{ title: `Learner mode: ${learning ? "On" : "Off"}`, value: "learning", description: "Toggle evidence-based learning tools" },
+						{ title: `Title settle workaround: ${titleSettle ? "On" : "Off"}`, value: "titleSettleWorkaround", description: "Delay automatic continuation while OpenCode generates a session title" },
 					],
 					onSelect: (option) => {
-						const key = option.value as "recoveryCheckpoints" | "projectMemory" | "learning";
+						const key = option.value as ProjectToggle;
 						const enabled = !readProjectOption(root, key);
 						const path = writeProjectOption(root, key, enabled);
 						api.ui.dialog.clear();
