@@ -89,7 +89,7 @@ import { audit } from "../src/lib/audit.ts";
 import { isProjectMemoryFreshAsync } from "../src/lib/project-memory.ts";
 import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
-import { WorkflowGuardTui, setLastBlockedReasonForTesting, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
+import { WorkflowGuardTui, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 
 let pass = 0;
 let fail = 0;
@@ -1770,11 +1770,27 @@ const whyResultAllowed = await customPlugin.tool?.guard_why?.execute({ tool: "ba
 check("guard_why confirms allowed command", typeof whyResultAllowed === "string" && whyResultAllowed.startsWith("ALLOWED:"));
 
 fakeParents.set("s-reviewer-tool", "s-active");
+const unrelatedClient = {
+	session: {
+		todo: fakeClient.session.todo,
+		get: async () => ({ data: { id: "unrelated" } }),
+	},
+};
+await (defaultExport?.server ?? WorkflowGuard)({
+	directory: root,
+	worktree: root,
+	client: unrelatedClient as any,
+	project: {} as any,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
 const reviewToolResult = await customPlugin.tool?.record_review?.execute(
 	{ reviewer: "subagent-1", summary: "Test integrity: real assertions. Task completeness: done. Cleanliness: no stubs. Security: clean. Platform fit: ok.", passed: true },
 	{ sessionID: "s-reviewer-tool", agent: "reviewer", worktree: root, directory: root } as any,
 );
-check("record_review tool execution succeeds", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+check("record_review resolves subagent lineage through its own plugin client", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+setSdkClient(fakeClient);
 
 fakeParents.set("s-reviewer-changes", "s-active");
 const changesReviewResult = await customPlugin.tool?.record_review?.execute(
@@ -2784,60 +2800,19 @@ rmSync(externalPlanningRoot, { recursive: true, force: true });
 
 check("plugin registers guard_next_tasks tool", "guard_next_tasks" in ((continuationPlugin as any).tool ?? {}));
 
-// TUI badge: session-scoped, guard-originated toast sourcing.
+// TUI badge remains stable; block details are communicated by toasts.
 console.log("- TUI Companion Status Badge -");
-let toastHandler: ((event: any) => void) | undefined;
-const realSetTimeout = globalThis.setTimeout;
-const realClearTimeout = globalThis.clearTimeout;
-let nextBadgeTimer = 1;
-const badgeTimers = new Map<number, () => void>();
-globalThis.setTimeout = ((callback: (...args: any[]) => void) => {
-	const id = nextBadgeTimer++;
-	badgeTimers.set(id, callback);
-	return id;
-}) as typeof setTimeout;
-globalThis.clearTimeout = ((id: ReturnType<typeof setTimeout>) => {
-	badgeTimers.delete(id as unknown as number);
-}) as typeof clearTimeout;
 const fakeTuiBadgeApi = {
 	theme: { current: { success: "green", warning: "yellow", error: "red" } },
 	route: { current: { name: "session", params: { sessionID: "s-badge" } } },
 	keymap: { registerLayer() {} },
-	event: {
-		on(type: string, handler: (event: any) => void) {
-			if (type === "tui.toast.show") toastHandler = handler;
-			return () => {};
-		},
-	},
+	event: { on() { return () => {}; } },
 	slots: { register() {} },
 };
 await WorkflowGuardTui(fakeTuiBadgeApi as any, undefined, {} as any);
 
-setLastBlockedReasonForTesting(undefined);
 const activeBadge = formatBadge();
-check("TUI badge renders shield label when no block", activeBadge.text === "Workflow Guard 🛡️" && !activeBadge.isBlocked);
-
-setLastBlockedReasonForTesting("[workflow-guard] Blocked todowrite: active task remains");
-const blockedBadge = formatBadge();
-check("TUI badge renders Blocked status when block occurs", blockedBadge.text.includes("Workflow Guard: Blocked:") && blockedBadge.isBlocked);
-check("TUI badge does not duplicate Blocked text", blockedBadge.text.startsWith("[Workflow Guard: Blocked: todowrite:") && !blockedBadge.text.includes("Blocked: Blocked"));
-setLastBlockedReasonForTesting(undefined);
-
-toastHandler?.({ properties: { title: "Other Plugin", message: "Blocked: unrelated" } });
-check("TUI ignores unrelated blocked toasts", !formatBadge("s-badge").isBlocked);
-toastHandler?.({ properties: { title: "Workflow Guard Blocked", message: "Blocked: protected branch" } });
-check("TUI associates guard toast with current session", formatBadge("s-badge").isBlocked);
-check("TUI does not leak session block to another session", !formatBadge("s-other").isBlocked);
-check("TUI does not leak session block to home badge", !formatBadge().isBlocked);
-const firstBadgeTimer = [...badgeTimers.keys()][0];
-toastHandler?.({ properties: { title: "Workflow Guard Blocked", message: "Blocked: protected branch" } });
-const refreshedBadgeTimer = [...badgeTimers.keys()][0];
-check("TUI repeated block refreshes badge timeout", badgeTimers.size === 1 && refreshedBadgeTimer !== firstBadgeTimer && formatBadge("s-badge").isBlocked);
-badgeTimers.get(refreshedBadgeTimer!)?.();
-check("TUI blocked badge returns to shield after timeout", !formatBadge("s-badge").isBlocked);
-globalThis.setTimeout = realSetTimeout;
-globalThis.clearTimeout = realClearTimeout;
-setLastBlockedReasonForTesting(undefined);
+check("TUI badge always renders the stable shield label", activeBadge.text === "Workflow Guard 🛡️" && !activeBadge.isBlocked);
 
 // ── Policy 24: Completion claims vs evidence (observability) ──
 console.log("- Policy 24: Completion Claims vs Evidence -");

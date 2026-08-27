@@ -51,6 +51,6 @@ npm run test:all
 | **Adversarial Invariants** | Verifies defense against compound shell mutations, symlink escapes, chained git normalization, verify script abuse, and external repo mutations. |
 | **Audit & Permission Events** | Verifies the typed `permission.ask` hook, permission replies, and command journaling in the audit trail. |
 | **Completion Claims & Tool Honesty** | Verifies the claims-vs-evidence detector (missing/failing/stale/fresh states), `experimental.text.complete` journaling, and `tool.definition` enrichment idempotence. |
-| **Compaction & TUI Feedback** | Verifies active task injection in `experimental.session.compacting`, session-scoped dynamic last-block badge state, guard-only toast sourcing, and clean error propagation. |
+| **Compaction & TUI Feedback** | Verifies active task injection in `experimental.session.compacting`, the static TUI badge, guard block warning toasts, and clean error propagation. |
 | **Runtime Instance Isolation** | Verifies concurrent plugin instances keep workspace root and SDK client state isolated via `runWithRuntimeState`. |
 | **Modular Exports & Shape** | Verifies V1 `PluginModule` `{ id, server }` structure, modular policy imports, and `output.args` hook contract. |

@@ -23,7 +23,7 @@ opencode plugin "opencode-workflow-guard@$VERSION" --global --force
 
 *Requires OpenCode >= 1.18.* OpenCode detects the package's server and TUI targets and updates both global configs. Use the same command after a release to upgrade; the explicit version gives OpenCode a fresh package-cache key. Restart OpenCode after installation. See [docs/installation.md](docs/installation.md) for details and links to the OpenCode plugin documentation.
 
-For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json`. OpenCode resolves the package's exported `./tui` entrypoint automatically for TUI plugins. The companion shows a `Workflow Guard` shield in the prompt bar and reflects blocked state without changing agent behavior. Do not place the TUI module under the server `plugins/` directory.
+For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json`. OpenCode resolves the package's exported `./tui` entrypoint automatically for TUI plugins. The companion keeps a static `Workflow Guard` shield in the prompt bar; warning toasts provide block details without changing agent behavior. Do not place the TUI module under the server `plugins/` directory.
 
 ![Workflow Guard status badge in the OpenCode TUI](docs/assets/workflow-guard-tui-badge.png)
 
