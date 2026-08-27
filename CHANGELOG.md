@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8.7
+
+### Patch Changes
+
+- 94072ed: Keep the Workflow Guard TUI badge static when actions are blocked, relying on the existing toast for block details.
+
 ## 1.8.6
 
 ### Patch Changes
