@@ -1,5 +1,8 @@
-import { sessionVerifyResults, lastVerify, sessionMutationTimestamps, lastMutationTimestamp } from "../lib/state.ts";
+import { isEvidenceFresh, verificationEvidence } from "../lib/evidence.ts";
+import { projectRootKey } from "../lib/project-config.ts";
+import { getWorkspaceRoot, sessionVerifyResults, lastVerify, sessionMutationTimestamps, lastMutationTimestamp } from "../lib/state.ts";
 import type { VerifyResult } from "../lib/types.ts";
+import { getCurrentGitCommitHash, getGitWorktreeFingerprint } from "../lib/verify.ts";
 
 /**
  * Claims-vs-evidence check (Policy 24): when the assistant's final text
@@ -60,7 +63,12 @@ export function checkCompletionClaims(
 	} else if (!verifyResult.passed) {
 		evidenceState = "failing";
 	} else if (
-		verifyResult.timestamp < mutationTimestamp ||
+		!isEvidenceFresh(verificationEvidence(verifyResult, context?.sessionID), {
+			workspace: projectRootKey(getWorkspaceRoot()),
+			commitHash: getCurrentGitCommitHash(getWorkspaceRoot()),
+			worktreeFingerprint: getGitWorktreeFingerprint(getWorkspaceRoot()),
+			sessionID: context?.sessionID,
+		}, mutationTimestamp) ||
 		Date.now() - verifyResult.timestamp > VERIFICATION_FRESH_WINDOW_MS
 	) {
 		evidenceState = "stale-pass";

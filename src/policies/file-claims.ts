@@ -33,15 +33,22 @@ export function canonicalPath(path: string, seen = new Set<string>()): string {
 
 export function claimFiles(paths: string[], sessionID: string, callID: string): string | undefined {
 	const canonical = [...new Set(paths.map((path) => canonicalPath(path)))];
+	const conflict = fileClaimConflictReason(canonical, sessionID);
+	if (conflict) return conflict;
+	for (const path of canonical) {
+		if (!claims.has(path)) {
+			claims.set(path, { sessionID, callID });
+		}
+	}
+	return undefined;
+}
+
+export function fileClaimConflictReason(paths: string[], sessionID: string): string | undefined {
+	const canonical = [...new Set(paths.map((path) => canonicalPath(path)))];
 	for (const path of canonical) {
 		const existing = claims.get(path);
 		if (existing && existing.sessionID !== sessionID) {
 			return `Blocked: file '${path}' is claimed by another active session ('${existing.sessionID}'). Wait for that edit to finish or use an isolated worktree.`;
-		}
-	}
-	for (const path of canonical) {
-		if (!claims.has(path)) {
-			claims.set(path, { sessionID, callID });
 		}
 	}
 	return undefined;

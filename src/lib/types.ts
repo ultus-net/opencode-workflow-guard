@@ -24,6 +24,7 @@ export interface TodoSdkClient {
 }
 
 export interface ProjectConfig {
+	profile?: "interactive" | "autonomous";
 	protectedBranches?: string[];
 	verifyCommand?: string;
 	postEditValidators?: Array<{
@@ -37,8 +38,20 @@ export interface ProjectConfig {
 	projectMemory?: boolean;
 	learning?: boolean;
 	titleSettleWorkaround?: boolean;
+	ralphMode?: boolean;
+	ralphMaxIterations?: number;
 	maxSubagentMutations?: number;
 	maxLearningInterventions?: number;
+}
+
+export type PolicyDecisionStatus = "allowed" | "blocked" | "needs_approval" | "verification_failed";
+
+export interface PolicyDecision {
+	status: PolicyDecisionStatus;
+	code: string;
+	policy?: string;
+	message: string;
+	details?: Record<string, unknown>;
 }
 
 export interface VerifyResult {
@@ -50,6 +63,7 @@ export interface VerifyResult {
 	commitHash?: string;
 	gitStatus?: string;
 	workspaceRoot?: string;
+	worktreeFingerprint?: string;
 }
 
 export interface ReviewResult {
@@ -64,12 +78,33 @@ export interface ReviewResult {
 	worktreeFingerprint?: string;
 }
 
+export type EvidenceConfidence = "deterministic_observation" | "attestation" | "derived_state" | "agent_assertion";
+
+export interface EvidenceRecord {
+	id: string;
+	kind: "verification" | "review" | "tool_outcome" | "policy_evaluation" | "lifecycle_state" | "agent_assertion";
+	confidence: EvidenceConfidence;
+	observedAt: number;
+	subject: {
+		workspace?: string;
+		commitHash?: string;
+		worktreeFingerprint?: string;
+		sessionID?: string;
+		callID?: string;
+		actor?: string;
+	};
+	source: Record<string, unknown>;
+}
+
+export type EvidenceSubject = EvidenceRecord["subject"];
+
 export interface AuditEntry {
 	ts: string;
 	sessionID?: string;
 	callID?: string;
 	tool: string;
 	decision: "allow" | "block";
+	policyDecision?: PolicyDecision;
 	phase?: "decision" | "outcome" | "event";
 	durationMs?: number;
 	reason?: string;

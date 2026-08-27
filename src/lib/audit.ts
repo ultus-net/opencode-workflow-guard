@@ -3,7 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Database, type SqliteDatabase } from "./sqlite.ts";
-import type { AuditEntry, VerifyResult } from "./types.ts";
+import type { AuditEntry, PolicyDecision, VerifyResult } from "./types.ts";
 import { asRecord } from "./utils.ts";
 
 const AUDIT_DIR = join(
@@ -207,17 +207,19 @@ export function logDecision(
 	tool: string,
 	input: unknown,
 	context: { sessionID?: string; callID?: string } | undefined,
-	reason: string | undefined,
+	policyDecision: PolicyDecision,
 	evidence?: AuditEntry["evidence"],
 ): void {
+	const blocked = policyDecision.status !== "allowed";
 	audit({
 		ts: new Date().toISOString(),
 		sessionID: context?.sessionID,
 		callID: context?.callID,
 		tool,
-		decision: reason ? "block" : "allow",
+		decision: blocked ? "block" : "allow",
+		policyDecision,
 		phase: "decision",
-		reason,
+		reason: blocked ? policyDecision.message : undefined,
 		input: summarizeInput(input),
 		evidence,
 	});

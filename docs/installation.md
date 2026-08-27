@@ -76,7 +76,17 @@ The TUI badge uses OpenCode's Solid slot API (`@opentui/solid`). It is a runtime
 
 ## Recovery Checkpoints
 
-Durable recovery checkpoints are opt-in per project. Enable them in `.opencode/workflow-guard.json` (JSONC is also supported):
+Workflow Guard supports two optional operation profiles in `.opencode/workflow-guard.json` (JSONC is also supported): `interactive` is the default and preserves the standard behavior, while `autonomous` enables durable recovery checkpoints by default for longer-running agent work. Profiles only supply defaults for optional workflow behavior; they never weaken secret protection, protected-path protection, workspace confinement, protected-branch safeguards, or other deterministic policy checks.
+
+```json
+{
+  "profile": "autonomous"
+}
+```
+
+Explicit feature settings take precedence over the profile. For example, an autonomous project can disable checkpoints with `{ "profile": "autonomous", "recoveryCheckpoints": false }`. Unknown profile values are treated as `interactive`. Project memory, Socratic learning, and Ralph mode remain independently configurable rather than being enabled by a profile.
+
+Durable recovery checkpoints can also be enabled directly per project:
 
 ```json
 {
@@ -88,9 +98,11 @@ For each genuine user run in a root session, Workflow Guard captures the pre-run
 
 When the root session reaches idle, the checkpoint records the resulting workspace fingerprint. The `guard_recovery_restore` tool can then restore a selected run, but only for that same root session and only while the workspace still exactly matches the recorded idle boundary. Any intervening workspace change makes recovery refuse rather than overwrite newer work. Recovery checkpoints require an existing Git commit and deliberately fail open if a snapshot cannot be created.
 
-With the optional TUI companion installed, open the command palette and choose **Workflow Guard: Project Options** (or run `/guard-options`) to toggle recovery checkpoints, project memory, learner mode, or the title-settle workaround for the current project. The command writes the existing Workflow Guard project config location, defaulting to `.opencode/workflow-guard.json`; restart OpenCode after changing a setting so the server plugin can expose the matching tools.
+With the optional TUI companion installed, open the command palette and choose **Workflow Guard: Project Options** (or run `/guard-options`) to toggle recovery checkpoints, project memory, learner mode, Ralph mode, or the title-settle workaround for the current project. The command writes the existing Workflow Guard project config location, defaulting to `.opencode/workflow-guard.json`; restart OpenCode after changing a setting so the server plugin can expose the matching tools.
 
 The title-settle workaround is off by default. When enabled with `titleSettleWorkaround: true`, Workflow Guard briefly waits for OpenCode's asynchronous native title generation before sending an automatic continuation for unfinished root-session work. The wait is bounded, applies only when that session owns unfinished todos, and never changes the title or provider/model parameters itself.
+
+Ralph mode is also off by default, including under the `autonomous` profile. Enable it explicitly with `ralphMode: true`; `ralphMaxIterations` sets its positive integer continuation budget from 1 through 100 (default 10; invalid values use the default). Ralph only continues a root session while that session already owns unfinished native todos. It does not create, prioritize, select, sequence, or delegate work, and every resumed run remains subject to the normal guardrails. Genuine user input stops an active Ralph run instead of resetting its budget. Reaching the budget with unfinished work reports `budget_exhausted`; completion is reported only when owned todos are actually finished. A `blocked` outcome is reserved for a demonstrable guard state and is never inferred merely from repeated idle events. `guard_status` exposes the effective Ralph configuration and current calling-session outcome.
 
 OpenCode's model/provider request timeout is separate from Workflow Guard. In OpenCode 1.18+, configure it under the selected provider's `options.timeout` in project `opencode.json[c]`; the default is 300000 ms (5 minutes), and `false` disables the provider request timeout. Workflow Guard does not impose a whole-session wall-clock limit.
 

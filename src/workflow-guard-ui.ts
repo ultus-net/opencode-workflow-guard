@@ -31,7 +31,7 @@ function text(props: Record<string, unknown>, children: Child[]) {
 
 const BADGE_ACTIVE = "Workflow Guard 🛡️";
 
-type ProjectToggle = "recoveryCheckpoints" | "projectMemory" | "learning" | "titleSettleWorkaround";
+type ProjectToggle = "recoveryCheckpoints" | "projectMemory" | "learning" | "titleSettleWorkaround" | "ralphMode";
 
 export function readProjectOption(root: string, option: ProjectToggle): boolean {
 	const path = projectConfigPath(root);
@@ -88,6 +88,7 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 				const memory = readProjectOption(root, "projectMemory");
 				const learning = readProjectOption(root, "learning");
 				const titleSettle = readProjectOption(root, "titleSettleWorkaround");
+				const ralphMode = readProjectOption(root, "ralphMode");
 				api.ui.dialog.replace(() => api.ui.DialogSelect({
 					title: "Workflow Guard Project Options",
 					current: undefined,
@@ -96,6 +97,7 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 						{ title: `Project memory: ${memory ? "On" : "Off"}`, value: "projectMemory", description: "Toggle durable local project memory" },
 						{ title: `Learner mode: ${learning ? "On" : "Off"}`, value: "learning", description: "Toggle evidence-based learning tools" },
 						{ title: `Title settle workaround: ${titleSettle ? "On" : "Off"}`, value: "titleSettleWorkaround", description: "Delay automatic continuation while OpenCode generates a session title" },
+						{ title: `Ralph mode: ${ralphMode ? "On" : "Off"}`, value: "ralphMode", description: "Opt into bounded autonomous continuation of already-owned todos" },
 					],
 					onSelect: (option) => {
 						const key = option.value as ProjectToggle;

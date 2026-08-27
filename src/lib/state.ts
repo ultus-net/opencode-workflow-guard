@@ -2,7 +2,7 @@ import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { persistVerifyCache, persistVerifyHistory } from "./audit.ts";
-import { getCachedProjectConfig, loadProjectConfig } from "./project-config.ts";
+import { getCachedProjectConfig, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint } from "./verify.ts";
 import type {
 	TodoSdkClient,
@@ -70,6 +70,8 @@ export function runWithRuntimeState<T>(root: string, client: unknown, fn: () => 
 
 export let lastMutationTimestamp = 0;
 export let mutationCount = 0;
+const workspaceMutationTimestamps = new Map<string, number>();
+const workspaceMutationCounts = new Map<string, number>();
 export const sessionMutationTimestamps = new Map<string, number>();
 export const sessionMutationCounts = new Map<string, number>();
 
@@ -82,6 +84,9 @@ export const sessionReviews = new Map<string, ReviewResult>();
 export function recordMutation(sessionID?: string, actorSessionID?: string): void {
 	lastMutationTimestamp = Date.now();
 	mutationCount++;
+	const workspace = projectRootKey(runtimeState.getStore()?.workspaceRoot ?? getWorkspaceRoot());
+	workspaceMutationTimestamps.set(workspace, lastMutationTimestamp);
+	workspaceMutationCounts.set(workspace, (workspaceMutationCounts.get(workspace) ?? 0) + 1);
 	for (const id of new Set([sessionID, actorSessionID].filter((value): value is string => Boolean(value)))) {
 		sessionMutationTimestamps.set(id, lastMutationTimestamp);
 		sessionMutationCounts.set(id, (sessionMutationCounts.get(id) ?? 0) + 1);
@@ -108,8 +113,24 @@ export function getLastMutationTimestamp(): number {
 	return lastMutationTimestamp;
 }
 
+export function getWorkspaceMutationTimestamp(root: string): number {
+	return workspaceMutationTimestamps.get(projectRootKey(root)) ?? 0;
+}
+
+export function getWorkspaceMutationCount(root: string): number {
+	return workspaceMutationCounts.get(projectRootKey(root)) ?? 0;
+}
+
 export function getLastVerifyResult(): typeof lastVerify {
 	return lastVerify;
+}
+
+export function getLastVerifyResultForWorkspace(root: string): typeof lastVerify {
+	const workspace = projectRootKey(root);
+	const candidates = [lastVerify, ...sessionVerifyResults.values()].filter(
+		(result): result is NonNullable<VerifyResult> => result?.workspaceRoot != null && projectRootKey(result.workspaceRoot) === workspace,
+	);
+	return candidates.reduce<NonNullable<VerifyResult> | undefined>((latest, result) => !latest || result.timestamp > latest.timestamp ? result : latest, undefined);
 }
 
 export function recordVerifyResult(
@@ -126,7 +147,8 @@ export function recordVerifyResult(
 		durationMs: result.durationMs,
 		commitHash: getCurrentGitCommitHash(root),
 		gitStatus: getGitStatusSummary(root),
-		workspaceRoot: resolve(root),
+		workspaceRoot: projectRootKey(root),
+		worktreeFingerprint: getGitWorktreeFingerprint(root),
 	};
 	if (sessionID && lastVerify) sessionVerifyResults.set(sessionID, lastVerify);
 	persistVerifyHistory(lastVerify);
@@ -145,6 +167,8 @@ export function resetVerifyState(): void {
 	lastVerify = undefined;
 	sessionMutationTimestamps.clear();
 	sessionMutationCounts.clear();
+	workspaceMutationTimestamps.clear();
+	workspaceMutationCounts.clear();
 	sessionVerifyResults.clear();
 }
 
@@ -155,7 +179,7 @@ export function recordReviewResult(
 	targetSessionID?: string,
 	workspace?: string,
 ): void {
-	const root = resolve(workspace ?? getWorkspaceRoot());
+	const root = projectRootKey(workspace ?? getWorkspaceRoot());
 	lastReview = {
 		reviewer,
 		summary: summary.slice(-4000),
@@ -174,6 +198,14 @@ export function getLastReviewResult(): typeof lastReview {
 	return lastReview;
 }
 
+export function getLastReviewResultForWorkspace(root: string): typeof lastReview {
+	const workspace = projectRootKey(root);
+	const candidates = [lastReview, ...sessionReviews.values()].filter(
+		(result): result is ReviewResult => result?.workspace != null && projectRootKey(result.workspace) === workspace,
+	);
+	return candidates.reduce<ReviewResult | undefined>((latest, result) => !latest || result.timestamp > latest.timestamp ? result : latest, undefined);
+}
+
 export function resetReviewState(): void {
 	lastReview = undefined;
 	sessionReviews.clear();
@@ -181,8 +213,8 @@ export function resetReviewState(): void {
 
 export function getProjectConfig(root: string): ProjectConfig {
 	const active = runtimeState.getStore();
-	if (active?.workspaceRoot === root) return active.projectConfig;
-	return getCachedProjectConfig() ?? loadProjectConfig(root);
+	if (active && projectRootKey(active.workspaceRoot) === projectRootKey(root)) return active.projectConfig;
+	return getCachedProjectConfig(root) ?? loadProjectConfig(root);
 }
 
 export function isReviewRequired(root: string): boolean {
@@ -195,6 +227,25 @@ export function isDocumentationRequired(root: string): boolean {
 	if (process.env.WORKFLOW_GUARD_REQUIRE_DOCS === "1") return true;
 	const cfg = getProjectConfig(root);
 	return cfg.requireDocumentation === true;
+}
+
+export function getOperationProfile(root: string): "interactive" | "autonomous" {
+	return getProjectConfig(root).profile === "autonomous" ? "autonomous" : "interactive";
+}
+
+export function isRecoveryCheckpointsEnabled(root: string): boolean {
+	const cfg = getProjectConfig(root);
+	return cfg.recoveryCheckpoints ?? getOperationProfile(root) === "autonomous";
+}
+
+export function isRalphModeEnabled(root: string): boolean {
+	return getProjectConfig(root).ralphMode === true;
+}
+
+export function getRalphMaxIterations(root: string): number {
+	const configured = getProjectConfig(root).ralphMaxIterations;
+	if (typeof configured === "number" && Number.isInteger(configured) && configured > 0 && configured <= 100) return configured;
+	return 10;
 }
 
 export function getSubagentMutationBudget(root: string): number {
