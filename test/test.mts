@@ -1770,11 +1770,27 @@ const whyResultAllowed = await customPlugin.tool?.guard_why?.execute({ tool: "ba
 check("guard_why confirms allowed command", typeof whyResultAllowed === "string" && whyResultAllowed.startsWith("ALLOWED:"));
 
 fakeParents.set("s-reviewer-tool", "s-active");
+const unrelatedClient = {
+	session: {
+		todo: fakeClient.session.todo,
+		get: async () => ({ data: { id: "unrelated" } }),
+	},
+};
+await (defaultExport?.server ?? WorkflowGuard)({
+	directory: root,
+	worktree: root,
+	client: unrelatedClient as any,
+	project: {} as any,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
 const reviewToolResult = await customPlugin.tool?.record_review?.execute(
 	{ reviewer: "subagent-1", summary: "Test integrity: real assertions. Task completeness: done. Cleanliness: no stubs. Security: clean. Platform fit: ok.", passed: true },
 	{ sessionID: "s-reviewer-tool", agent: "reviewer", worktree: root, directory: root } as any,
 );
-check("record_review tool execution succeeds", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+check("record_review resolves subagent lineage through its own plugin client", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+setSdkClient(fakeClient);
 
 fakeParents.set("s-reviewer-changes", "s-active");
 const changesReviewResult = await customPlugin.tool?.record_review?.execute(

@@ -58,7 +58,7 @@ OpenCode automatically discovers the adapter from the project-level `.opencode/p
 
 ### 3. TUI Visual Indicator (Prompt Box Badge)
 
-To enable the dynamic prompt-bar badge - `Workflow Guard 🛡️` during normal operation, switching to `[Workflow Guard: Blocked: <reason>]` for the current session when a guard policy intercepts an action:
+To enable the static `Workflow Guard 🛡️` prompt-bar badge, with block details reported separately through warning toasts:
 
 The recommended `opencode plugin "opencode-workflow-guard@$VERSION" --global --force` command configures this automatically. For manual installation, use the same explicit package version in `~/.config/opencode/tui.json`:
 ```json

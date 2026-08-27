@@ -115,9 +115,9 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
   - Uncommitted mutation counts.
 - Preserves policy-relevant context across session compactions without assigning, prioritizing, or sequencing tasks for the model.
 
-### 16. TUI Visual Feedback & Dynamic Last-Block Status
+### 16. TUI Visual Feedback & Static Status Badge
 - Emits real-time warning toasts to the user interface via `tui.showToast` whenever a guard policy blocks a tool call.
-- The companion TUI plugin (`workflow-guard-ui.ts`) dynamically reflects the latest guard state in the prompt bar, displaying `Workflow Guard 🛡️` during normal operation and `[Workflow Guard: Blocked: <reason>]` when an action is intercepted. Blocked state is scoped to the session that triggered it and sourced only from guard-originated toasts.
+- The companion TUI plugin (`workflow-guard-ui.ts`) keeps `Workflow Guard 🛡️` static in the prompt bar. Block details remain in the warning toast rather than changing badge content or color.
 
 ### 17. Secret-File READ Block & Safe Schema Masking
 - Blocks reading sensitive credential files (`.env*`, `*.pem`, `*.key`, `id_rsa*`, `id_ed25519*`, `*kubeconfig*`, `*credentials*.json`, `service-account*.json`) through the `read` tool, shell commands (`cat`, `less`, `more`, `grep`, `awk`, `head`, `tail`, `base64`), or inline interpreter payloads (`python3 -c "open('.env')"`, `bash -c 'cat id_rsa'`).

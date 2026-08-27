@@ -371,7 +371,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 	const toolOutcomes = new ToolOutcomeTracker();
 
 	return {
-		tool: createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions }),
+		tool: createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client: ctx.client }),
 
 		"tool.execute.before": async (input, output) => {
 			const toolWorktree =

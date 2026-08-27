@@ -24,6 +24,7 @@ import {
 	isReviewRequired,
 	recordMutation,
 	recordReviewResult,
+	runWithRuntimeState,
 } from "./state.ts";
 import { loadProjectConfig } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash } from "./verify.ts";
@@ -53,8 +54,9 @@ export function createCustomTools(options: {
 	followupStore: ProjectMemoryStore | undefined;
 	portableMemoryPath: string;
 	learningInterventions: Map<string, number>;
+	client: unknown;
 }) {
-	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions } = options;
+	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client } = options;
 	return {
 		...(getProjectConfig(effectiveRoot).recoveryCheckpoints === true ? {
 			guard_recovery_restore: tool({
@@ -155,7 +157,7 @@ export function createCustomTools(options: {
 			args: { reviewer: tool.schema.string().describe("Identifier/name of the reviewer subagent"), summary: tool.schema.string().describe("Review findings summary across the 5 core review axes"), passed: tool.schema.boolean().describe("True if change is approved, false if changes requested") },
 			execute: async (args, toolContext) => {
 				const auditVerdict = (verdict: "approved" | "changes_requested" | "rejected", reason: string) => audit({ ts: new Date().toISOString(), sessionID: toolContext.sessionID, tool: "record_review.verdict", decision: verdict === "rejected" ? "block" : "allow", phase: "event", reason, evidence: { reviewVerdict: verdict } });
-				const parentSessionID = await fetchParentSessionID(toolContext.sessionID);
+				const parentSessionID = await runWithRuntimeState(effectiveRoot, client, () => fetchParentSessionID(toolContext.sessionID));
 				if (!parentSessionID) { auditVerdict("rejected", "missing_parent_session"); return "[workflow-guard] Review rejected: record_review must be called from a secondary/subagent session."; }
 				const axesRefs = ["test integrity", "task completeness", "cleanliness", "security", "platform"];
 				const referenced = axesRefs.filter((axis) => args.summary.toLowerCase().includes(axis));
