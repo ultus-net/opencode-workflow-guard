@@ -12,24 +12,31 @@ import {
 	searchProjectMemory,
 } from "./project-memory.ts";
 import { loadLearnerProfile, recordLearningEvidence, selectLearningOpportunity, updateLearnerProfile } from "./learning.ts";
+import { isEvidenceFresh, reviewEvidence, verificationEvidence } from "./evidence.ts";
 import {
 	getLearningInterventionBudget,
+	getOperationProfile,
 	getProjectConfig,
-	getLastMutationTimestamp,
-	getLastReviewResult,
-	getLastVerifyResult,
-	getMutationCount,
+	getRalphMaxIterations,
+	getLastReviewResultForWorkspace,
+	getLastVerifyResultForWorkspace,
+	getWorkspaceMutationCount,
+	getWorkspaceMutationTimestamp,
 	getWorkspaceRoot,
 	isDocumentationRequired,
+	isRecoveryCheckpointsEnabled,
+	isRalphModeEnabled,
 	isReviewRequired,
 	recordMutation,
 	recordReviewResult,
 	runWithRuntimeState,
 } from "./state.ts";
-import { loadProjectConfig } from "./project-config.ts";
-import { detectVerifyCommand, getCurrentGitCommitHash } from "./verify.ts";
+import { getRalphOutcome } from "../policies/continuation.ts";
+import { loadProjectConfig, projectRootKey } from "./project-config.ts";
+import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
 import { createGitWorktree, cleanupGitWorktree } from "./worktree.ts";
+import { branchHasDocumentationChange } from "../policies/docs.ts";
 import { restoreRecoveryCheckpoint } from "./checkpoint.ts";
 import { audit, getRecentAuditEntries } from "./audit.ts";
 import { guardToolCallImpl } from "./guard-dispatcher.ts";
@@ -58,7 +65,7 @@ export function createCustomTools(options: {
 }) {
 	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client } = options;
 	return {
-		...(getProjectConfig(effectiveRoot).recoveryCheckpoints === true ? {
+		...(isRecoveryCheckpointsEnabled(effectiveRoot) ? {
 			guard_recovery_restore: tool({
 				description: "Restore this root session's workspace to its pre-run recovery checkpoint. Refuses if the run has not gone idle or if the workspace changed after that boundary.",
 				args: { run: tool.schema.number() },
@@ -145,13 +152,27 @@ export function createCustomTools(options: {
 		} : {}),
 		guard_status: tool({
 			description: "Inspect active guardrails, current branch protection, and verification/review status.", args: {},
-			execute: async () => {
-				const root = getWorkspaceRoot(); const branch = currentGitBranch(root) ?? "unknown"; const isProtected = onProtectedBranch(root); const lastV = getLastVerifyResult(); const lastR = getLastReviewResult(); const lastMut = getLastMutationTimestamp(); const cfg = loadProjectConfig(root);
-				return JSON.stringify({ workspaceRoot: root, branch, onProtectedBranch: isProtected, lastMutationTimestamp: lastMut, mutationCount: getMutationCount(), lastVerify: lastV ? { command: lastV.command, passed: lastV.passed, fresh: lastV.timestamp >= lastMut, commitHash: lastV.commitHash } : null, lastReview: lastR ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary } : null, projectConfig: { protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: detectVerifyCommand(root) ?? null, requireReview: isReviewRequired(root), requireDocumentation: isDocumentationRequired(root) } }, null, 2);
+			execute: async (_args, toolContext) => {
+				const root = effectiveRoot; const branch = currentGitBranch(root) ?? "unknown"; const isProtected = onProtectedBranch(root); const lastV = getLastVerifyResultForWorkspace(root); const lastR = getLastReviewResultForWorkspace(root); const lastMut = getWorkspaceMutationTimestamp(root); const cfg = loadProjectConfig(root);
+				const subject = { workspace: projectRootKey(root), commitHash: getCurrentGitCommitHash(root), worktreeFingerprint: getGitWorktreeFingerprint(root) };
+				const verifyEvidence = lastV ? verificationEvidence(lastV) : undefined;
+				const reviewEvidenceRecord = lastR ? reviewEvidence(lastR) : undefined;
+				const verifyCommand = detectVerifyCommand(root);
+				const verifyFresh = Boolean(lastV && verifyEvidence && lastV.passed && lastV.command === verifyCommand && isEvidenceFresh(verifyEvidence, subject, lastMut));
+				const reviewRequired = isReviewRequired(root);
+				const reviewFresh = Boolean(lastR && reviewEvidenceRecord && lastR.passed && isEvidenceFresh(reviewEvidenceRecord, { ...subject, sessionID: lastR.targetSessionID }, lastMut));
+				const documentationRequired = isDocumentationRequired(root);
+				const outstandingRequirements = [
+					...(verifyCommand && !verifyFresh ? ["verification"] : []),
+					...(reviewRequired && !reviewFresh ? ["review"] : []),
+					...(documentationRequired && !branchHasDocumentationChange(root) ? ["documentation"] : []),
+				];
+				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
+				return JSON.stringify({ workspaceRoot: root, branch, onProtectedBranch: isProtected, outstandingRequirements, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) } }, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),
-		guard_why: tool({ description: "Simulate and explain whether a specific tool call or command would be blocked by guardrails.", args: { tool: tool.schema.string().describe("Tool name (e.g. bash, edit, write, read, apply_patch)"), input: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Tool input arguments") }, execute: async (args) => { const reason = await guardToolCallImpl(args.tool, args.input ?? {}); return reason ? `BLOCKED: ${reason}` : "ALLOWED: Satisfies all current guardrails."; } }),
+		guard_why: tool({ description: "Simulate and return the structured policy decision for a specific tool call or command.", args: { tool: tool.schema.string().describe("Tool name (e.g. bash, edit, write, read, apply_patch)"), input: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Tool input arguments") }, execute: async (args, toolContext) => JSON.stringify(await runWithRuntimeState(effectiveRoot, client, () => guardToolCallImpl(args.tool, args.input ?? {}, { sessionID: toolContext.sessionID, worktree: toolContext.worktree, directory: toolContext.directory, simulate: true })), null, 2) }),
 		record_review: tool({
 			description: "Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric.",
 			args: { reviewer: tool.schema.string().describe("Identifier/name of the reviewer subagent"), summary: tool.schema.string().describe("Review findings summary across the 5 core review axes"), passed: tool.schema.boolean().describe("True if change is approved, false if changes requested") },

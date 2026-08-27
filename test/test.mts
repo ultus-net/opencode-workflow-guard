@@ -4,8 +4,10 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
+import { getRalphMaxIterations, runWithRuntimeState } from "../src/lib/state.ts";
 import {
 	guardToolCall,
+	guardToolDecision,
 	setWorkspaceRoot,
 	setSdkClient,
 	WorkflowGuard,
@@ -38,6 +40,14 @@ import {
 	buildReviewRubric,
 	recordReviewResult,
 	getLastReviewResult,
+	verificationEvidence,
+	reviewEvidence,
+	toolOutcomeEvidence,
+	policyDecisionEvidence,
+	lifecycleStateEvidence,
+	agentAssertionEvidence,
+	evidenceMatchesSubject,
+	isEvidenceFresh,
 	resetReviewState,
 	isSecretPath,
 	isProtectedPath,
@@ -51,6 +61,8 @@ import {
 	checkLockfileSync,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
+	getOperationProfile,
+	isRecoveryCheckpointsEnabled,
 	getSubagentMutationBudget,
 	isReadOnlyRole,
 	checkInteractiveTtyCommand,
@@ -79,6 +91,7 @@ import {
 	importProjectKnowledge,
 	getProjectMemoryIdentity,
 	discoverPlanningSources,
+	getRalphOutcome,
 	ensureProjectMemoryExcluded,
 	isProjectMemoryFresh,
 	default as defaultExport,
@@ -101,6 +114,13 @@ const root = mkdtempSync(join(tmpdir(), "wg-test-"));
 const prevLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 delete process.env.WORKFLOW_GUARD_ALLOW_LIVE;
 setWorkspaceRoot(root);
+
+const structuredAllow = await guardToolDecision("bash", { command: "ls -la" }, { sessionID: "s-structured-decision" });
+check("structured policy decision represents allows without human-text parsing", structuredAllow.status === "allowed" && structuredAllow.code === "allowed" && structuredAllow.message === "Allowed by current guardrails.");
+const structuredSecretBlock = await guardToolDecision("read", { filePath: ".env" }, { sessionID: "s-structured-decision" });
+check("structured policy decision preserves secret policy identity", structuredSecretBlock.status === "blocked" && structuredSecretBlock.policy === "secrets" && structuredSecretBlock.code === "secret_read");
+const structuredBoundaryBlock = await guardToolDecision("write", { filePath: join(root, "..", "outside.txt"), content: "safe" }, { sessionID: "s-structured-decision" });
+check("structured policy decision preserves workspace boundary identity", structuredBoundaryBlock.status === "blocked" && structuredBoundaryBlock.policy === "boundary" && structuredBoundaryBlock.code === "workspace_escape");
 
 interface TestTodo {
 	content: string;
@@ -666,6 +686,11 @@ try {
 	claimConflict = String(error).includes("claimed by another active session");
 }
 check("concurrent file claims block another session through a symlink alias", claimConflict);
+const whyClaimConflict = JSON.parse(String(await claimsHooks.tool?.guard_why?.execute(
+	{ tool: "edit", input: { filePath: join(claimsDir, "shared-link.ts"), content: "b" } },
+	{ sessionID: "s-claim-b", worktree: claimsDir, directory: claimsDir } as any,
+)));
+check("guard_why reports file claim conflicts without acquiring a claim", whyClaimConflict.code === "file_claim_conflict");
 let unrelatedAllowed = true;
 try {
 	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-other" }, { args: { filePath: join(claimsDir, "other.ts"), content: "b" } });
@@ -745,6 +770,11 @@ try {
 	unreadBlocked = String(error).toLowerCase().includes("re-read");
 }
 check("stale-write protection requires reading an existing file", unreadBlocked);
+const whyUnread = JSON.parse(String(await staleHooks.tool?.guard_why?.execute(
+	{ tool: "write", input: { filePath: join(staleDir, "target.ts"), content: "next" } },
+	{ sessionID: "s-stale-other", worktree: staleDir, directory: staleDir } as any,
+)));
+check("guard_why reports stale-write blocks without recording an edit", whyUnread.code === "stale_write");
 await staleBefore?.({ tool: "read", sessionID: "s-stale", callID: "read-race" }, { args: { filePath: join(staleDir, "target.ts") } });
 writeFileSync(join(staleDir, "target.ts"), "changed during read");
 await staleAfter?.({ tool: "read", sessionID: "s-stale", callID: "read-race", args: { filePath: join(staleDir, "target.ts") } }, { title: "target.ts", output: "observed", metadata: {} });
@@ -975,6 +1005,8 @@ check(
 	"audit trail records shell decisions",
 	auditSizeAfter > auditSizeBefore,
 );
+const structuredAudit = getRecentAuditEntries(2);
+check("audit decisions retain structured policy status and code", structuredAudit.some((entry) => entry.policyDecision?.status === "blocked" && entry.policyDecision.policy === "git" && entry.policyDecision.code === "protected_branch_push") && structuredAudit.some((entry) => entry.policyDecision?.status === "allowed" && entry.policyDecision.code === "allowed"));
 for (let i = 0; i < 5; i++) audit({ ts: new Date().toISOString(), tool: "retention-probe", decision: "allow", reason: "x".repeat(1024 * 1024) });
 check("audit trail compacts after exceeding retention cap", statSync(getAuditFilePath()).size < 4 * 1024 * 1024);
 const concurrentAuditState = mkdtempSync(join(tmpdir(), "workflow-guard-audit-"));
@@ -1117,6 +1149,10 @@ check("tui project-options command can enable learner mode", readProjectOption(t
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
 tuiDialogSelectProps?.onSelect?.({ value: "titleSettleWorkaround" });
 check("tui project-options command can enable title settle workaround", readProjectOption(tuiCommandOptionsDir, "titleSettleWorkaround") === true);
+registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
+check("ralph mode project option defaults off", readProjectOption(tuiCommandOptionsDir, "ralphMode") === false);
+tuiDialogSelectProps?.onSelect?.({ value: "ralphMode" });
+check("tui project-options command can enable ralph mode", readProjectOption(tuiCommandOptionsDir, "ralphMode") === true);
 rmSync(tuiCommandOptionsDir, { recursive: true, force: true });
 const tuiOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-options-"));
 check("recovery checkpoint project option defaults off", readRecoveryCheckpointsOption(tuiOptionsDir) === false);
@@ -1452,6 +1488,27 @@ check("getLastReviewResult initial state is undefined", getLastReviewResult() ==
 recordReviewResult("reviewer-subagent", "All checks passed. Real unit tests verified.", true);
 const reviewRes = getLastReviewResult();
 check("recordReviewResult records passed reviewer and summary", reviewRes?.passed === true && reviewRes?.reviewer === "reviewer-subagent");
+
+const verificationEvidenceResult = verificationEvidence({ passed: true, command: "npm test", output: "ok", timestamp: 123, workspaceRoot: "/tmp/ws", commitHash: "abc", gitStatus: "clean", worktreeFingerprint: "tree-1" }, "s-evidence");
+check("verificationEvidence projects deterministic subject-bound provenance", verificationEvidenceResult.kind === "verification" && verificationEvidenceResult.confidence === "deterministic_observation" && verificationEvidenceResult.observedAt === 123 && verificationEvidenceResult.subject.workspace === "/tmp/ws" && verificationEvidenceResult.subject.commitHash === "abc" && verificationEvidenceResult.subject.worktreeFingerprint === "tree-1" && verificationEvidenceResult.subject.sessionID === "s-evidence" && verificationEvidenceResult.source.command === "npm test" && verificationEvidenceResult.id.length > 0);
+
+const reviewEvidenceResult = reviewEvidence({ passed: true, reviewer: "reviewer-subagent", summary: "approved", timestamp: 456, targetSessionID: "s-evidence", workspace: "/tmp/ws", commitHash: "abc", gitStatus: "clean", worktreeFingerprint: "tree-1" });
+check("reviewEvidence projects attested subject-bound provenance", reviewEvidenceResult.kind === "review" && reviewEvidenceResult.confidence === "attestation" && reviewEvidenceResult.observedAt === 456 && reviewEvidenceResult.subject.workspace === "/tmp/ws" && reviewEvidenceResult.subject.commitHash === "abc" && reviewEvidenceResult.subject.worktreeFingerprint === "tree-1" && reviewEvidenceResult.subject.sessionID === "s-evidence" && reviewEvidenceResult.subject.actor === "reviewer-subagent" && reviewEvidenceResult.source.reviewer === "reviewer-subagent" && reviewEvidenceResult.id.length > 0);
+
+const toolEvidenceResult = toolOutcomeEvidence({ sessionID: "s-evidence", callID: "call-1", tool: "bash", status: "completed", durationMs: 12 }, 789, "/tmp/ws");
+check("toolOutcomeEvidence projects deterministic call provenance", toolEvidenceResult.kind === "tool_outcome" && toolEvidenceResult.confidence === "deterministic_observation" && toolEvidenceResult.observedAt === 789 && toolEvidenceResult.subject.workspace === "/tmp/ws" && toolEvidenceResult.subject.sessionID === "s-evidence" && toolEvidenceResult.subject.callID === "call-1" && toolEvidenceResult.source.tool === "bash" && toolEvidenceResult.source.status === "completed" && toolEvidenceResult.id.length > 0);
+const policyEvidenceResult = policyDecisionEvidence({ status: "blocked", policy: "secrets", code: "secret_read", message: "redacted diagnostic" }, 790, { workspace: "/tmp/ws", sessionID: "s-evidence", callID: "call-2" });
+check("policyDecisionEvidence projects policy identity without duplicating diagnostics", policyEvidenceResult.kind === "policy_evaluation" && policyEvidenceResult.confidence === "deterministic_observation" && policyEvidenceResult.source.policy === "secrets" && policyEvidenceResult.source.code === "secret_read" && !JSON.stringify(policyEvidenceResult.source).includes("redacted diagnostic"));
+const lifecycleEvidenceResult = lifecycleStateEvidence("verification_required", 791, { workspace: "/tmp/ws", sessionID: "s-evidence" }, { requirement: "verification" });
+check("lifecycleStateEvidence projects derived lifecycle state with provenance", lifecycleEvidenceResult.kind === "lifecycle_state" && lifecycleEvidenceResult.confidence === "derived_state" && lifecycleEvidenceResult.source.state === "verification_required" && lifecycleEvidenceResult.source.requirement === "verification" && lifecycleEvidenceResult.subject.sessionID === "s-evidence");
+const assertionEvidenceResult = agentAssertionEvidence("tests pass", 792, { workspace: "/tmp/ws", sessionID: "s-evidence" });
+check("agentAssertionEvidence remains non-authoritative assertion evidence", assertionEvidenceResult.kind === "agent_assertion" && assertionEvidenceResult.confidence === "agent_assertion" && assertionEvidenceResult.source.assertion === "tests pass" && assertionEvidenceResult.subject.sessionID === "s-evidence");
+check("evidence subject matching rejects workspace mismatch", !evidenceMatchesSubject(verificationEvidenceResult, { workspace: "/tmp/other", commitHash: "abc", worktreeFingerprint: "tree-1", sessionID: "s-evidence" }));
+check("evidence subject matching rejects worktree mismatch", !evidenceMatchesSubject(verificationEvidenceResult, { workspace: "/tmp/ws", commitHash: "abc", worktreeFingerprint: "tree-2", sessionID: "s-evidence" }));
+check("evidence subject matching rejects session mismatch", !evidenceMatchesSubject(verificationEvidenceResult, { workspace: "/tmp/ws", commitHash: "abc", worktreeFingerprint: "tree-1", sessionID: "s-other" }));
+check("evidence freshness requires exact subject and post-mutation observation", isEvidenceFresh(verificationEvidenceResult, { workspace: "/tmp/ws", commitHash: "abc", worktreeFingerprint: "tree-1", sessionID: "s-evidence" }, 122) && !isEvidenceFresh(verificationEvidenceResult, { workspace: "/tmp/ws", commitHash: "abc", worktreeFingerprint: "tree-1", sessionID: "s-evidence" }, 124));
+const missingProvenanceEvidence = verificationEvidence({ passed: true, command: "npm test", output: "ok", timestamp: 123, workspaceRoot: "/tmp/ws" }, "s-evidence");
+check("evidence freshness fails closed when Git provenance is unavailable", !isEvidenceFresh(missingProvenanceEvidence, { workspace: "/tmp/ws", sessionID: "s-evidence" }, 0) && !isEvidenceFresh(verificationEvidenceResult, { workspace: "/tmp/ws", sessionID: "s-evidence" }, 0));
 await call("edit", { filePath: join(root, "after-review.ts"), content: "changed" }, { sessionID: "s-active" });
 check("new mutation invalidates prior review approval", getLastReviewResult() === undefined);
 recordReviewResult("reviewer-subagent", "Child review passed all axes.", true, "s-reviewed-child");
@@ -1640,6 +1697,20 @@ const loadedCfg = loadProjectConfig(projectConfigDir);
 check("project config loads protectedBranches", loadedCfg.protectedBranches?.includes("release/prod") ?? false);
 check("project config loads verifyCommand", loadedCfg.verifyCommand === "node -e 'process.exit(0)'");
 check("project config loads requireReview", loadedCfg.requireReview === true);
+const profileConfigDir = mkdtempSync(join(tmpdir(), "wg-profile-cfg-"));
+mkdirSync(join(profileConfigDir, ".opencode"), { recursive: true });
+writeFileSync(join(profileConfigDir, ".opencode", "workflow-guard.json"), JSON.stringify({ profile: "autonomous" }));
+reloadProjectConfig(profileConfigDir);
+check("project config loads autonomous profile", loadProjectConfig(profileConfigDir).profile === "autonomous");
+check("autonomous profile enables recovery checkpoints by default", isRecoveryCheckpointsEnabled(profileConfigDir) === true);
+writeFileSync(join(profileConfigDir, ".opencode", "workflow-guard.json"), JSON.stringify({ profile: "autonomous", recoveryCheckpoints: false }));
+reloadProjectConfig(profileConfigDir);
+check("explicit recovery checkpoint setting overrides profile default", isRecoveryCheckpointsEnabled(profileConfigDir) === false);
+writeFileSync(join(profileConfigDir, ".opencode", "workflow-guard.json"), JSON.stringify({ profile: "unsupported" }));
+reloadProjectConfig(profileConfigDir);
+check("unknown operation profile falls back to interactive", getOperationProfile(profileConfigDir) === "interactive" && isRecoveryCheckpointsEnabled(profileConfigDir) === false);
+rmSync(profileConfigDir, { recursive: true, force: true });
+reloadProjectConfig(projectConfigDir);
 
 // JSONC with comments and trailing commas
 const jsoncDir = mkdtempSync(join(tmpdir(), "wg-cfg-jsonc-"));
@@ -1762,12 +1833,112 @@ check("plugin registers record_review tool", typeof customPlugin.tool?.record_re
 
 const statusResult = await customPlugin.tool?.guard_status?.execute({}, {} as any);
 check("guard_status executes and returns JSON string", typeof statusResult === "string" && statusResult.includes("workspaceRoot"));
+const parsedStatus = JSON.parse(statusResult as string);
+check("guard_status exposes subject-bound evidence references", parsedStatus.lastVerify === null || (typeof parsedStatus.lastVerify.evidenceId === "string" && typeof parsedStatus.lastVerify.fresh === "boolean"));
+check("guard_status exposes effective operation profile without TUI state", parsedStatus.projectConfig.profile === "interactive" && typeof parsedStatus.projectConfig.recoveryCheckpoints === "boolean");
+check("guard_status exposes disabled-by-default Ralph accountability state", parsedStatus.ralph?.enabled === false && parsedStatus.ralph?.maxIterations === 10 && parsedStatus.ralph?.outcome === null);
+check("guard_status exposes bounded outstanding requirements", Array.isArray(parsedStatus.outstandingRequirements) && parsedStatus.outstandingRequirements.every((requirement: unknown) => ["verification", "review", "documentation"].includes(String(requirement))));
+
+const requirementsRoot = mkdtempSync(join(tmpdir(), "wg-status-requirements-"));
+mkdirSync(join(requirementsRoot, ".opencode"), { recursive: true });
+writeFileSync(join(requirementsRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ verifyCommand: "node -e 'process.exit(0)'", requireReview: true, requireDocumentation: true }));
+const requirementsPlugin = await (defaultExport?.server ?? WorkflowGuard)({ directory: requirementsRoot, worktree: requirementsRoot, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+setWorkspaceRoot(root);
+const requirementsStatus = JSON.parse(String(await requirementsPlugin.tool?.guard_status?.execute({}, {} as any)));
+check("guard_status reports configured unsatisfied requirements directly", requirementsStatus.workspaceRoot === requirementsRoot && ["verification", "review", "documentation"].every((requirement) => requirementsStatus.outstandingRequirements.includes(requirement)));
+
+const conflictingConfigRoot = mkdtempSync(join(tmpdir(), "wg-status-conflicting-config-"));
+mkdirSync(join(conflictingConfigRoot, ".opencode"), { recursive: true });
+writeFileSync(join(conflictingConfigRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ profile: "autonomous", requireReview: false, requireDocumentation: false }));
+const conflictingPlugin = await (defaultExport?.server ?? WorkflowGuard)({ directory: conflictingConfigRoot, worktree: conflictingConfigRoot, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const autonomousStatus = JSON.parse(String(await conflictingPlugin.tool?.guard_status?.execute({}, {} as any)));
+check("autonomous profile does not implicitly enable Ralph mode", autonomousStatus.projectConfig.profile === "autonomous" && autonomousStatus.ralph?.enabled === false);
+recordVerifyResult("foreign-root-verification", { passed: true, output: "ok" }, undefined, conflictingConfigRoot);
+runWithRuntimeState(conflictingConfigRoot, fakeClient, () => recordMutation());
+const isolatedRequirementsStatus = JSON.parse(String(await requirementsPlugin.tool?.guard_status?.execute({}, {} as any)));
+check("guard_status keeps effective config isolated across plugin roots", isolatedRequirementsStatus.projectConfig.profile === "interactive" && isolatedRequirementsStatus.projectConfig.requireReview === true && isolatedRequirementsStatus.projectConfig.requireDocumentation === true);
+check("guard_status does not expose foreign-root accountability state", isolatedRequirementsStatus.lastVerify === null && isolatedRequirementsStatus.lastMutationTimestamp === 0 && isolatedRequirementsStatus.mutationCount === 0);
+const conflictingWhy = JSON.parse(String(await conflictingPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, {} as any)));
+const requirementsWhy = JSON.parse(String(await requirementsPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, {} as any)));
+check("guard_why keeps policy evaluation isolated across plugin roots", conflictingWhy.policy === "git" && requirementsWhy.policy === "git" && conflictingWhy.code === "protected_branch_push" && requirementsWhy.code === "protected_branch_push");
+
+const requirementsAlias = `${requirementsRoot}-alias`;
+symlinkSync(requirementsRoot, requirementsAlias, "dir");
+const aliasPlugin = await (defaultExport?.server ?? WorkflowGuard)({ directory: requirementsAlias, worktree: requirementsAlias, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+runWithRuntimeState(requirementsRoot, fakeClient, () => recordMutation());
+const aliasStatus = JSON.parse(String(await aliasPlugin.tool?.guard_status?.execute({}, {} as any)));
+check("guard_status canonicalizes alias roots for config and accountability state", aliasStatus.projectConfig.requireReview === true && aliasStatus.projectConfig.requireDocumentation === true && aliasStatus.lastMutationTimestamp > 0 && aliasStatus.mutationCount === 1);
+rmSync(requirementsAlias, { force: true });
+rmSync(conflictingConfigRoot, { recursive: true, force: true });
+rmSync(requirementsRoot, { recursive: true, force: true });
+reloadProjectConfig(root);
 
 const whyResultBlocked = await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, {} as any);
-check("guard_why explains blocked command", typeof whyResultBlocked === "string" && whyResultBlocked.startsWith("BLOCKED:"));
+const parsedWhyBlocked = JSON.parse(whyResultBlocked as string);
+check("guard_why explains blocked command with authoritative policy identity", parsedWhyBlocked.status === "blocked" && parsedWhyBlocked.policy === "git" && parsedWhyBlocked.code === "protected_branch_push" && typeof parsedWhyBlocked.message === "string");
+let simulatedBlockLogs = 0;
+const diagnosticClient = { ...fakeClient, app: { log: async () => { simulatedBlockLogs++; } } };
+const diagnosticPlugin = await WorkflowGuard({ directory: root, worktree: root, client: diagnosticClient as any } as any);
+simulatedBlockLogs = 0;
+await diagnosticPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, {} as any);
+check("guard_why simulation does not emit durable block logs", simulatedBlockLogs === 0);
 
 const whyResultAllowed = await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "ls -la" } }, {} as any);
-check("guard_why confirms allowed command", typeof whyResultAllowed === "string" && whyResultAllowed.startsWith("ALLOWED:"));
+const parsedWhyAllowed = JSON.parse(whyResultAllowed as string);
+check("guard_why confirms allowed command with structured decision", parsedWhyAllowed.status === "allowed" && parsedWhyAllowed.code === "allowed");
+const mutationCountBeforeWhy = getMutationCount();
+const whyEditResult = JSON.parse(String(await customPlugin.tool?.guard_why?.execute({ tool: "edit", input: { filePath: join(root, "why-simulation.txt"), oldString: "a", newString: "b" } }, {} as any)));
+check("guard_why simulation does not mutate accountability state", whyEditResult.status === "allowed" && getMutationCount() === mutationCountBeforeWhy);
+const whyShellResult = JSON.parse(String(await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "touch why-shell-simulation.txt" } }, {} as any)));
+check("guard_why shell simulation does not mutate accountability state", whyShellResult.status === "allowed" && getMutationCount() === mutationCountBeforeWhy);
+
+const whyVerifyRoot = mkdtempSync(join(tmpdir(), "wg-why-verify-"));
+spawnSync("git", ["init", "-b", "feature/why"], { cwd: whyVerifyRoot });
+writeFileSync(join(whyVerifyRoot, "package.json"), JSON.stringify({ scripts: { typecheck: "node -e 'process.exit(9)'" } }));
+const whyVerifyPlugin = await WorkflowGuard({ directory: whyVerifyRoot, worktree: whyVerifyRoot, client: diagnosticClient as any } as any);
+todo("s-why-verify", item("finish", "in_progress"));
+const verifyHistoryBeforeWhy = getRecentVerifyHistory(100).length;
+const verifyResultBeforeWhy = getLastVerifyResult();
+const auditBeforeWhy = getRecentAuditEntries(50).length;
+simulatedBlockLogs = 0;
+const whyFinalize = JSON.parse(String(await whyVerifyPlugin.tool?.guard_why?.execute({ tool: "todowrite", input: { todos: [item("finish", "completed")] } }, { sessionID: "s-why-verify", worktree: whyVerifyRoot, directory: whyVerifyRoot } as any)));
+check("guard_why finalization simulation does not execute or record verification", whyFinalize.code === "verification_required" && getLastVerifyResult() === verifyResultBeforeWhy && getRecentVerifyHistory(100).length === verifyHistoryBeforeWhy);
+check("guard_why finalization simulation does not write audit or app logs", getRecentAuditEntries(50).length === auditBeforeWhy && simulatedBlockLogs === 0);
+rmSync(whyVerifyRoot, { recursive: true, force: true });
+
+todo("s-why-mutations", item("simulate mutations", "in_progress"));
+const mutationCountBeforeConsequentialWhy = getMutationCount();
+const consequentialContext = { sessionID: "s-why-mutations", worktree: root, directory: root } as any;
+const whyInterpreter = JSON.parse(String(await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "node -e 'require(\"fs\").writeFileSync(\"why-interpreter.txt\", \"x\")'" } }, consequentialContext)));
+const whyGit = JSON.parse(String(await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "git switch -c feature/why-simulated" } }, consequentialContext)));
+const whyPr = JSON.parse(String(await customPlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "gh pr create --title test --body 'Summary\n\nSimulation'" } }, consequentialContext)));
+check("guard_why interpreter and git simulations do not mutate accountability state", whyInterpreter.status === "allowed" && whyGit.status === "allowed" && getMutationCount() === mutationCountBeforeConsequentialWhy && !existsSync(join(root, "why-interpreter.txt")));
+check("guard_why PR preflight simulation does not mutate accountability state", ["allowed", "blocked"].includes(whyPr.status) && getMutationCount() === mutationCountBeforeConsequentialWhy);
+
+const whyRemoteRoot = mkdtempSync(join(tmpdir(), "wg-why-remote-"));
+const whyRemoteBin = join(whyRemoteRoot, "bin");
+mkdirSync(whyRemoteBin);
+spawnSync("git", ["init", "-b", "feature/why-remote"], { cwd: whyRemoteRoot });
+writeFileSync(join(whyRemoteRoot, "tracked.txt"), "tracked\n");
+spawnSync("git", ["add", "tracked.txt"], { cwd: whyRemoteRoot });
+spawnSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"], { cwd: whyRemoteRoot });
+const ghMarker = join(whyRemoteRoot, "gh-called");
+const azMarker = join(whyRemoteRoot, "az-called");
+writeFileSync(join(whyRemoteBin, "gh"), `#!/bin/sh\ntouch '${ghMarker}'\nexit 0\n`);
+writeFileSync(join(whyRemoteBin, "az"), `#!/bin/sh\ntouch '${azMarker}'\nexit 0\n`);
+chmodSync(join(whyRemoteBin, "gh"), 0o755);
+chmodSync(join(whyRemoteBin, "az"), 0o755);
+const oldPath = process.env.PATH;
+process.env.PATH = `${whyRemoteBin}:${oldPath ?? ""}`;
+try {
+	const whyRemotePlugin = await WorkflowGuard({ directory: whyRemoteRoot, worktree: whyRemoteRoot, client: diagnosticClient as any } as any);
+	const whyRemoteResult = JSON.parse(String(await whyRemotePlugin.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin feature/why-remote" } }, { sessionID: "s-why-remote", worktree: whyRemoteRoot, directory: whyRemoteRoot } as any)));
+	check("guard_why merged-branch simulation performs no remote PR lookup", !existsSync(ghMarker) && !existsSync(azMarker));
+	check("guard_why reports intentionally unchecked remote PR state instead of a false allow", whyRemoteResult.status === "needs_approval" && whyRemoteResult.code === "remote_state_unchecked");
+} finally {
+	process.env.PATH = oldPath;
+	rmSync(whyRemoteRoot, { recursive: true, force: true });
+}
 
 fakeParents.set("s-reviewer-tool", "s-active");
 const unrelatedClient = {
@@ -2733,6 +2904,60 @@ await continuationPlugin.event?.({ event: { type: "message.updated", properties:
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-cap" } } } as any);
 check("genuine user message resets continuation budget", continuationPrompts.filter((id) => id === "s-resume-cap").length === 4);
 
+const ralphRoot = mkdtempSync(join(tmpdir(), "wg-ralph-"));
+mkdirSync(join(ralphRoot, ".opencode"));
+writeFileSync(join(ralphRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ ralphMode: true, ralphMaxIterations: 2 }));
+const ralphPrompts: string[] = [];
+const ralphMessageIDs = new Map<string, string[]>();
+const ralphClient = {
+	session: {
+		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+		get: async ({ path }: { path: { id: string } }) => ({ data: { parentID: fakeParents.get(path.id) } }),
+		promptAsync: async ({ path, body }: any) => { ralphPrompts.push(path.id); ralphMessageIDs.set(path.id, [...(ralphMessageIDs.get(path.id) ?? []), body.messageID]); },
+	},
+};
+const ralphPlugin = await WorkflowGuard({ directory: ralphRoot, worktree: ralphRoot, client: ralphClient as any } as any);
+const oversizedRalphRoot = mkdtempSync(join(tmpdir(), "wg-ralph-oversized-"));
+mkdirSync(join(oversizedRalphRoot, ".opencode"));
+writeFileSync(join(oversizedRalphRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ ralphMode: true, ralphMaxIterations: 101 }));
+check("ralph mode rejects iteration budgets above its hard ceiling", getRalphMaxIterations(oversizedRalphRoot) === 10);
+writeFileSync(join(oversizedRalphRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ ralphMode: true, ralphMaxIterations: 0 }));
+reloadProjectConfig(oversizedRalphRoot);
+check("ralph mode rejects non-positive iteration budgets", getRalphMaxIterations(oversizedRalphRoot) === 10);
+rmSync(oversizedRalphRoot, { recursive: true, force: true });
+todo("s-ralph-budget", item("bounded work", "pending"));
+for (let i = 0; i < 3; i++) {
+	await ralphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-budget" } } } as any);
+	const messageID = ralphMessageIDs.get("s-ralph-budget")?.[i];
+	if (messageID) await ralphPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: messageID, role: "user", sessionID: "s-ralph-budget" } } } } as any);
+}
+check("ralph mode obeys its configured iteration budget", ralphPrompts.filter((id) => id === "s-ralph-budget").length === 2);
+check("ralph mode reports budget exhaustion", runWithRuntimeState(ralphRoot, ralphClient as any, () => getRalphOutcome("s-ralph-budget")) === "budget_exhausted");
+todo("s-ralph-stop", item("interruptible work", "pending"));
+await ralphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-stop" } } } as any);
+await ralphPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: "human-stop", role: "user", sessionID: "s-ralph-stop" } } } } as any);
+await ralphPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: "human-stop", role: "user", sessionID: "s-ralph-stop" } } } } as any);
+await ralphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-stop" } } } as any);
+check("duplicate genuine user events leave an active ralph run stopped", ralphPrompts.filter((id) => id === "s-ralph-stop").length === 1 && runWithRuntimeState(ralphRoot, ralphClient as any, () => getRalphOutcome("s-ralph-stop")) === "user_stopped");
+await ralphPlugin.event?.({ event: { type: "message.updated", properties: { info: { id: "human-restart", role: "user", sessionID: "s-ralph-stop" } } } } as any);
+await ralphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-stop" } } } as any);
+check("distinct later user input can establish a fresh ralph run", ralphPrompts.filter((id) => id === "s-ralph-stop").length === 2 && runWithRuntimeState(ralphRoot, ralphClient as any, () => getRalphOutcome("s-ralph-stop")) === "running");
+todo("s-ralph-complete", item("completable work", "pending"));
+await ralphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-complete" } } } as any);
+todo("s-ralph-complete", item("completable work", "completed"));
+await ralphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-complete" } } } as any);
+check("ralph mode reports completion after owned work finishes", runWithRuntimeState(ralphRoot, ralphClient as any, () => getRalphOutcome("s-ralph-complete")) === "completed");
+const isolatedRalphRoot = mkdtempSync(join(tmpdir(), "wg-ralph-isolated-"));
+mkdirSync(join(isolatedRalphRoot, ".opencode"));
+writeFileSync(join(isolatedRalphRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ ralphMode: true, ralphMaxIterations: 1 }));
+const isolatedRalphPlugin = await WorkflowGuard({ directory: isolatedRalphRoot, worktree: isolatedRalphRoot, client: ralphClient as any } as any);
+todo("s-ralph-isolated", item("isolated work", "pending"));
+await ralphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-isolated" } } } as any);
+await isolatedRalphPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-ralph-isolated" } } } as any);
+check("ralph continuation state is isolated by root for a shared client and session", ralphPrompts.filter((id) => id === "s-ralph-isolated").length === 2);
+rmSync(isolatedRalphRoot, { recursive: true, force: true });
+rmSync(ralphRoot, { recursive: true, force: true });
+
 todo("s-resume-message-order", item("ordered work", "pending"));
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-message-order" } } } as any);
 const generatedMessageID = continuationMessageIDs.get("s-resume-message-order")?.[0];
@@ -2832,11 +3057,22 @@ check("claim with no evidence is flagged missing", checkCompletionClaims("All te
 // Fresh passing verification -> no mismatch
 resetVerifyState();
 todo("s-claim-fresh", item("verify task", "in_progress"));
-writeFileSync(join(root, "package.json"), JSON.stringify({ scripts: { test: "node -e 'process.exit(0)'" } }));
-await call("edit", { filePath: join(root, "claim.ts"), content: "x" }, { sessionID: "s-claim-fresh" });
+const freshClaimRoot = mkdtempSync(join(tmpdir(), "wg-claim-fresh-"));
+spawnSync("git", ["init", "-b", "feature/claims"], { cwd: freshClaimRoot });
+setWorkspaceRoot(freshClaimRoot);
+writeFileSync(join(freshClaimRoot, "package.json"), JSON.stringify({ scripts: { test: "node -e 'process.exit(0)'" } }));
+await call("edit", { filePath: join(freshClaimRoot, "claim.ts"), content: "x" }, { sessionID: "s-claim-fresh" });
 await call("todowrite", { todos: [item("verify task", "completed")] }, { sessionID: "s-claim-fresh" });
 const freshCheck = checkCompletionClaims("All tests pass.", { sessionID: "s-claim-fresh" });
 check("fresh passing evidence satisfies the claim", freshCheck.evidenceState === "fresh-pass");
+const freshClaimAlias = `${freshClaimRoot}-alias`;
+symlinkSync(freshClaimRoot, freshClaimAlias, "dir");
+setWorkspaceRoot(freshClaimAlias);
+const aliasFreshCheck = checkCompletionClaims("All tests pass.", { sessionID: "s-claim-fresh" });
+check("completion claims canonicalize alias roots when matching evidence", aliasFreshCheck.evidenceState === "fresh-pass");
+rmSync(freshClaimAlias, { force: true });
+rmSync(freshClaimRoot, { recursive: true, force: true });
+setWorkspaceRoot(root);
 
 // Failing evidence -> flagged
 resetVerifyState();

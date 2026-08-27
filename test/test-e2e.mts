@@ -148,6 +148,7 @@ cpSync(join(import.meta.dirname, "..", "src", "policies"), join(sourceDir, "poli
 const localAdapter = join(pluginsDir, "workflow-guard.ts");
 const importedMarker = join(testDir, ".workflow-guard-imported");
 const initializedMarker = join(testDir, ".workflow-guard-initialized");
+const accountabilityMarker = join(testDir, ".workflow-guard-accountability");
 writeFileSync(localAdapter, `import { writeFileSync } from "node:fs";
 
 writeFileSync(${JSON.stringify(importedMarker)}, "imported\\n");
@@ -155,6 +156,9 @@ writeFileSync(${JSON.stringify(importedMarker)}, "imported\\n");
 export const WorkflowGuardE2E = async (ctx: any) => {
 \tconst { WorkflowGuard } = await import("../workflow-guard-source/workflow-guard.ts");
 \tconst hooks = await WorkflowGuard(ctx);
+\tconst status = await hooks.tool?.guard_status?.execute({}, { sessionID: "headless-e2e", directory: ctx.directory, worktree: ctx.worktree });
+\tconst why = await hooks.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, { sessionID: "headless-e2e", directory: ctx.directory, worktree: ctx.worktree });
+\twriteFileSync(${JSON.stringify(accountabilityMarker)}, JSON.stringify({ status: JSON.parse(String(status)), why: JSON.parse(String(why)) }) + "\\n");
 \twriteFileSync(${JSON.stringify(initializedMarker)}, "initialized\\n");
 \treturn hooks;
 };
@@ -191,6 +195,11 @@ try {
 	);
 } catch {}
 check("OpenCode resolves isolated local plugin config without a model provider", configProbe.status === 0 && configLoadsLocalPlugin);
+let headlessAccountability: any;
+try {
+	headlessAccountability = JSON.parse(readFileSync(accountabilityMarker, "utf8"));
+} catch {}
+check("headless OpenCode runtime exposes structured guard status and why without TUI", headlessAccountability?.status?.workspaceRoot === testDir && headlessAccountability?.why?.policy === "git" && headlessAccountability?.why?.code === "protected_branch_push");
 
 if (process.env.WORKFLOW_GUARD_LIVE_E2E !== "1") {
 	console.log("SKIP: model-driven policy probes require WORKFLOW_GUARD_LIVE_E2E=1.");

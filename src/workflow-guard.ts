@@ -19,7 +19,7 @@ import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
 import { guardToolCallImpl, isReadOnlyRole } from "./lib/guard-dispatcher.ts";
 import { createCustomTools } from "./lib/custom-tools.ts";
-import type { TodoSdkClient } from "./lib/types.ts";
+import type { PolicyDecision, TodoSdkClient } from "./lib/types.ts";
 export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
 export { extractReviewFollowups } from "./lib/custom-tools.ts";
 
@@ -30,6 +30,11 @@ export type {
 	VerifyResult,
 	ReviewResult,
 	AuditEntry,
+	PolicyDecision,
+	PolicyDecisionStatus,
+	EvidenceRecord,
+	EvidenceConfidence,
+	EvidenceSubject,
 	GitInvocation,
 	ShellMutation,
 	LearnerProfile,
@@ -37,6 +42,8 @@ export type {
 	LearningOpportunity,
 } from "./lib/types.ts";
 export type { TodoSdkClient };
+export { verificationEvidence, reviewEvidence, toolOutcomeEvidence, policyDecisionEvidence, lifecycleStateEvidence, agentAssertionEvidence, evidenceMatchesSubject, isEvidenceFresh } from "./lib/evidence.ts";
+export { getRalphOutcome } from "./policies/continuation.ts";
 
 // ── State & runtime context ──────────────────────────────────────────────────
 import {
@@ -57,6 +64,8 @@ import {
 	sessionMutationTimestamps,
 	sessionVerifyResults,
 	getProjectConfig,
+	getOperationProfile,
+	isRecoveryCheckpointsEnabled,
 	isReviewRequired,
 	isDocumentationRequired,
 	getSubagentMutationBudget,
@@ -83,6 +92,8 @@ export {
 	loadProjectConfig,
 	reloadProjectConfig,
 	stripJsonComments,
+	getOperationProfile,
+	isRecoveryCheckpointsEnabled,
 	isReviewRequired,
 	isDocumentationRequired,
 	getSubagentMutationBudget,
@@ -293,20 +304,28 @@ function logObservation(client: unknown, message: string): void {
  * Public guard entry point. Audits every decision (block or allow) to a
  * durable JSONL file before returning.
  */
+export async function guardToolDecision(
+	toolName: string,
+	input: unknown,
+	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
+): Promise<PolicyDecision> {
+	const customRoot = context?.worktree || context?.directory;
+	const runImpl = () => guardToolCallImpl(toolName, input, context);
+	return customRoot
+		? await runWithRuntimeState(customRoot, getSdkClient(), runImpl)
+		: await runImpl();
+}
+
 export async function guardToolCall(
 	toolName: string,
 	input: unknown,
 	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
 ): Promise<string | undefined> {
-	const customRoot = context?.worktree || context?.directory;
-	const runImpl = () => guardToolCallImpl(toolName, input, context);
-	const reason = customRoot
-		? await runWithRuntimeState(customRoot, getSdkClient(), runImpl)
-		: await runImpl();
+	const decision = await guardToolDecision(toolName, input, context);
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 	const isMutation = EDIT_TOOL_NAMES.has(toolName);
 	const targetPath = extractRecordTargetPath(input);
-	logDecision(toolName, input, context, reason, {
+	logDecision(toolName, input, context, decision, {
 		mutation: isMutation,
 		targetPath,
 		allowLive,
@@ -319,7 +338,7 @@ export async function guardToolCall(
 				}
 			: undefined,
 	});
-	return reason;
+	return decision.status === "allowed" ? undefined : decision.message;
 }
 
 async function emitBlockFeedback(message: string): Promise<void> {
@@ -597,7 +616,7 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 		},
 
 		"chat.message": async (input) => {
-			if (getProjectConfig(effectiveRoot).recoveryCheckpoints !== true) return;
+			if (!isRecoveryCheckpointsEnabled(effectiveRoot)) return;
 			if (isGeneratedContinuationMessage(input.sessionID, input.messageID)) return;
 			const parent = await runWithRuntimeState(effectiveRoot, ctx.client, () => fetchParentSession(input.sessionID));
 			if (!parent.ok || parent.parentID) return;

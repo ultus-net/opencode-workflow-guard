@@ -195,6 +195,7 @@ export function branchGuardReason(): string {
 export function isBranchAlreadyMergedOrClosed(
 	root: string,
 	branch: string,
+	checkRemotePrs = true,
 ): { merged: boolean; reason?: string } {
 	if (!branch || PROTECTED_BRANCHES.has(branch)) {
 		return { merged: false };
@@ -220,6 +221,7 @@ export function isBranchAlreadyMergedOrClosed(
 			}
 		}
 	}
+	if (!checkRemotePrs) return { merged: false };
 
 	try {
 		const ghRes = spawnSync(

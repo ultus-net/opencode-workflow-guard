@@ -1,8 +1,16 @@
-import { existsSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { ProjectConfig } from "./types.ts";
 
-let cachedProjectConfig: ProjectConfig | undefined;
+const projectConfigCache = new Map<string, ProjectConfig>();
+
+export function projectRootKey(root: string): string {
+	try {
+		return realpathSync(root);
+	} catch {
+		return resolve(root);
+	}
+}
 
 export function projectConfigCandidates(root: string): string[] {
 	return [
@@ -60,9 +68,9 @@ export function loadProjectConfig(root: string): ProjectConfig {
 }
 
 export function reloadProjectConfig(root: string): void {
-	cachedProjectConfig = loadProjectConfig(root);
+	projectConfigCache.set(projectRootKey(root), loadProjectConfig(root));
 }
 
-export function getCachedProjectConfig(): ProjectConfig | undefined {
-	return cachedProjectConfig;
+export function getCachedProjectConfig(root: string): ProjectConfig | undefined {
+	return projectConfigCache.get(projectRootKey(root));
 }

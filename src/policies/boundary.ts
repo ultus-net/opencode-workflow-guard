@@ -317,6 +317,7 @@ export function detectShellMutation(command: string): ShellMutation | undefined 
 export async function guardShellMutation(
 	command: string,
 	sessionID: string | undefined,
+	record = true,
 ): Promise<string | undefined> {
 	const root = getWorkspaceRoot();
 	let hasMutation = false;
@@ -383,7 +384,7 @@ export async function guardShellMutation(
 			}
 		}
 	}
-	if (hasMutation) {
+	if (hasMutation && record) {
 		recordMutation(await effectiveTodoOwnerSessionID(sessionID), sessionID);
 	}
 	return undefined;
