@@ -61,18 +61,3 @@ jobs:
           create-github-releases: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Changesets v3 CLI creates git tags locally during publish but changesets/action
-      # does not push them when published packages format is not parsed. Ensure tags are pushed
-      # and GitHub Releases are generated for any unreleased tags on publish.
-      - name: Push git tags and create GitHub Releases
-        run: |
-          git push --tags
-          for tag in $(git tag --points-at HEAD); do
-            if ! gh release view "$tag" &>/dev/null; then
-              echo "Creating GitHub Release for $tag"
-              gh release create "$tag" --generate-notes --title "$tag"
-            fi
-          done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
