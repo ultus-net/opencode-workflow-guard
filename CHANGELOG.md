@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.9.2
+
+### Patch Changes
+
+- 7a1a80b: Fix the release workflow configuration for `changesets/action@v2`.
+- e33f204: Fix the TUI project-options menu so selecting an option actually toggles and persists the setting, and enable the title-settle workaround by default while preserving `titleSettleWorkaround: false` as an explicit opt-out.
+
 ## 1.9.1
 
 ### Patch Changes
