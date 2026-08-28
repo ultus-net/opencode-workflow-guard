@@ -35,11 +35,12 @@ type ProjectToggle = "recoveryCheckpoints" | "projectMemory" | "learning" | "tit
 
 export function readProjectOption(root: string, option: ProjectToggle): boolean {
 	const path = projectConfigPath(root);
-	if (!existsSync(path)) return option === "projectMemory";
+	const enabledByDefault = option === "projectMemory" || option === "titleSettleWorkaround";
+	if (!existsSync(path)) return enabledByDefault;
 	const errors: ParseError[] = [];
 	const config = parse(readFileSync(path, "utf8"), errors, { allowTrailingComma: true });
 	if (errors.length > 0) throw new Error(`Invalid Workflow Guard project config: ${path}`);
-	return option === "projectMemory" ? config?.projectMemory !== false : config?.[option] === true;
+	return enabledByDefault ? config?.[option] !== false : config?.[option] === true;
 }
 
 function writeProjectOption(root: string, option: ProjectToggle, enabled: boolean): string {
@@ -89,23 +90,22 @@ export const WorkflowGuardTui: TuiPlugin = async (api) => {
 				const learning = readProjectOption(root, "learning");
 				const titleSettle = readProjectOption(root, "titleSettleWorkaround");
 				const ralphMode = readProjectOption(root, "ralphMode");
+				const toggle = (key: ProjectToggle) => {
+					const enabled = !readProjectOption(root, key);
+					const path = writeProjectOption(root, key, enabled);
+					api.ui.dialog.clear();
+					api.ui.toast({ variant: "success", title: "Workflow Guard", message: `Saved ${key} ${enabled ? "on" : "off"} in ${path}. Restart OpenCode to apply.` });
+				};
 				api.ui.dialog.replace(() => api.ui.DialogSelect({
 					title: "Workflow Guard Project Options",
 					current: undefined,
 					options: [
-						{ title: `Recovery checkpoints: ${recovery ? "On" : "Off"}`, value: "recoveryCheckpoints", description: "Toggle durable pre-run Git checkpoints" },
-						{ title: `Project memory: ${memory ? "On" : "Off"}`, value: "projectMemory", description: "Toggle durable local project memory" },
-						{ title: `Learner mode: ${learning ? "On" : "Off"}`, value: "learning", description: "Toggle evidence-based learning tools" },
-						{ title: `Title settle workaround: ${titleSettle ? "On" : "Off"}`, value: "titleSettleWorkaround", description: "Delay automatic continuation while OpenCode generates a session title" },
-						{ title: `Ralph mode: ${ralphMode ? "On" : "Off"}`, value: "ralphMode", description: "Opt into bounded autonomous continuation of already-owned todos" },
+						{ title: `Recovery checkpoints: ${recovery ? "On" : "Off"}`, value: "recoveryCheckpoints", description: "Toggle durable pre-run Git checkpoints", onSelect: () => toggle("recoveryCheckpoints") },
+						{ title: `Project memory: ${memory ? "On" : "Off"}`, value: "projectMemory", description: "Toggle durable local project memory", onSelect: () => toggle("projectMemory") },
+						{ title: `Learner mode: ${learning ? "On" : "Off"}`, value: "learning", description: "Toggle evidence-based learning tools", onSelect: () => toggle("learning") },
+						{ title: `Title settle workaround: ${titleSettle ? "On" : "Off"}`, value: "titleSettleWorkaround", description: "Delay automatic continuation while OpenCode generates a session title", onSelect: () => toggle("titleSettleWorkaround") },
+						{ title: `Ralph mode: ${ralphMode ? "On" : "Off"}`, value: "ralphMode", description: "Opt into bounded autonomous continuation of already-owned todos", onSelect: () => toggle("ralphMode") },
 					],
-					onSelect: (option) => {
-						const key = option.value as ProjectToggle;
-						const enabled = !readProjectOption(root, key);
-						const path = writeProjectOption(root, key, enabled);
-						api.ui.dialog.clear();
-						api.ui.toast({ variant: "success", title: "Workflow Guard", message: `Saved ${key} ${enabled ? "on" : "off"} in ${path}. Restart OpenCode to apply.` });
-					},
 				}));
 			},
 		}],

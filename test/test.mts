@@ -1139,20 +1139,21 @@ check("tui plugin registers session_prompt_right slot", typeof registeredSlots.s
 check("tui plugin registers home_prompt_right slot", typeof registeredSlots.home_prompt_right === "function");
 check("tui plugin registers project-options command through keymap", registeredTuiCommands.some((command) => command.name === "workflow-guard.project-options"));
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
-tuiDialogSelectProps?.onSelect?.({ value: "recoveryCheckpoints" });
+tuiDialogSelectProps?.options?.find((option: any) => option.value === "recoveryCheckpoints")?.onSelect?.(fakeTuiApi.ui.dialog);
 check("tui project-options command persists selected recovery setting", readRecoveryCheckpointsOption(tuiCommandOptionsDir) === true);
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
-tuiDialogSelectProps?.onSelect?.({ value: "projectMemory" });
+tuiDialogSelectProps?.options?.find((option: any) => option.value === "projectMemory")?.onSelect?.(fakeTuiApi.ui.dialog);
 check("tui project-options command can disable project memory", readProjectOption(tuiCommandOptionsDir, "projectMemory") === false);
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
-tuiDialogSelectProps?.onSelect?.({ value: "learning" });
+tuiDialogSelectProps?.options?.find((option: any) => option.value === "learning")?.onSelect?.(fakeTuiApi.ui.dialog);
 check("tui project-options command can enable learner mode", readProjectOption(tuiCommandOptionsDir, "learning") === true);
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
-tuiDialogSelectProps?.onSelect?.({ value: "titleSettleWorkaround" });
-check("tui project-options command can enable title settle workaround", readProjectOption(tuiCommandOptionsDir, "titleSettleWorkaround") === true);
+check("title settle workaround project option defaults on", readProjectOption(tuiCommandOptionsDir, "titleSettleWorkaround") === true);
+tuiDialogSelectProps?.options?.find((option: any) => option.value === "titleSettleWorkaround")?.onSelect?.(fakeTuiApi.ui.dialog);
+check("tui project-options command can disable title settle workaround", readProjectOption(tuiCommandOptionsDir, "titleSettleWorkaround") === false);
 registeredTuiCommands.find((command) => command.name === "workflow-guard.project-options")?.run?.();
 check("ralph mode project option defaults off", readProjectOption(tuiCommandOptionsDir, "ralphMode") === false);
-tuiDialogSelectProps?.onSelect?.({ value: "ralphMode" });
+tuiDialogSelectProps?.options?.find((option: any) => option.value === "ralphMode")?.onSelect?.(fakeTuiApi.ui.dialog);
 check("tui project-options command can enable ralph mode", readProjectOption(tuiCommandOptionsDir, "ralphMode") === true);
 rmSync(tuiCommandOptionsDir, { recursive: true, force: true });
 const tuiOptionsDir = mkdtempSync(join(tmpdir(), "wg-tui-options-"));
@@ -2841,7 +2842,6 @@ const continuationClient = {
 };
 const continuationRoot = mkdtempSync(join(tmpdir(), "wg-title-settle-"));
 mkdirSync(join(continuationRoot, ".opencode"));
-writeFileSync(join(continuationRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ titleSettleWorkaround: true }));
 const continuationPlugin = await WorkflowGuard({ directory: continuationRoot, worktree: continuationRoot, client: continuationClient as any } as any);
 todo("s-resume", item("finish work", "pending"));
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume" } } } as any);
@@ -2849,20 +2849,22 @@ check("session idle auto-continues unfinished owned todos", continuationPrompts.
 check("automatic continuation remains synthetic", continuationParts.get("s-resume")?.every((part) => part.synthetic === true) === true);
 check("title settle workaround waits for OpenCode's native generated title before continuing", continuationTitleReads.get("s-resume") === 2 && continuationTitles.get("s-resume") === "Native generated title");
 
-let defaultOffTitleReads = 0;
-let defaultOffPrompts = 0;
-const defaultOffRoot = mkdtempSync(join(tmpdir(), "wg-title-settle-off-"));
-const defaultOffPlugin = await WorkflowGuard({ directory: defaultOffRoot, worktree: defaultOffRoot, client: {
+let optOutTitleReads = 0;
+let optOutPrompts = 0;
+const optOutRoot = mkdtempSync(join(tmpdir(), "wg-title-settle-off-"));
+mkdirSync(join(optOutRoot, ".opencode"));
+writeFileSync(join(optOutRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ titleSettleWorkaround: false }));
+const optOutPlugin = await WorkflowGuard({ directory: optOutRoot, worktree: optOutRoot, client: {
 	session: {
 		todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
-		get: async () => { defaultOffTitleReads++; return { data: { title: "New session - 2026-08-27T12:00:00.000Z" } }; },
-		promptAsync: async () => { defaultOffPrompts++; },
+		get: async () => { optOutTitleReads++; return { data: { title: "New session - 2026-08-27T12:00:00.000Z" } }; },
+		promptAsync: async () => { optOutPrompts++; },
 	},
 } as any } as any);
-todo("s-resume-default-off", item("finish without title wait", "pending"));
-await defaultOffPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-default-off" } } } as any);
-check("title settle workaround defaults off without suppressing continuation", defaultOffTitleReads === 0 && defaultOffPrompts === 1);
-rmSync(defaultOffRoot, { recursive: true, force: true });
+todo("s-resume-opt-out", item("finish without title wait", "pending"));
+await optOutPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-opt-out" } } } as any);
+check("title settle workaround explicit false skips title wait without suppressing continuation", optOutTitleReads === 0 && optOutPrompts === 1);
+rmSync(optOutRoot, { recursive: true, force: true });
 
 todo("s-resume-done", item("finished", "completed"));
 await continuationPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: "s-resume-done" } } } as any);
