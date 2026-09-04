@@ -1096,6 +1096,14 @@ if (typeof cmdEvt.event === "function") {
 }
 check("tool.execute.after provides deduplicated fallback outcome telemetry", getRecentAuditEntries(10).filter((entry) => entry.callID === "after-only-outcome" && entry.phase === "outcome").length === 1);
 
+let circuitBreakerMessage = "";
+try {
+	await cmdEvt["tool.execute.before"]?.({ tool: "edit", sessionID: "s-outcome", callID: "call-cb" } as any, { args: { filePath: join(root, "file.txt"), content: "hello" } } as any);
+} catch (err) {
+	circuitBreakerMessage = (err as Error).message;
+}
+check("repeated failures trigger circuit breaker guidance in block error", circuitBreakerMessage.includes("Workflow Guard Circuit Breaker") && circuitBreakerMessage.includes("Repeated failures detected"));
+
 const outcomeTracker = new ToolOutcomeTracker();
 const failedPart = (callID: string, error: string) => ({ type: "tool", sessionID: "s-tracker", callID, tool: "bash", state: { status: "error", error } } as const);
 check("duplicate terminal tool updates are ignored", !!outcomeTracker.record(failedPart("duplicate", "same failure")) && outcomeTracker.record(failedPart("duplicate", "same failure")) === undefined);
@@ -3140,6 +3148,13 @@ check("tool.definition leaves other tools untouched", otherDef.description === "
 const idemDef = { description: todoDef.description, parameters: {} };
 await defPlugin["tool.definition"]?.({ toolID: "todowrite" } as any, idemDef);
 check("tool.definition enrichment is idempotent", idemDef.description === todoDef.description);
+
+const editDef = { description: "Edit a file.", parameters: {} };
+await defPlugin["tool.definition"]?.({ toolID: "edit" } as any, editDef);
+check("tool.definition enriches edit tool with preconditions", editDef.description.includes("Workflow Guard requirement") && editDef.description.includes("todowrite"));
+const editIdemDef = { description: editDef.description, parameters: {} };
+await defPlugin["tool.definition"]?.({ toolID: "edit" } as any, editIdemDef);
+check("tool.definition edit enrichment is idempotent", editIdemDef.description === editDef.description);
 
 // Socratic learning engine: evidence is explicit and interventions favor
 // relevant gaps without repeatedly interrupting demonstrated knowledge.

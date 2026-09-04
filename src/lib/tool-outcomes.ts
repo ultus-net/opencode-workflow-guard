@@ -74,6 +74,10 @@ export class ToolOutcomeTracker {
 		return { sessionID, callID, tool, status: "completed", durationMs };
 	}
 
+	getFailureCount(sessionID: string): number {
+		return this.failures.get(sessionID)?.count ?? 0;
+	}
+
 	clearSession(sessionID: string): void {
 		this.failures.delete(sessionID);
 		this.terminalCalls.delete(sessionID);
