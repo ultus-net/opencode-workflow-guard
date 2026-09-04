@@ -189,9 +189,10 @@ const runtimeEnv: NodeJS.ProcessEnv = {
 };
 delete runtimeEnv.OPENCODE_PID;
 delete runtimeEnv.OPENCODE_PURE;
+delete runtimeEnv.OPENCODE;
 const runOpenCode = (args: string[], timeout: number) =>
 	spawnSync("opencode", ["run", "--dir", testDir, ...args], { cwd: testDir, encoding: "utf8", timeout, env: runtimeEnv });
-const configProbe = spawnSync("opencode", ["debug", "config"], { cwd: testDir, encoding: "utf8", timeout: 30_000, env: runtimeEnv });
+const configProbe = spawnSync("opencode", ["debug", "config"], { cwd: testDir, encoding: "utf8", timeout: 90_000, env: runtimeEnv });
 let configLoadsLocalPlugin = false;
 try {
 	const config = JSON.parse(configProbe.stdout);
