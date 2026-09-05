@@ -74,7 +74,16 @@ jobs:
           node-version: "22"
           cache: npm
       - run: npm ci
-      - run: npm audit --audit-level=high
+      - name: Run npm audit with 503 tolerance
+        run: |
+          npm audit --audit-level=high || {
+            code=$?
+            if npm audit --audit-level=high 2>&1 | grep -qi "503"; then
+              echo "::warning::npm registry audit service unavailable (HTTP 503); skipping advisory check"
+            else
+              exit $code
+            fi
+          }
 
   # ───── PR etiquette ─────
   # Every PR must update CHANGELOG.md or add a .changeset/*.md fragment (Policy 3).

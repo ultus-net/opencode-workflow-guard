@@ -83,6 +83,13 @@ export async function continueUnfinishedSession(sessionID: string, settleTitle =
 		}
 		generatedIDs.add(messageID);
 		state.generatedMessageIDs.set(sessionID, generatedIDs);
+		const activeTasks = (effective.todos ?? [])
+			.filter((t) => t.status === "in_progress" || t.status === "pending")
+			.slice(0, 10);
+		const tasksSummary = activeTasks.length > 0
+			? "\nRemaining active tasks:\n" + activeTasks.map((t) => `- [${t.status === "in_progress" ? "IN_PROGRESS" : "PENDING"}] ${t.content}`).join("\n")
+			: "";
+
 		try {
 			await session.promptAsync({
 				path: { id: sessionID },
@@ -90,7 +97,7 @@ export async function continueUnfinishedSession(sessionID: string, settleTitle =
 					messageID,
 					parts: [{
 						type: "text",
-						text: "Workflow Guard: unfinished todos remain. Continue working through them. If you need user input, use the question tool instead of ending the run.",
+						text: `Workflow Guard: unfinished todos remain. Continue working through them.${tasksSummary}\nIf you need user input, use the question tool instead of ending the run.`,
 						synthetic: true,
 					}],
 				},

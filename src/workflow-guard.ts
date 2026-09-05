@@ -414,7 +414,11 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 				});
 				if (reason !== undefined) {
 					await emitBlockFeedback(reason);
-					throw new Error(`[workflow-guard] ${reason}`);
+					const failureCount = input.sessionID ? toolOutcomes.getFailureCount(input.sessionID) : 0;
+					const circuitBreakerSuffix = failureCount >= 2
+						? "\n\n[Workflow Guard Circuit Breaker: Repeated failures detected in this session. Stop attempting alternative workarounds or shell laundering. Address the required step above directly.]"
+						: "";
+					throw new Error(`[workflow-guard] ${reason}${circuitBreakerSuffix}`);
 				}
 				toolLifecycle.start(input.sessionID, input.callID);
 				if (input.tool === "read") {
@@ -606,13 +610,24 @@ export const WorkflowGuard: Plugin = async (ctx) => {
 
 		// Keep tool descriptions honest: todowrite's description reflects lifecycle
 		// and finalization gates so the model is not surprised by preventable blocks.
+		// Similarly, mutating tools reflect their active-todo, feature-branch, and prior-read requirements.
 		"tool.definition": async (input, output) => {
-			if (input.toolID !== "todowrite") return;
-			const description = typeof output.description === "string" ? output.description : "";
-			if (description.includes("verification evidence")) return;
-			output.description =
-				description +
-				"\n\nWorkflow Guard lifecycle: each todowrite call replaces the complete task list. Preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled; do not omit active tasks when adding new work. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply.";
+			if (input.toolID === "todowrite") {
+				const description = typeof output.description === "string" ? output.description : "";
+				if (description.includes("verification evidence")) return;
+				output.description =
+					description +
+					"\n\nWorkflow Guard lifecycle: each todowrite call replaces the complete task list. Preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled; do not omit active tasks when adding new work. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply.";
+				return;
+			}
+			if (EDIT_TOOL_NAMES.has(input.toolID)) {
+				const description = typeof output.description === "string" ? output.description : "";
+				if (description.includes("Workflow Guard requirement")) return;
+				output.description =
+					description +
+					"\n\nWorkflow Guard requirement: Modifications require an active task in todowrite (status pending or in_progress), a feature branch (edits on main/master are blocked), and a prior read of existing files in the current session.";
+				return;
+			}
 		},
 
 		"chat.message": async (input) => {
