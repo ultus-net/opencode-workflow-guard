@@ -1,5 +1,5 @@
 import { mkdtempSync, rmSync, existsSync, readFileSync, copyFileSync, cpSync, mkdirSync, writeFileSync } from "node:fs";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse as parseJsonc } from "jsonc-parser";
@@ -143,8 +143,29 @@ if (opencodeCheck.status !== 0) {
 }
 console.log(`  Found OpenCode version: ${opencodeCheck.stdout.trim()}`);
 
-const pluginsDir = join(testDir, ".opencode", "plugins");
+const opencodeDir = join(testDir, ".opencode");
+const pluginsDir = join(opencodeDir, "plugins");
 mkdirSync(pluginsDir, { recursive: true });
+
+// Pre-seed .opencode with dependencies already installed into testDir
+// so opencode does not execute a cold network install at runtime startup.
+const opencodeVersion = opencodeCheck.stdout.trim();
+const lockPath = join(testDir, "package-lock.json");
+if (existsSync(lockPath) && existsSync(join(testDir, "node_modules"))) {
+	try {
+		const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+		lock.name = ".opencode";
+		if (lock.packages?.["node_modules/@opencode-ai/plugin"]) {
+			lock.packages["node_modules/@opencode-ai/plugin"].version = opencodeVersion;
+		}
+		if (lock.packages?.[""]) {
+			lock.packages[""].dependencies = { "@opencode-ai/plugin": opencodeVersion };
+		}
+		writeFileSync(join(opencodeDir, "package-lock.json"), JSON.stringify(lock, null, 2) + "\n");
+		writeFileSync(join(opencodeDir, "package.json"), JSON.stringify({ name: ".opencode", dependencies: { "@opencode-ai/plugin": opencodeVersion } }, null, 2) + "\n");
+		cpSync(join(testDir, "node_modules"), join(opencodeDir, "node_modules"), { recursive: true });
+	} catch {}
+}
 
 const sourcePlugin = join(import.meta.dirname, "..", "src", "workflow-guard.ts");
 const sourceDir = join(testDir, ".opencode", "workflow-guard-source");
@@ -192,7 +213,40 @@ delete runtimeEnv.OPENCODE_PURE;
 delete runtimeEnv.OPENCODE;
 const runOpenCode = (args: string[], timeout: number) =>
 	spawnSync("opencode", ["run", "--dir", testDir, ...args], { cwd: testDir, encoding: "utf8", timeout, env: runtimeEnv });
-const configProbe = spawnSync("opencode", ["debug", "config"], { cwd: testDir, encoding: "utf8", timeout: 90_000, env: runtimeEnv });
+const configProbe = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
+	const child = spawn("opencode", ["debug", "config"], { cwd: testDir, env: runtimeEnv });
+	let stdout = "";
+	let stderr = "";
+	let timer: NodeJS.Timeout | undefined;
+	let pollInterval: NodeJS.Timeout | undefined;
+
+	const done = (status: number | null) => {
+		if (timer) clearTimeout(timer);
+		if (pollInterval) clearInterval(pollInterval);
+		try { child.kill("SIGTERM"); } catch {}
+		resolve({ status: status ?? 0, stdout, stderr });
+	};
+
+	const checkReady = () => {
+		try {
+			if (JSON.parse(stdout)?.plugin_origins && existsSync(initializedMarker)) {
+				done(0);
+			}
+		} catch {}
+	};
+
+	pollInterval = setInterval(checkReady, 50);
+
+	child.stdout?.on("data", (d) => {
+		stdout += d.toString();
+		checkReady();
+	});
+	child.stderr?.on("data", (d) => { stderr += d.toString(); });
+	child.on("close", (code) => done(code));
+	child.on("error", () => done(null));
+
+	timer = setTimeout(() => done(null), 30_000);
+});
 let configLoadsLocalPlugin = false;
 try {
 	const config = JSON.parse(configProbe.stdout);
