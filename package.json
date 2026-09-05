@@ -1,6 +1,6 @@
 {
   "name": "opencode-workflow-guard",
-  "version": "1.9.3",
+  "version": "1.10.0",
   "description": "Deterministic workflow and safety policy enforcement for OpenCode",
   "license": "MIT",
   "type": "module",
