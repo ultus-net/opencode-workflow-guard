@@ -8,14 +8,105 @@
  */
 
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui";
-import { Plugin } from "@opencode/plugin/tui";
+import { Plugin, usePlugin } from "@opencode/plugin/tui";
 import type { JSX } from "@opentui/solid";
-import { createElement, insert, setProp } from "@opentui/solid";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { createElement, insert, setProp, RendererContext } from "@opentui/solid";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative } from "node:path";
+import { homedir } from "node:os";
+import { getOwner, useContext } from "solid-js";
 import { applyEdits, modify, parse, type ParseError } from "jsonc-parser";
 import { projectConfigPath } from "./lib/project-config.ts";
 import { canonicalPath } from "./policies/file-claims.ts";
+
+// ── V2 render diagnostics (bounded; never throws) ────────────────────────────
+// Slot renders run inside the TUI provider tree, but recurring failures have
+// been observed in long-running sessions after plugin versions were swapped
+// (opencode 2.0.10, "No renderer found" from @opentui/solid createElement).
+// Instead of rethrowing — which makes the host error boundary toast on every
+// retry for a cosmetic badge — a failing slot renders null, and failures are
+// logged with owner/renderer context to a state file, bounded to the first
+// DIAG_MAX_FAILURES_PER_SLOT failures per slot between successes. The next
+// render attempt retries naturally, and a later success is logged again.
+const DIAG_DIR = join(process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state"), "opencode");
+const DIAG_LOG = join(DIAG_DIR, "workflow-guard-ui.log");
+const DIAG_MAX_FAILURES_PER_SLOT = 3;
+const DIAG_MAX_LOG_BYTES = 2_000_000;
+
+function diag(line: string): void {
+	try {
+		mkdirSync(DIAG_DIR, { recursive: true });
+		if (existsSync(DIAG_LOG) && statSync(DIAG_LOG).size > DIAG_MAX_LOG_BYTES) {
+			writeFileSync(DIAG_LOG, "", { mode: 0o600 });
+		}
+		appendFileSync(DIAG_LOG, `${new Date().toISOString()} ${line}\n`, { mode: 0o600 });
+	} catch {
+		// diagnostics must never crash the plugin
+	}
+}
+
+try {
+	diag(`module load: ${import.meta.url}; @opentui/solid -> ${import.meta.resolve("@opentui/solid")}; solid-js -> ${import.meta.resolve("solid-js")}`);
+} catch (error) {
+	diag(`module load: ${import.meta.url}; resolve probe failed: ${error}`);
+}
+
+const diagOkSlots = new Set<string>();
+const diagFailureCount = new Map<string, number>();
+
+function diagRender(slot: string): void {
+	try {
+		const owner = getOwner() as { context?: Record<string, unknown> | null } | null;
+		const contextKeys = owner ? (owner.context ? Object.keys(owner.context).join(",") : "null") : "no-owner";
+		const renderer = useContext(RendererContext);
+		let plugin = "ok";
+		try {
+			usePlugin();
+		} catch (error) {
+			plugin = `FAILED: ${error}`;
+		}
+		if (!diagOkSlots.has(slot)) {
+			diagOkSlots.add(slot);
+			diag(`render ${slot} ok; owner=${owner ? "present" : "null"}; contextKeys=[${contextKeys}]; rendererContext=${renderer ? "found" : "MISSING"}; usePlugin=${plugin}`);
+		}
+	} catch (error) {
+		diag(`render ${slot} probe FAILED: ${error instanceof Error ? `${error.message}\n${error.stack}` : String(error)}`);
+	}
+}
+
+function diagFailure(slot: string, error: unknown): void {
+	const count = (diagFailureCount.get(slot) ?? 0) + 1;
+	diagFailureCount.set(slot, count);
+	if (count > DIAG_MAX_FAILURES_PER_SLOT) {
+		if (count === DIAG_MAX_FAILURES_PER_SLOT + 1) {
+			diag(`render ${slot} still failing after ${DIAG_MAX_FAILURES_PER_SLOT} logged failures; further failures are suppressed until a render succeeds`);
+		}
+		return;
+	}
+	const lines = [
+		`render ${slot} FAILED (${count}/${DIAG_MAX_FAILURES_PER_SLOT}): ${error instanceof Error ? error.message : String(error)}`,
+		`  stack: ${error instanceof Error ? error.stack : "(none)"}`,
+	];
+	try {
+		const owner = getOwner() as { context?: Record<string, unknown> | null } | null;
+		lines.push(`  owner=${owner ? "present" : "null"}; contextKeys=[${owner ? (owner.context ? Object.keys(owner.context).join(",") : "null") : "none"}]`);
+	} catch (probeError) {
+		lines.push(`  owner probe failed: ${probeError}`);
+	}
+	try {
+		lines.push(`  useContext(RendererContext): ${useContext(RendererContext) ? "found" : "MISSING"}`);
+	} catch (probeError) {
+		lines.push(`  renderer probe failed: ${probeError}`);
+	}
+	try {
+		usePlugin();
+		lines.push(`  usePlugin: ok`);
+	} catch (probeError) {
+		lines.push(`  usePlugin: FAILED ${probeError}`);
+	}
+	diag(lines.join("\n"));
+}
+// ── end render diagnostics ───────────────────────────────────────────────────
 
 type Child = JSX.Element | string | number | null | undefined | false;
 
@@ -98,6 +189,8 @@ const TOGGLE_OPTIONS: Array<{ key: ProjectToggle; label: string; description: st
 ];
 
 export const WorkflowGuardTuiV2 = (ctx: TuiContext) => {
+	diag(`setup: app=${ctx.app?.version ?? "?"}; location=${ctx.location?.directory ?? "?"}`);
+
 	const badge = () => {
 		const formatted = formatBadge();
 		return text({ fg: ctx.theme.text.feedback.success.base }, [formatted.text]);
@@ -164,8 +257,29 @@ export const WorkflowGuardTuiV2 = (ctx: TuiContext) => {
 		},
 	});
 
-	ctx.ui.slot({ append: "home.footer.status", render: () => badge() });
-	ctx.ui.slot({ append: "prompt.footer.status", render: () => badge() });
+	const registerBadgeSlot = (slot: NonNullable<Parameters<TuiContext["ui"]["slot"]>[0]["append"]>) => {
+		ctx.ui.slot({
+			append: slot,
+			render: () => {
+				try {
+					const element = badge();
+					if (!diagOkSlots.has(slot)) {
+						diagOkSlots.add(slot);
+						diagFailureCount.delete(slot);
+						diag(`render ${slot} ok`);
+					}
+					return element;
+				} catch (error) {
+					diagOkSlots.delete(slot);
+					diagFailure(slot, error);
+					return null;
+				}
+			},
+		});
+	};
+	registerBadgeSlot("home.footer.status");
+	registerBadgeSlot("prompt.footer.status");
+	diagRender("probe-after-setup");
 
 	return () => {
 		// Slot claims and keymap layers are disposed automatically on unload.

@@ -114,7 +114,7 @@ import { audit } from "../src/lib/audit.ts";
 import { isProjectMemoryFreshAsync } from "../src/lib/project-memory.ts";
 import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
-import { WorkflowGuardTui, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
+import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 import { scanSessionTodos, toolPartName } from "../src/lib/v2-todo.ts";
 import { effectiveTodosWithOwner } from "../src/policies/todo.ts";
 
@@ -1344,6 +1344,32 @@ try { writeRecoveryCheckpointsOption(tuiOptionsDir, true); } catch { tuiSymlinkR
 check("recovery checkpoint project option refuses symlink escape", tuiSymlinkRejected && !existsSync(join(outsideTuiOptions, "workflow-guard.json")));
 rmSync(outsideTuiOptions, { recursive: true, force: true });
 rmSync(tuiOptionsDir, { recursive: true, force: true });
+
+// V2 TUI companion degrades gracefully when slot renders fail (bounded diagnostics)
+const v2SlotClaims: Array<{ append: string; render: () => unknown }> = [];
+const fakeV2TuiCtx = {
+	app: { version: "9.9.9-test", channel: "test" },
+	location: { directory: tuiCommandOptionsDir },
+	theme: { text: { feedback: { success: { base: "#00ff00" } } } },
+	ui: { slot: (claim: { append: string; render: () => unknown }) => { v2SlotClaims.push(claim); } },
+};
+await WorkflowGuardTuiV2(fakeV2TuiCtx as any);
+check("v2 tui companion registers home and prompt status slots", v2SlotClaims.filter((claim) => claim.append === "home.footer.status" || claim.append === "prompt.footer.status").length === 2);
+const diagLogPath = join(process.env.XDG_STATE_HOME!, "opencode", "workflow-guard-ui.log");
+const diagLogText = () => readFileSync(diagLogPath, "utf8");
+check("v2 tui companion logs module load and setup with app version", diagLogText().includes("module load:") && diagLogText().includes("setup: app=9.9.9-test"));
+const v2HomeRender = v2SlotClaims.find((claim) => claim.append === "home.footer.status")!.render;
+// In a plain Node process there is no OpenTUI renderer, so badge() throws the
+// same "No renderer found" the long-running-session bug produced in the TUI.
+check("v2 slot render returns null instead of throwing when the render context is unavailable", v2HomeRender() === null);
+check("v2 slot failure log records probes and stack", diagLogText().includes("render home.footer.status FAILED (1/3)") && diagLogText().includes("owner=null") && diagLogText().includes("useContext(RendererContext): MISSING") && diagLogText().includes("  stack: "));
+for (let i = 0; i < 6; i++) v2HomeRender();
+const v2FailuresLogged = diagLogText().split("\n").filter((line) => line.includes("render home.footer.status FAILED (")).length;
+check("v2 slot failure logging is bounded to 3 per success epoch", v2FailuresLogged === 3);
+check("v2 slot failure suppression notice is logged once", diagLogText().split("still failing after 3 logged failures").length === 2);
+const v2PromptRender = v2SlotClaims.find((claim) => claim.append === "prompt.footer.status")!.render;
+check("v2 prompt status slot also degrades to null on render failure", v2PromptRender() === null);
+
 
 // ── Adversarial tests & hardened invariants ──
 console.log("- Adversarial tests & hardened invariants -");
