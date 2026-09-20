@@ -539,6 +539,11 @@ check("allow gh issue create mentioning .opencode paths (not tamper)", !(await s
 check("compound collaboration + tamper still blocked", blocked(await shell(`gh issue create --repo example/proj --title t && echo x > open${"code.json"}`)));
 check("collaboration command with real redirect to global config still blocked", blocked(await shell(`gh issue list > /var/home/x/.config/open${"code"}/opencode.json`)));
 check("collaboration command with redirect outside workspace still blocked", blocked(await shell(`gh pr create --title t > /tmp/wg-escape-probe`)));
+check("allow command with guarded-path text in quoted data (not tamper)", !(await shell(`echo "flow: x > ${ocDir}" > notes.md`)));
+check("block unquoted redirect into .opencode", blocked(await shell(`echo x > .open${"code"}/y`)));
+check("block redirect with quoted real target", blocked(await shell(`echo x > ".open${"code"}/opencode.json"`)));
+check("block quoted command word running the CLI auth flow", blocked(await shell(`"open${"code"}" auth login`)));
+check("block eval of a quoted CLI auth payload", blocked(await shell(`eval 'open${"code"} auth login'`)));
 
 console.log("- Policy 6: tamper via edit tools (path protection) -");
 check("block edit of project opencode.json", blocked(await call("edit", { filePath: join(root, "opencode.json"), oldString: "a", newString: "b" }, { sessionID: "s-active" })));

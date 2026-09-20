@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
-import { decodeShellEscapes } from "../lib/shell.ts";
+import { decodeShellEscapes, prepareRedirectResidue } from "../lib/shell.ts";
 
 export const PROTECTED_PATH_REASON =
 	"Blocked: modifying Open" +
@@ -22,6 +22,15 @@ export const SETTINGS_TAMPER_PATTERNS: RegExp[] = [
 	new RegExp("(?:" + "^|\\s)(?:op" + "encode)\\s+(?:-[^|;&]*\\s+)*(?:auth|config|permission)\\b", "i"),
 	new RegExp("(?:" + "^|\\s)(?:op" + "encode)\\s+(?:run\\s+)?--auto\\b", "i"),
 ];
+
+// Patterns 1-4 match redirect operators and mutation verbs writing into
+// guarded paths: they run on the quote-stripped residue (quoted data spans
+// are command data and their ">" characters are not redirects). Patterns
+// 5-6 match the opencode CLI verbs themselves: those run on the
+// quote-FLATTENED text, because a quoted command word or an eval payload
+// still executes the verb.
+const PATH_PATTERNS = SETTINGS_TAMPER_PATTERNS.slice(0, 4);
+const VERB_PATTERNS = SETTINGS_TAMPER_PATTERNS.slice(4);
 
 export function normalizeShellEvasion(text: string): string {
 	return decodeShellEscapes(text)
@@ -48,13 +57,12 @@ export function isCollaborationInvocation(segment: string): boolean {
 }
 
 export function isSettingsTamper(command: string): boolean {
-	const segments = command.split(/[\n|;&]+/).map((s) =>
-		normalizeGlobPathEvasion(normalizeShellEvasion(s)),
-	);
-	return segments.some((segment) =>
-		!isCollaborationInvocation(segment) &&
-		SETTINGS_TAMPER_PATTERNS.some((re) => re.test(segment)),
-	);
+	return command.split(/[\n|;&]+/).some((s) => {
+		if (isCollaborationInvocation(s)) return false;
+		const residue = normalizeGlobPathEvasion(normalizeShellEvasion(prepareRedirectResidue(s)));
+		const flattened = normalizeGlobPathEvasion(normalizeShellEvasion(s));
+		return PATH_PATTERNS.some((re) => re.test(residue)) || VERB_PATTERNS.some((re) => re.test(flattened));
+	});
 }
 
 export function isProtectedPath(targetPath: string): boolean {

@@ -7,7 +7,7 @@ import {
 	getWorkspaceRootReal,
 	recordMutation,
 } from "../lib/state.ts";
-import { shellWords, unwrapShellCommand } from "../lib/shell.ts";
+import { prepareRedirectResidue, shellWords, unwrapShellCommand } from "../lib/shell.ts";
 import { isCollaborationInvocation, isProtectedPath, PROTECTED_PATH_REASON } from "./tamper.ts";
 import { isSecretPath, secretIn } from "./secrets.ts";
 import { onProtectedBranch, branchGuardReason } from "./git.ts";
@@ -129,10 +129,14 @@ export function teeTargetsIn(segment: string): string[] {
 
 function redirectMutationsIn(segment: string): ShellMutation[] {
 	const mutations: ShellMutation[] = [];
+	// Redirect detection runs on the quote-stripped residue: quoted data
+	// spans are command data and their ">" characters are not redirects,
+	// while redirect targets keep their value whether quoted or not.
 	// The `(?!=)` lookahead after the op rejects comparison operators (`>=`,
 	// `==`) so they cannot match as a redirect op with `=` as its target.
+	const residue = prepareRedirectResidue(segment);
 	const redirectRe = /(?:^|[\s>]|(?<=[^\s"']))([0-9]*&?>>?&?(?!=))\s*["']?([^\s>&|;"']+)/g;
-	for (const redirectMatch of segment.matchAll(redirectRe)) {
+	for (const redirectMatch of residue.matchAll(redirectRe)) {
 		if (!redirectMatch[1] || !redirectMatch[2]) continue;
 		const op = redirectMatch[1];
 		const target = redirectMatch[2];
@@ -314,7 +318,10 @@ export function secretSourceInFilesystemCommand(segment: string): string | undef
 // Remove single- and double-quoted spans from a shell segment. Used to
 // analyze the residue of collaboration invocations: quoted arguments are
 // command data and can never be shell redirects, while unquoted redirects
-// keep receiving full validation.
+// keep receiving full validation. NOTE: unlike shell.ts's
+// prepareRedirectResidue, this strips EVERY span including redirect
+// targets and glued concatenations - only use it for collaboration
+// segments where all quoted content is command data.
 function stripQuotedSpans(segment: string): string {
 	return segment.replace(/'[^'\n]*'/g, " ").replace(/"[^"\n]*"/g, " ");
 }

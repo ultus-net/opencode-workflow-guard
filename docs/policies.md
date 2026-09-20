@@ -60,7 +60,8 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
   - Direct edits of the same paths through the `edit`/`write`/`apply_patch` tools
   - Shell commands invoking `opencode auth`, `opencode config`, `opencode permission`, or `opencode run --auto`
   - Evasion-normalized: quote-concatenation (`open''code.json`), escapes (`open\c\ode`), and glob wildcards (`opencode.jso?`) are stripped before matching.
-- Collaboration commands (`gh issue`, `gh pr`, `glab issue`, `glab pr`, `az repos pr`) and document content mentioning guarded paths are not tampering: quoted arguments are command data, not shell syntax (redirect analysis runs on the quote-stripped residue), and the redirect heuristic applies to shell commands only (write/edit content is guarded by the target path check instead).
+- Collaboration commands (`gh issue`, `gh pr`, `glab issue`, `glab pr`, `az repos pr`) and document content mentioning guarded paths are not tampering: quoted arguments are command data, not shell syntax, and the redirect heuristic applies to shell commands only (write/edit content is guarded by the target path check instead).
+- Quoted data spans are not shell syntax: pattern matching runs on the quote-stripped residue, where redirect targets are honored quoted or not and quote-concatenated paths keep normalizing. A quoted span containing a guarded path is never treated as a redirect or command verb; unquoted redirects into guarded paths stay blocked.
 - Plan files under `.opencode/plans/` are exempt: opencode's plan mode writes agent-authored plan markdown there, and plans are content, not configuration. Everything else under `.opencode/` (including the directory itself) stays protected.
 - **Read-only access is allowed** (`cat`, `less`, `grep`, `head`, `tail` on config files) - only modification attempts trigger the guard.
 
