@@ -52,6 +52,10 @@ export interface PolicyDecision {
 	code: string;
 	policy?: string;
 	message: string;
+	/** What the policy matched: the target path, command segment, or payload surface. */
+	surface?: string;
+	/** The sanctioned path forward the decision names for the agent. */
+	alternative?: string;
 	details?: Record<string, unknown>;
 }
 

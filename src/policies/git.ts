@@ -33,7 +33,7 @@ export function hasUnsafeGitAlias(command: string): boolean {
 }
 
 export const GIT_BRANCH_CREATE_RE =
-	/\bgit\s+(?:checkout\s+-b|switch\s+(?:-c|--create))\b/;
+	/\bgit\s+(?:checkout\s+-b|switch\s+(?:-c|--create))\b|\bgit\s+branch\s+(?![^|;&]*\s-[dDM]\b)(?:[^|;&]*\s)?[^\s-][^\s]*/;
 
 const GIT_DIR_OPTION_TAKES_VALUE = new Set([
 	"-C",

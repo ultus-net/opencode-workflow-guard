@@ -1,7 +1,13 @@
 import { realpathSync } from "node:fs";
-import { basename, relative, resolve } from "node:path";
+import { homedir } from "node:os";
+import { join, relative, resolve } from "node:path";
 import { getWorkspaceRoot } from "../lib/state.ts";
 import { decodeShellEscapes, prepareRedirectResidue } from "../lib/shell.ts";
+import { expandShellTargetPath, isCollaborationInvocation, mutationDestinationsIn } from "./shell-mutations.ts";
+
+// Collaboration-segment classification moved to shell-mutations.ts (shared
+// with the boundary policy); re-exported here for the historical surface.
+export { isCollaborationInvocation } from "./shell-mutations.ts";
 
 export const PROTECTED_PATH_REASON =
 	"Blocked: modifying Open" +
@@ -9,28 +15,27 @@ export const PROTECTED_PATH_REASON =
 	"plugin itself is not allowed from the agent. The user must change " +
 	"these manually in configuration or the UI.";
 
-const GT = String.fromCharCode(62);
-const V_LIST = ["sed\\s+-i", "tee", "mv", "cp", "rm", "chmod", "chown", "ln", "install", "truncate", "dd"].join("|");
-const C_LIST = ["open" + "code\\.jsonc?", "\\.config\\/open" + "code", "\\.open" + "code\\/"].join("|");
-const U_LIST = ["\\.config\\/open" + "code\\/(?:plugins|ui)\\/"].join("|");
+/**
+ * Names the sanctioned path forward for a protected-path block: the agent
+ * works on versioned drafts inside the repository; the user owns the live
+ * config and the guard itself.
+ */
+export function protectedPathAlternative(): string {
+	return (
+		"Work on the versioned draft inside the repository and open a PR; " +
+		"the user promotes changes to the live OpenCode config and updates the guard themselves."
+	);
+}
 
+// The opencode CLI verbs themselves: these run on the quote-FLATTENED text,
+// because a quoted command word or an eval payload still executes the verb.
+// Path-based tamper detection is no longer pattern-based: mutation
+// destinations are extracted and matched against live config surfaces
+// (consumption anchoring) in isSettingsTamper below.
 export const SETTINGS_TAMPER_PATTERNS: RegExp[] = [
-	new RegExp(`(?:^|\\s)(?:${V_LIST})\\s+[^|;&]*?(?:[\\w\\/.~-]*(?:${C_LIST}))`, "i"),
-	new RegExp(`${GT}\\s*["']?[\\w\\/.~-]*(?:${C_LIST})`, "i"),
-	new RegExp(`(?:^|\\s)(?:${V_LIST})\\s+[^|;&]*?[\\w\\/.~-]*(?:${U_LIST})`, "i"),
-	new RegExp(`${GT}\\s*["']?[\\w\\/.~-]*(?:${U_LIST})`, "i"),
 	new RegExp("(?:" + "^|\\s)(?:op" + "encode)\\s+(?:-[^|;&]*\\s+)*(?:auth|config|permission)\\b", "i"),
 	new RegExp("(?:" + "^|\\s)(?:op" + "encode)\\s+(?:run\\s+)?--auto\\b", "i"),
 ];
-
-// Patterns 1-4 match redirect operators and mutation verbs writing into
-// guarded paths: they run on the quote-stripped residue (quoted data spans
-// are command data and their ">" characters are not redirects). Patterns
-// 5-6 match the opencode CLI verbs themselves: those run on the
-// quote-FLATTENED text, because a quoted command word or an eval payload
-// still executes the verb.
-const PATH_PATTERNS = SETTINGS_TAMPER_PATTERNS.slice(0, 4);
-const VERB_PATTERNS = SETTINGS_TAMPER_PATTERNS.slice(4);
 
 export function normalizeShellEvasion(text: string): string {
 	return decodeShellEscapes(text)
@@ -45,67 +50,152 @@ export function normalizeGlobPathEvasion(text: string): string {
 		.replace(/opencode\.[?*]/gi, ocJson);
 }
 
-// Collaboration invocations (hosted-git/PR/issue CLIs) never write local
-// configuration: their arguments may legitimately mention guarded paths.
-const COLLABORATION_INVOCATION_PATTERNS: RegExp[] = [
-	/^\s*(?:gh|glab)\s+(?:issue|pr)\b/,
-	/^\s*az\s+repos\s+pr\b/,
-];
+// Agent payload under .opencode/: role definitions, prompts, and command
+// markdown are harness payload - the safe, versionable, reviewable
+// modifiable surface. Plugins, config, memory, and the guard source stay
+// protected. (The live user-level config directory has no payload
+// exemption: agents never write live paths; the user promotes drafts.)
+const OPENCODE_PAYLOAD_DIRS = new Set(["agent", "agents", "command", "commands"]);
 
-export function isCollaborationInvocation(segment: string): boolean {
-	return COLLABORATION_INVOCATION_PATTERNS.some((re) => re.test(segment));
+function workspaceProtected(root: string, path: string): boolean {
+	const rel = relative(root, path);
+	if (!rel || rel.startsWith("..")) return false;
+	const relLower = rel.toLowerCase();
+	if (relLower === ".opencode" || relLower.startsWith(".opencode/")) {
+		// opencode plan mode writes agent plan markdown under the project's
+		// .opencode/plans/ directory - plan files are documents, not
+		// configuration. The plans directory itself stays protected.
+		if (relLower.startsWith(".opencode/plans/")) return false;
+		const first = relLower.slice(".opencode/".length).split("/")[0]!;
+		if (OPENCODE_PAYLOAD_DIRS.has(first)) {
+			// The exemption covers markdown payload only: role definitions and
+			// command markdown are the versionable, reviewable documents. Any
+			// other file type under a payload directory (scripts, binaries,
+			// unknown extensions) is control-plane surface and stays protected.
+			const rest = relLower.slice(".opencode/".length + first.length + 1);
+			if (rest.endsWith(".md") || rest.endsWith(".markdown")) return false;
+			return true;
+		}
+		return true;
+	}
+	if (/^opencode\.jsonc?$/.test(relLower) || /^workflow-guard\.jsonc?$/.test(relLower)) return true;
+	if (relLower === ".config/opencode" || relLower.startsWith(".config/opencode/")) return true;
+	if (relLower === ".config/opencode.json" || relLower === ".config/opencode.jsonc") return true;
+	if (relLower === "node_modules/opencode-workflow-guard" || relLower.startsWith("node_modules/opencode-workflow-guard/")) return true;
+	return false;
 }
 
-export function isSettingsTamper(command: string): boolean {
-	return command.split(/[\n|;&]+/).some((s) => {
-		if (isCollaborationInvocation(s)) return false;
-		const residue = normalizeGlobPathEvasion(normalizeShellEvasion(prepareRedirectResidue(s)));
-		const flattened = normalizeGlobPathEvasion(normalizeShellEvasion(s));
-		return PATH_PATTERNS.some((re) => re.test(residue)) || VERB_PATTERNS.some((re) => re.test(flattened));
-	});
+function liveConfigBase(): string {
+	return process.env.XDG_CONFIG_HOME ? resolve(process.env.XDG_CONFIG_HOME) : join(homedir(), ".config");
 }
 
+/**
+ * Live user-level OpenCode config consumed by the running process: only
+ * absolute paths under the global config directory (or its legacy file
+ * locations) match. No payload exemption here - agents never write live
+ * paths; the user promotes versioned drafts.
+ */
+function liveUserConfigProtected(path: string): boolean {
+	const base = liveConfigBase();
+	const cfgDir = join(base, "opencode");
+	const cfgDirPrefix = cfgDir.endsWith("/") ? cfgDir : cfgDir + "/";
+	if (path === cfgDir || path.startsWith(cfgDirPrefix)) return true;
+	return path === join(base, "opencode.json") || path === join(base, "opencode.jsonc");
+}
+
+/**
+ * Installed copies of the guard plugin itself, wherever package resolution
+ * finds them: node_modules trees and versioned install caches under the
+ * opencode cache directory. These are consumption anchors (how the runtime
+ * loads the guard), not name matches.
+ */
+function guardInstallProtected(path: string): boolean {
+	const lower = path.toLowerCase();
+	return (
+		lower.includes("/node_modules/opencode-workflow-guard") ||
+		(lower.includes("/.cache/opencode/") && lower.includes("opencode-workflow-guard@"))
+	);
+}
+
+/**
+ * Whether `targetPath` (resolved against the workspace root) is a surface
+ * the running OpenCode process actually consumes: project-root config
+ * files, the project .opencode control directory (minus agent/command
+ * payload and plans), the live user-level config directory, and installed
+ * guard copies.
+ *
+ * Matching is anchored on consumption - nested config-shaped trees inside
+ * the repo (versioned dotfiles drafts), scratch copies, and docs are NOT
+ * protected surfaces. Checks remain symlink-aware: the final existing path
+ * and, for new files, the nearest existing ancestor are resolved through
+ * realpath before matching.
+ */
 export function isProtectedPath(targetPath: string): boolean {
 	if (!targetPath) return false;
 	const root = getWorkspaceRoot();
 	const resolved = resolve(root, targetPath);
-	const matches = (path: string): boolean => {
-		const base = basename(path);
-		const lower = path.toLowerCase();
-		const dotOc = "." + "opencode/";
-		// opencode plan mode writes agent plan markdown under the project's
-		// .opencode/plans/ directory - plan files are documents, not
-		// configuration. The trailing slash keeps the plans directory
-		// itself protected.
-		if (lower.includes("/" + dotOc + "plans/")) return false;
-		const cfgOc = "/.config/" + "opencode/";
-		const cfgOcJson = "/.config/" + "opencode.json";
-		return (
-			/^opencode\.jsonc?$/i.test(base) ||
-			/^workflow-guard\.jsonc?$/i.test(base) ||
-			// the .opencode directory itself and anything under it (project
-		// plugins, agents) - including the exact directory, not just paths
-		// nested inside it
-		lower === ".opencode" ||
-		lower.endsWith("/.opencode") ||
-		lower.includes("/" + dotOc) ||
-			lower.includes(cfgOc) ||
-			lower.includes(cfgOcJson)
-		);
-	};
-	if (matches(resolved)) return true;
+	if (guardInstallProtected(resolved)) return true;
+	if (liveUserConfigProtected(resolved)) return true;
+	if (workspaceProtected(root, resolved)) return true;
 	try {
-		return matches(realpathSync(resolved));
+		const real = realpathSync(resolved);
+		if (guardInstallProtected(real)) return true;
+		if (liveUserConfigProtected(real)) return true;
+		if (workspaceProtected(root, real)) return true;
 	} catch {
 		let ancestor = resolve(resolved, "..");
 		while (ancestor !== resolve(ancestor, "..")) {
 			try {
 				const realAncestor = realpathSync(ancestor);
-				return matches(resolve(realAncestor, relative(ancestor, resolved)));
+				const joined = resolve(realAncestor, relative(ancestor, resolved));
+				if (guardInstallProtected(joined)) return true;
+				if (liveUserConfigProtected(joined)) return true;
+				if (workspaceProtected(root, joined)) return true;
+				break;
 			} catch {
 				ancestor = resolve(ancestor, "..");
 			}
 		}
 		return false;
 	}
+	return false;
+}
+
+// Interpreter payloads are program text, not shell: write destinations
+// cannot be extracted structurally (computed paths like os.homedir() +
+// "/.config/opencode/..." produce no shell mutation to anchor on). In
+// payload mode the matcher therefore falls back to config-shaped segment
+// names in the flattened text - the historical, conservative payload
+// behavior. Shell commands keep the anchored destination scan.
+const CONFIG_SEGMENT_RE = new RegExp(
+	"(?:\\.config\\/open" + "code|(?:^|[\\/\\\\])\\.open" + "code(?:[\\/\\\\]|$)|open" + "code\\.jsonc?|workflow-guard\\.jsonc?|open" + "code-workflow-guard@)",
+	"i",
+);
+
+export function isSettingsTamper(command: string, payloadMode = false): boolean {
+	const root = getWorkspaceRoot();
+	return command.split(/[\n|;&]+/).some((s) => {
+		if (isCollaborationInvocation(s)) return false;
+		const flattened = normalizeGlobPathEvasion(normalizeShellEvasion(s));
+		if (SETTINGS_TAMPER_PATTERNS.some((re) => re.test(flattened))) return true;
+		if (payloadMode && CONFIG_SEGMENT_RE.test(flattened)) return true;
+		// Path tamper detection is anchored to live config surfaces: extract
+		// actual write destinations and check where they land, never match
+		// path segments anywhere in the text (drafts, scratch, docs are free).
+		const residue = normalizeGlobPathEvasion(normalizeShellEvasion(prepareRedirectResidue(s)));
+		for (const destination of mutationDestinationsIn(residue)) {
+			const expanded = expandShellTargetPath(destination);
+			if (expanded === null) {
+				// Indeterminate destination: fail closed only for config-shaped
+				// segment names (exactly where the old matcher fired), so
+				// ordinary `$OUT/build.log` outputs are not tamper hits.
+				if (CONFIG_SEGMENT_RE.test(destination)) {
+					return true;
+				}
+				continue;
+			}
+			if (isProtectedPath(resolve(root, expanded))) return true;
+		}
+		return false;
+	});
 }

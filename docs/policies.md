@@ -56,19 +56,24 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
 
 ### 6. Settings Tamper Guard
 - Prevents the agent from weakening its own permission gates **via shell or edit tools**:
-  - Shell writes/redirects to `opencode.json[c]`, `~/.config/opencode/*`, `.opencode/*` (including the `.opencode` directory itself), or the guard's own plugin/TUI files (`~/.config/opencode/plugins/*`, `~/.config/opencode/ui/*`)
-  - Direct edits of the same paths through the `edit`/`write`/`apply_patch` tools
+  - Shell writes/redirects and direct edits (`edit`/`write`/`apply_patch`) of the **live consumption surfaces** the running OpenCode process actually reads:
+    - Project-root config files: `opencode.json[c]`, `workflow-guard.json[c]`
+    - The project `.opencode/` control directory (including the directory itself) - except agent/command payload markdown under `.opencode/agent[s]/` and `.opencode/command[s]/`, and `.opencode/plans/`
+    - The live user-level config directory `~/.config/opencode/**` (or `$XDG_CONFIG_HOME/opencode/**`), including the guard plugin and TUI files under `plugins/` and `ui/`, plus the legacy `~/.config/opencode.json[c]` location
+    - Installed copies of the guard itself: `node_modules/opencode-workflow-guard/**` and versioned install caches (`opencode-workflow-guard@*`)
   - Shell commands invoking `opencode auth`, `opencode config`, `opencode permission`, or `opencode run --auto`
   - Evasion-normalized: quote-concatenation (`open''code.json`), escapes (`open\c\ode`), and glob wildcards (`opencode.jso?`) are stripped before matching.
+- Matching is **consumption-anchored, not name-based**: nested config-shaped trees inside the repository (versioned dotfiles drafts such as `dotfiles/.config/opencode/**`), scratch copies (`/tmp/.../opencode.jsonc`), and deep docs/examples files are editable drafts. Writes there remain subject to the Policy 8 workspace boundary, and promoting a draft into a live path (`cp draft ~/.config/opencode/...`) stays blocked - draft changes go through a PR and the user promotes them.
 - Collaboration commands (`gh issue`, `gh pr`, `glab issue`, `glab pr`, `az repos pr`) and document content mentioning guarded paths are not tampering: quoted arguments are command data, not shell syntax, and the redirect heuristic applies to shell commands only (write/edit content is guarded by the target path check instead).
-- Quoted data spans are not shell syntax: pattern matching runs on the quote-stripped residue, where redirect targets are honored quoted or not and quote-concatenated paths keep normalizing. A quoted span containing a guarded path is never treated as a redirect or command verb; unquoted redirects into guarded paths stay blocked.
-- Plan files under `.opencode/plans/` are exempt: opencode's plan mode writes agent-authored plan markdown there, and plans are content, not configuration. Everything else under `.opencode/` (including the directory itself) stays protected.
+- Quoted data spans are not shell syntax: pattern matching runs on the quote-stripped residue, where redirect targets are honored quoted or not and quote-concatenated paths keep normalizing. A quoted span containing a guarded path is never treated as a redirect or command verb; unquoted redirects into guarded paths stay blocked. Shell tamper detection extracts write destinations with the same parsers the boundary policy uses and tests each destination against the anchored surfaces; an indeterminate `$VARIABLE` destination fails closed only when the destination itself is config-shaped.
+- Agent/command payload markdown under `.opencode/agent[s]/` and `.opencode/command[s]/`, and plan files under `.opencode/plans/`, are exempt: they are agent-authored documents (harness payload), not configuration. Everything else under `.opencode/` - including the directory itself, plugins, memory, and config JSON - stays protected.
 - **Read-only access is allowed** (`cat`, `less`, `grep`, `head`, `tail` on config files) - only modification attempts trigger the guard.
 
 ### 7. Feature-Branch Workflow
 - When the workspace git repository is on `main` or `master`, all file mutations and history-changing git commands (`commit`, `merge`, `rebase`, `cherry-pick`, `revert`, `apply`, `am`, `reset`, `restore`, `stash pop`, `update-ref`, `filter-branch`, `branch -D/-M`) are blocked.
 - Git global flags are parsed, so `git -C /repo commit` is gated on `/repo`'s branch, not the workspace's.
 - The agent is prompted to create a feature branch first (`git switch -c feat/my-feature`).
+- Branch creation (`git checkout -b`, `git switch -c`, `git branch <name>`) is **never gated**, on any branch: it is the sanctioned escape from branch protection, and blocking the exit invites rationalized workarounds. Base staleness is recorded as an audited advisory (`branch_base_behind_advisory`) instead of blocking branch creation; real breakage is caught by the merge-conflict preflight (Policy 19) at PR creation.
 
 ### 8. Workspace Boundary Guard
 - File modification tools (`edit`, `write`, `apply_patch`) and recognized shell mutations (redirection `>`, `>>`, `&>`, `>&`, `tee`, `sed -i`, `cp`/`mv`/`ln`, `touch`, `mkdir`, `rm`, `truncate`, `dd of=`, `git apply`/`git am`) are validated to ensure detected targets cannot escape the current workspace root via `../` traversal, symlinks, absolute paths, or shell expansions (`~`, `~user`, `$HOME`). Unresolvable `$VARIABLE` references fail closed. This is command-level enforcement, not filesystem sandboxing; arbitrary programs and dynamically computed paths require the OS isolation described under Known Limits.
@@ -109,6 +114,7 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
 
 ### 14. Audit Trail & Permission Journaling
 - Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with a timestamp, session id, tool name, decision, subagent/parent session attribution, and reason - a durable record.
+- Every `PolicyDecision` carries the matched `surface` (target path, command segment, or payload), the sanctioned `alternative`, and the `policy`/`code` identity. `guard_why` returns the same structured decision and audit entries store it as data, so observability never depends on parsing block prose - and agents and controllers query decisions the same way humans read them.
 - Permission prompts are journaled at request time via the typed `permission.ask` plugin hook, and `permission.replied` outcomes (including rejections) are preserved instead of being labeled as allows.
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
@@ -140,7 +146,7 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
 
 ### 20. Merged Branch & Base Freshness Guard
 - Blocks pushing to branches already merged or associated with closed PRs in GitHub or Azure DevOps.
-- Blocks creating fresh feature branches when the local base branch is behind the remote, prompting the agent to pull latest changes first.
+- Records an audited advisory (`branch_base_behind_advisory`) when the local base branch is behind the remote during branch creation - branch creation itself is never blocked (Policy 7). Merge or rebase the base before opening the PR; actual breakage is caught by the Policy 19 conflict preflight.
 - Tag push refspecs are exempt: publishing an existing tag (`git push origin v1.2.0`, `git push origin refs/tags/v1.2.0`) and creating tags (`git tag v1.2.0`, `git tag -a -m ...`) are release operations, not branch mutations - only tag deletions (`git tag -d`, `git push origin :refs/tags/v1.2.0`, `--delete`) stay blocked.
 
 ### 21. Documentation Review & Synchronization Guard
