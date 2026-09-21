@@ -4,6 +4,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { findGitRoot, getCachedProjectConfig, isSameGitRepo, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint } from "./verify.ts";
+import { normalizeLiveControlPlaneRoots } from "./live-control-plane.ts";
 import type {
 	TodoSdkClient,
 	ProjectConfig,
@@ -303,6 +304,20 @@ export function getProjectConfig(root: string): ProjectConfig {
 	const active = runtimeState.getStore();
 	if (active && projectRootKey(active.workspaceRoot) === projectRootKey(root)) return active.projectConfig;
 	return getCachedProjectConfig(root) ?? loadProjectConfig(root);
+}
+
+/**
+ * The host-declared live control-plane roots: `WORKFLOW_GUARD_LIVE_CONTROL_PLANE_PATHS`
+ * (comma-separated) overrides, else project config `liveControlPlanePaths`.
+ * Returns undefined when unset or when any declared root is unusable, so
+ * callers fall back to the legacy fail-closed segment matching.
+ */
+export function getLiveControlPlaneRoots(root: string = getWorkspaceRoot()): readonly string[] | undefined {
+	const env = process.env.WORKFLOW_GUARD_LIVE_CONTROL_PLANE_PATHS;
+	if (env && env.trim()) {
+		return normalizeLiveControlPlaneRoots(env.split(",").map((value) => value.trim()).filter(Boolean));
+	}
+	return normalizeLiveControlPlaneRoots(getProjectConfig(root).liveControlPlanePaths);
 }
 
 export function isReviewRequired(root: string): boolean {

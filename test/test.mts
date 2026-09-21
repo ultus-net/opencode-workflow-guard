@@ -3915,6 +3915,43 @@ check("project-memory initialization failure leaves core guard hooks active", ty
 if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDataHome;
 
+console.log("- live control-plane paths (tier port: config-path facts) -");
+const liveBase = mkdtempSync(join(tmpdir(), "wg-lcp-base-"));
+const livePlane = join(liveBase, ".config", "open" + "code");
+mkdirSync(livePlane, { recursive: true });
+const lcpRoot = mkdtempSync(join(tmpdir(), "wg-lcp-root-"));
+mkdirSync(join(lcpRoot, ".opencode"), { recursive: true });
+const ocJson = "open" + "code.json";
+const ocJsonc = "open" + "code.jsonc";
+setWorkspaceRoot(root);
+
+// Legacy (no live roots configured): the copy SOURCE under a config path alone
+// blocks the command — the F3 false positive, pinned as current behavior.
+check("legacy: cp FROM a .config/opencode source is blocked without live roots", blocked(await call("bash", { command: `cp ${livePlane}/agent/x.md ./draft.md` }, { sessionID: "s-active" })));
+
+// Declare the live control plane via project config, then reload.
+writeFileSync(join(lcpRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ liveControlPlanePaths: [livePlane] }));
+reloadProjectConfig(lcpRoot);
+setWorkspaceRoot(lcpRoot);
+
+// With facts: the same copy is allowed — the SOURCE is no longer matched and
+// the destination is a sanctioned workspace draft (F3 fixed).
+check("facts: cp FROM live config into a workspace draft is allowed", !(await call("bash", { command: `cp ${livePlane}/agent/x.md ./draft.md` }, { sessionID: "s-active" })));
+// The live destination stays protected.
+check("facts: cp INTO the live config is blocked", blocked(await call("bash", { command: `cp ./draft.md ${livePlane}/agent/x.md` }, { sessionID: "s-active" })));
+check("facts: redirect into the live config is blocked", blocked(await call("bash", { command: `echo x > ${livePlane}/${ocJsonc}` }, { sessionID: "s-active" })));
+// A config-shaped draft inside the workspace is allowed.
+check("facts: write to a project .opencode draft is allowed", !(await call("write", { filePath: join(lcpRoot, ".opencode", ocJson), content: "{}" }, { sessionID: "s-active" })));
+
+// An unusable declared root rejects the whole fact set -> fail-closed legacy.
+writeFileSync(join(lcpRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ liveControlPlanePaths: ["relative/dir"] }));
+reloadProjectConfig(lcpRoot);
+check("facts: an unusable declared root falls back to legacy segment matching", blocked(await call("write", { filePath: join(lcpRoot, ".opencode", ocJson), content: "{}" }, { sessionID: "s-active" })));
+
+setWorkspaceRoot(root);
+rmSync(lcpRoot, { recursive: true, force: true });
+rmSync(liveBase, { recursive: true, force: true });
+
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
 console.log(`\n${pass} passed, ${fail} failed`);
