@@ -446,8 +446,27 @@ export async function guardToolCallImpl(
 						review = diskCached;
 					}
 				}
-				const reviewMatchesContext = review?.passed === true && isEvidenceFresh(reviewEvidence(review), { workspace: projectRootKey(prRoot), commitHash: getCurrentGitCommitHash(prRoot), worktreeFingerprint: getGitWorktreeFingerprint(prRoot), sessionID: review.targetSessionID }, 0) && (!review.targetSessionID || review.targetSessionID === context?.sessionID);
-				if (!reviewMatchesContext) preflightFailures.push("Passing secondary review approval is required; invoke a secondary review subagent and record approval with record_review.");
+				const prFingerprint = getGitWorktreeFingerprint(prRoot);
+				const reviewMatchesContext = review?.passed === true && isEvidenceFresh(reviewEvidence(review), { workspace: projectRootKey(prRoot), commitHash: getCurrentGitCommitHash(prRoot), worktreeFingerprint: prFingerprint, sessionID: review.targetSessionID }, 0) && (!review.targetSessionID || review.targetSessionID === context?.sessionID);
+				if (!reviewMatchesContext) {
+					// When an approval exists but cannot be matched to this
+					// worktree, the message must name the actual cause instead
+					// of the generic "review required" (which sends the agent
+					// into an endless re-review loop on an unreadable entry).
+					// Cause attribution only makes sense for approvals of THIS
+					// repository; a review of another repo is not evidence here.
+					const reviewIsForThisRepo = typeof review?.workspace === "string" && (projectRootKey(review.workspace) === projectRootKey(prRoot) || isSameGitRepo(review.workspace, prRoot));
+					const sameRepoApproval = review && review.passed === true && reviewIsForThisRepo ? review : undefined;
+					if (sameRepoApproval && prFingerprint === undefined) {
+						preflightFailures.push("Worktree fingerprint could not be computed (git unavailable or worktree unreadable), so review evidence cannot be bound to this worktree; resolve worktree readability and re-run the secondary review.");
+					} else if (sameRepoApproval && !sameRepoApproval.worktreeFingerprint) {
+						preflightFailures.push(`The recorded review approval from '${sameRepoApproval.reviewer}' has no worktree fingerprint binding (recorded against an unreadable worktree or an older guard version); re-run the secondary review and record it with record_review.`);
+					} else if (sameRepoApproval && sameRepoApproval.worktreeFingerprint !== prFingerprint) {
+						preflightFailures.push(`The recorded review approval from '${sameRepoApproval.reviewer}' does not match the current worktree contents (worktree fingerprint changed after review); re-run the secondary review and record it with record_review.`);
+					} else {
+						preflightFailures.push("Passing secondary review approval is required; invoke a secondary review subagent and record approval with record_review.");
+					}
+				}
 			}
 			if (isDocumentationRequired(prRoot) && !branchHasDocumentationChange(prRoot)) preflightFailures.push("Documentation update is required (Policy 21); update README.md or relevant documentation in docs/.");
 			const branchChangelog = branchHasChangelogChange(prRoot);
