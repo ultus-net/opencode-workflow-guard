@@ -753,6 +753,9 @@ check("F5: agent payload (agents dir) is editable", !(await call("write", { file
 check("F5: agent payload (agent dir) is editable", !(await call("write", { filePath: join(portRepo, ".opencode", "agent", "explore.md"), content: "x" }, { sessionID: "s-port" })));
 check("F5: command payload (commands dir) is editable", !(await call("write", { filePath: join(portRepo, ".opencode", "commands", "deploy.md"), content: "x" }, { sessionID: "s-port" })));
 check("F5: command payload (command dir) is editable", !(await call("write", { filePath: join(portRepo, ".opencode", "command", "build.md"), content: "x" }, { sessionID: "s-port" })));
+// The payload exemption covers markdown only: scripts or unknown file
+// types under payload directories are control-plane surface.
+check("F5: non-markdown file under a payload dir stays protected", blocked(await call("write", { filePath: join(portRepo, ".opencode", "agents", "tool.sh"), content: "#!/bin/sh\n" }, { sessionID: "s-port" })));
 check("F5: project plugins stay protected", blocked(await call("write", { filePath: join(portRepo, ".opencode", "plugins", "custom.ts"), content: "export default {}" }, { sessionID: "s-port" })));
 check("F5: project config stays protected", blocked(await call("write", { filePath: join(portRepo, ".opencode", "workflow-guard.json"), content: "{}" }, { sessionID: "s-port" })));
 check("F5: root config stays protected", blocked(await call("write", { filePath: join(portRepo, "opencode.json"), content: "{}" }, { sessionID: "s-port" })));
@@ -798,6 +801,8 @@ check("F1 fixture: local base is behind the remote", checkBranchBaseIsUpToDate(b
 const f1Behind = await guardToolDecision("bash", { command: "git switch -c feat/fresh-on-behind" }, { sessionID: "s-port" });
 check("F1: base staleness does not gate branch creation", f1Behind.status === "allowed");
 check("F1: base staleness is recorded as an audited advisory", getRecentAuditEntries(30).some((entry) => entry.reason === "branch_base_behind_advisory"));
+const f1PlainBranch = await guardToolDecision("bash", { command: "git branch feat/advisory-plain" }, { sessionID: "s-port" });
+check("F1: plain git branch creation is allowed and advised", f1PlainBranch.status === "allowed" && getRecentAuditEntries(30).some((entry) => entry.reason === "branch_base_behind_advisory"));
 rmSync(behindRepo, { recursive: true, force: true });
 rmSync(originRepo, { recursive: true, force: true });
 rmSync(cloneRepo, { recursive: true, force: true });

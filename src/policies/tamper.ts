@@ -67,7 +67,15 @@ function workspaceProtected(root: string, path: string): boolean {
 		// configuration. The plans directory itself stays protected.
 		if (relLower.startsWith(".opencode/plans/")) return false;
 		const first = relLower.slice(".opencode/".length).split("/")[0]!;
-		if (OPENCODE_PAYLOAD_DIRS.has(first)) return false;
+		if (OPENCODE_PAYLOAD_DIRS.has(first)) {
+			// The exemption covers markdown payload only: role definitions and
+			// command markdown are the versionable, reviewable documents. Any
+			// other file type under a payload directory (scripts, binaries,
+			// unknown extensions) is control-plane surface and stays protected.
+			const rest = relLower.slice(".opencode/".length + first.length + 1);
+			if (rest.endsWith(".md") || rest.endsWith(".markdown")) return false;
+			return true;
+		}
 		return true;
 	}
 	if (/^opencode\.jsonc?$/.test(relLower) || /^workflow-guard\.jsonc?$/.test(relLower)) return true;
