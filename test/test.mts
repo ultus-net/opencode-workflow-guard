@@ -1,6 +1,6 @@
 import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { tmpdir, homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
@@ -695,6 +695,109 @@ check("tee -ai outside workspace is blocked", blocked(await call("bash", { comma
 check("tee -- flag separator outside workspace is blocked", blocked(await call("bash", { command: "echo x | tee -- /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
 check("multi-target tee with an outside path is blocked", blocked(await call("bash", { command: "echo x | tee in.txt /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
 check("tee --append within workspace is allowed with todos", !(await call("bash", { command: "echo x | tee --append src/a.ts" }, { sessionID: "s-active" })));
+
+console.log("- Policy port rules: consumption-anchored config surfaces (research findings F1-F6) -");
+const portRepo = mkdtempSync(join(tmpdir(), "wg-port-rules-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: portRepo });
+writeFileSync(join(portRepo, "README.md"), "port rules fixture\n");
+spawnSync("git", ["add", "."], { cwd: portRepo });
+spawnSync("git", ["-c", "user.email=" + "t" + "@example.com", "-c", "user.name=t", "commit", "-m", "init"], { cwd: portRepo });
+mkdirSync(join(portRepo, "dotfiles", ".config", "opencode"), { recursive: true });
+mkdirSync(join(portRepo, "docs", "agents"), { recursive: true });
+mkdirSync(join(portRepo, ".opencode", "agents"), { recursive: true });
+mkdirSync(join(portRepo, ".opencode", "command"), { recursive: true });
+mkdirSync(join(portRepo, ".opencode", "plugins"), { recursive: true });
+todo("s-port", item("Apply research port rules", "in_progress"));
+setWorkspaceRoot(portRepo);
+reloadProjectConfig(portRepo);
+
+// F1: branch creation is the sanctioned escape from a protected branch and
+// is never gated; commits stay gated and the block names the escape.
+// The fixture stays on protected main for these gates.
+const f1Checkout = await guardToolDecision("bash", { command: "git checkout -b feat/port-x" }, { sessionID: "s-port" });
+check("F1: checkout -b branch creation is never gated on protected main", f1Checkout.status === "allowed");
+const f1Switch = await guardToolDecision("bash", { command: "git switch -c feat/port-x" }, { sessionID: "s-port" });
+check("F1: switch -c branch creation is never gated on protected main", f1Switch.status === "allowed");
+const f1Commit = await guardToolDecision("bash", { command: "git commit -m x" }, { sessionID: "s-port" });
+check("F1: commits stay gated on protected main", f1Commit.status === "blocked" && f1Commit.policy === "git");
+check("F1: block names the sanctioned escape hatch", typeof f1Commit.alternative === "string" && f1Commit.alternative.includes("git switch -c"));
+
+// The sanctioned escape is taken for the draft/payload edit checks: F2-F5
+// assert editability on a feature branch, exactly as the guard prescribes.
+spawnSync("git", ["checkout", "-b", "feat/port-rules"], { cwd: portRepo });
+
+// F2: versioned draft config trees inside the repo are editable; promotion
+// into the live user-level config stays gated with a draft-PR alternative.
+check("F2: versioned draft config tree is editable", !(await call("write", { filePath: join(portRepo, "dotfiles", ".config", "opencode", "opencode.json"), content: "{}" }, { sessionID: "s-port" })));
+check("F2: drafts can be renamed within the repo", !(await call("bash", { command: "mv dotfiles/.config/opencode/opencode.json dotfiles/.config/opencode/opencode.json.bak" }, { sessionID: "s-port" })));
+const f2Promotion = await guardToolDecision("bash", { command: "cp dotfiles/.config/opencode/opencode.json ~/.config/opencode/opencode.json" }, { sessionID: "s-port" });
+check("F2: promotion into the live config is gated", f2Promotion.status === "blocked");
+check("F2: promotion decision names the draft-PR alternative", typeof f2Promotion.alternative === "string" && f2Promotion.alternative.includes("draft"));
+
+// F3: config-shaped names outside consumption surfaces are not tamper hits;
+// scratch dirs stay boundary-gated only.
+const f3Scratch = await guardToolDecision("write", { filePath: "/tmp/opencode/wg-port-draft/opencode.jsonc", content: "{}" }, { sessionID: "s-port" });
+check("F3: scratch config-named files are a boundary matter, not tamper", f3Scratch.status === "blocked" && f3Scratch.policy === "boundary" && f3Scratch.code === "workspace_escape");
+check("F3: deep config-named files in the repo are drafts", !(await call("write", { filePath: join(portRepo, "docs", "examples", "opencode.json"), content: "{}" }, { sessionID: "s-port" })));
+const f3ShellScratch = await guardToolDecision("bash", { command: "echo x > /tmp/opencode/wg-port-draft/other.json" }, { sessionID: "s-port" });
+check("F3: shell writes to scratch dirs stay boundary-gated only", f3ShellScratch.status === "blocked" && f3ShellScratch.policy === "boundary" && f3ShellScratch.code === "shell_mutation");
+
+// F4: documentation may describe the guarded surfaces (pinned; the write
+// content tamper scan was removed and must not return).
+check("F4: docs may describe the guarded config surface", !(await call("write", { filePath: join(portRepo, "docs", "agents", "policy.md"), content: "The guard protects ~/.config/opencode/ and the .opencode control dir; create a feature branch instead." }, { sessionID: "s-port" })));
+
+// F5: agent/command payload under .opencode/ is editable; control-plane
+// files, plugins, root config, installed guard copies, and live user
+// config stay protected.
+check("F5: agent payload (agents dir) is editable", !(await call("write", { filePath: join(portRepo, ".opencode", "agents", "reviewer.md"), content: "---\ndescription: review\n---\n" }, { sessionID: "s-port" })));
+check("F5: agent payload (agent dir) is editable", !(await call("write", { filePath: join(portRepo, ".opencode", "agent", "explore.md"), content: "x" }, { sessionID: "s-port" })));
+check("F5: command payload (commands dir) is editable", !(await call("write", { filePath: join(portRepo, ".opencode", "commands", "deploy.md"), content: "x" }, { sessionID: "s-port" })));
+check("F5: command payload (command dir) is editable", !(await call("write", { filePath: join(portRepo, ".opencode", "command", "build.md"), content: "x" }, { sessionID: "s-port" })));
+check("F5: project plugins stay protected", blocked(await call("write", { filePath: join(portRepo, ".opencode", "plugins", "custom.ts"), content: "export default {}" }, { sessionID: "s-port" })));
+check("F5: project config stays protected", blocked(await call("write", { filePath: join(portRepo, ".opencode", "workflow-guard.json"), content: "{}" }, { sessionID: "s-port" })));
+check("F5: root config stays protected", blocked(await call("write", { filePath: join(portRepo, "opencode.json"), content: "{}" }, { sessionID: "s-port" })));
+check("F5: installed guard copies stay protected", isProtectedPath(join(portRepo, "node_modules", "opencode-workflow-guard", "src", "workflow-guard.ts")));
+check("F5: live user-level plugins stay protected", isProtectedPath(join(homedir(), ".config", "opencode", "plugins", "workflow-guard.ts")));
+
+// F6: decisions carry the matched surface and sanctioned alternative, and
+// the audit trail records them as structured data.
+const f6Tamper = await guardToolDecision("write", { filePath: join(portRepo, "opencode.json"), content: "{}" }, { sessionID: "s-port" });
+check("F6: protected-path decision carries the matched surface", f6Tamper.surface === join(portRepo, "opencode.json"));
+check("F6: protected-path decision names the sanctioned alternative", typeof f6Tamper.alternative === "string" && f6Tamper.alternative.length > 20);
+await call("write", { filePath: join(portRepo, "opencode.json"), content: "{}" }, { sessionID: "s-port" });
+check("F6: audit trail records the structured decision", getRecentAuditEntries(50).some((entry) => entry.policyDecision?.code === "protected_path" && Boolean(entry.policyDecision?.surface) && typeof entry.policyDecision?.alternative === "string"));
+
+// F1 (advisory): base staleness never gates branch creation either - it is
+// recorded as an audited advisory and re-tested by merge-conflict checks
+// at PR preflight.
+const behindRepo = mkdtempSync(join(tmpdir(), "wg-port-behind-"));
+const originRepo = mkdtempSync(join(tmpdir(), "wg-port-origin-"));
+const cloneRepo = mkdtempSync(join(tmpdir(), "wg-port-clone-"));
+const gitIdentity = ["-c", "user.email=t@example.com", "-c", "user.name=t"];
+spawnSync("git", ["init", "-b", "main"], { cwd: behindRepo });
+writeFileSync(join(behindRepo, "f.txt"), "one");
+spawnSync("git", ["add", "."], { cwd: behindRepo });
+spawnSync("git", [...gitIdentity, "commit", "-m", "one"], { cwd: behindRepo });
+spawnSync("git", ["clone", "--bare", behindRepo, originRepo]);
+spawnSync("git", ["clone", originRepo, cloneRepo]);
+writeFileSync(join(cloneRepo, "g.txt"), "two");
+spawnSync("git", ["add", "."], { cwd: cloneRepo });
+spawnSync("git", [...gitIdentity, "commit", "-m", "two"], { cwd: cloneRepo });
+spawnSync("git", ["push", "origin", "main"], { cwd: cloneRepo });
+spawnSync("git", ["remote", "add", "origin", originRepo], { cwd: behindRepo });
+spawnSync("git", ["fetch", "origin"], { cwd: behindRepo });
+setWorkspaceRoot(behindRepo);
+check("F1 fixture: local base is behind the remote", checkBranchBaseIsUpToDate(behindRepo).isBehind === true);
+const f1Behind = await guardToolDecision("bash", { command: "git switch -c feat/fresh-on-behind" }, { sessionID: "s-port" });
+check("F1: base staleness does not gate branch creation", f1Behind.status === "allowed");
+check("F1: base staleness is recorded as an audited advisory", getRecentAuditEntries(30).some((entry) => entry.reason === "branch_base_behind_advisory"));
+rmSync(behindRepo, { recursive: true, force: true });
+rmSync(originRepo, { recursive: true, force: true });
+rmSync(cloneRepo, { recursive: true, force: true });
+
+rmSync(portRepo, { recursive: true, force: true });
+setWorkspaceRoot(root);
+reloadProjectConfig(root);
 
 console.log("- Compaction focus preservation & TUI toast -");
 const boundedCompaction = buildCompactionContext("## Operational Guard State\n- critical", ["## Active Tasks\n" + "a".repeat(10_000), "## Project Memory\nshould-not-fit"], 500);

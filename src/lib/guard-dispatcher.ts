@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { loadReviewCache, loadVerifyCache } from "./audit.ts";
+import { audit, loadReviewCache, loadVerifyCache } from "./audit.ts";
 import { isEvidenceFresh, reviewEvidence, verificationEvidence } from "./evidence.ts";
 import { findGitRoot, isSameGitRepo, projectRootKey } from "./project-config.ts";
 import {
@@ -64,7 +64,7 @@ import { editTargets } from "../policies/post-edit-validation.ts";
 import { generateMaskedEnvSchema, isEnvFilePath, isSecretPath, secretFileReadIn, secretIn } from "../policies/secrets.ts";
 import { checkInteractiveTtyCommand, checkPackageHygiene } from "../policies/shell-safety.ts";
 import { staleWriteReason } from "../policies/stale-write.ts";
-import { PROTECTED_PATH_REASON, isProtectedPath, isSettingsTamper } from "../policies/tamper.ts";
+import { PROTECTED_PATH_REASON, isProtectedPath, isSettingsTamper, protectedPathAlternative } from "../policies/tamper.ts";
 import {
 	EDIT_TOOL_NAMES,
 	effectiveTodoOwnerSessionID,
@@ -114,8 +114,21 @@ export async function guardToolCallImpl(
 	const logPolicyBlock = (message: string) => logBlock(message, context?.simulate);
 	const currentRoot = getWorkspaceRoot();
 	const allow = (): PolicyDecision => ({ status: "allowed", code: "allowed", message: "Allowed by current guardrails." });
-	const block = (policy: string, code: string, message: string): PolicyDecision => ({ status: "blocked", policy, code, message });
-	const needsApproval = (policy: string, code: string, message: string): PolicyDecision => ({ status: "needs_approval", policy, code, message });
+	const block = (
+		policy: string,
+		code: string,
+		message: string,
+		extra?: { surface?: string; alternative?: string },
+	): PolicyDecision => ({ status: "blocked", policy, code, message, ...extra });
+	const needsApproval = (
+		policy: string,
+		code: string,
+		message: string,
+		extra?: { surface?: string; alternative?: string },
+	): PolicyDecision => ({ status: "needs_approval", policy, code, message, ...extra });
+	const keepInWorkspace = `Keep all changes inside the workspace root (${currentRoot}).`;
+	const featureBranchAlternative = "Create a feature branch first - `git switch -c feat/description` - then open a PR.";
+	const liveOverrideAlternative = "Only the user can allow live changes, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment variable set before launching the agent.";
 	let remotePrStateUnchecked = false;
 
 	if (context?.agent && isReadOnlyRole(context.agent)) {
@@ -203,7 +216,7 @@ export async function guardToolCallImpl(
 		const target = extractTargetPath(input) ?? "";
 		if (target && isProtectedPath(target)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: protected path ${target}`);
-			return block("tamper", "protected_path", PROTECTED_PATH_REASON);
+			return block("tamper", "protected_path", PROTECTED_PATH_REASON, { surface: target, alternative: protectedPathAlternative() });
 		}
 		if (target && isSecretPath(target)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: secret file path ${target}`);
@@ -214,7 +227,7 @@ export async function guardToolCallImpl(
 			for (const patchPath of extractPatchPaths(patchText)) {
 				if (isProtectedPath(patchPath)) {
 					logPolicyBlock(`[workflow-guard] blocked apply_patch: protected path ${patchPath}`);
-					return block("tamper", "protected_path", PROTECTED_PATH_REASON);
+					return block("tamper", "protected_path", PROTECTED_PATH_REASON, { surface: patchPath, alternative: protectedPathAlternative() });
 				}
 				if (isSecretPath(patchPath)) {
 					logPolicyBlock(`[workflow-guard] blocked apply_patch: secret file path ${patchPath}`);
@@ -222,13 +235,13 @@ export async function guardToolCallImpl(
 				}
 				if (isPathOutsideWorkspace(patchPath, currentRoot)) {
 					logPolicyBlock(`[workflow-guard] blocked apply_patch: patch target escapes workspace: ${patchPath}`);
-					return block("boundary", "workspace_escape", `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`);
+					return block("boundary", "workspace_escape", `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`, { surface: patchPath, alternative: keepInWorkspace });
 				}
 			}
 		}
 		if (target && isPathOutsideWorkspace(target, currentRoot)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: path escapes workspace: ${target}`);
-			return block("boundary", "workspace_escape", `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`);
+			return block("boundary", "workspace_escape", `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`, { surface: target, alternative: keepInWorkspace });
 		}
 		for (const content of extractEditContent(input)) {
 			const secret = secretIn(content);
@@ -245,14 +258,15 @@ export async function guardToolCallImpl(
 					const what = liveMutationIn(normalizeGitCommands(line));
 					if (what) {
 						logPolicyBlock(`[workflow-guard] blocked ${toolName}: payload contains ${what}`);
-						return block("destructive", "live_mutation_payload", `Blocked: the file you are writing contains a ${what}. Script files are not a way to smuggle destructive commands past the shell guard. Only the user can allow live mutations (WORKFLOW_GUARD_ALLOW_LIVE=1).`);
+						return block("destructive", "live_mutation_payload", `Blocked: the file you are writing contains a ${what}. Script files are not a way to smuggle destructive commands past the shell guard. Only the user can allow live mutations (WORKFLOW_GUARD_ALLOW_LIVE=1).`, { alternative: liveOverrideAlternative });
 					}
 				}
 			}
 		}
 		if (onProtectedBranch(currentRoot)) {
-			logPolicyBlock(`[workflow-guard] blocked ${toolName}: on protected branch ${currentGitBranch(currentRoot)}`);
-			return block("git", "protected_branch", branchGuardReason());
+			const branchName = currentGitBranch(currentRoot);
+			logPolicyBlock(`[workflow-guard] blocked ${toolName}: on protected branch ${branchName}`);
+			return block("git", "protected_branch", branchGuardReason(), { surface: branchName, alternative: featureBranchAlternative });
 		}
 		const todos = await effectiveTodos(context?.sessionID);
 		if (todos !== undefined && !hasActiveTodo(todos)) {
@@ -294,7 +308,7 @@ export async function guardToolCallImpl(
 		const mcpWhat = mcpMutationTool(toolName);
 		if (mcpWhat) {
 			logPolicyBlock(`[workflow-guard] blocked MCP tool ${toolName} (${mcpWhat} mutation)`);
-			return block("mcp", "live_mcp_mutation", `Blocked: ${toolName} mutates ${mcpWhat} - a live system. Changes must be made in code unless the user explicitly allows live changes. Only the user can override this, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment variable set before launching the agent.`);
+			return block("mcp", "live_mcp_mutation", `Blocked: ${toolName} mutates ${mcpWhat} - a live system. Changes must be made in code unless the user explicitly allows live changes. Only the user can override this, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment variable set before launching the agent.`, { surface: toolName, alternative: liveOverrideAlternative });
 		}
 	}
 	if (!SHELL_TOOL_NAMES.has(toolName)) return allow();
@@ -326,26 +340,40 @@ export async function guardToolCallImpl(
 			const normalizedInvocation = `git ${invocation.rest}`;
 			if (isPathOutsideWorkspace(invocation.repoDir, currentRoot) && (GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))) {
 				logPolicyBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
-				return block("boundary", "workspace_escape", `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`);
+				return block("boundary", "workspace_escape", `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`, { surface: invocation.repoDir, alternative: keepInWorkspace });
 			}
 		}
 		for (const invocation of gitInvocations) {
 			if (tagRefspecIn(`git ${invocation.rest}`, invocation.repoDir)) continue;
 			if (GIT_WRITE_RE.test(`git ${invocation.rest}`) && onProtectedBranch(invocation.repoDir)) {
 				logPolicyBlock(`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`);
-				return block("git", "protected_branch", branchGuardReason());
+				return block("git", "protected_branch", branchGuardReason(), { surface: currentGitBranch(invocation.repoDir), alternative: featureBranchAlternative });
 			}
 		}
 		if (GIT_BRANCH_CREATE_RE.test(normalizedCommand)) {
 			const behindCheck = checkBranchBaseIsUpToDate(effectiveRoot);
 			if (behindCheck.isBehind) {
-				logPolicyBlock(`[workflow-guard] blocked branch creation: base is behind remote ${behindCheck.baseRef}`);
-				return block("git", "branch_base_behind", `Blocked: ${behindCheck.reason}`);
+				// Branch creation is the sanctioned escape from a protected
+				// branch and is never gated (research port rule F1): base
+				// staleness is recorded as an advisory here, and real
+				// breakage is caught by the merge-conflict preflight at PR
+				// creation. Blocking the exit invites workarounds.
+				const advisory = `Branch base is ${behindCheck.count} commit(s) behind ${behindCheck.baseRef}: merge or rebase the base before opening a PR.`;
+				logPolicyBlock(`[workflow-guard] advisory: ${advisory}`);
+				audit({
+					ts: new Date().toISOString(),
+					sessionID: context?.sessionID,
+					tool: toolName,
+					decision: "allow",
+					phase: "event",
+					reason: "branch_base_behind_advisory",
+					policyDecision: { status: "allowed", code: "branch_base_behind_advisory", policy: "git", message: advisory },
+				});
 			}
 		}
 		if (isSettingsTamper(command)) {
 			logPolicyBlock(`[workflow-guard] blocked settings tamper: ${command.slice(0, 120)}`);
-			return block("tamper", "settings_tamper", PROTECTED_PATH_REASON);
+			return block("tamper", "settings_tamper", PROTECTED_PATH_REASON, { surface: command.slice(0, 120), alternative: protectedPathAlternative() });
 		}
 		for (const segment of command.split(/[\n|;&]+/)) {
 			const secretFile = secretFileReadIn(segment.trim());
@@ -358,13 +386,15 @@ export async function guardToolCallImpl(
 			const outsidePath = outsideWritePathInPayload(payload, currentRoot);
 			if (outsidePath) {
 				logPolicyBlock(`[workflow-guard] blocked interpreter payload writing outside workspace: ${outsidePath}`);
-				return block("boundary", "workspace_escape", `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`);
+				return block("boundary", "workspace_escape", `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`, { surface: outsidePath, alternative: keepInWorkspace });
 			}
 			const writePaths = writePathsInPayload(payload);
 			if (writePaths.length > 0) {
 				if (context?.agent && isReadOnlyRole(context.agent)) return block("subagent-role", "read_only_role", `Blocked: subagent with read-only role '${context.agent}' cannot perform shell file mutations.`);
-				for (const path of writePaths) if (isProtectedPath(path)) return block("tamper", "protected_path", PROTECTED_PATH_REASON);
-				if (onProtectedBranch(currentRoot)) return block("git", "protected_branch", branchGuardReason());
+				for (const path of writePaths) {
+					if (isProtectedPath(path)) return block("tamper", "protected_path", PROTECTED_PATH_REASON, { surface: path, alternative: protectedPathAlternative() });
+				}
+				if (onProtectedBranch(currentRoot)) return block("git", "protected_branch", branchGuardReason(), { surface: currentGitBranch(currentRoot), alternative: featureBranchAlternative });
 				const todos = await effectiveTodos(context?.sessionID);
 				if (todos !== undefined && !hasActiveTodo(todos)) return block("todo", "no_active_todo", "Blocked: inline interpreter file mutation with no active todo item.");
 				if (!context?.simulate) recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
@@ -373,10 +403,10 @@ export async function guardToolCallImpl(
 				const liveCheck = liveMutationIn(normalizeGitCommands(normalize(payload)));
 				if (liveCheck) {
 					logPolicyBlock(`[workflow-guard] blocked interpreter payload containing ${liveCheck}`);
-					return block("destructive", "live_mutation_payload", `Blocked: inline interpreter script contains a ${liveCheck}. Interpreter payloads cannot smuggle live destructive commands past the guard.`);
+					return block("destructive", "live_mutation_payload", `Blocked: inline interpreter script contains a ${liveCheck}. Interpreter payloads cannot smuggle live destructive commands past the guard.`, { surface: payload.slice(0, 120), alternative: liveOverrideAlternative });
 				}
 			}
-			if (isSettingsTamper(payload)) return block("tamper", "settings_tamper", PROTECTED_PATH_REASON);
+			if (isSettingsTamper(payload)) return block("tamper", "settings_tamper", PROTECTED_PATH_REASON, { surface: payload.slice(0, 120), alternative: protectedPathAlternative() });
 			const secretPath = secretPathInPayload(payload);
 			if (secretPath) return block("secrets", "secret_read", `Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted.`);
 		}
@@ -389,12 +419,12 @@ export async function guardToolCallImpl(
 			const what = liveMutationIn(normalizedCommand) ?? liveMutationIn(command);
 			if (what) {
 				logPolicyBlock(`[workflow-guard] blocked ${what}: ${command.slice(0, 120)}`);
-				return block("destructive", "live_mutation", `Blocked: ${what} targets a live system. Changes must be made in code (IaC, migrations, source) unless the user explicitly allows live changes. Only the user can override this, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment variable set before launching the agent.`);
+				return block("destructive", "live_mutation", `Blocked: ${what} targets a live system. Changes must be made in code (IaC, migrations, source) unless the user explicitly allows live changes. Only the user can override this, via the WORKFLOW_GUARD_ALLOW_LIVE=1 environment variable set before launching the agent.`, { surface: command.slice(0, 120), alternative: liveOverrideAlternative });
 			}
 		}
 		if (PUSH_TO_MAIN_RE.test(normalizedCommand)) {
 			logPolicyBlock(`[workflow-guard] blocked push to main/master: ${command}`);
-			return block("git", "protected_branch_push", "Blocked: direct pushes to main/master are not allowed. Create a feature branch and open a PR instead.");
+			return block("git", "protected_branch_push", "Blocked: direct pushes to main/master are not allowed. Create a feature branch and open a PR instead.", { surface: command, alternative: featureBranchAlternative });
 		}
 		for (const invocation of gitInvocations) {
 			const pushText = `git ${invocation.rest}`;
@@ -403,7 +433,7 @@ export async function guardToolCallImpl(
 			const pushedBranch = pushedProtectedBranchIn(pushText, invocation.repoDir);
 			if (pushedBranch) {
 				logPolicyBlock(`[workflow-guard] blocked push to protected branch '${pushedBranch}': ${command}`);
-				return block("git", "protected_branch_push", `Blocked: direct pushes to protected branch '${pushedBranch}' are not allowed. Create a feature branch and open a PR instead.`);
+				return block("git", "protected_branch_push", `Blocked: direct pushes to protected branch '${pushedBranch}' are not allowed. Create a feature branch and open a PR instead.`, { surface: pushedBranch, alternative: featureBranchAlternative });
 			}
 		}
 		for (const invocation of gitInvocations) {
@@ -411,7 +441,7 @@ export async function guardToolCallImpl(
 			if (tagRefspecIn(`git ${invocation.rest}`, invocation.repoDir)) continue;
 			if (onProtectedBranch(invocation.repoDir)) {
 				logPolicyBlock(`[workflow-guard] blocked push from protected branch: ${command}`);
-				return block("git", "protected_branch", branchGuardReason());
+				return block("git", "protected_branch", branchGuardReason(), { surface: currentGitBranch(invocation.repoDir), alternative: featureBranchAlternative });
 			}
 			const branch = currentGitBranch(invocation.repoDir);
 			if (branch) {
@@ -419,7 +449,7 @@ export async function guardToolCallImpl(
 				const mergedStatus = isBranchAlreadyMergedOrClosed(invocation.repoDir, branch, !context?.simulate);
 				if (mergedStatus.merged) {
 					logPolicyBlock(`[workflow-guard] blocked push to merged/closed branch: ${branch}`);
-					return block("git", "merged_branch", `Blocked: ${mergedStatus.reason}`);
+					return block("git", "merged_branch", `Blocked: ${mergedStatus.reason}`, { surface: branch, alternative: "Create a fresh feature branch for new changes." });
 				}
 			}
 		}
