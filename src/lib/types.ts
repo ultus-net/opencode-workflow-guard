@@ -35,6 +35,15 @@ export interface ProjectConfig {
 	}>;
 	requireReview?: boolean;
 	requireDocumentation?: boolean;
+	/**
+	 * Absolute paths of the LIVE control plane (runtime `~/.config/opencode`,
+	 * the guard's own install). When set, config-path protection classifies by
+	 * runtime consumption instead of filename segments: only targets under a
+	 * live root are protected, while versioned drafts (project `.opencode/`,
+	 * dotfiles `.config/opencode`, worktrees) are not. Unset keeps the legacy
+	 * fail-closed segment matching.
+	 */
+	liveControlPlanePaths?: string[];
 	recoveryCheckpoints?: boolean;
 	projectMemory?: boolean;
 	learning?: boolean;
