@@ -1745,6 +1745,53 @@ check("commitless repo content change updates review fingerprint", getGitWorktre
 rmSync(commitlessRepo, { recursive: true, force: true });
 rmSync(fingerprintRepo, { recursive: true, force: true });
 
+// Untracked special entries must never void the worktree fingerprint: a
+// symlink to a directory (readFileSync throws EISDIR), a broken symlink,
+// an unreadable file, and a FIFO all keep the fingerprint computable and
+// stable. One unopenable entry previously returned undefined, making
+// review/verification evidence permanently unfresh for that worktree and
+// surfacing as a misleading "review approval required" preflight failure.
+const specialRepo = mkdtempSync(join(tmpdir(), "wg-fingerprint-specials-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: specialRepo });
+spawnSync("git", ["config", "user.email", "test" + "@example.com"], { cwd: specialRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: specialRepo });
+writeFileSync(join(specialRepo, "tracked.txt"), "base\n");
+spawnSync("git", ["add", "tracked.txt"], { cwd: specialRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: specialRepo });
+mkdirSync(join(specialRepo, "target-dir"));
+symlinkSync(join(specialRepo, "target-dir"), join(specialRepo, "dir-link"));
+symlinkSync(join(specialRepo, "missing-target"), join(specialRepo, "broken-link"));
+writeFileSync(join(specialRepo, "locked.txt"), "unreadable\n");
+chmodSync(join(specialRepo, "locked.txt"), 0o000);
+const fifoPath = join(specialRepo, "pipe.fifo");
+if (process.platform !== "win32") spawnSync("mkfifo", [fifoPath], { cwd: specialRepo });
+const fpWithSpecials = getGitWorktreeFingerprint(specialRepo);
+check("fingerprint stays computable with untracked dir-symlink/broken-symlink/unreadable-file/fifo", typeof fpWithSpecials === "string" && fpWithSpecials.length === 64);
+check("fingerprint is stable across repeated computation with special entries", fpWithSpecials !== undefined && getGitWorktreeFingerprint(specialRepo) === fpWithSpecials);
+if ((process.getuid?.() ?? 1) !== 0) {
+	check("audit trail names the skipped unreadable entry", getRecentAuditEntries(50).some((entry) => entry.tool === "worktree-fingerprint" && (entry.input as { file?: string } | undefined)?.file === "locked.txt"));
+}
+// git's untracked listing binds a symlink to its target STRING (the link
+// bytes), never the target's contents. The link target lives outside the
+// repo so target contents cannot leak into the untracked listing.
+const linkTargetBase = mkdtempSync(join(tmpdir(), "wg-link-target-"));
+mkdirSync(join(linkTargetBase, "one"));
+mkdirSync(join(linkTargetBase, "two"));
+rmSync(join(specialRepo, "dir-link"));
+symlinkSync(join(linkTargetBase, "one"), join(specialRepo, "dir-link"));
+check("re-pointing an untracked directory symlink updates the fingerprint", getGitWorktreeFingerprint(specialRepo) !== fpWithSpecials);
+rmSync(join(specialRepo, "dir-link"));
+symlinkSync(join(linkTargetBase, "two"), join(specialRepo, "dir-link"));
+const fpAfterTargetChange = getGitWorktreeFingerprint(specialRepo);
+writeFileSync(join(linkTargetBase, "two", "inner.txt"), "changed inside the link target\n");
+check("changing symlink target contents does not change the fingerprint", getGitWorktreeFingerprint(specialRepo) === fpAfterTargetChange);
+rmSync(join(specialRepo, "dir-link"));
+check("removing an untracked symlink updates the fingerprint", getGitWorktreeFingerprint(specialRepo) !== fpAfterTargetChange);
+symlinkSync(join(specialRepo, "missing-target-2"), join(specialRepo, "broken-link-2"));
+check("adding an untracked symlink updates the fingerprint", getGitWorktreeFingerprint(specialRepo) !== fpWithSpecials);
+rmSync(specialRepo, { recursive: true, force: true });
+rmSync(linkTargetBase, { recursive: true, force: true });
+
 // 9. Secret-File READ Blocks (Policy 17)
 console.log("- Policy 17: Secret-File READ Blocks -");
 check("isSecretPath detects .env", isSecretPath(".env"));
