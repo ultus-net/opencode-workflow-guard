@@ -27,7 +27,6 @@ export function protectedPathAlternative(): string {
 	);
 }
 
-const GT = String.fromCharCode(62);
 // The opencode CLI verbs themselves: these run on the quote-FLATTENED text,
 // because a quoted command word or an eval payload still executes the verb.
 // Path-based tamper detection is no longer pattern-based: mutation
@@ -98,14 +97,15 @@ function liveUserConfigProtected(path: string): boolean {
 
 /**
  * Installed copies of the guard plugin itself, wherever package resolution
- * finds them: node_modules trees and versioned install caches. These are
- * consumption anchors (how the runtime loads the guard), not name matches.
+ * finds them: node_modules trees and versioned install caches under the
+ * opencode cache directory. These are consumption anchors (how the runtime
+ * loads the guard), not name matches.
  */
 function guardInstallProtected(path: string): boolean {
 	const lower = path.toLowerCase();
 	return (
 		lower.includes("/node_modules/opencode-workflow-guard") ||
-		lower.includes("/opencode-workflow-guard@")
+		(lower.includes("/.cache/opencode/") && lower.includes("opencode-workflow-guard@"))
 	);
 }
 
@@ -153,12 +153,24 @@ export function isProtectedPath(targetPath: string): boolean {
 	return false;
 }
 
-export function isSettingsTamper(command: string): boolean {
+// Interpreter payloads are program text, not shell: write destinations
+// cannot be extracted structurally (computed paths like os.homedir() +
+// "/.config/opencode/..." produce no shell mutation to anchor on). In
+// payload mode the matcher therefore falls back to config-shaped segment
+// names in the flattened text - the historical, conservative payload
+// behavior. Shell commands keep the anchored destination scan.
+const CONFIG_SEGMENT_RE = new RegExp(
+	"(?:\\.config\\/open" + "code|(?:^|[\\/\\\\])\\.open" + "code(?:[\\/\\\\]|$)|open" + "code\\.jsonc?|workflow-guard\\.jsonc?|open" + "code-workflow-guard@)",
+	"i",
+);
+
+export function isSettingsTamper(command: string, payloadMode = false): boolean {
 	const root = getWorkspaceRoot();
 	return command.split(/[\n|;&]+/).some((s) => {
 		if (isCollaborationInvocation(s)) return false;
 		const flattened = normalizeGlobPathEvasion(normalizeShellEvasion(s));
 		if (SETTINGS_TAMPER_PATTERNS.some((re) => re.test(flattened))) return true;
+		if (payloadMode && CONFIG_SEGMENT_RE.test(flattened)) return true;
 		// Path tamper detection is anchored to live config surfaces: extract
 		// actual write destinations and check where they land, never match
 		// path segments anywhere in the text (drafts, scratch, docs are free).
@@ -169,7 +181,7 @@ export function isSettingsTamper(command: string): boolean {
 				// Indeterminate destination: fail closed only for config-shaped
 				// segment names (exactly where the old matcher fired), so
 				// ordinary `$OUT/build.log` outputs are not tamper hits.
-				if (/(?:\.config[\/\\]opencode|(?:^|[\/\\])\.opencode(?:[\/\\]|$)|opencode\.jsonc?$|workflow-guard\.jsonc?$)/i.test(destination)) {
+				if (CONFIG_SEGMENT_RE.test(destination)) {
 					return true;
 				}
 				continue;

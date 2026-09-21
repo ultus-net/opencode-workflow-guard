@@ -758,6 +758,13 @@ check("F5: project config stays protected", blocked(await call("write", { filePa
 check("F5: root config stays protected", blocked(await call("write", { filePath: join(portRepo, "opencode.json"), content: "{}" }, { sessionID: "s-port" })));
 check("F5: installed guard copies stay protected", isProtectedPath(join(portRepo, "node_modules", "opencode-workflow-guard", "src", "workflow-guard.ts")));
 check("F5: live user-level plugins stay protected", isProtectedPath(join(homedir(), ".config", "opencode", "plugins", "workflow-guard.ts")));
+// Interpreter payloads are program text with no shell structure: payload
+// mode keeps the conservative config-segment fallback, and the boundary
+// inner layer expands ~/$HOME before protected-path classification.
+check("F5: computed-homedir interpreter payload is blocked", blocked(await call("bash", { command: `node -e 'require("fs").writeFileSync(require("os").homedir() + "/.config/opencode/opencode.json", "x")'` }, { sessionID: "s-port" })));
+check("F5: literal-tilde interpreter payload is blocked", blocked(await call("bash", { command: `node -e 'require("fs").writeFileSync("~/.config/opencode/opencode.json", "x")'` }, { sessionID: "s-port" })));
+check("F2: $HOME promotion via shell is blocked", blocked(await call("bash", { command: "cp notes.md $HOME/.config/opencode/opencode.json" }, { sessionID: "s-port" })));
+check("F5: mv of a live config file to an innocuous name is blocked", blocked(await call("bash", { command: "mv ~/.config/opencode/opencode.json renamed.json" }, { sessionID: "s-port" })));
 
 // F6: decisions carry the matched surface and sanctioned alternative, and
 // the audit trail records them as structured data.

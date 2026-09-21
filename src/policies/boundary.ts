@@ -119,7 +119,8 @@ export async function guardShellMutation(
 		const transfer = filesystemTransferInfo(segment);
 		if (transfer && shellWords(unwrapShellCommand(segment))[0] === "mv") {
 			for (const source of transfer.sources) {
-				if (isProtectedPath(source)) {
+				const expandedSource = expandShellTargetPath(source);
+				if (expandedSource && isProtectedPath(expandedSource)) {
 					return PROTECTED_PATH_REASON;
 				}
 				if (isPathOutsideWorkspace(source, root)) {
@@ -147,7 +148,8 @@ export async function guardShellMutation(
 				return `Blocked: shell file mutation payload appears to contain a ${secret}. Secrets must not be written to disk from agent commands.`;
 			}
 			const target = mutation.target ?? "";
-			if (target && isProtectedPath(target)) {
+			const expandedTarget = expandShellTargetPath(target);
+			if (expandedTarget && isProtectedPath(expandedTarget)) {
 				return `${PROTECTED_PATH_REASON} ${protectedPathAlternative()}`;
 			}
 			if (target && isPathOutsideWorkspace(target, root)) {

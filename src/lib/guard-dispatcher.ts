@@ -406,7 +406,10 @@ export async function guardToolCallImpl(
 					return block("destructive", "live_mutation_payload", `Blocked: inline interpreter script contains a ${liveCheck}. Interpreter payloads cannot smuggle live destructive commands past the guard.`, { surface: payload.slice(0, 120), alternative: liveOverrideAlternative });
 				}
 			}
-			if (isSettingsTamper(payload)) return block("tamper", "settings_tamper", PROTECTED_PATH_REASON, { surface: payload.slice(0, 120), alternative: protectedPathAlternative() });
+			// Payload mode: interpreter scripts are program text with no shell
+			// structure, so destinations cannot be extracted - fall back to
+			// config-shaped segment scanning (conservative, historical).
+			if (isSettingsTamper(payload, true)) return block("tamper", "settings_tamper", PROTECTED_PATH_REASON, { surface: payload.slice(0, 120), alternative: protectedPathAlternative() });
 			const secretPath = secretPathInPayload(payload);
 			if (secretPath) return block("secrets", "secret_read", `Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted.`);
 		}
