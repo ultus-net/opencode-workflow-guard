@@ -4597,6 +4597,60 @@ else process.env.XDG_DATA_HOME = prevDataHome;
 // npm-installed one (observed on-device: npm i -g updates ignored while a
 // home-level pnpm node_modules copy kept loading). The version is therefore
 // surfaced in guard_status and in the startup app log.
+console.log("- Git hygiene snapshot -");
+const hygieneRepo = join(root, "wg-hygiene");
+mkdirSync(hygieneRepo, { recursive: true });
+const hgit = (args: string[]): string => {
+	const res = spawnSync("git", args, { cwd: hygieneRepo, encoding: "utf8" });
+	if (res.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${res.stderr}`);
+	return res.stdout;
+};
+hgit(["init", "-b", "main"]);
+hgit(["config", "user.email", "test@test.local"]);
+hgit(["config", "user.name", "Test Runner"]);
+writeFileSync(join(hygieneRepo, "base.txt"), "base\n");
+hgit(["add", "base.txt"]);
+hgit(["commit", "-m", "base"]);
+hgit(["switch", "-c", "feature/done"]);
+writeFileSync(join(hygieneRepo, "done.txt"), "done\n");
+hgit(["add", "done.txt"]);
+hgit(["commit", "-m", "done work"]);
+hgit(["switch", "main"]);
+hgit(["merge", "--ff-only", "feature/done"]);
+hgit(["switch", "-c", "feature/open"]);
+writeFileSync(join(hygieneRepo, "open.txt"), "open\n");
+hgit(["add", "open.txt"]);
+hgit(["commit", "-m", "open work"]);
+// Prunable worktree: register one, then delete its directory (crashed-add
+// simulation) so the admin entry stays behind.
+hgit(["worktree", "add", join(root, "wg-hygiene-wt"), "feature/done"]);
+rmSync(join(root, "wg-hygiene-wt"), { recursive: true, force: true });
+const hygieneStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: hygieneRepo }, { sessionID: "s-hygiene", worktree: hygieneRepo, directory: hygieneRepo } as any)));
+check("guard_status exposes the git hygiene snapshot", typeof hygieneStatus.gitHygiene === "object" && hygieneStatus.gitHygiene !== null);
+check("hygiene lists merged local branches excluding the current and unmerged", Array.isArray(hygieneStatus.gitHygiene.mergedLocalBranches) && hygieneStatus.gitHygiene.mergedLocalBranches.includes("feature/done") && !hygieneStatus.gitHygiene.mergedLocalBranches.includes("feature/open") && !hygieneStatus.gitHygiene.mergedLocalBranches.includes("main"));
+check("hygiene counts prunable worktree admin entries", hygieneStatus.gitHygiene.prunableWorktreeCount === 1);
+check("hygiene omits base-behind without a remote", hygieneStatus.gitHygiene.baseBehind === undefined);
+// The list is capped while the count reflects reality.
+for (let i = 0; i < 12; i++) {
+	hgit(["switch", "main"]);
+	hgit(["switch", "-c", `feature/merged-${i}`]);
+	writeFileSync(join(hygieneRepo, `merged-${i}.txt`), `${i}\n`);
+	hgit(["add", `merged-${i}.txt`]);
+	hgit(["commit", "-m", `merged ${i}`]);
+	hgit(["switch", "main"]);
+	hgit(["merge", "--ff-only", `feature/merged-${i}`]);
+}
+// End on a merged, non-base current branch: the current-branch filter must
+// exclude it from the merged list independently of the base filter.
+hgit(["switch", "feature/merged-11"]);
+const cappedStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: hygieneRepo }, { sessionID: "s-hygiene-capped", worktree: hygieneRepo, directory: hygieneRepo } as any)));
+check("hygiene branch list is capped, counts reality, and excludes the merged current branch", cappedStatus.gitHygiene.mergedLocalBranchCount === 12 && cappedStatus.gitHygiene.mergedLocalBranches.length === 10 && !cappedStatus.gitHygiene.mergedLocalBranches.includes("feature/merged-11") && cappedStatus.gitHygiene.mergedLocalBranches.includes("feature/merged-10"));
+rmSync(hygieneRepo, { recursive: true, force: true });
+const hygieneNonGit = mkdtempSync(join(tmpdir(), "wg-hygiene-nongit-"));
+const nonGitStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: hygieneNonGit }, { sessionID: "s-hygiene-nongit", worktree: hygieneNonGit, directory: hygieneNonGit } as any)));
+check("hygiene snapshot is null outside a git repository", nonGitStatus.gitHygiene === null);
+rmSync(hygieneNonGit, { recursive: true, force: true });
+
 console.log("- Loaded plugin version visibility -");
 const expectedVersion = String((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
 check("loadedPluginVersion reads the adjacent package manifest", loadedPluginVersion() === expectedVersion);
