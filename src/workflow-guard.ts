@@ -66,6 +66,7 @@ import {
 	sessionMutationTimestamps,
 	sessionVerifyResults,
 	getProjectConfig,
+	getLiveControlPlaneRoots,
 	getOperationProfile,
 	isRecoveryCheckpointsEnabled,
 	isReviewRequired,
@@ -88,6 +89,7 @@ import { findGitRoot, isSameGitRepo, loadProjectConfig, reloadProjectConfig, str
 export {
 	setWorkspaceRoot,
 	getWorkspaceRoot,
+	getLiveControlPlaneRoots,
 	setSdkClient,
 	getLastMutationTimestamp,
 	getMutationCount,

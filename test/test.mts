@@ -1747,6 +1747,52 @@ check("commitless repo content change updates review fingerprint", getGitWorktre
 rmSync(commitlessRepo, { recursive: true, force: true });
 rmSync(fingerprintRepo, { recursive: true, force: true });
 
+// Untracked special entries must never void the worktree fingerprint: a
+// symlink to a directory (readFileSync throws EISDIR), a broken symlink,
+// an unreadable file, and a FIFO all keep the fingerprint computable and
+// stable. One unopenable entry previously returned undefined, making
+// review/verification evidence permanently unfresh for that worktree and
+// surfacing as a misleading "review approval required" preflight failure.
+const specialRepo = mkdtempSync(join(tmpdir(), "wg-fingerprint-specials-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: specialRepo });
+spawnSync("git", ["config", "user.email", "test" + "@example.com"], { cwd: specialRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: specialRepo });
+writeFileSync(join(specialRepo, "tracked.txt"), "base\n");
+spawnSync("git", ["add", "tracked.txt"], { cwd: specialRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: specialRepo });
+mkdirSync(join(specialRepo, "target-dir"));
+symlinkSync(join(specialRepo, "target-dir"), join(specialRepo, "dir-link"));
+symlinkSync(join(specialRepo, "missing-target"), join(specialRepo, "broken-link"));
+writeFileSync(join(specialRepo, "locked.txt"), "unreadable\n");
+chmodSync(join(specialRepo, "locked.txt"), 0o000);
+const fifoPath = join(specialRepo, "pipe.fifo");
+if (process.platform !== "win32") spawnSync("mkfifo", [fifoPath], { cwd: specialRepo });
+const fpWithSpecials = getGitWorktreeFingerprint(specialRepo);
+check("fingerprint stays computable with untracked dir-symlink/broken-symlink/unreadable-file/fifo", typeof fpWithSpecials === "string" && fpWithSpecials.length === 64);
+check("fingerprint is stable across repeated computation with special entries", fpWithSpecials !== undefined && getGitWorktreeFingerprint(specialRepo) === fpWithSpecials);
+if ((process.getuid?.() ?? 1) !== 0) {
+	check("audit trail names the skipped unreadable entry", getRecentAuditEntries(50).some((entry) => entry.tool === "worktree-fingerprint" && (entry.input as { file?: string } | undefined)?.file === "locked.txt"));
+}
+// git's untracked listing binds a symlink to its target STRING (the link
+// bytes), never the target's contents. The link target lives outside the
+// repo so target contents cannot leak into the untracked listing.
+const linkTargetBase = mkdtempSync(join(tmpdir(), "wg-link-target-"));
+mkdirSync(join(linkTargetBase, "one"));
+mkdirSync(join(linkTargetBase, "two"));
+rmSync(join(specialRepo, "dir-link"));
+symlinkSync(join(linkTargetBase, "one"), join(specialRepo, "dir-link"));
+check("re-pointing an untracked directory symlink updates the fingerprint", getGitWorktreeFingerprint(specialRepo) !== fpWithSpecials);
+rmSync(join(specialRepo, "dir-link"));
+symlinkSync(join(linkTargetBase, "two"), join(specialRepo, "dir-link"));
+const fpAfterTargetChange = getGitWorktreeFingerprint(specialRepo);
+writeFileSync(join(linkTargetBase, "two", "inner.txt"), "changed inside the link target\n");
+check("changing symlink target contents does not change the fingerprint", getGitWorktreeFingerprint(specialRepo) === fpAfterTargetChange);
+rmSync(join(specialRepo, "dir-link"));
+check("removing an untracked symlink updates the fingerprint", getGitWorktreeFingerprint(specialRepo) !== fpAfterTargetChange);
+symlinkSync(join(specialRepo, "missing-target-2"), join(specialRepo, "broken-link-2"));
+check("adding an untracked symlink updates the fingerprint", getGitWorktreeFingerprint(specialRepo) !== fpWithSpecials);
+rmSync(specialRepo, { recursive: true, force: true });
+rmSync(linkTargetBase, { recursive: true, force: true });
 // Review evidence binds to tracked content only: untracked scratch files are
 // not part of the reviewed diff, so creating or deleting them must keep the
 // approval fresh, while the full fingerprint still covers untracked contents
@@ -4067,6 +4113,43 @@ const unavailableMemory = await (memoryUnavailablePlugin.tool as any).project_me
 check("project-memory initialization failure leaves core guard hooks active", typeof memoryUnavailablePlugin["tool.execute.before"] === "function" && unavailableMemory.includes("core guard enforcement remains active"));
 if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDataHome;
+
+console.log("- live control-plane paths (tier port: config-path facts) -");
+const liveBase = mkdtempSync(join(tmpdir(), "wg-lcp-base-"));
+const livePlane = join(liveBase, ".config", "open" + "code");
+mkdirSync(livePlane, { recursive: true });
+const lcpRoot = mkdtempSync(join(tmpdir(), "wg-lcp-root-"));
+mkdirSync(join(lcpRoot, ".opencode"), { recursive: true });
+const ocJson = "open" + "code.json";
+const ocJsonc = "open" + "code.jsonc";
+setWorkspaceRoot(root);
+
+// Legacy (no live roots configured): the copy SOURCE under a config path alone
+// blocks the command — the F3 false positive, pinned as current behavior.
+check("legacy: cp FROM a .config/opencode source is blocked without live roots", blocked(await call("bash", { command: `cp ${livePlane}/agent/x.md ./draft.md` }, { sessionID: "s-active" })));
+
+// Declare the live control plane via project config, then reload.
+writeFileSync(join(lcpRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ liveControlPlanePaths: [livePlane] }));
+reloadProjectConfig(lcpRoot);
+setWorkspaceRoot(lcpRoot);
+
+// With facts: the same copy is allowed — the SOURCE is no longer matched and
+// the destination is a sanctioned workspace draft (F3 fixed).
+check("facts: cp FROM live config into a workspace draft is allowed", !(await call("bash", { command: `cp ${livePlane}/agent/x.md ./draft.md` }, { sessionID: "s-active" })));
+// The live destination stays protected.
+check("facts: cp INTO the live config is blocked", blocked(await call("bash", { command: `cp ./draft.md ${livePlane}/agent/x.md` }, { sessionID: "s-active" })));
+check("facts: redirect into the live config is blocked", blocked(await call("bash", { command: `echo x > ${livePlane}/${ocJsonc}` }, { sessionID: "s-active" })));
+// A config-shaped draft inside the workspace is allowed.
+check("facts: write to a project .opencode draft is allowed", !(await call("write", { filePath: join(lcpRoot, ".opencode", ocJson), content: "{}" }, { sessionID: "s-active" })));
+
+// An unusable declared root rejects the whole fact set -> fail-closed legacy.
+writeFileSync(join(lcpRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ liveControlPlanePaths: ["relative/dir"] }));
+reloadProjectConfig(lcpRoot);
+check("facts: an unusable declared root falls back to legacy segment matching", blocked(await call("write", { filePath: join(lcpRoot, ".opencode", ocJson), content: "{}" }, { sessionID: "s-active" })));
+
+setWorkspaceRoot(root);
+rmSync(lcpRoot, { recursive: true, force: true });
+rmSync(liveBase, { recursive: true, force: true });
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;

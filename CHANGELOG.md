@@ -1,5 +1,19 @@
 # Changelog
 
+## 1.14.0
+
+### Minor Changes
+
+- d240134: Add opt-in `liveControlPlanePaths` (project config `.opencode/workflow-guard.json`, or the `WORKFLOW_GUARD_LIVE_CONTROL_PLANE_PATHS` env override). When set, the Settings Tamper Guard classifies by runtime consumption instead of filename segments: only targets that resolve under a declared live control-plane root are protected (symlink-aware), so copying **from** a live config path into a sanctioned workspace draft is no longer blocked, and versioned drafts (a project `.opencode/`, a dotfiles `.config/opencode`, a worktree) are editable. Roots must be absolute (`~`/`$HOME` are expanded); an unusable root rejects the whole set and falls back to the legacy fail-closed segment matching. Unset keeps the legacy behavior.
+
+## 1.13.6
+
+### Patch Changes
+
+- 0724061: Fix evidence freshness in worktrees containing untracked special files: `getGitWorktreeFingerprint` no longer voids on a single unreadable or unopenable untracked entry. Directory symlinks hash their link string (git semantics - re-pointing a link moves the fingerprint, changing the link target's contents does not), FIFOs/sockets hash path and mode, and unopenable files are skipped with a `worktree-fingerprint` entry naming them in the durable audit trail instead of returning `undefined` for the whole fingerprint. PR preflight now names the actual cause when an existing approval cannot be matched (missing fingerprint binding, fingerprint mismatch, or uncomputable fingerprint) instead of the misleading generic "review approval required".
+
+    Also changes the `.gitignore` pattern from `node_modules/` to `node_modules`: the directory-only pattern does not match a `node_modules` symlink (as created in isolated worktrees), which previously let `git add -A` stage it.
+
 ## 1.13.5
 
 ### Patch Changes

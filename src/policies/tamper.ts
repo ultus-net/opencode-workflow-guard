@@ -1,7 +1,8 @@
 import { realpathSync } from "node:fs";
 import { basename, relative, resolve } from "node:path";
-import { getWorkspaceRoot } from "../lib/state.ts";
+import { getLiveControlPlaneRoots, getWorkspaceRoot } from "../lib/state.ts";
 import { decodeShellEscapes, prepareRedirectResidue } from "../lib/shell.ts";
+import { pathWithinAnyRoot, realpathWithinAnyRoot } from "../lib/live-control-plane.ts";
 
 export const PROTECTED_PATH_REASON =
 	"Blocked: modifying Open" +
@@ -56,19 +57,37 @@ export function isCollaborationInvocation(segment: string): boolean {
 	return COLLABORATION_INVOCATION_PATTERNS.some((re) => re.test(segment));
 }
 
-export function isSettingsTamper(command: string): boolean {
+export function isSettingsTamper(command: string, liveControlPlaneRoots?: readonly string[]): boolean {
+	// When the host declares its live control-plane roots, path-shaped tamper is
+	// decided by the mutation TARGET's runtime location (`isProtectedPath`), not
+	// by matching any operand's raw text. That stops a copy/move SOURCE under a
+	// config path from being flagged while the destination is a sanctioned draft
+	// (finding F3). The opencode CLI verb patterns still apply. Callers that scan
+	// written content (edit payloads) pass no roots and keep the legacy
+	// fail-closed path matching.
+	const factMode = liveControlPlaneRoots !== undefined && liveControlPlaneRoots.length > 0;
 	return command.split(/[\n|;&]+/).some((s) => {
 		if (isCollaborationInvocation(s)) return false;
-		const residue = normalizeGlobPathEvasion(normalizeShellEvasion(prepareRedirectResidue(s)));
 		const flattened = normalizeGlobPathEvasion(normalizeShellEvasion(s));
-		return PATH_PATTERNS.some((re) => re.test(residue)) || VERB_PATTERNS.some((re) => re.test(flattened));
+		if (VERB_PATTERNS.some((re) => re.test(flattened))) return true;
+		if (factMode) return false;
+		const residue = normalizeGlobPathEvasion(normalizeShellEvasion(prepareRedirectResidue(s)));
+		return PATH_PATTERNS.some((re) => re.test(residue));
 	});
 }
 
-export function isProtectedPath(targetPath: string): boolean {
+export function isProtectedPath(
+	targetPath: string,
+	liveControlPlaneRoots: readonly string[] | undefined = getLiveControlPlaneRoots(),
+): boolean {
 	if (!targetPath) return false;
 	const root = getWorkspaceRoot();
 	const resolved = resolve(root, targetPath);
+	if (liveControlPlaneRoots && liveControlPlaneRoots.length > 0) {
+		// Fact mode: only the LIVE control plane is protected; versioned drafts
+		// (project .opencode/, dotfiles .config/opencode, worktrees) are not.
+		return pathWithinAnyRoot(resolved, liveControlPlaneRoots) || realpathWithinAnyRoot(resolved, liveControlPlaneRoots);
+	}
 	const matches = (path: string): boolean => {
 		const base = basename(path);
 		const lower = path.toLowerCase();

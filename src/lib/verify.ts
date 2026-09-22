@@ -1,6 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash, type Hash } from "node:crypto";
-import { readFileSync, existsSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { dynamicShellSyntaxIn, normalize } from "./shell.ts";
 import { getCleanEnv } from "./utils.ts";
@@ -8,6 +8,7 @@ import { getProjectConfig } from "./state.ts";
 import { normalizeGitCommands } from "../policies/git.ts";
 import { liveMutationIn } from "../policies/destructive.ts";
 import { isSettingsTamper } from "../policies/tamper.ts";
+import { audit } from "./audit.ts";
 
 export function detectVerifyCommand(root: string): string | undefined {
 	if (process.env.WORKFLOW_GUARD_VERIFY !== undefined) {
@@ -118,6 +119,28 @@ export function getGitStatusSummary(root: string): string | undefined {
 	return undefined;
 }
 
+// One warning per unreadable/unopenable untracked entry per process: the
+// fingerprint skips the entry (fail-open per entry, path still hashed) but
+// the durable audit trail must name it, since evidence binding silently
+// excludes its contents from the worktree identity.
+const fingerprintSkipWarnings = new Set<string>();
+
+function warnFingerprintSkip(root: string, file: string, detail: string): void {
+	const key = `${root}\0${file}`;
+	if (fingerprintSkipWarnings.has(key)) return;
+	fingerprintSkipWarnings.add(key);
+	try {
+		audit({
+			ts: new Date().toISOString(),
+			tool: "worktree-fingerprint",
+			decision: "allow",
+			phase: "event",
+			reason: `fingerprint_entry_skipped: untracked entry '${file}' could not be read (${detail}); its contents are excluded from the worktree fingerprint`,
+			input: { root, file },
+		});
+	} catch {}
+}
+
 /**
  * Content hash over tracked repository content only: the index listing
  * (staged/tracked blob hashes) plus the worktree-vs-index diff (unstaged
@@ -163,11 +186,33 @@ export function getGitWorktreeFingerprint(root: string): string | undefined {
 		});
 		if (untracked.status !== 0) return undefined;
 		for (const file of untracked.stdout.split("\0").filter(Boolean).sort()) {
+			// The path itself is always part of the fingerprint, so a skipped
+			// entry still binds its presence even when its contents do not.
 			hash.update("\0" + file + "\0");
 			try {
-				hash.update(readFileSync(join(root, file)));
-			} catch {
-				return undefined;
+				// Classify with lstat (never follows the final component):
+				// git's untracked listing treats a symlink as a file whose
+				// content is the target string, so hash link bytes for
+				// symlinks - a symlink to a directory (readFileSync throws
+				// EISDIR), a broken link, or a link whose target changes
+				// contents are all bound by the link itself, matching git.
+				const stats = lstatSync(join(root, file));
+				if (stats.isSymbolicLink()) {
+					hash.update(readlinkSync(join(root, file)));
+				} else if (stats.isFile()) {
+					hash.update(readFileSync(join(root, file)));
+				} else {
+					// FIFOs, sockets, devices: opening them can block or fail
+					// and they have no stable hashable content - bind their
+					// identity by path (above) and file mode.
+					hash.update(`special:${stats.mode}`);
+				}
+			} catch (error) {
+				// A single unreadable entry must never void the whole
+				// fingerprint: that made review/verification evidence
+				// permanently unfresh for the worktree. Skip its contents
+				// and name the entry in the audit trail instead.
+				warnFingerprintSkip(root, file, error instanceof Error ? error.message : String(error));
 			}
 		}
 		return hash.digest("hex");

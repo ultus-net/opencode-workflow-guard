@@ -5,6 +5,7 @@ import { isEvidenceFresh, reviewEvidence, verificationEvidence } from "./evidenc
 import { findGitRoot, isSameGitRepo, projectRootKey } from "./project-config.ts";
 import {
 	getLastReviewResultForWorkspace,
+	getLiveControlPlaneRoots,
 	getSdkClient,
 	getWorkspaceRoot,
 	isDocumentationRequired,
@@ -343,7 +344,7 @@ export async function guardToolCallImpl(
 				return block("git", "branch_base_behind", `Blocked: ${behindCheck.reason}`);
 			}
 		}
-		if (isSettingsTamper(command)) {
+		if (isSettingsTamper(command, getLiveControlPlaneRoots(currentRoot))) {
 			logPolicyBlock(`[workflow-guard] blocked settings tamper: ${command.slice(0, 120)}`);
 			return block("tamper", "settings_tamper", PROTECTED_PATH_REASON);
 		}
