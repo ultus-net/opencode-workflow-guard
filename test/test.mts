@@ -1600,22 +1600,19 @@ const fakeV2TuiCtx = {
 	ui: { slot: (claim: { append: string; render: () => unknown }) => { v2SlotClaims.push(claim); } },
 };
 await WorkflowGuardTuiV2(fakeV2TuiCtx as any);
-check("v2 tui companion registers home and prompt status slots", v2SlotClaims.filter((claim) => claim.append === "home.footer.status" || claim.append === "prompt.footer.status").length === 2);
+check("v2 tui companion registers only the prompt footer status slot", v2SlotClaims.filter((claim) => claim.append === "home.footer.status" || claim.append === "prompt.footer.status").length === 1 && v2SlotClaims.some((claim) => claim.append === "prompt.footer.status"));
 const diagLogPath = join(process.env.XDG_STATE_HOME!, "opencode", "workflow-guard-ui.log");
 const diagLogText = () => readFileSync(diagLogPath, "utf8");
 check("v2 tui companion logs module load and setup with app version", diagLogText().includes("module load:") && diagLogText().includes("setup: app=9.9.9-test"));
-const v2HomeRender = v2SlotClaims.find((claim) => claim.append === "home.footer.status")!.render;
+const v2StatusRender = v2SlotClaims.find((claim) => claim.append === "prompt.footer.status")!.render;
 // In a plain Node process there is no OpenTUI renderer, so badge() throws the
 // same "No renderer found" the long-running-session bug produced in the TUI.
-check("v2 slot render returns null instead of throwing when the render context is unavailable", v2HomeRender() === null);
-check("v2 slot failure log records probes and stack", diagLogText().includes("render home.footer.status FAILED (1/3)") && diagLogText().includes("owner=null") && diagLogText().includes("useContext(RendererContext): MISSING") && diagLogText().includes("  stack: "));
-for (let i = 0; i < 6; i++) v2HomeRender();
-const v2FailuresLogged = diagLogText().split("\n").filter((line) => line.includes("render home.footer.status FAILED (")).length;
+check("v2 slot render returns null instead of throwing when the render context is unavailable", v2StatusRender() === null);
+check("v2 slot failure log records probes and stack", diagLogText().includes("render prompt.footer.status FAILED (1/3)") && diagLogText().includes("owner=null") && diagLogText().includes("useContext(RendererContext): MISSING") && diagLogText().includes("  stack: "));
+for (let i = 0; i < 6; i++) v2StatusRender();
+const v2FailuresLogged = diagLogText().split("\n").filter((line) => line.includes("render prompt.footer.status FAILED (")).length;
 check("v2 slot failure logging is bounded to 3 per success epoch", v2FailuresLogged === 3);
 check("v2 slot failure suppression notice is logged once", diagLogText().split("still failing after 3 logged failures").length === 2);
-const v2PromptRender = v2SlotClaims.find((claim) => claim.append === "prompt.footer.status")!.render;
-check("v2 prompt status slot also degrades to null on render failure", v2PromptRender() === null);
-
 
 // ── Adversarial tests & hardened invariants ──
 console.log("- Adversarial tests & hardened invariants -");
@@ -3122,6 +3119,39 @@ check(
 spawnSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: conflictRepo });
 const baseUpToDateCheck = checkBranchBaseIsUpToDate(conflictRepo);
 check("checkBranchBaseIsUpToDate passes when equal to remote", !baseUpToDateCheck.isBehind);
+
+// Policy 20: branch creation start-point awareness. Advance the simulated
+// remote past the current branch so HEAD is stale, then verify that an
+// explicit fresh start point clears the gate while startless and
+// indeterminate creations still fail (closed).
+spawnSync("git", ["switch", "-c", "wg-origin-advance"], { cwd: conflictRepo });
+writeFileSync(join(conflictRepo, "file.txt"), "remote advance content\n");
+spawnSync("git", ["commit", "-am", "remote advance"], { cwd: conflictRepo });
+spawnSync("git", ["update-ref", "refs/remotes/origin/main", "HEAD"], { cwd: conflictRepo });
+spawnSync("git", ["switch", "feat/conflict-branch"], { cwd: conflictRepo });
+const staleHeadCheck = checkBranchBaseIsUpToDate(conflictRepo);
+check(
+	"checkBranchBaseIsUpToDate attributes the stale current branch and working remedies",
+	staleHeadCheck.isBehind &&
+		staleHeadCheck.baseRef === "origin/main" &&
+		(staleHeadCheck.reason ?? "").includes("'feat/conflict-branch'") &&
+		(staleHeadCheck.reason ?? "").includes("git rebase origin/main"),
+);
+const freshStartCheck = checkBranchBaseIsUpToDate(conflictRepo, ["origin/main"]);
+check("checkBranchBaseIsUpToDate accepts an explicit start point containing the remote default", !freshStartCheck.isBehind);
+const staleStartSha = spawnSync("git", ["rev-parse", "HEAD"], { cwd: conflictRepo, encoding: "utf8" }).stdout!.trim();
+const staleStartCheck = checkBranchBaseIsUpToDate(conflictRepo, [staleStartSha]);
+check("checkBranchBaseIsUpToDate blocks an explicit stale start point", staleStartCheck.isBehind && (staleStartCheck.reason ?? "").includes("start point"));
+const unresolvableCheck = checkBranchBaseIsUpToDate(conflictRepo, ["$WG_START_REF"]);
+check("checkBranchBaseIsUpToDate fails closed on an unresolvable start point", unresolvableCheck.isBehind && (unresolvableCheck.reason ?? "").includes("could not be resolved"));
+const mixedStartCheck = checkBranchBaseIsUpToDate(conflictRepo, ["origin/main", undefined]);
+check("checkBranchBaseIsUpToDate keeps the head check when a creation lacks a start point", mixedStartCheck.isBehind && (mixedStartCheck.reason ?? "").includes("'feat/conflict-branch'"));
+check("git switch -c without a start point is blocked on a stale branch", blocked(await shell("git switch -c wg-start-stale")));
+check("git switch -c origin/main with a stale branch is allowed", !blocked(await shell("git switch -c wg-start-fresh origin/main")));
+check("git checkout -b origin/main with a stale branch is allowed", !blocked(await shell("git checkout -b wg-checkout-fresh origin/main")));
+check("wrapper git switch -c origin/main keeps the fresh start point exemption", !blocked(await shell("env git switch -c wg-wrapper-fresh origin/main")));
+check("variable start point fails closed on a stale branch", blocked(await shell("git switch -c wg-start-var $WG_REF")));
+check("plain git branch is not treated as guarded branch creation", !blocked(await shell("git branch wg-plain-branch origin/main")));
 
 // Lockfile synchronization tests
 const lockRepo = mkdtempSync(join(tmpdir(), "wg-lock-repo-"));

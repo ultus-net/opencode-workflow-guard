@@ -48,6 +48,7 @@ import {
 	GIT_WRITE_RE,
 	PUSH_TO_MAIN_RE,
 	branchGuardReason,
+	branchCreationStartPoint,
 	checkBranchBaseIsUpToDate,
 	checkMergeConflicts,
 	currentGitBranch,
@@ -366,9 +367,27 @@ export async function guardToolCallImpl(
 			}
 		}
 		if (GIT_BRANCH_CREATE_RE.test(normalizedCommand)) {
-			const behindCheck = checkBranchBaseIsUpToDate(effectiveRoot);
+			// A branch created from an explicit start point that already contains
+			// the remote default is fresh by construction; only creations without
+			// one (or with an unclassifiable shape — fail closed) inherit the
+			// current branch's staleness.
+			const creationStarts: Array<string | undefined> = [];
+			let classifiable = true;
+			for (const invocation of gitInvocations) {
+				if (!GIT_BRANCH_CREATE_RE.test(`git ${invocation.rest}`)) continue;
+				const parsed = branchCreationStartPoint(invocation.rest);
+				if (parsed === undefined) {
+					classifiable = false;
+					break;
+				}
+				creationStarts.push(parsed.start);
+			}
+			const behindCheck = checkBranchBaseIsUpToDate(
+				effectiveRoot,
+				classifiable && creationStarts.length > 0 ? creationStarts : undefined,
+			);
 			if (behindCheck.isBehind) {
-				logPolicyBlock(`[workflow-guard] blocked branch creation: base is behind remote ${behindCheck.baseRef}`);
+				logPolicyBlock(`[workflow-guard] blocked branch creation: ${behindCheck.reason ?? "base is behind remote"}`);
 				return block("git", "branch_base_behind", `Blocked: ${behindCheck.reason}`);
 			}
 		}

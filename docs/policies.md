@@ -143,7 +143,7 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
 
 ### 20. Merged Branch & Base Freshness Guard
 - Blocks pushing to branches already merged or associated with closed PRs in GitHub or Azure DevOps.
-- Blocks creating fresh feature branches when the local base branch is behind the remote, prompting the agent to pull latest changes first.
+- Blocks creating feature branches (`git switch -c`, `git checkout -b`) from a stale base: without an explicit start point, the current branch must be fresh against the remote default; an explicit start point that already contains the remote default (`origin/HEAD`) is accepted because the new branch is fresh by construction, and start points that cannot be resolved fail closed. Block reasons name the branch actually checked and remedies that work under the guard (rebase or ff-merge the branch, or branch from the remote default directly).
 - Tag push refspecs are exempt: publishing an existing tag (`git push origin v1.2.0`, `git push origin refs/tags/v1.2.0`) and creating tags (`git tag v1.2.0`, `git tag -a -m ...`) are release operations, not branch mutations - only tag deletions (`git tag -d`, `git push origin :refs/tags/v1.2.0`, `--delete`) stay blocked.
 
 ### 21. Documentation Review & Synchronization Guard

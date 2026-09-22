@@ -2,7 +2,7 @@
  * Workflow Guard TUI companion plugin for OpenCode V2 (CLI plugin API).
  *
  * - Registers the `/guard-options` palette + slash command to toggle project options.
- * - Renders the Workflow Guard badge in the home and prompt footer status slots.
+ * - Renders the Workflow Guard badge in the prompt footer status slot.
  *
  * The V1 entrypoint (`WorkflowGuardTui`) remains for OpenCode 1.x TUI clients.
  */
@@ -277,7 +277,6 @@ export const WorkflowGuardTuiV2 = (ctx: TuiContext) => {
 			},
 		});
 	};
-	registerBadgeSlot("home.footer.status");
 	registerBadgeSlot("prompt.footer.status");
 	diagRender("probe-after-setup");
 
