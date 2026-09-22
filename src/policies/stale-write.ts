@@ -51,6 +51,23 @@ export function recordSuccessfulRead(observation: ReadObservation, sessionID: st
 	reads.set(sessionID, sessionReads);
 }
 
+/**
+ * Records the session's observation of a file it just mutated. A successful
+ * edit/write means the session authored the resulting bytes, so a follow-up
+ * edit to that file must not demand a redundant re-read. The pre-mutation
+ * digest is compared so a no-op or failed call (content unchanged) does not
+ * seed an observation, and an external change after the mutation still fails
+ * the next comparison.
+ */
+export function recordMutationObservation(path: string, sessionID: string, beforeDigest?: string): void {
+	const current = fingerprint(path);
+	if (!current) return;
+	if (beforeDigest !== undefined && current.digest === beforeDigest) return;
+	const sessionReads = reads.get(sessionID) ?? new Map<string, ReadFingerprint>();
+	sessionReads.set(canonicalPath(path), current);
+	reads.set(sessionID, sessionReads);
+}
+
 export function staleWriteReason(path: string, sessionID: string): string | undefined {
 	const current = fingerprint(path);
 	const canonical = canonicalPath(path);

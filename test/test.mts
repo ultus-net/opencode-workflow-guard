@@ -982,6 +982,56 @@ try {
 }
 check("stale-write protection allows creating a new file without a prior read", newFileAllowed);
 await staleAfter?.({ tool: "write", sessionID: "s-stale", callID: "new-file", args: {} }, { title: "write", output: "written", metadata: {} });
+// A successful mutation seeds the session's observation of the bytes it
+// authored, so iterating on a just-created/modified file needs no re-read;
+// a no-op mutation seeds nothing and external changes stay blocked.
+const mutationSession = "s-stale-mutation";
+todo(mutationSession, item("iterate on authored file", "in_progress"));
+const authoredPath = join(staleDir, "authored.ts");
+await staleBefore?.({ tool: "write", sessionID: mutationSession, callID: "write-authored" }, { args: { filePath: authoredPath, content: "v1" } });
+writeFileSync(authoredPath, "v1");
+await staleAfter?.({ tool: "write", sessionID: mutationSession, callID: "write-authored", args: {} }, { title: "write", output: "written", metadata: {} });
+let authoredEditAllowed = true;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: mutationSession, callID: "edit-authored-1" }, { args: { filePath: authoredPath, oldString: "v1", newString: "v2" } });
+} catch {
+	authoredEditAllowed = false;
+}
+check("a successful write seeds the session observation so the authored file can be edited without a re-read", authoredEditAllowed);
+writeFileSync(authoredPath, "v2");
+await staleAfter?.({ tool: "edit", sessionID: mutationSession, callID: "edit-authored-1", args: {} }, { title: "edit", output: "edited", metadata: {} });
+let chainedEditAllowed = true;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: mutationSession, callID: "edit-authored-2" }, { args: { filePath: authoredPath, oldString: "v2", newString: "v3" } });
+} catch {
+	chainedEditAllowed = false;
+}
+check("a successful edit seeds the observation so chained edits need no re-read", chainedEditAllowed);
+writeFileSync(authoredPath, "changed externally");
+let externalAfterMutationBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: mutationSession, callID: "edit-authored-3" }, { args: { filePath: authoredPath, oldString: "v3", newString: "v4" } });
+} catch (error) {
+	externalAfterMutationBlocked = String(error).includes("changed since this session read it");
+}
+check("an external change after a successful mutation is still blocked", externalAfterMutationBlocked);
+// Negative branch: a mutation that leaves content unchanged must not seed.
+// apply_patch is not stale-write checked, so this unobserved session can run
+// it; because the file is left unchanged, the seed gate must skip and a
+// later edit must still demand a read.
+const noopSession = "s-stale-noop";
+todo(noopSession, item("no-op patch", "in_progress"));
+const noopPath = join(staleDir, "noop.ts");
+writeFileSync(noopPath, "stable");
+await staleBefore?.({ tool: "apply_patch", sessionID: noopSession, callID: "noop-patch" }, { args: { patchText: `*** Begin Patch\n*** Update File: ${noopPath}\n@@\n stable\n*** End Patch` } });
+await staleAfter?.({ tool: "apply_patch", sessionID: noopSession, callID: "noop-patch", args: {} }, { title: "patch", output: "done", metadata: {} });
+let noopEditBlocked = false;
+try {
+	await staleBefore?.({ tool: "edit", sessionID: noopSession, callID: "noop-edit" }, { args: { filePath: noopPath, oldString: "stable", newString: "changed" } });
+} catch (error) {
+	noopEditBlocked = String(error).includes("has not been read");
+}
+check("a no-op mutation does not seed an observation for a later edit", noopEditBlocked);
 const staleAlternateRoot = mkdtempSync(join(tmpdir(), "wg-stale-root-"));
 writeFileSync(join(staleAlternateRoot, "relative.ts"), "observed");
 todo("s-stale-root", item("edit relative file", "in_progress"));

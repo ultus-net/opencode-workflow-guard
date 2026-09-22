@@ -16,7 +16,7 @@ import { resolve } from "node:path";
 import { join } from "node:path";
 import { editTargets, runPostEditValidators, snapshotFile } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
-import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
+import { beginReadObservation, clearReadFingerprints, recordMutationObservation, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
 import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
 import { guardToolCallImpl, isReadOnlyRole } from "./lib/guard-dispatcher.ts";
@@ -518,6 +518,12 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 			const pending = toolLifecycle.takePostEditSnapshots(input.sessionID, input.callID);
 			if (!pending) return;
 			await runWithRuntimeState(pending.root, ctx.client, async () => {
+				// A successful mutation means this session authored the resulting
+				// bytes, so seed its observation: a follow-up edit to a just
+				// created/modified file must not demand a redundant re-read. A
+				// no-op/failed call (content unchanged) seeds nothing, and an
+				// external change after the mutation still fails the comparison.
+				for (const before of pending.snapshots) recordMutationObservation(before.path, input.sessionID, before.digest);
 				const reports = await Promise.all(pending.snapshots.map((before) => runPostEditValidators(pending.root, before)));
 				const report = reports.filter((value): value is string => Boolean(value)).join("\n\n");
 				if (report) output.output = `${output.output}\n\n${report}`;
