@@ -2578,6 +2578,30 @@ else process.env.WORKFLOW_GUARD_WORKTREE_DIR = prevWorktreeDirFlow;
 rmSync(join(root, "wg-flow-worktrees"), { recursive: true, force: true });
 resetReviewState();
 
+// Commit drift: a review recorded with its change already staged stays
+// fingerprint-identical once that change is committed, so the commit-hash
+// binding is the invalidation signal and the preflight must name it.
+const driftRepo = join(root, "wg-review-commit-drift");
+mkdirSync(driftRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "feature/commit-drift"], { cwd: driftRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: driftRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: driftRepo });
+writeFileSync(join(driftRepo, "code.txt"), "base\n");
+spawnSync("git", ["add", "code.txt"], { cwd: driftRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: driftRepo });
+mkdirSync(join(driftRepo, ".opencode"), { recursive: true });
+writeFileSync(join(driftRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: true }));
+writeFileSync(join(driftRepo, "code.txt"), "reviewed staged edit\n");
+spawnSync("git", ["add", "code.txt"], { cwd: driftRepo });
+const driftFingerprintBefore = getTrackedWorktreeFingerprint(driftRepo);
+recordReviewResult("commit-drift-reviewer", "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.", true, "s-drift", driftRepo);
+spawnSync("git", ["commit", "-qm", "commit reviewed change"], { cwd: driftRepo });
+check("committing staged reviewed content keeps the tracked fingerprint", getTrackedWorktreeFingerprint(driftRepo) === driftFingerprintBefore);
+const driftPr = await call("bash", { command: "gh pr create --title t --body 'Changelog: drift'", workdir: driftRepo }, { sessionID: "s-drift", worktree: driftRepo, directory: driftRepo });
+check("PR blocked when only the reviewed commit drifted, with a commit-specific cause", blocked(driftPr) && String(driftPr).includes("bound to commit"));
+rmSync(driftRepo, { recursive: true, force: true });
+resetReviewState();
+
 // Event hook handles permission events
 if (typeof customPlugin.event === "function") {
 	await customPlugin.event({

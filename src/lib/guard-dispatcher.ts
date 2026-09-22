@@ -495,6 +495,12 @@ export async function guardToolCallImpl(
 						preflightFailures.push(`The recorded review approval from '${sameRepoReview.reviewer}' has no worktree fingerprint binding (recorded against an unreadable worktree or an older guard version); re-run the secondary review and record it with record_review.`);
 					} else if (sameRepoReview && sameRepoReview.worktreeFingerprint !== prFingerprint) {
 						preflightFailures.push(`The recorded review approval from '${sameRepoReview.reviewer}' does not match the current worktree contents (tracked content changed after review); re-run the secondary review and record it with record_review.`);
+					} else if (sameRepoReview && sameRepoReview.commitHash && prCommitHash && sameRepoReview.commitHash !== prCommitHash) {
+						// Tracked fingerprint can be unchanged while HEAD moves
+						// (for example a review recorded with changes already
+						// staged, then committed): name the commit drift instead
+						// of the generic review-required message.
+						preflightFailures.push(`The recorded review approval from '${sameRepoReview.reviewer}' is bound to commit ${sameRepoReview.commitHash.slice(0, 12)} but this worktree is at commit ${prCommitHash.slice(0, 12)}; re-run the secondary review at the current commit and record it with record_review.`);
 					} else {
 						preflightFailures.push("Passing secondary review approval is required; invoke a secondary review subagent and record approval with record_review.");
 					}
