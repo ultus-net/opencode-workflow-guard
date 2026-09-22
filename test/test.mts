@@ -2740,10 +2740,12 @@ if (strictPrAfterSubagent.status === "blocked") console.log("   blocked:", stric
 
 // The knob follows the REVIEWED workspace's config, not the caller's: a root
 // session based in a non-strict context cannot approve strictRepo's work by
-// pointing the verdict at it from outside strict mode.
+// naming it as the reviewed directory from outside strict mode. Note the
+// reviewed workspace comes from the tool ARG (`directory`), not the caller's
+// context; the context worktree below is deliberately the non-strict temp root.
 const strictCrossAttempt = await strictPlugin.tool?.record_review?.execute(
-	{ reviewer: "cross-root", summary: strictSummary, passed: true },
-	{ sessionID: "s-strict-cross", worktree: root, directory: strictRepo } as any,
+	{ reviewer: "cross-root", summary: strictSummary, passed: true, directory: strictRepo },
+	{ sessionID: "s-strict-cross", worktree: root, directory: root } as any,
 );
 const strictCrossAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "record_review.verdict" && entry.sessionID === "s-strict-cross");
 check("strict mode: the knob follows the reviewed workspace, not the caller's repo", typeof strictCrossAttempt === "string" && strictCrossAttempt.includes("rejected") && strictCrossAttempt.includes("requireSubagentReview") && !strictCrossAttempt.includes("APPROVED"));
