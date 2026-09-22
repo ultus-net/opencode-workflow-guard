@@ -1,6 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import { spawnSync } from "node:child_process";
-import type { LearningEvidenceKind } from "./types.ts";
+import type { AuditEntry, LearningEvidenceKind } from "./types.ts";
 import type { ProjectMemoryStore } from "./project-memory.ts";
 import {
 	exportProjectKnowledge,
@@ -34,7 +34,7 @@ import {
 } from "./state.ts";
 import { getRalphOutcome } from "../policies/continuation.ts";
 import { loadProjectConfig, projectRootKey } from "./project-config.ts";
-import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint } from "./verify.ts";
+import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
 import { createGitWorktree, cleanupGitWorktree } from "./worktree.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
@@ -218,7 +218,12 @@ export function createCustomTools(options: {
 				const verifyCommand = detectVerifyCommand(root);
 				const verifyFresh = Boolean(lastV && verifyEvidence && lastV.passed && lastV.command === verifyCommand && isEvidenceFresh(verifyEvidence, subject, lastMut));
 				const reviewRequired = isReviewRequired(root);
-				const reviewFresh = Boolean(lastR && reviewEvidenceRecord && lastR.passed && isEvidenceFresh(reviewEvidenceRecord, { ...subject, sessionID: lastR.targetSessionID }, lastMut));
+				// Review freshness is content-scoped, matching the PR preflight:
+				// the approval covers the tracked tree it reviewed, so it stays
+				// fresh until that content changes. Untracked scratch cleanup
+				// (or mutations in a sibling worktree) must not read as stale,
+				// while any tracked edit or new commit does.
+				const reviewFresh = Boolean(lastR && reviewEvidenceRecord && lastR.passed && isEvidenceFresh(reviewEvidenceRecord, { ...subject, worktreeFingerprint: getTrackedWorktreeFingerprint(root), sessionID: lastR.targetSessionID }, 0));
 				const documentationRequired = isDocumentationRequired(root);
 				const outstandingRequirements = [
 					...(verifyCommand && !verifyFresh ? ["verification"] : []),
@@ -258,18 +263,43 @@ export function createCustomTools(options: {
 				directory: tool.schema.string().optional().describe("Target repository directory being reviewed (defaults to parent session's repository or active directory)"),
 			},
 			execute: async (args, toolContext) => {
-				const auditVerdict = (verdict: "approved" | "changes_requested" | "rejected", reason: string) => audit({ ts: new Date().toISOString(), sessionID: toolContext.sessionID, tool: "record_review.verdict", decision: verdict === "rejected" ? "block" : "allow", phase: "event", reason, evidence: { reviewVerdict: verdict } });
-				const parentSessionID = await runWithRuntimeState(effectiveRoot, client, () => fetchParentSessionID(toolContext.sessionID));
-				if (!parentSessionID) { auditVerdict("rejected", "missing_parent_session"); return "[workflow-guard] Review rejected: record_review must be called from a secondary/subagent session."; }
+				const auditVerdict = (verdict: "approved" | "changes_requested" | "rejected", reason: string, binding?: NonNullable<AuditEntry["evidence"]>["binding"]) => audit({ ts: new Date().toISOString(), sessionID: toolContext.sessionID, tool: "record_review.verdict", decision: verdict === "rejected" ? "block" : "allow", phase: "event", reason, evidence: { reviewVerdict: verdict, ...(binding ? { binding } : {}) } });
 				const axesRefs = ["test integrity", "task completeness", "cleanliness", "security", "platform"];
 				const referenced = axesRefs.filter((axis) => args.summary.toLowerCase().includes(axis));
 				if (referenced.length < 3) { auditVerdict("rejected", "insufficient_rubric_axes"); return `[workflow-guard] Review rejected: summary must reference the review axes (found ${referenced.length}/5). Call guard_review_rubric to get the rubric, evaluate each axis, and include findings per axis in the summary.`; }
 				if (args.passed && /(?:^|\s)(?:\[p[01]\]|p[01]\s*:\s*(?:blocker|defect|vulnerability|error|bug|issue)|p[01]\s+blocker)/i.test(args.summary)) { auditVerdict("rejected", "approval_contains_blocker"); return "[workflow-guard] Review rejected: cannot record approval when P0 or P1 blockers are flagged in findings. Resolve all P0/P1 issues before approving or record review with passed=false."; }
+				// Any session may record a verdict so that reviewer agents whose
+				// toolset lacks record_review can have their verdict relayed.
+				// The verdict is bound to the reviewed DIRECTORY content (commit
+				// hash + tracked worktree fingerprint); the recorder's lineage is
+				// captured in the audit trail. The review-before-PR requirement
+				// itself is unchanged.
 				const reviewWorkspace = await resolveEffectiveWorkspace({ sessionID: toolContext.sessionID, directory: args.directory, fallback: toolContext.worktree || toolContext.directory || effectiveRoot });
-				recordReviewResult(args.reviewer, args.summary, args.passed, parentSessionID, reviewWorkspace);
-				if (followupStore && !secretIn(args.summary)) for (const finding of extractReviewFollowups(args.summary)) recordReviewFollowup(followupStore, { severity: finding.severity, summary: finding.summary, reviewer: args.reviewer, sessionID: toolContext.sessionID, commit: getCurrentGitCommitHash(reviewWorkspace) });
-				auditVerdict(args.passed ? "approved" : "changes_requested", args.passed ? "approved" : "changes_requested");
-				return args.passed ? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}.` : `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}.`;
+				const bindingFingerprint = getTrackedWorktreeFingerprint(reviewWorkspace);
+				if (!bindingFingerprint) {
+					auditVerdict("rejected", "review_workspace_unbindingable", { workspace: reviewWorkspace, recorderSessionID: toolContext.sessionID });
+					return `[workflow-guard] Review rejected: the verdict cannot be bound because no tracked-content fingerprint is available for '${reviewWorkspace}' (not a git repository, or git is unavailable). The verdict was NOT recorded. Call record_review with 'directory' set to the reviewed repository worktree, or run it from a session rooted there.`;
+				}
+				const parentSessionID = await runWithRuntimeState(effectiveRoot, client, () => fetchParentSessionID(toolContext.sessionID));
+				const bindingCommitHash = getCurrentGitCommitHash(reviewWorkspace);
+				const binding = {
+					workspace: reviewWorkspace,
+					commitHash: bindingCommitHash,
+					worktreeFingerprint: bindingFingerprint.slice(0, 16),
+					recorderSessionID: toolContext.sessionID,
+					recorderRole: parentSessionID ? ("subagent" as const) : ("root" as const),
+					targetSessionID: parentSessionID ?? toolContext.sessionID,
+				};
+				recordReviewResult(args.reviewer, args.summary, args.passed, parentSessionID ?? toolContext.sessionID, reviewWorkspace);
+				if (followupStore && !secretIn(args.summary)) for (const finding of extractReviewFollowups(args.summary)) recordReviewFollowup(followupStore, { severity: finding.severity, summary: finding.summary, reviewer: args.reviewer, sessionID: toolContext.sessionID, commit: bindingCommitHash });
+				auditVerdict(args.passed ? "approved" : "changes_requested", args.passed ? "approved" : "changes_requested", binding);
+				const recorderNote = parentSessionID
+					? `Recorded by secondary session ${toolContext.sessionID} for parent ${parentSessionID}.`
+					: `Recorded by root session ${toolContext.sessionID}; prefer relaying through an independent secondary reviewer subagent when one is available.`;
+				const boundTo = `Bound to ${reviewWorkspace} (commit ${bindingCommitHash?.slice(0, 12) ?? "unversioned"}, tracked fingerprint ${bindingFingerprint.slice(0, 12)}).`;
+				return args.passed
+					? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}. ${boundTo} ${recorderNote}`
+					: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}. ${boundTo} ${recorderNote}`;
 			},
 		}),
 		guard_review_followups: tool({ description: "List durable local P2/P3 review follow-ups (technical debt) for this project. Proactively check during planning or before final verification to address open findings.", args: {}, execute: async () => JSON.stringify(followupStore ? listReviewFollowups(followupStore) : [], null, 2) }),

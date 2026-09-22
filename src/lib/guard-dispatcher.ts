@@ -1,10 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { loadReviewCache, loadVerifyCache } from "./audit.ts";
+import { audit, loadVerifyCache } from "./audit.ts";
 import { isEvidenceFresh, reviewEvidence, verificationEvidence } from "./evidence.ts";
 import { findGitRoot, isSameGitRepo, projectRootKey } from "./project-config.ts";
 import {
-	getLastReviewResult,
+	getLastReviewResultForWorkspace,
 	getLiveControlPlaneRoots,
 	getSdkClient,
 	getWorkspaceRoot,
@@ -15,7 +15,6 @@ import {
 	recordMutation,
 	recordVerifyResult,
 	sessionMutationTimestamps,
-	sessionReviews,
 	sessionVerifyResults,
 } from "./state.ts";
 import {
@@ -34,6 +33,7 @@ import {
 	getCurrentGitCommitHash,
 	getGitStatusSummary,
 	getGitWorktreeFingerprint,
+	getTrackedWorktreeFingerprint,
 	runVerify,
 	resolveVerifyTimeoutMs,
 	snipVerifyOutput,
@@ -440,16 +440,45 @@ export async function guardToolCallImpl(
 				if (mergedStatus.merged) preflightFailures.push(mergedStatus.reason ?? "Branch is already merged or closed.");
 			}
 			if (isReviewRequired(prRoot)) {
-				let review = context?.sessionID ? (sessionReviews.get(context.sessionID) ?? getLastReviewResult()) : getLastReviewResult();
-				if (!review) {
-					const diskCached = loadReviewCache();
-					if (diskCached && diskCached.passed && diskCached.workspace && (projectRootKey(diskCached.workspace) === projectRootKey(prRoot) || isSameGitRepo(diskCached.workspace, prRoot))) {
-						review = diskCached;
+				// Review evidence binds to the reviewed repository CONTENT: a
+				// passing approval satisfies this PR when its recorded subject
+				// (same repository, same commit hash, same tracked-content
+				// worktree fingerprint) matches the tree this PR would publish.
+				// It deliberately does NOT bind to the PR-creating session's ID:
+				// record_review records from a secondary session (binding the
+				// verdict to the recorder's parent or its own directory), and
+				// sessions can move between directories (session_move) and
+				// spawn subagents from many roots, so the previous
+				// session-identity requirement made the documented
+				// review->PR flow impossible to satisfy from linked worktrees.
+				// Content binding is the security property; the requirement
+				// itself is not removed or weakened.
+				const prCommitHash = getCurrentGitCommitHash(prRoot);
+				const prFingerprint = getTrackedWorktreeFingerprint(prRoot);
+				const review = getLastReviewResultForWorkspace(prRoot);
+				const matchedReview = review?.passed === true && isEvidenceFresh(reviewEvidence(review), { workspace: projectRootKey(prRoot), commitHash: prCommitHash, worktreeFingerprint: prFingerprint, sessionID: review.targetSessionID }, 0) ? review : undefined;
+				if (matchedReview) {
+					if (!context?.simulate) {
+						audit({
+							ts: new Date().toISOString(),
+							sessionID: context?.sessionID,
+							tool: "pr-preflight.review-binding",
+							decision: "allow",
+							phase: "event",
+							reason: "review_evidence_matched",
+							evidence: {
+								evidenceId: reviewEvidence(matchedReview).id,
+								reviewer: matchedReview.reviewer,
+								reviewTimestamp: matchedReview.timestamp,
+								binding: {
+									workspace: projectRootKey(prRoot),
+									commitHash: prCommitHash,
+									worktreeFingerprint: prFingerprint?.slice(0, 16),
+								},
+							},
+						});
 					}
-				}
-				const prFingerprint = getGitWorktreeFingerprint(prRoot);
-				const reviewMatchesContext = review?.passed === true && isEvidenceFresh(reviewEvidence(review), { workspace: projectRootKey(prRoot), commitHash: getCurrentGitCommitHash(prRoot), worktreeFingerprint: prFingerprint, sessionID: review.targetSessionID }, 0) && (!review.targetSessionID || review.targetSessionID === context?.sessionID);
-				if (!reviewMatchesContext) {
+				} else {
 					// When an approval exists but cannot be matched to this
 					// worktree, the message must name the actual cause instead
 					// of the generic "review required" (which sends the agent
@@ -457,13 +486,21 @@ export async function guardToolCallImpl(
 					// Cause attribution only makes sense for approvals of THIS
 					// repository; a review of another repo is not evidence here.
 					const reviewIsForThisRepo = typeof review?.workspace === "string" && (projectRootKey(review.workspace) === projectRootKey(prRoot) || isSameGitRepo(review.workspace, prRoot));
-					const sameRepoApproval = review && review.passed === true && reviewIsForThisRepo ? review : undefined;
-					if (sameRepoApproval && prFingerprint === undefined) {
+					const sameRepoReview = review && reviewIsForThisRepo ? review : undefined;
+					if (sameRepoReview && !sameRepoReview.passed) {
+						preflightFailures.push(`The most recent secondary review for this repository (by '${sameRepoReview.reviewer}') requested changes; address the findings and obtain a fresh passing approval with record_review.`);
+					} else if (sameRepoReview && prFingerprint === undefined) {
 						preflightFailures.push("Worktree fingerprint could not be computed (git unavailable or worktree unreadable), so review evidence cannot be bound to this worktree; resolve worktree readability and re-run the secondary review.");
-					} else if (sameRepoApproval && !sameRepoApproval.worktreeFingerprint) {
-						preflightFailures.push(`The recorded review approval from '${sameRepoApproval.reviewer}' has no worktree fingerprint binding (recorded against an unreadable worktree or an older guard version); re-run the secondary review and record it with record_review.`);
-					} else if (sameRepoApproval && sameRepoApproval.worktreeFingerprint !== prFingerprint) {
-						preflightFailures.push(`The recorded review approval from '${sameRepoApproval.reviewer}' does not match the current worktree contents (worktree fingerprint changed after review); re-run the secondary review and record it with record_review.`);
+					} else if (sameRepoReview && !sameRepoReview.worktreeFingerprint) {
+						preflightFailures.push(`The recorded review approval from '${sameRepoReview.reviewer}' has no worktree fingerprint binding (recorded against an unreadable worktree or an older guard version); re-run the secondary review and record it with record_review.`);
+					} else if (sameRepoReview && sameRepoReview.worktreeFingerprint !== prFingerprint) {
+						preflightFailures.push(`The recorded review approval from '${sameRepoReview.reviewer}' does not match the current worktree contents (tracked content changed after review); re-run the secondary review and record it with record_review.`);
+					} else if (sameRepoReview && sameRepoReview.commitHash && prCommitHash && sameRepoReview.commitHash !== prCommitHash) {
+						// Tracked fingerprint can be unchanged while HEAD moves
+						// (for example a review recorded with changes already
+						// staged, then committed): name the commit drift instead
+						// of the generic review-required message.
+						preflightFailures.push(`The recorded review approval from '${sameRepoReview.reviewer}' is bound to commit ${sameRepoReview.commitHash.slice(0, 12)} but this worktree is at commit ${prCommitHash.slice(0, 12)}; re-run the secondary review at the current commit and record it with record_review.`);
 					} else {
 						preflightFailures.push("Passing secondary review approval is required; invoke a secondary review subagent and record approval with record_review.");
 					}

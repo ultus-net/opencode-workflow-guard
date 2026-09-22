@@ -1,5 +1,5 @@
-import { spawnSync } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, symlinkSync } from "node:fs";
+import { spawnSync, type SpawnSyncReturns } from "node:child_process";
+import { existsSync, lstatSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { getWorkspaceRoot } from "./state.ts";
@@ -63,6 +63,89 @@ function localBranchExists(branch: string, root: string): boolean {
 	return res.status === 0;
 }
 
+/**
+ * Worktree timeout: WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS env wins, then the
+ * 15s default. Large checkouts can exceed 15s; without this the killed
+ * `git worktree add` left the branch behind with only its stderr progress
+ * text as the reported reason.
+ */
+export function resolveWorktreeTimeoutMs(): number {
+	const envValue = Number(process.env.WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS);
+	return Number.isFinite(envValue) && envValue > 0 ? envValue : 15_000;
+}
+
+/** git exit status is the failure signal; stderr is only context (progress lines land there too). */
+function describeGitFailure(operation: string, res: SpawnSyncReturns<string>): string {
+	const status = res.status === null
+		? `null (killed${res.signal ? ` via ${res.signal}` : ""}${res.error ? `: ${res.error.message}` : ""})`
+		: String(res.status);
+	const stderrTail = (res.stderr ?? "").trim().split("\n").filter(Boolean).slice(-3).join("; ");
+	return `git ${operation} failed (exit status ${status})${stderrTail ? `: ${stderrTail}` : ""}`;
+}
+
+/**
+ * Rolls back the partial state of a failed `git worktree add`. git creates
+ * the branch ref before the worktree checkout, so a failure after that point
+ * (target path collision, killed checkout, hook error) leaves a dangling
+ * branch and possibly stale worktree admin entries behind. Deletion of the
+ * branch only happens when this call created it.
+ */
+function rollbackFailedWorktreeAdd(options: { branch: string; branchCreatedByUs: boolean; targetPath: string; existedBefore: boolean; root: string }): string {
+	const { branch, branchCreatedByUs, targetPath, existedBefore, root } = options;
+	const notes: string[] = [];
+	try {
+		const registered = (registeredWorktreePaths(root) ?? []).map((path) => resolve(path));
+		const targetRegistered = registered.includes(resolve(targetPath));
+		if (targetRegistered && !existedBefore && existsSync(targetPath)) {
+			// Only a worktree this call registered may be force-removed. A
+			// pre-existing registered worktree at the same sanitized path
+			// (duplicate name, concurrent subagents, feat/x vs feat:x) is the
+			// reason the add failed - it must never be destroyed by rollback.
+			spawnSync("git", ["worktree", "remove", "--force", targetPath], {
+				cwd: root,
+				env: getCleanGitEnv(),
+				encoding: "utf8",
+				timeout: 10_000,
+			});
+		}
+		if (!existedBefore) {
+			// Clear stale worktree admin entries left by an interrupted add for
+			// this new path. Scoped to the new-path case so unrelated
+			// worktrees on temporarily unavailable paths are never pruned.
+			spawnSync("git", ["worktree", "prune"], {
+				cwd: root,
+				env: getCleanGitEnv(),
+				encoding: "utf8",
+				timeout: 10_000,
+			});
+		}
+		if (!existedBefore && existsSync(targetPath)) {
+			// git may have partially populated the directory before failing.
+			// It did not exist before this call, so removing it is safe; a
+			// pre-existing path (e.g. the reason the add failed) is left alone.
+			try { rmSync(targetPath, { recursive: true, force: true }); } catch {}
+		}
+		if (branchCreatedByUs) {
+			// After the deregistration above: a branch cannot be deleted while
+			// still checked out in a worktree.
+			const deleteRes = spawnSync("git", ["branch", "-D", branch], {
+				cwd: root,
+				env: getCleanGitEnv(),
+				encoding: "utf8",
+				timeout: 5_000,
+			});
+			if (deleteRes.status !== 0) {
+				notes.push(`the created branch '${branch}' could not be rolled back and was left in place; delete it manually if it is not needed`);
+			}
+		}
+	} catch {
+		if (branchCreatedByUs) {
+			notes.push(`the created branch '${branch}' may remain; delete it manually if it is not needed`);
+		}
+	}
+	return notes.join("; ");
+}
+
 export function createGitWorktree(
 	branch: string,
 	baseBranch = "HEAD",
@@ -77,12 +160,13 @@ export function createGitWorktree(
 
 	const storageBase = getWorktreeStorageDir(root);
 	const targetPath = join(storageBase, branch.replace(/[/\\:]/g, "-"));
+	const existedBefore = existsSync(targetPath);
 
 	try {
 		mkdirSync(storageBase, { recursive: true });
 
-		const exists = localBranchExists(branch, root);
-		const gitArgs = exists
+		const branchAlreadyExisted = localBranchExists(branch, root);
+		const gitArgs = branchAlreadyExisted
 			? ["worktree", "add", targetPath, branch]
 			: ["worktree", "add", "-b", branch, targetPath, baseBranch];
 
@@ -90,10 +174,12 @@ export function createGitWorktree(
 			cwd: root,
 			env: getCleanGitEnv(),
 			encoding: "utf8",
-			timeout: 15_000,
+			timeout: resolveWorktreeTimeoutMs(),
 		});
 		if (addRes.status !== 0) {
-			return { success: false, error: addRes.stderr.trim() || `git worktree add failed` };
+			const rollbackNote = rollbackFailedWorktreeAdd({ branch, branchCreatedByUs: !branchAlreadyExisted, targetPath, existedBefore, root });
+			const error = describeGitFailure("worktree add", addRes) + (rollbackNote ? `; ${rollbackNote}` : "");
+			return { success: false, error };
 		}
 
 		// Symlink the parent's node_modules so tooling works without a fresh install.

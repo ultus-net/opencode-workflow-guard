@@ -130,6 +130,17 @@ export interface AuditEntry {
 		};
 		allowLive?: boolean;
 		reviewVerdict?: "approved" | "changes_requested" | "rejected";
+		evidenceId?: string;
+		reviewer?: string;
+		reviewTimestamp?: number;
+		binding?: {
+			workspace?: string;
+			commitHash?: string;
+			worktreeFingerprint?: string;
+			recorderSessionID?: string;
+			recorderRole?: "root" | "subagent";
+			targetSessionID?: string;
+		};
 	};
 }
 

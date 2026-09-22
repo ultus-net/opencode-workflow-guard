@@ -1,5 +1,5 @@
 import { spawn, spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, type Hash } from "node:crypto";
 import { lstatSync, readFileSync, readlinkSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { dynamicShellSyntaxIn, normalize } from "./shell.ts";
@@ -141,6 +141,35 @@ function warnFingerprintSkip(root: string, file: string, detail: string): void {
 	} catch {}
 }
 
+/**
+ * Content hash over tracked repository content only: the index listing
+ * (staged/tracked blob hashes) plus the worktree-vs-index diff (unstaged
+ * edits). Review evidence binds to this fingerprint, not to the full one:
+ * untracked scratch files are not part of the reviewed diff, so creating,
+ * modifying, or deleting them must never invalidate a recorded approval.
+ */
+function trackedContentHash(root: string): Hash | undefined {
+	const staged = spawnSync("git", ["ls-files", "--stage", "-z"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	const unstaged = spawnSync("git", ["diff", "--no-ext-diff", "--"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	if (staged.status !== 0 || unstaged.status !== 0) return undefined;
+	return createHash("sha256").update(staged.stdout).update(unstaged.stdout);
+}
+
+export function getTrackedWorktreeFingerprint(root: string): string | undefined {
+	try {
+		return trackedContentHash(root)?.digest("hex");
+	} catch {}
+	return undefined;
+}
+
 export function getGitWorktreeFingerprint(root: string): string | undefined {
 	try {
 		// Index listing captures the exact staged/tracked content (blob hashes);
@@ -148,23 +177,14 @@ export function getGitWorktreeFingerprint(root: string): string | undefined {
 		// contents cover files git does not yet track. Together these bind the
 		// fingerprint to file contents regardless of whether HEAD exists, so
 		// freshly initialized (commitless) repositories are covered too.
-		const staged = spawnSync("git", ["ls-files", "--stage", "-z"], {
-			cwd: root,
-			encoding: "utf8",
-			timeout: 5_000,
-		});
-		const unstaged = spawnSync("git", ["diff", "--no-ext-diff", "--"], {
-			cwd: root,
-			encoding: "utf8",
-			timeout: 5_000,
-		});
+		const hash = trackedContentHash(root);
+		if (!hash) return undefined;
 		const untracked = spawnSync("git", ["ls-files", "--others", "--exclude-standard", "-z"], {
 			cwd: root,
 			encoding: "utf8",
 			timeout: 5_000,
 		});
-		if (staged.status !== 0 || unstaged.status !== 0 || untracked.status !== 0) return undefined;
-		const hash = createHash("sha256").update(staged.stdout).update(unstaged.stdout);
+		if (untracked.status !== 0) return undefined;
 		for (const file of untracked.stdout.split("\0").filter(Boolean).sort()) {
 			// The path itself is always part of the fingerprint, so a skipped
 			// entry still binds its presence even when its contents do not.
