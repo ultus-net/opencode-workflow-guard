@@ -229,7 +229,7 @@ export async function guardToolCallImpl(
 						hasUnresolvableVariable(patchPath)
 							? `Blocked: patch targets file '${patchPath}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
 							: isEnvironmentScratchTarget(patchPath, currentRoot)
-								? `Blocked: patch targets file '${patchPath}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${currentRoot}) instead.`
+								? `Blocked: patch targets file '${patchPath}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${currentRoot}) instead (for example .tmp-notes.md).`
 								: `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`,
 					);
 				}
