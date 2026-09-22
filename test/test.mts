@@ -2738,6 +2738,26 @@ const strictPrAfterSubagent = JSON.parse(String(await strictPlugin.tool?.guard_w
 check("strict mode: PR preflight passes after subagent-recorded approval", strictPrAfterSubagent.status !== "blocked" && (strictPrAfterSubagent.status === "allowed" || strictPrAfterSubagent.code === "remote_state_unchecked"));
 if (strictPrAfterSubagent.status === "blocked") console.log("   blocked:", strictPrAfterSubagent.message);
 
+// The knob follows the REVIEWED workspace's config, not the caller's: a root
+// session based in a non-strict context cannot approve strictRepo's work by
+// pointing the verdict at it from outside strict mode.
+const strictCrossAttempt = await strictPlugin.tool?.record_review?.execute(
+	{ reviewer: "cross-root", summary: strictSummary, passed: true },
+	{ sessionID: "s-strict-cross", worktree: root, directory: strictRepo } as any,
+);
+const strictCrossAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "record_review.verdict" && entry.sessionID === "s-strict-cross");
+check("strict mode: the knob follows the reviewed workspace, not the caller's repo", typeof strictCrossAttempt === "string" && strictCrossAttempt.includes("rejected") && strictCrossAttempt.includes("requireSubagentReview") && !strictCrossAttempt.includes("APPROVED"));
+check("strict mode: cross-repo root approval audited as subagent_recorder_required", strictCrossAudit?.reason === "subagent_recorder_required");
+
+// Env override: =0 disables the knob even when project config enables it
+process.env.WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW = "0";
+const strictEnvOff = await strictPlugin.tool?.record_review?.execute(
+	{ reviewer: "env-off-root", summary: strictSummary, passed: true },
+	{ sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any,
+);
+check("strict mode env off: WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=0 overrides the enabled project config", typeof strictEnvOff === "string" && strictEnvOff.includes("APPROVED"));
+delete process.env.WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW;
+
 rmSync(strictRepo, { recursive: true, force: true });
 resetReviewState();
 
