@@ -2592,6 +2592,36 @@ check(
 );
 rmSync(rubricDiffRepo, { recursive: true, force: true });
 
+// The default-bases loop is directly asserted: with no origin remote, the
+// loop falls through origin/main and origin/master to the local main branch
+// and embeds the real branch diff. The spawn also keeps a trailing `--` after
+// the revision so the base ref can never parse as a pathspec (LL-001).
+const rubricNoOrigin = join(root, "wg-rubric-no-origin");
+mkdirSync(rubricNoOrigin, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: rubricNoOrigin });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: rubricNoOrigin });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: rubricNoOrigin });
+writeFileSync(join(rubricNoOrigin, "fallthrough.txt"), "base\n");
+spawnSync("git", ["add", "fallthrough.txt"], { cwd: rubricNoOrigin });
+spawnSync("git", ["commit", "-m", "base"], { cwd: rubricNoOrigin });
+spawnSync("git", ["switch", "-c", "feature/rubric-fallthrough"], { cwd: rubricNoOrigin });
+writeFileSync(join(rubricNoOrigin, "fallthrough.txt"), "branch marker\n");
+spawnSync("git", ["add", "fallthrough.txt"], { cwd: rubricNoOrigin });
+spawnSync("git", ["commit", "-qm", "branch change"], { cwd: rubricNoOrigin });
+// An uncommitted tracked edit discriminates the fallbacks: main...HEAD is
+// committed-only and must NOT include it, while the HEAD~1 fallback (commit
+// vs worktree) would — so the assertion proves the base loop won.
+writeFileSync(join(rubricNoOrigin, "fallthrough.txt"), "branch marker\nuncommitted worktree edit\n");
+const rubricFallthrough = await customPlugin.tool?.guard_review_rubric?.execute(
+	{ directory: rubricNoOrigin },
+	{ sessionID: "s-rubric-fallthrough", worktree: rubricNoOrigin, directory: rubricNoOrigin } as any,
+);
+check(
+	"rubric default bases fall through to the local main when no origin exists",
+	typeof rubricFallthrough === "string" && rubricFallthrough.includes("diff --git") && rubricFallthrough.includes("fallthrough.txt") && rubricFallthrough.includes("branch marker") && !rubricFallthrough.includes("uncommitted worktree edit"),
+);
+rmSync(rubricNoOrigin, { recursive: true, force: true });
+
 // Reviewer-type agents often lack record_review in their toolset entirely, so
 // the tool accepts recorders of any session type: the verdict binds to the
 // recording session's directory and the audit trail captures the recorder

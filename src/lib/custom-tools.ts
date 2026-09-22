@@ -318,7 +318,7 @@ export function createCustomTools(options: {
 		guard_review_rubric: tool({
 			description: "Get the secondary-review rubric for the current branch diff across 5 core review axes (test integrity, task completeness, cleanliness, security, platform). The orchestrator should call this before finalizing work or creating a PR, then spawn a reviewer subagent with the rubric as the prompt, which records its verdict via record_review.",
 			args: {
-				base: tool.schema.string().optional().describe("Base ref to diff against (default: origin/main, origin/master, main)"),
+				base: tool.schema.string().optional().describe("Base ref to diff against (default: origin/main, origin/master, main, master)"),
 				directory: tool.schema.string().optional().describe("Target repository directory (defaults to active session directory or workspace root)"),
 			},
 			execute: async (args, toolContext) => {
@@ -326,8 +326,10 @@ export function createCustomTools(options: {
 				const bases = sanitizedBase ? [sanitizedBase] : ["origin/main", "origin/master", "main", "master"];
 				const rubricWorkspace = await resolveEffectiveWorkspace({ sessionID: toolContext?.sessionID, directory: args?.directory, fallback: toolContext?.worktree || toolContext?.directory || effectiveRoot });
 				let diffText = "";
-				for (const base of bases) { const res = spawnSync("git", ["diff", "--no-ext-diff", `${base}...HEAD`], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); if (res.status === 0 && res.stdout.trim()) { diffText = res.stdout; break; } }
-				if (!diffText) { const last = spawnSync("git", ["diff", "--no-ext-diff", "HEAD~1"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); diffText = last.status === 0 ? last.stdout : "(no diff available)"; }
+				// Revision before the trailing `--` (LL-001) so the base ref is
+				// always parsed as a revision, never as a pathspec.
+				for (const base of bases) { const res = spawnSync("git", ["diff", "--no-ext-diff", `${base}...HEAD`, "--"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); if (res.status === 0 && res.stdout.trim()) { diffText = res.stdout; break; } }
+				if (!diffText) { const last = spawnSync("git", ["diff", "--no-ext-diff", "HEAD~1", "--"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); diffText = last.status === 0 ? last.stdout : "(no diff available)"; }
 				return buildReviewRubric(diffText);
 			},
 		}),
