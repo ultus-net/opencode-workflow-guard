@@ -34,6 +34,14 @@ export interface ProjectConfig {
 		timeoutMs?: number;
 	}>;
 	requireReview?: boolean;
+	/**
+	 * Opt-in strict mode for secondary reviews: when true, record_review
+	 * rejects approvals recorded by the root session itself, so a passing
+	 * verdict must come from a subagent session with a parent. Unset or false
+	 * keeps the documented relay flow where any session may record a verdict
+	 * that is then bound to the reviewed content.
+	 */
+	requireSubagentReview?: boolean;
 	requireDocumentation?: boolean;
 	/**
 	 * Absolute paths of the LIVE control plane (runtime `~/.config/opencode`,

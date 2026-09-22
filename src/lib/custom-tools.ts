@@ -27,6 +27,7 @@ import {
 	isRecoveryCheckpointsEnabled,
 	isRalphModeEnabled,
 	isReviewRequired,
+	isSubagentReviewRequired,
 	recordMutation,
 	recordReviewResult,
 	resolveEffectiveWorkspace,
@@ -249,13 +250,13 @@ export function createCustomTools(options: {
 					recommendedActions.push("All operational requirements are satisfied for task finalization and PR creation.");
 				}
 				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
-				return JSON.stringify({ workspaceRoot: root, branch, onProtectedBranch: isProtected, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) } }, null, 2);
+				return JSON.stringify({ workspaceRoot: root, branch, onProtectedBranch: isProtected, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) } }, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),
 		guard_why: tool({ description: "Simulate and return the structured policy decision for a specific tool call or command. Proactively use before executing questionable or complex commands to check if they would be blocked by guard policies.", args: { tool: tool.schema.string().describe("Tool name (e.g. bash, edit, write, read, apply_patch)"), input: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Tool input arguments") }, execute: async (args, toolContext) => JSON.stringify(await runWithRuntimeState(effectiveRoot, client, () => guardToolCallImpl(args.tool, args.input ?? {}, { sessionID: toolContext.sessionID, worktree: toolContext.worktree, directory: toolContext.directory, simulate: true })), null, 2) }),
 		record_review: tool({
-			description: "Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric (test integrity, task completeness, cleanliness, security, platform).",
+			description: "Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric (test integrity, task completeness, cleanliness, security, platform). Projects with requireSubagentReview enabled only accept APPROVALS recorded from a subagent session (one with a parent session), never from the root session itself.",
 			args: {
 				reviewer: tool.schema.string().describe("Identifier/name of the reviewer subagent"),
 				summary: tool.schema.string().describe("Review findings summary across the 5 core review axes"),
@@ -281,6 +282,15 @@ export function createCustomTools(options: {
 					return `[workflow-guard] Review rejected: the verdict cannot be bound because no tracked-content fingerprint is available for '${reviewWorkspace}' (not a git repository, or git is unavailable). The verdict was NOT recorded. Call record_review with 'directory' set to the reviewed repository worktree, or run it from a session rooted there.`;
 				}
 				const parentSessionID = await runWithRuntimeState(effectiveRoot, client, () => fetchParentSessionID(toolContext.sessionID));
+				if (args.passed && !parentSessionID && isSubagentReviewRequired(reviewWorkspace)) {
+					// Opt-in strict mode: a root session approving its own work
+					// is the self-approval loophole; require the recorder to be
+					// a subagent session (lineage, not agent role, so relay
+					// subagents still work). Content binding is unchanged —
+					// this only tightens WHO may record an approval.
+					auditVerdict("rejected", "subagent_recorder_required", { workspace: reviewWorkspace, recorderSessionID: toolContext.sessionID });
+					return `[workflow-guard] Review rejected: this project requires approvals to be recorded from a subagent session (requireSubagentReview), and '${toolContext.sessionID}' has no parent session. Spawn a secondary reviewer subagent with the task tool and record the verdict from that session, or set requireSubagentReview=false / WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=0.`;
+				}
 				const bindingCommitHash = getCurrentGitCommitHash(reviewWorkspace);
 				const binding = {
 					workspace: reviewWorkspace,
