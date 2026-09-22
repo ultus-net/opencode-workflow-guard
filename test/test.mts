@@ -3239,6 +3239,21 @@ check(
 	!rogueCleanup.success && existsSync(join(roguePath, "keep.txt")),
 );
 
+// Idempotent cleanup: a registered worktree whose directory vanished (the
+// prunable admin entry `git worktree list` shows) must be deregistered rather
+// than refused, while unregistered missing paths stay refused.
+const prunableCreate = createGitWorktree("feat/prunable-cleanup", "HEAD", worktreeBaseRepo);
+check("prunable-cleanup setup creates a worktree", prunableCreate.success && typeof prunableCreate.worktreePath === "string");
+const prunablePath = prunableCreate.worktreePath!;
+rmSync(prunablePath, { recursive: true, force: true });
+const prunableListedBefore = (spawnSync("git", ["worktree", "list", "--porcelain"], { cwd: worktreeBaseRepo, encoding: "utf8" }).stdout ?? "").includes(prunablePath);
+check("a removed-directory worktree is still listed as prunable before cleanup", prunableListedBefore);
+const prunableCleanup = cleanupGitWorktree(prunablePath, worktreeBaseRepo);
+const prunableStillListed = (spawnSync("git", ["worktree", "list", "--porcelain"], { cwd: worktreeBaseRepo, encoding: "utf8" }).stdout ?? "").includes(prunablePath);
+check("cleanupGitWorktree deregisters a registered worktree whose directory is missing", prunableCleanup.success && !prunableStillListed);
+const missingRogue = cleanupGitWorktree(join(storageBase, "missing-rogue"), worktreeBaseRepo);
+check("cleanupGitWorktree still refuses an unregistered missing path", !missingRogue.success);
+
 // Snapshot integrity: when the snapshot commit cannot be established (e.g. a
 // failing pre-commit hook), cleanup must abort and preserve the worktree.
 const failingHooks = mkdtempSync(join(tmpdir(), "wg-wt-hooks-"));

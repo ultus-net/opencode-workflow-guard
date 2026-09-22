@@ -189,6 +189,7 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 ### `guard_worktree_cleanup`
 - Commits a final snapshot of any remaining changes (`chore(worktree): auto-snapshot before cleanup`, excluding the plugin-created `node_modules` symlink) and then removes the worktree directory with `git worktree remove --force`.
 - **Ownership validation:** only registered worktrees of the current repository under the configured worktree storage directory can be cleaned up; arbitrary directories, other repositories' worktrees, and the primary working tree are refused. A failed `git worktree remove` is an error, never a fallback to raw directory deletion.
+- **Idempotent for prunable entries:** a registered worktree whose directory is already gone (manual removal, a crashed add, external cleanup) is deregistered (`git worktree prune`, reported with its exit status on failure) and reported as cleaned, so stale admin entries that `git worktree list` shows as prunable can be cleared through the tool. The prune is repo-wide for the current repository: every worktree whose directory is missing at that moment is deregistered, so a temporarily unavailable path's admin entry can be dropped (worktree contents are never touched; use `git worktree repair` if a path returns).
 - **Lossless by construction:** if the snapshot commit cannot be established (failing hook, missing identity, lock error), cleanup aborts and the worktree is left fully intact.
 
 ### Hook-Context Safety
