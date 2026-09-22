@@ -315,8 +315,8 @@ export function createCustomTools(options: {
 				const bases = sanitizedBase ? [sanitizedBase] : ["origin/main", "origin/master", "main", "master"];
 				const rubricWorkspace = await resolveEffectiveWorkspace({ sessionID: toolContext?.sessionID, directory: args?.directory, fallback: toolContext?.worktree || toolContext?.directory || effectiveRoot });
 				let diffText = "";
-				for (const base of bases) { const res = spawnSync("git", ["diff", "--", `${base}...HEAD`], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); if (res.status === 0 && res.stdout.trim()) { diffText = res.stdout; break; } }
-				if (!diffText) { const last = spawnSync("git", ["diff", "--", "HEAD~1"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); diffText = last.status === 0 ? last.stdout : "(no diff available)"; }
+				for (const base of bases) { const res = spawnSync("git", ["diff", "--no-ext-diff", `${base}...HEAD`], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); if (res.status === 0 && res.stdout.trim()) { diffText = res.stdout; break; } }
+				if (!diffText) { const last = spawnSync("git", ["diff", "--no-ext-diff", "HEAD~1"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); diffText = last.status === 0 ? last.stdout : "(no diff available)"; }
 				return buildReviewRubric(diffText);
 			},
 		}),
