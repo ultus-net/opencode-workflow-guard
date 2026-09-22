@@ -28,9 +28,9 @@ When this ecosystem-research task is requested again, do a fresh full pass rathe
 
 ## Stale-Write Protection
 
-- Implemented: successful reads record per-session fingerprints for existing regular files, and direct `edit`/`write` calls fail closed unless the same session observed the current canonical file state.
+- Implemented: successful reads (and successful `edit`/`write` calls, when they actually change the file) record per-session fingerprints for existing regular files, and direct `edit`/`write` calls fail closed unless the same session observed the current canonical file state.
 - Fingerprints combine filesystem identity, size, nanosecond mtime, and SHA-256 content rather than relying on timestamps alone. Canonical paths make symlink aliases converge, while replacement and deletion/recreation invalidate the observation.
-- OpenCode's tool lifecycle invokes `tool.execute.after` for completed tool results while failures use the error path, so only successful reads seed observations. Parent/subagent sessions intentionally do not share fingerprints.
+- OpenCode's tool lifecycle invokes `tool.execute.after` for completed tool results while failures use the error path; V2 skips errored calls, and V1 seeds a mutation observation only when the before/after digest shows the file content changed, so calls that leave content unchanged (no-ops) do not seed observations. A failed call that did leave the file changed can still seed in V1, since the after-hook has no documented success discriminator. Parent/subagent sessions intentionally do not share fingerprints.
 - This remains optimistic concurrency rather than an atomic compare-and-write: `apply_patch`, shell writers, and external changes in the interval between the before-hook comparison and OpenCode's write are outside this bounded mechanism. Concurrent File Claims separately protect overlapping direct mutations between guarded sessions.
 
 ## Durable Recovery Checkpoints
