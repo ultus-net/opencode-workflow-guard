@@ -72,7 +72,12 @@ export function fileClaimConflictReason(paths: string[], sessionID: string): str
  * in-flight tool call — that call finished before the turn ended — so it is
  * provably stale and is released with an audited takeover. Without an SDK
  * client, or when the owner record cannot be read, nothing is released:
- * fail-closed keeps live two-session protection intact.
+ * fail-closed keeps live two-session protection intact. Clock skew between
+ * this process and the server is not expected (local service); negative skew
+ * fails closed. Concurrent claimants can emit duplicate takeover audits
+ * (append-only, harmless). Release is per-claim: only the path whose claim is
+ * provably stale is dropped, re-read AFTER the lookup round-trip so an owner
+ * that re-claimed (and refreshed) the path meanwhile keeps its live claim.
  */
 export async function releaseStaleFileClaims(paths: string[], claimantSessionID: string): Promise<void> {
 	const canonical = [...new Set(paths.map((path) => canonicalPath(path)))];
@@ -88,14 +93,17 @@ export async function releaseStaleFileClaims(paths: string[], claimantSessionID:
 	const session = client?.session;
 	const get = session?.get;
 	if (!session || typeof get !== "function") return;
-	for (const [ownerSessionID, path] of staleOwners) {
-		const existing = claims.get(path);
-		if (!existing || existing.sessionID !== ownerSessionID) continue;
+	for (const [ownerSessionID] of staleOwners) {
 		try {
 			const result = await get.call(session, { path: { id: ownerSessionID } });
 			const idle = (result as { data?: { time?: { idle?: unknown } } } | undefined)?.data?.time?.idle;
-			if (typeof idle === "number" && idle > 0 && existing.ts < idle) {
-				releaseFileClaims(ownerSessionID);
+			if (typeof idle !== "number" || idle <= 0) continue;
+			// Release every claim of this owner that is provably stale. Each
+			// claim is re-read after the lookup round-trip so an owner that
+			// re-claimed (and refreshed) a path meanwhile keeps its live claim.
+			for (const [claimPath, claim] of [...claims]) {
+				if (claim.sessionID !== ownerSessionID || claim.ts >= idle) continue;
+				claims.delete(claimPath);
 				audit({
 					ts: new Date().toISOString(),
 					sessionID: claimantSessionID,
@@ -103,7 +111,7 @@ export async function releaseStaleFileClaims(paths: string[], claimantSessionID:
 					decision: "allow",
 					phase: "event",
 					reason: "stale_claim_takeover",
-					evidence: { mutation: false, targetPath: path },
+					evidence: { mutation: false, targetPath: claimPath, claimOwnerSessionID: ownerSessionID },
 				});
 			}
 		} catch {}

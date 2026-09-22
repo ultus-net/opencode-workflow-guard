@@ -906,6 +906,7 @@ console.log("- Stale file-claim takeover -");
 const takeoverDir = mkdtempSync(join(tmpdir(), "wg-claim-takeover-"));
 writeFileSync(join(takeoverDir, "stale.ts"), "before");
 writeFileSync(join(takeoverDir, "live.ts"), "before");
+writeFileSync(join(takeoverDir, "refresh.ts"), "before");
 const takeoverIdle = new Map<string, number>();
 const takeoverClient = {
 	session: {
@@ -934,7 +935,8 @@ const takeoverAfter = takeoverHooks["tool.execute.after"];
 // The owner claims the file, its after-hook is skipped, and it idles LATER.
 await recordRead(takeoverBefore, takeoverAfter, "s-stale-owner", join(takeoverDir, "stale.ts"), "takeover-read-stale");
 await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "stale-claim" }, { args: { filePath: join(takeoverDir, "stale.ts"), content: "a" } });
-takeoverIdle.set("s-stale-owner", Date.now() + 50);
+await new Promise((resolve) => setTimeout(resolve, 10));
+takeoverIdle.set("s-stale-owner", Date.now());
 // A live owner, still mid-session, claims the other file.
 await recordRead(takeoverBefore, takeoverAfter, "s-live-owner", join(takeoverDir, "live.ts"), "takeover-read-live");
 await takeoverBefore?.({ tool: "edit", sessionID: "s-live-owner", callID: "live-claim" }, { args: { filePath: join(takeoverDir, "live.ts"), content: "b" } });
@@ -948,9 +950,10 @@ try {
 }
 check("a claim older than its owner's recorded idle is released for the next claimant", staleTakeoverAllowed);
 const takeoverAudit = getRecentAuditEntries(30).find((entry) => entry.tool === "file-claims" && entry.reason === "stale_claim_takeover");
-check("stale claim takeover is audited with the released path", takeoverAudit?.decision === "allow" && typeof takeoverAudit?.evidence?.targetPath === "string" && takeoverAudit.evidence.targetPath.endsWith("stale.ts"));
+check("stale claim takeover is audited with the released path and owner", takeoverAudit?.decision === "allow" && typeof takeoverAudit?.evidence?.targetPath === "string" && takeoverAudit.evidence.targetPath.endsWith("stale.ts") && takeoverAudit.evidence.claimOwnerSessionID === "s-stale-owner");
 await takeoverAfter?.({ tool: "edit", sessionID: "s-claimant", callID: "takeover-claim", args: {} }, { title: "edit", output: "edited", metadata: {} });
 
+// A live owner, still mid-turn (no idle timestamp recorded), keeps its claim.
 await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "live.ts"), "takeover-read-live-claimant");
 let liveClaimBlocked = false;
 try {
@@ -963,18 +966,30 @@ await takeoverAfter?.({ tool: "edit", sessionID: "s-live-owner", callID: "live-c
 
 // A same-session re-claim refreshes the stored claim (new callID/timestamp):
 // an owner that idled with a leaked claim and comes back to the same file
-// mid-turn must not have its fresh claim taken over.
-await recordRead(takeoverBefore, takeoverAfter, "s-stale-owner", join(takeoverDir, "stale.ts"), "takeover-read-reclaim");
-await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "stale-reclaim" }, { args: { filePath: join(takeoverDir, "stale.ts"), content: "d" } });
-await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "stale.ts"), "takeover-read-reclaim-claimant");
-let reclaimBlocked = false;
+// mid-turn must not have its fresh claim taken over, and the refreshed
+// callID must be the one the after-hook releases.
+await recordRead(takeoverBefore, takeoverAfter, "s-stale-owner", join(takeoverDir, "refresh.ts"), "takeover-read-refresh");
+await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "refresh-claim-1" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "d" } });
+await new Promise((resolve) => setTimeout(resolve, 10));
+takeoverIdle.set("s-stale-owner", Date.now());
+await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "refresh-claim-2" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "e" } });
+await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "refresh.ts"), "takeover-read-refresh-claimant");
+let refreshClaimBlocked = false;
 try {
-	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "reclaim-conflict" }, { args: { filePath: join(takeoverDir, "stale.ts"), content: "e" } });
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "refresh-conflict" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "f" } });
 } catch (error) {
-	reclaimBlocked = String(error).includes("claimed by another active session");
+	refreshClaimBlocked = String(error).includes("claimed by another active session");
 }
-check("a same-session re-claim refreshes past the owner's idle so it is not taken over mid-turn", reclaimBlocked);
-await takeoverAfter?.({ tool: "edit", sessionID: "s-stale-owner", callID: "stale-reclaim", args: {} }, { title: "edit", output: "edited", metadata: {} });
+check("a same-session re-claim refreshes past the owner's idle so it is not taken over mid-turn", refreshClaimBlocked);
+await takeoverAfter?.({ tool: "edit", sessionID: "s-stale-owner", callID: "refresh-claim-2", args: {} }, { title: "edit", output: "edited", metadata: {} });
+let refreshReleasedAllowed = true;
+try {
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "refresh-after-release" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "g" } });
+} catch {
+	refreshReleasedAllowed = false;
+}
+check("the refreshed claim releases through its updated callID", refreshReleasedAllowed);
+await takeoverAfter?.({ tool: "edit", sessionID: "s-claimant", callID: "refresh-after-release", args: {} }, { title: "edit", output: "edited", metadata: {} });
 
 // Fail-closed: no session lookup on the client, and a lookup that throws.
 const noLookupDir = mkdtempSync(join(tmpdir(), "wg-claim-nolookup-"));
