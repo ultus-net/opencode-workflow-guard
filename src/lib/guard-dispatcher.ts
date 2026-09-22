@@ -345,7 +345,13 @@ export async function guardToolCallImpl(
 			const normalizedInvocation = `git ${invocation.rest}`;
 			if (isPathOutsideWorkspace(invocation.repoDir, currentRoot) && (GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))) {
 				logPolicyBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
-				return block("boundary", "workspace_escape", `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`);
+				return block(
+					"boundary",
+					"workspace_escape",
+					hasUnresolvableVariable(invocation.repoDir)
+						? `Blocked: git command targets repository '${invocation.repoDir}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
+						: `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`,
+				);
 			}
 		}
 		for (const invocation of gitInvocations) {
@@ -377,7 +383,13 @@ export async function guardToolCallImpl(
 			const outsidePath = outsideWritePathInPayload(payload, currentRoot);
 			if (outsidePath) {
 				logPolicyBlock(`[workflow-guard] blocked interpreter payload writing outside workspace: ${outsidePath}`);
-				return block("boundary", "workspace_escape", `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`);
+				return block(
+					"boundary",
+					"workspace_escape",
+					hasUnresolvableVariable(outsidePath)
+						? `Blocked: inline interpreter script targets file '${outsidePath}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
+						: `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`,
+				);
 			}
 			const writePaths = writePathsInPayload(payload);
 			if (writePaths.length > 0) {

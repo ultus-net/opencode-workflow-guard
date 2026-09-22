@@ -382,6 +382,9 @@ export async function guardShellMutation(
 					return PROTECTED_PATH_REASON;
 				}
 				if (isPathOutsideWorkspace(source, root)) {
+					if (hasUnresolvableVariable(source)) {
+						return `Blocked: mv source '${source}' contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${root}). Use a literal workspace-relative path.`;
+					}
 					return `Blocked: mv would remove source '${source}' from outside the workspace root (${root}). File mutations must stay within the workspace.`;
 				}
 			}

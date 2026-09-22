@@ -693,6 +693,10 @@ const unresolvableShell = await call("bash", { command: "mkdir -p $D/sub" }, { s
 check("shell mutation with unresolvable $VAR names the variable cause", blocked(unresolvableShell) && String(unresolvableShell).includes("unresolvable variable reference") && String(unresolvableShell).includes("$D"));
 const unresolvablePatch = await call("apply_patch", { patchText: "*** Update File: $UNKNOWN_DIR/file.ts\n" }, { sessionID: "s-active" });
 check("apply_patch with unresolvable $VAR names the variable cause", blocked(unresolvablePatch) && String(unresolvablePatch).includes("unresolvable variable reference"));
+const unresolvableMv = await call("bash", { command: "mv $D/foo.txt ./bar.txt" }, { sessionID: "s-active" });
+check("mv source with unresolvable $VAR names the variable cause", blocked(unresolvableMv) && String(unresolvableMv).includes("unresolvable variable reference"));
+const unresolvableGit = await call("bash", { command: "git -C $OTHER_REPO commit -m x" }, { sessionID: "s-active" });
+check("git repoDir with unresolvable $VAR names the variable cause", blocked(unresolvableGit) && String(unresolvableGit).includes("unresolvable variable reference"));
 check("allow apply_patch within workspace", !(await call("apply_patch", { patchText: "*** Update File: src/app.ts\n" }, { sessionID: "s-active" })));
 check("block apply_patch escaping workspace", blocked(await call("apply_patch", { patchText: "*** Update File: ../../secret.env\n" }, { sessionID: "s-active" })));
 
