@@ -3285,6 +3285,20 @@ check(
 	"a pre-existing branch is not deleted when worktree add fails",
 	spawnSync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${preservedBranch}`], { cwd: worktreeBaseRepo }).status === 0,
 );
+// A colliding sanitized path must never let rollback destroy a live
+// registered worktree (duplicate names, concurrent subagents, feat/x vs
+// feat:x). The failed add must leave it and its uncommitted work intact.
+const liveCollision = createGitWorktree("feat/live-collision", "HEAD", worktreeBaseRepo);
+check("live-collision setup creates a registered worktree", liveCollision.success && typeof liveCollision.worktreePath === "string");
+const liveCollisionPath = liveCollision.worktreePath!;
+writeFileSync(join(liveCollisionPath, "uncommitted-work.txt"), "do not lose me\n");
+const duplicateCreate = createGitWorktree("feat/live-collision", "HEAD", worktreeBaseRepo);
+const liveSurvived = existsSync(liveCollisionPath) && existsSync(join(liveCollisionPath, "uncommitted-work.txt"));
+const liveCleanup = cleanupGitWorktree(liveCollisionPath, worktreeBaseRepo);
+check(
+	"failed duplicate create leaves a live registered worktree and its uncommitted work intact",
+	duplicateCreate.success === false && liveSurvived && liveCleanup.success,
+);
 process.env.WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS = "2500";
 check("resolveWorktreeTimeoutMs honors WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS", resolveWorktreeTimeoutMs() === 2500);
 delete process.env.WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS;

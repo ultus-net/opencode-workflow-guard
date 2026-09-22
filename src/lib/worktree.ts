@@ -96,7 +96,11 @@ function rollbackFailedWorktreeAdd(options: { branch: string; branchCreatedByUs:
 	try {
 		const registered = (registeredWorktreePaths(root) ?? []).map((path) => resolve(path));
 		const targetRegistered = registered.includes(resolve(targetPath));
-		if (targetRegistered && existsSync(targetPath)) {
+		if (targetRegistered && !existedBefore && existsSync(targetPath)) {
+			// Only a worktree this call registered may be force-removed. A
+			// pre-existing registered worktree at the same sanitized path
+			// (duplicate name, concurrent subagents, feat/x vs feat:x) is the
+			// reason the add failed - it must never be destroyed by rollback.
 			spawnSync("git", ["worktree", "remove", "--force", targetPath], {
 				cwd: root,
 				env: getCleanGitEnv(),
@@ -104,13 +108,17 @@ function rollbackFailedWorktreeAdd(options: { branch: string; branchCreatedByUs:
 				timeout: 10_000,
 			});
 		}
-		// Clear stale worktree admin entries left by an interrupted add.
-		spawnSync("git", ["worktree", "prune"], {
-			cwd: root,
-			env: getCleanGitEnv(),
-			encoding: "utf8",
-			timeout: 10_000,
-		});
+		if (!existedBefore) {
+			// Clear stale worktree admin entries left by an interrupted add for
+			// this new path. Scoped to the new-path case so unrelated
+			// worktrees on temporarily unavailable paths are never pruned.
+			spawnSync("git", ["worktree", "prune"], {
+				cwd: root,
+				env: getCleanGitEnv(),
+				encoding: "utf8",
+				timeout: 10_000,
+			});
+		}
 		if (!existedBefore && existsSync(targetPath)) {
 			// git may have partially populated the directory before failing.
 			// It did not exist before this call, so removing it is safe; a
