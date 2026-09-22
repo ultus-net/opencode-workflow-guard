@@ -14,6 +14,7 @@ import { WorkflowGuardV2 } from "./lib/v2-plugin.ts";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { join } from "node:path";
+import { loadedPluginVersion } from "./lib/version.ts";
 import { editTargets, runPostEditValidators, snapshotFile } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
 import { beginReadObservation, clearReadFingerprints, recordMutationObservation, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
@@ -190,6 +191,8 @@ export function managedConfigDiagnostic(platform = process.platform, env: NodeJS
 		? `managed config ${detected ? "detected" : "not detected"} at ${directory}; plugin provenance is not verified by the OpenCode V1 API`
 		: "managed config location is unknown on this platform; plugin provenance is not verified by the OpenCode V1 API";
 }
+
+export { loadedPluginVersion } from "./lib/version.ts";
 
 // ── Verification engine ──────────────────────────────────────────────────────
 import {
@@ -433,7 +436,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 			body: {
 				service: "workflow-guard",
 				level: "info",
-				message: `Workflow Guard plugin initialized for ${effectiveRoot}; ${managedConfigDiagnostic()}`,
+				message: `Workflow Guard v${loadedPluginVersion() ?? "unknown"} plugin initialized for ${effectiveRoot}; ${managedConfigDiagnostic()}`,
 			},
 		});
 	} catch {}
