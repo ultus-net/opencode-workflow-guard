@@ -680,6 +680,19 @@ check("block write to /etc/passwd", blocked(await call("write", { filePath: "/et
 check("block write to ~ path", blocked(await call("write", { filePath: "~/.bashrc", content: "x" }, { sessionID: "s-active" })));
 check("block write to $HOME path", blocked(await call("write", { filePath: "$HOME/.profile", content: "x" }, { sessionID: "s-active" })));
 check("block write to unresolvable $VAR path", blocked(await call("write", { filePath: "$UNKNOWN_DIR/file.txt", content: "x" }, { sessionID: "s-active" })));
+// Cause attribution: indeterminate $VARIABLE destinations get a message that
+// names the unresolvable reference (the on-device over-block class), while
+// deterministically-outside paths keep the generic escape message.
+const unresolvableWrite = await call("write", { filePath: "$UNKNOWN_DIR/file.txt", content: "x" }, { sessionID: "s-active" });
+check("unresolvable $VAR write names the variable cause", blocked(unresolvableWrite) && String(unresolvableWrite).includes("unresolvable variable reference") && String(unresolvableWrite).includes("$UNKNOWN_DIR"));
+const literalEscapeWrite = await call("write", { filePath: "/etc/passwd", content: "x" }, { sessionID: "s-active" });
+check("literal outside path keeps the generic escape message", blocked(literalEscapeWrite) && String(literalEscapeWrite).includes("escapes workspace root") && !String(literalEscapeWrite).includes("unresolvable variable reference"));
+const homeWrite = await call("write", { filePath: "$HOME/.profile", content: "x" }, { sessionID: "s-active" });
+check("deterministically-expanded $HOME path keeps the generic escape message", blocked(homeWrite) && String(homeWrite).includes("escapes workspace root") && !String(homeWrite).includes("unresolvable variable reference"));
+const unresolvableShell = await call("bash", { command: "mkdir -p $D/sub" }, { sessionID: "s-active" });
+check("shell mutation with unresolvable $VAR names the variable cause", blocked(unresolvableShell) && String(unresolvableShell).includes("unresolvable variable reference") && String(unresolvableShell).includes("$D"));
+const unresolvablePatch = await call("apply_patch", { patchText: "*** Update File: $UNKNOWN_DIR/file.ts\n" }, { sessionID: "s-active" });
+check("apply_patch with unresolvable $VAR names the variable cause", blocked(unresolvablePatch) && String(unresolvablePatch).includes("unresolvable variable reference"));
 check("allow apply_patch within workspace", !(await call("apply_patch", { patchText: "*** Update File: src/app.ts\n" }, { sessionID: "s-active" })));
 check("block apply_patch escaping workspace", blocked(await call("apply_patch", { patchText: "*** Update File: ../../secret.env\n" }, { sessionID: "s-active" })));
 

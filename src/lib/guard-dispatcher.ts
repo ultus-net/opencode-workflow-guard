@@ -38,7 +38,7 @@ import {
 	resolveVerifyTimeoutMs,
 	snipVerifyOutput,
 } from "./verify.ts";
-import { detectShellMutation, extractPatchPaths, guardShellMutation, isPathOutsideWorkspace } from "../policies/boundary.ts";
+import { detectShellMutation, extractPatchPaths, guardShellMutation, hasUnresolvableVariable, isPathOutsideWorkspace } from "../policies/boundary.ts";
 import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyHasLiteralLineBreakEscapes, prBodyIncludesChangelog } from "../policies/changelog.ts";
 import { extractEditContent, liveMutationIn } from "../policies/destructive.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
@@ -223,13 +223,25 @@ export async function guardToolCallImpl(
 				}
 				if (isPathOutsideWorkspace(patchPath, currentRoot)) {
 					logPolicyBlock(`[workflow-guard] blocked apply_patch: patch target escapes workspace: ${patchPath}`);
-					return block("boundary", "workspace_escape", `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`);
+					return block(
+						"boundary",
+						"workspace_escape",
+						hasUnresolvableVariable(patchPath)
+							? `Blocked: patch targets file '${patchPath}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
+							: `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`,
+					);
 				}
 			}
 		}
 		if (target && isPathOutsideWorkspace(target, currentRoot)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: path escapes workspace: ${target}`);
-			return block("boundary", "workspace_escape", `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`);
+			return block(
+				"boundary",
+				"workspace_escape",
+				hasUnresolvableVariable(target)
+					? `Blocked: file path '${target}' contains an unresolvable variable reference, so the boundary treats it as outside the workspace root (${currentRoot}). Use a literal workspace-relative path; all changes must stay within the workspace.`
+					: `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`,
+			);
 		}
 		for (const content of extractEditContent(input)) {
 			const secret = secretIn(content);
