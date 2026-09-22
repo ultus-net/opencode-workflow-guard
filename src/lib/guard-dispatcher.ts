@@ -38,7 +38,7 @@ import {
 	resolveVerifyTimeoutMs,
 	snipVerifyOutput,
 } from "./verify.ts";
-import { detectShellMutation, extractPatchPaths, guardShellMutation, isPathOutsideWorkspace } from "../policies/boundary.ts";
+import { detectShellMutation, extractPatchPaths, guardShellMutation, hasUnresolvableVariable, isPathOutsideWorkspace } from "../policies/boundary.ts";
 import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyHasLiteralLineBreakEscapes, prBodyIncludesChangelog } from "../policies/changelog.ts";
 import { extractEditContent, liveMutationIn } from "../policies/destructive.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
@@ -223,13 +223,25 @@ export async function guardToolCallImpl(
 				}
 				if (isPathOutsideWorkspace(patchPath, currentRoot)) {
 					logPolicyBlock(`[workflow-guard] blocked apply_patch: patch target escapes workspace: ${patchPath}`);
-					return block("boundary", "workspace_escape", `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`);
+					return block(
+						"boundary",
+						"workspace_escape",
+						hasUnresolvableVariable(patchPath)
+							? `Blocked: patch targets file '${patchPath}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
+							: `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`,
+					);
 				}
 			}
 		}
 		if (target && isPathOutsideWorkspace(target, currentRoot)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: path escapes workspace: ${target}`);
-			return block("boundary", "workspace_escape", `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`);
+			return block(
+				"boundary",
+				"workspace_escape",
+				hasUnresolvableVariable(target)
+					? `Blocked: file path '${target}' contains an unresolvable variable reference, so the boundary treats it as outside the workspace root (${currentRoot}). Use a literal workspace-relative path; all changes must stay within the workspace.`
+					: `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`,
+			);
 		}
 		for (const content of extractEditContent(input)) {
 			const secret = secretIn(content);
@@ -333,7 +345,13 @@ export async function guardToolCallImpl(
 			const normalizedInvocation = `git ${invocation.rest}`;
 			if (isPathOutsideWorkspace(invocation.repoDir, currentRoot) && (GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))) {
 				logPolicyBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
-				return block("boundary", "workspace_escape", `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`);
+				return block(
+					"boundary",
+					"workspace_escape",
+					hasUnresolvableVariable(invocation.repoDir)
+						? `Blocked: git command targets repository '${invocation.repoDir}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
+						: `Blocked: git command targets repository '${invocation.repoDir}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`,
+				);
 			}
 		}
 		for (const invocation of gitInvocations) {
@@ -365,7 +383,13 @@ export async function guardToolCallImpl(
 			const outsidePath = outsideWritePathInPayload(payload, currentRoot);
 			if (outsidePath) {
 				logPolicyBlock(`[workflow-guard] blocked interpreter payload writing outside workspace: ${outsidePath}`);
-				return block("boundary", "workspace_escape", `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`);
+				return block(
+					"boundary",
+					"workspace_escape",
+					hasUnresolvableVariable(outsidePath)
+						? `Blocked: inline interpreter script targets file '${outsidePath}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
+						: `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`,
+				);
 			}
 			const writePaths = writePathsInPayload(payload);
 			if (writePaths.length > 0) {

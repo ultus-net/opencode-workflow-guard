@@ -53,6 +53,16 @@ export function expandShellTargetPath(targetPath: string): string | null {
 	return out;
 }
 
+/**
+ * A mutation/redirect target whose expansion is indeterminate (it contains an
+ * unresolvable `$VARIABLE` reference): the boundary treats such destinations
+ * as outside the workspace, and block messages attribute that cause instead
+ * of the generic escape message.
+ */
+export function hasUnresolvableVariable(targetPath: string): boolean {
+	return expandShellTargetPath(targetPath) === null;
+}
+
 export function isPathOutsideWorkspace(targetPath: string, root: string): boolean {
 	if (!targetPath) return false;
 	const expanded = expandShellTargetPath(targetPath);
@@ -372,6 +382,9 @@ export async function guardShellMutation(
 					return PROTECTED_PATH_REASON;
 				}
 				if (isPathOutsideWorkspace(source, root)) {
+					if (hasUnresolvableVariable(source)) {
+						return `Blocked: mv source '${source}' contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${root}). Use a literal workspace-relative path.`;
+					}
 					return `Blocked: mv would remove source '${source}' from outside the workspace root (${root}). File mutations must stay within the workspace.`;
 				}
 			}
@@ -403,6 +416,9 @@ export async function guardShellMutation(
 				// The workspace boundary has no override: a write outside the
 				// workspace is out of bounds even with WORKFLOW_GUARD_ALLOW_LIVE
 				// (that override covers live-system commands, not the boundary).
+				if (hasUnresolvableVariable(target)) {
+					return `Blocked: shell mutation '${mutation.what}' targets '${target}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${root}). Use a literal workspace-relative path.`;
+				}
 				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${root}). All changes must stay within the workspace.`;
 			}
 			if (onProtectedBranch(root)) {
