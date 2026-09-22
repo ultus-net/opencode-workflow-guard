@@ -139,6 +139,8 @@ To opt out of the PR secondary review gate for a project, set `requireReview: fa
 
 Or set `WORKFLOW_GUARD_REQUIRE_REVIEW=0` in your environment. Conversely, `WORKFLOW_GUARD_REQUIRE_REVIEW=1` enforces the review gate regardless of repository configuration.
 
+For stricter environments, set `requireSubagentReview: true` in `.opencode/workflow-guard.json` to reject approvals recorded by the root session itself: a passing verdict must then be recorded from a subagent session (one with a parent session), never by the root session approving its own work. Changes-requested findings remain relayable from any session. `WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=1` enables the same requirement for any project; `WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=0` disables it even when project config enables it.
+
 ---
 
 ## Recommended Companion Configuration

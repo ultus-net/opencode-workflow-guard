@@ -2677,6 +2677,97 @@ check("PR blocked when only the reviewed commit drifted, with a commit-specific 
 rmSync(driftRepo, { recursive: true, force: true });
 resetReviewState();
 
+// Strict recorder mode (requireSubagentReview): an opt-in policy that closes
+// the root-session self-approval path which default content binding keeps
+// open for read-only reviewer relays. Approvals must be recorded from a
+// subagent session (lineage, not agent role); changes-requested verdicts
+// stay relayable.
+console.log("- Strict Recorder Mode (requireSubagentReview) -");
+const strictSummary = "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.";
+const strictRepo = join(root, "wg-review-strict");
+mkdirSync(strictRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "feature/strict-recorder"], { cwd: strictRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: strictRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: strictRepo });
+writeFileSync(join(strictRepo, "code.txt"), "base\n");
+spawnSync("git", ["add", "code.txt"], { cwd: strictRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: strictRepo });
+mkdirSync(join(strictRepo, ".opencode"), { recursive: true });
+writeFileSync(join(strictRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: true, requireSubagentReview: true }));
+const strictPlugin = await WorkflowGuard({
+	directory: root,
+	worktree: root,
+	client: fakeClient as any,
+	project: {} as any,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+const strictPrProbe = { tool: "bash", input: { command: "gh pr create --title t --body 'Changelog: strict'", workdir: strictRepo } };
+
+// Root-session self-approval is rejected before any verdict is recorded
+const strictRootAttempt = await strictPlugin.tool?.record_review?.execute(
+	{ reviewer: "self-approved", summary: strictSummary, passed: true },
+	{ sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any,
+);
+const strictRootAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "record_review.verdict" && entry.sessionID === "s-strict-root");
+check("strict mode: root-session approval is rejected with an actionable cause", typeof strictRootAttempt === "string" && strictRootAttempt.includes("rejected") && strictRootAttempt.includes("requireSubagentReview") && !strictRootAttempt.includes("APPROVED"));
+check("strict mode: rejected root approval is audited as subagent_recorder_required", strictRootAudit?.reason === "subagent_recorder_required");
+const strictStatusAfterRoot = JSON.parse(String(await strictPlugin.tool?.guard_status?.execute({ directory: strictRepo }, { sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any)));
+check("strict mode: review gate stays unsatisfied after rejected self-approval", strictStatusAfterRoot.outstandingRequirements.includes("review") && strictStatusAfterRoot.lastReview === null && strictStatusAfterRoot.projectConfig?.requireSubagentReview === true);
+const strictPrAfterRoot = JSON.parse(String(await strictPlugin.tool?.guard_why?.execute(strictPrProbe, { sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any)));
+check("strict mode: PR preflight still blocked after rejected self-approval", strictPrAfterRoot.status === "blocked" && strictPrAfterRoot.message.includes("Passing secondary review approval is required"));
+
+// Changes-requested findings remain relayable from the root session
+const strictRootNegative = await strictPlugin.tool?.record_review?.execute(
+	{ reviewer: "self-flagged", summary: strictSummary, passed: false },
+	{ sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any,
+);
+check("strict mode: root session may still relay changes-requested verdicts", typeof strictRootNegative === "string" && strictRootNegative.includes("CHANGES REQUESTED"));
+
+// A subagent session (has a parent) records the approval
+fakeParents.set("s-strict-reviewer", "s-strict-root");
+const strictSubagentResult = await strictPlugin.tool?.record_review?.execute(
+	{ reviewer: "strict-reviewer", summary: strictSummary, passed: true },
+	{ sessionID: "s-strict-reviewer", agent: "general", worktree: strictRepo, directory: strictRepo } as any,
+);
+check("strict mode: subagent recorder records the approval", typeof strictSubagentResult === "string" && strictSubagentResult.includes("APPROVED"));
+const strictStatusAfterSubagent = JSON.parse(String(await strictPlugin.tool?.guard_status?.execute({ directory: strictRepo }, { sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any)));
+check("strict mode: subagent approval satisfies the review gate", !strictStatusAfterSubagent.outstandingRequirements.includes("review") && strictStatusAfterSubagent.lastReview?.fresh === true);
+const strictPrAfterSubagent = JSON.parse(String(await strictPlugin.tool?.guard_why?.execute(strictPrProbe, { sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any)));
+check("strict mode: PR preflight passes after subagent-recorded approval", strictPrAfterSubagent.status !== "blocked" && (strictPrAfterSubagent.status === "allowed" || strictPrAfterSubagent.code === "remote_state_unchecked"));
+if (strictPrAfterSubagent.status === "blocked") console.log("   blocked:", strictPrAfterSubagent.message);
+
+rmSync(strictRepo, { recursive: true, force: true });
+resetReviewState();
+
+// Environment overrides follow the requireReview pattern; the default keeps
+// root-session relay recording allowed without the knob.
+const relaxedRepo = join(root, "wg-review-relaxed");
+mkdirSync(relaxedRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "feature/relaxed-recorder"], { cwd: relaxedRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: relaxedRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: relaxedRepo });
+writeFileSync(join(relaxedRepo, "code.txt"), "base\n");
+spawnSync("git", ["add", "code.txt"], { cwd: relaxedRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: relaxedRepo });
+process.env.WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW = "1";
+const relaxedEnvAttempt = await strictPlugin.tool?.record_review?.execute(
+	{ reviewer: "self-approved", summary: strictSummary, passed: true },
+	{ sessionID: "s-relaxed-root", worktree: relaxedRepo, directory: relaxedRepo } as any,
+);
+check("strict recorder env override: WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=1 applies without project config", typeof relaxedEnvAttempt === "string" && relaxedEnvAttempt.includes("rejected") && relaxedEnvAttempt.includes("subagent"));
+const relaxedEnvStatus = JSON.parse(String(await strictPlugin.tool?.guard_status?.execute({ directory: relaxedRepo }, { sessionID: "s-relaxed-root", worktree: relaxedRepo, directory: relaxedRepo } as any)));
+check("strict recorder env override: status echoes the forced requirement", relaxedEnvStatus.projectConfig?.requireSubagentReview === true);
+delete process.env.WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW;
+const relaxedDefault = await strictPlugin.tool?.record_review?.execute(
+	{ reviewer: "relayed-reviewer", summary: strictSummary, passed: true },
+	{ sessionID: "s-relaxed-root", worktree: relaxedRepo, directory: relaxedRepo } as any,
+);
+check("strict recorder default: root-session relay recording stays allowed without the knob", typeof relaxedDefault === "string" && relaxedDefault.includes("APPROVED"));
+rmSync(relaxedRepo, { recursive: true, force: true });
+resetReviewState();
+
 // Event hook handles permission events
 if (typeof customPlugin.event === "function") {
 	await customPlugin.event({
