@@ -897,6 +897,169 @@ try {
 }
 check("blocked multi-target patch leaves no partial claims", !partialPatchClaim);
 
+// Stale claim takeover (missed idle release): a claim created BEFORE its
+// owner's last recorded idle timestamp cannot belong to an in-flight tool
+// call, so a leaked claim must not block another session forever. Owners that
+// are still mid-session (no idle timestamp), a client without a session
+// lookup, and a failing lookup all keep the block (fail-closed).
+console.log("- Stale file-claim takeover -");
+const takeoverDir = mkdtempSync(join(tmpdir(), "wg-claim-takeover-"));
+writeFileSync(join(takeoverDir, "stale.ts"), "before");
+writeFileSync(join(takeoverDir, "live.ts"), "before");
+writeFileSync(join(takeoverDir, "refresh.ts"), "before");
+const takeoverIdle = new Map<string, number>();
+const takeoverClient = {
+	session: {
+		todo: fakeClient.session.todo,
+		get: async ({ path }: { path: { id: string } }) => {
+			const idle = takeoverIdle.get(path.id);
+			return { data: { id: path.id, parentID: fakeParents.get(path.id), ...(typeof idle === "number" ? { time: { idle } } : {}) } };
+		},
+	},
+};
+const takeoverHooks = await pluginFn({
+	directory: takeoverDir,
+	client: takeoverClient as any,
+	project: {} as any,
+	worktree: takeoverDir,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+todo("s-stale-owner", item("edit stale file", "in_progress"));
+todo("s-live-owner", item("edit live file", "in_progress"));
+todo("s-claimant", item("take over stale claim", "in_progress"));
+const takeoverBefore = takeoverHooks["tool.execute.before"];
+const takeoverAfter = takeoverHooks["tool.execute.after"];
+
+// The owner claims the file, its after-hook is skipped, and it idles LATER.
+await recordRead(takeoverBefore, takeoverAfter, "s-stale-owner", join(takeoverDir, "stale.ts"), "takeover-read-stale");
+await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "stale-claim" }, { args: { filePath: join(takeoverDir, "stale.ts"), content: "a" } });
+await new Promise((resolve) => setTimeout(resolve, 10));
+takeoverIdle.set("s-stale-owner", Date.now());
+// A live owner, still mid-session, claims the other file.
+await recordRead(takeoverBefore, takeoverAfter, "s-live-owner", join(takeoverDir, "live.ts"), "takeover-read-live");
+await takeoverBefore?.({ tool: "edit", sessionID: "s-live-owner", callID: "live-claim" }, { args: { filePath: join(takeoverDir, "live.ts"), content: "b" } });
+
+await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "stale.ts"), "takeover-read-claimant");
+let staleTakeoverAllowed = true;
+try {
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "takeover-claim" }, { args: { filePath: join(takeoverDir, "stale.ts"), content: "c" } });
+} catch {
+	staleTakeoverAllowed = false;
+}
+check("a claim older than its owner's recorded idle is released for the next claimant", staleTakeoverAllowed);
+const takeoverAudit = getRecentAuditEntries(30).find((entry) => entry.tool === "file-claims" && entry.reason === "stale_claim_takeover");
+check("stale claim takeover is audited with the released path and owner", takeoverAudit?.decision === "allow" && typeof takeoverAudit?.evidence?.targetPath === "string" && takeoverAudit.evidence.targetPath.endsWith("stale.ts") && takeoverAudit.evidence.claimOwnerSessionID === "s-stale-owner");
+await takeoverAfter?.({ tool: "edit", sessionID: "s-claimant", callID: "takeover-claim", args: {} }, { title: "edit", output: "edited", metadata: {} });
+
+// A live owner, still mid-turn (no idle timestamp recorded), keeps its claim.
+await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "live.ts"), "takeover-read-live-claimant");
+let liveClaimBlocked = false;
+try {
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "live-blocked" }, { args: { filePath: join(takeoverDir, "live.ts"), content: "c" } });
+} catch (error) {
+	liveClaimBlocked = String(error).includes("claimed by another active session");
+}
+check("a live owner without an idle timestamp keeps its claim", liveClaimBlocked);
+await takeoverAfter?.({ tool: "edit", sessionID: "s-live-owner", callID: "live-claim", args: {} }, { title: "edit", output: "edited", metadata: {} });
+
+// A same-session re-claim refreshes the stored claim (new callID/timestamp):
+// an owner that idled with a leaked claim and comes back to the same file
+// mid-turn must not have its fresh claim taken over, and the refreshed
+// callID must be the one the after-hook releases.
+await recordRead(takeoverBefore, takeoverAfter, "s-stale-owner", join(takeoverDir, "refresh.ts"), "takeover-read-refresh");
+await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "refresh-claim-1" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "d" } });
+await new Promise((resolve) => setTimeout(resolve, 10));
+takeoverIdle.set("s-stale-owner", Date.now());
+await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "refresh-claim-2" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "e" } });
+await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "refresh.ts"), "takeover-read-refresh-claimant");
+let refreshClaimBlocked = false;
+try {
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "refresh-conflict" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "f" } });
+} catch (error) {
+	refreshClaimBlocked = String(error).includes("claimed by another active session");
+}
+check("a same-session re-claim refreshes past the owner's idle so it is not taken over mid-turn", refreshClaimBlocked);
+await takeoverAfter?.({ tool: "edit", sessionID: "s-stale-owner", callID: "refresh-claim-2", args: {} }, { title: "edit", output: "edited", metadata: {} });
+let refreshReleasedAllowed = true;
+try {
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "refresh-after-release" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "g" } });
+} catch {
+	refreshReleasedAllowed = false;
+}
+check("the refreshed claim releases through its updated callID", refreshReleasedAllowed);
+await takeoverAfter?.({ tool: "edit", sessionID: "s-claimant", callID: "refresh-after-release", args: {} }, { title: "edit", output: "edited", metadata: {} });
+
+// The takeover releases every provably stale claim of the owner, each with
+// its own audit entry: an owner holding two stale paths loses both in one
+// pass, and no fresh claim of that owner is touched.
+writeFileSync(join(takeoverDir, "multi-a.ts"), "before");
+writeFileSync(join(takeoverDir, "multi-b.ts"), "before");
+await recordRead(takeoverBefore, takeoverAfter, "s-stale-owner", join(takeoverDir, "multi-a.ts"), "takeover-read-multi-a");
+await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "multi-claim-a" }, { args: { filePath: join(takeoverDir, "multi-a.ts"), content: "h" } });
+await recordRead(takeoverBefore, takeoverAfter, "s-stale-owner", join(takeoverDir, "multi-b.ts"), "takeover-read-multi-b");
+await takeoverBefore?.({ tool: "edit", sessionID: "s-stale-owner", callID: "multi-claim-b" }, { args: { filePath: join(takeoverDir, "multi-b.ts"), content: "h" } });
+await new Promise((resolve) => setTimeout(resolve, 10));
+takeoverIdle.set("s-stale-owner", Date.now());
+await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "multi-a.ts"), "takeover-read-multi-a-claimant");
+let multiTakeoverAllowed = true;
+try {
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "multi-takeover-a" }, { args: { filePath: join(takeoverDir, "multi-a.ts"), content: "i" } });
+} catch {
+	multiTakeoverAllowed = false;
+}
+check("one conflict releases every provably stale claim of the owner", multiTakeoverAllowed);
+await takeoverAfter?.({ tool: "edit", sessionID: "s-claimant", callID: "multi-takeover-a", args: {} }, { title: "edit", output: "edited", metadata: {} });
+await recordRead(takeoverBefore, takeoverAfter, "s-claimant", join(takeoverDir, "multi-b.ts"), "takeover-read-multi-b-claimant");
+let multiSecondAllowed = true;
+try {
+	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "multi-takeover-b" }, { args: { filePath: join(takeoverDir, "multi-b.ts"), content: "j" } });
+} catch {
+	multiSecondAllowed = false;
+}
+check("the owner's other stale path is released in the same pass", multiSecondAllowed);
+await takeoverAfter?.({ tool: "edit", sessionID: "s-claimant", callID: "multi-takeover-b", args: {} }, { title: "edit", output: "edited", metadata: {} });
+const takeoverAudits = getRecentAuditEntries(30).filter((entry) => entry.reason === "stale_claim_takeover" && typeof entry.evidence?.targetPath === "string" && entry.evidence.targetPath.includes("multi-"));
+check("each released stale path has its own audited takeover entry", takeoverAudits.length === 2 && takeoverAudits.every((entry) => entry.evidence?.claimOwnerSessionID === "s-stale-owner"));
+
+// Fail-closed: no session lookup on the client, and a lookup that throws.
+const noLookupDir = mkdtempSync(join(tmpdir(), "wg-claim-nolookup-"));
+writeFileSync(join(noLookupDir, "file.ts"), "before");
+const noLookupHooks = await pluginFn({ directory: noLookupDir, client: {} as any, project: {} as any, worktree: noLookupDir, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const noLookupBefore = noLookupHooks["tool.execute.before"];
+const noLookupAfter = noLookupHooks["tool.execute.after"];
+todo("s-nolookup-owner", item("edit file", "in_progress"));
+await recordRead(noLookupBefore, noLookupAfter, "s-nolookup-owner", join(noLookupDir, "file.ts"), "nolookup-read-owner");
+await noLookupBefore?.({ tool: "edit", sessionID: "s-nolookup-owner", callID: "nolookup-claim" }, { args: { filePath: join(noLookupDir, "file.ts"), content: "a" } });
+todo("s-nolookup-claimant", item("edit file", "in_progress"));
+await recordRead(noLookupBefore, noLookupAfter, "s-nolookup-claimant", join(noLookupDir, "file.ts"), "nolookup-read-claimant");
+let noLookupBlocked = false;
+try {
+	await noLookupBefore?.({ tool: "edit", sessionID: "s-nolookup-claimant", callID: "nolookup-claimant" }, { args: { filePath: join(noLookupDir, "file.ts"), content: "b" } });
+} catch (error) {
+	noLookupBlocked = String(error).includes("claimed by another active session");
+}
+check("stale takeover fails closed when the client has no session lookup", noLookupBlocked);
+
+const throwLookupDir = mkdtempSync(join(tmpdir(), "wg-claim-throwlookup-"));
+writeFileSync(join(throwLookupDir, "file.ts"), "before");
+const throwLookupHooks = await pluginFn({ directory: throwLookupDir, client: { session: { get: async () => { throw new Error("lookup failed"); } } } as any, project: {} as any, worktree: throwLookupDir, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const throwLookupBefore = throwLookupHooks["tool.execute.before"];
+const throwLookupAfter = throwLookupHooks["tool.execute.after"];
+todo("s-throwlookup-owner", item("edit file", "in_progress"));
+await recordRead(throwLookupBefore, throwLookupAfter, "s-throwlookup-owner", join(throwLookupDir, "file.ts"), "throwlookup-read-owner");
+await throwLookupBefore?.({ tool: "edit", sessionID: "s-throwlookup-owner", callID: "throwlookup-claim" }, { args: { filePath: join(throwLookupDir, "file.ts"), content: "a" } });
+todo("s-throwlookup-claimant", item("edit file", "in_progress"));
+await recordRead(throwLookupBefore, throwLookupAfter, "s-throwlookup-claimant", join(throwLookupDir, "file.ts"), "throwlookup-read-claimant");
+let throwLookupBlocked = false;
+try {
+	await throwLookupBefore?.({ tool: "edit", sessionID: "s-throwlookup-claimant", callID: "throwlookup-claimant" }, { args: { filePath: join(throwLookupDir, "file.ts"), content: "b" } });
+} catch (error) {
+	throwLookupBlocked = String(error).includes("claimed by another active session");
+}
+check("stale takeover fails closed when the session lookup throws", throwLookupBlocked);
+
 // Existing files must be read by the same session before edit/write, and the
 // bytes plus filesystem identity must still match when the mutation starts.
 const staleDir = mkdtempSync(join(tmpdir(), "wg-stale-write-"));

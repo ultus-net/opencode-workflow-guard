@@ -9,7 +9,14 @@ export interface TodoSdkClient {
 	};
 	session?: {
 		todo?: (opts: { path: { id: string } }) => Promise<{ data?: unknown }>;
-		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown; title?: unknown } }>;
+		/**
+		 * The returned record's `data.time.idle` (ms epoch, server-recorded
+		 * when a session's turn ends; absent/zero while mid-turn) is the
+		 * stale-claim staleness boundary in src/policies/file-claims.ts. The
+		 * field is assumption-typed because the minimal SDK surface here does
+		 * not declare it; a missing, zero, or non-numeric value fails closed.
+		 */
+		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown; title?: unknown; time?: { idle?: unknown } } }>;
 		promptAsync?: (opts: {
 			path: { id: string };
 			body: { messageID?: string; parts: Array<{ type: "text"; text: string; synthetic?: boolean }> };
@@ -130,6 +137,8 @@ export interface AuditEntry {
 	evidence?: {
 		mutation?: boolean;
 		targetPath?: string;
+		/** Owner of a released stale file claim (stale_claim_takeover audits). */
+		claimOwnerSessionID?: string;
 		verification?: {
 			command: string;
 			passed: boolean;

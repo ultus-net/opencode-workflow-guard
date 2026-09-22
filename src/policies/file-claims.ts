@@ -1,9 +1,13 @@
 import { readlinkSync, realpathSync } from "node:fs";
 import { dirname, relative, resolve } from "node:path";
+import { audit } from "../lib/audit.ts";
+import { getSdkClient } from "../lib/state.ts";
 
 interface FileClaim {
 	sessionID: string;
 	callID: string;
+	/** Creation timestamp; a claim older than its owner's last idle is stale. */
+	ts: number;
 }
 
 const claims = new Map<string, FileClaim>();
@@ -36,8 +40,14 @@ export function claimFiles(paths: string[], sessionID: string, callID: string): 
 	const conflict = fileClaimConflictReason(canonical, sessionID);
 	if (conflict) return conflict;
 	for (const path of canonical) {
-		if (!claims.has(path)) {
-			claims.set(path, { sessionID, callID });
+		const existing = claims.get(path);
+		if (!existing) {
+			claims.set(path, { sessionID, callID, ts: Date.now() });
+		} else if (existing.sessionID === sessionID) {
+			// The same session re-claiming the path refreshes the claim so the
+			// timestamp (and callID) reflect the in-flight call: stale-takeover
+			// never fires for it, and the after-hook release matches.
+			claims.set(path, { sessionID, callID, ts: Date.now() });
 		}
 	}
 	return undefined;
@@ -52,6 +62,62 @@ export function fileClaimConflictReason(paths: string[], sessionID: string): str
 		}
 	}
 	return undefined;
+}
+
+/**
+ * A claim is normally released by its owning tool call (after-hook) or by the
+ * owner's session.idle/session.deleted events. When an idle release is missed,
+ * the claim would otherwise block every other session forever. A claim created
+ * BEFORE its owner's last recorded idle timestamp cannot belong to an
+ * in-flight tool call — that call finished before the turn ended — so it is
+ * provably stale and is released with an audited takeover. Without an SDK
+ * client, or when the owner record cannot be read, nothing is released:
+ * fail-closed keeps live two-session protection intact. Clock skew between
+ * this process and the server is not expected for a local (same-host)
+ * service: negative skew fails closed; forward skew could make fresh claims
+ * look stale and is accepted for that deployment. Concurrent claimants can
+ * emit duplicate takeover audits (append-only, harmless). Release is
+ * per-claim: only claims whose ts is provably stale are dropped, re-read
+ * AFTER the lookup round-trip so an owner that re-claimed (and refreshed) a
+ * path meanwhile keeps its live claim.
+ */
+export async function releaseStaleFileClaims(paths: string[], claimantSessionID: string): Promise<void> {
+	const canonical = [...new Set(paths.map((path) => canonicalPath(path)))];
+	const staleOwners = new Map<string, string>();
+	for (const path of canonical) {
+		const existing = claims.get(path);
+		if (existing && existing.sessionID !== claimantSessionID && !staleOwners.has(existing.sessionID)) {
+			staleOwners.set(existing.sessionID, path);
+		}
+	}
+	if (staleOwners.size === 0) return;
+	const client = getSdkClient();
+	const session = client?.session;
+	const get = session?.get;
+	if (!session || typeof get !== "function") return;
+	for (const [ownerSessionID] of staleOwners) {
+		try {
+			const result = await get.call(session, { path: { id: ownerSessionID } });
+			const idle = (result as { data?: { time?: { idle?: unknown } } } | undefined)?.data?.time?.idle;
+			if (typeof idle !== "number" || idle <= 0) continue;
+			// Release every claim of this owner that is provably stale. Each
+			// claim is re-read after the lookup round-trip so an owner that
+			// re-claimed (and refreshed) a path meanwhile keeps its live claim.
+			for (const [claimPath, claim] of [...claims]) {
+				if (claim.sessionID !== ownerSessionID || claim.ts >= idle) continue;
+				claims.delete(claimPath);
+				audit({
+					ts: new Date().toISOString(),
+					sessionID: claimantSessionID,
+					tool: "file-claims",
+					decision: "allow",
+					phase: "event",
+					reason: "stale_claim_takeover",
+					evidence: { mutation: false, targetPath: claimPath, claimOwnerSessionID: ownerSessionID },
+				});
+			}
+		} catch {}
+	}
 }
 
 export function releaseFileClaims(sessionID: string, callID?: string): void {

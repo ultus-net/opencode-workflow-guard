@@ -42,7 +42,7 @@ import { detectShellMutation, extractPatchPaths, guardShellMutation, isPathOutsi
 import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyHasLiteralLineBreakEscapes, prBodyIncludesChangelog } from "../policies/changelog.ts";
 import { extractEditContent, liveMutationIn } from "../policies/destructive.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
-import { claimFiles, fileClaimConflictReason } from "../policies/file-claims.ts";
+import { claimFiles, fileClaimConflictReason, releaseStaleFileClaims } from "../policies/file-claims.ts";
 import {
 	GIT_BRANCH_CREATE_RE,
 	GIT_WRITE_RE,
@@ -278,6 +278,12 @@ export async function guardToolCallImpl(
 				}
 			}
 			const targets = editTargets(input, currentRoot);
+			if (!context.simulate) {
+				// A missed idle release can leave a finished session's claims
+				// behind; release provably stale ones before claiming. The
+				// simulate path (guard_why) stays read-only.
+				await releaseStaleFileClaims(targets, context.sessionID);
+			}
 			const claimReason = context.simulate
 				? fileClaimConflictReason(targets, context.sessionID)
 				: context.callID ? claimFiles(targets, context.sessionID, context.callID) : undefined;
