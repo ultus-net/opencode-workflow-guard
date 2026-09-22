@@ -217,16 +217,44 @@ export function cleanupGitWorktree(
 	root = getWorkspaceRoot(),
 ): { success: boolean; error?: string } {
 	try {
+		const resolved = resolve(worktreePath);
+		const storageBase = resolve(getWorktreeStorageDir(root));
 		if (!existsSync(worktreePath)) {
-			return { success: false, error: `Worktree path '${worktreePath}' does not exist.` };
+			// A registered worktree whose directory is gone (manual removal, a
+			// crashed add, external cleanup) still holds a stale admin entry that
+			// keeps it in `git worktree list` as prunable, and must still be
+			// cleanable. Anything outside storage or unregistered is refused.
+			// The primary working tree is never at risk: prune only removes
+			// admin dirs under .git/worktrees/<id>, which the main tree lacks.
+			if (resolved !== storageBase && !resolved.startsWith(storageBase + sep)) {
+				return {
+					success: false,
+					error: `Refusing to clean up '${worktreePath}': path is outside the worktree storage directory (${storageBase}).`,
+				};
+			}
+			const registeredMissing = registeredWorktreePaths(root);
+			if (!registeredMissing) {
+				return { success: false, error: "Failed to list registered worktrees - aborting cleanup." };
+			}
+			if (!registeredMissing.map((path) => resolve(path)).includes(resolved)) {
+				return { success: false, error: `Worktree path '${worktreePath}' does not exist.` };
+			}
+			const prune = spawnSync("git", ["worktree", "prune"], {
+				cwd: root,
+				env: getCleanGitEnv(),
+				encoding: "utf8",
+				timeout: 10_000,
+			});
+			if (prune.status !== 0) {
+				return { success: false, error: describeGitFailure("worktree prune", prune) };
+			}
+			return { success: true };
 		}
 
 		// Ownership validation: the path must live under the configured worktree
 		// storage directory AND be a registered worktree of this repository. This
 		// refuses arbitrary directories, other repos' worktrees, and the primary
 		// working tree - cleanup must never be an unrestricted delete primitive.
-		const resolved = resolve(worktreePath);
-		const storageBase = resolve(getWorktreeStorageDir(root));
 		if (resolved !== storageBase && !resolved.startsWith(storageBase + sep)) {
 			return {
 				success: false,
