@@ -38,7 +38,7 @@ import {
 	resolveVerifyTimeoutMs,
 	snipVerifyOutput,
 } from "./verify.ts";
-import { detectShellMutation, extractPatchPaths, guardShellMutation, hasUnresolvableVariable, isPathOutsideWorkspace } from "../policies/boundary.ts";
+import { detectShellMutation, extractPatchPaths, guardShellMutation, hasUnresolvableVariable, isEnvironmentScratchTarget, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR } from "../policies/boundary.ts";
 import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyHasLiteralLineBreakEscapes, prBodyIncludesChangelog } from "../policies/changelog.ts";
 import { extractEditContent, liveMutationIn } from "../policies/destructive.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
@@ -228,7 +228,9 @@ export async function guardToolCallImpl(
 						"workspace_escape",
 						hasUnresolvableVariable(patchPath)
 							? `Blocked: patch targets file '${patchPath}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
-							: `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`,
+							: isEnvironmentScratchTarget(patchPath, currentRoot)
+								? `Blocked: patch targets file '${patchPath}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${currentRoot}) instead.`
+								: `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`,
 					);
 				}
 			}
@@ -240,7 +242,9 @@ export async function guardToolCallImpl(
 				"workspace_escape",
 				hasUnresolvableVariable(target)
 					? `Blocked: file path '${target}' contains an unresolvable variable reference, so the boundary treats it as outside the workspace root (${currentRoot}). Use a literal workspace-relative path; all changes must stay within the workspace.`
-					: `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`,
+					: isEnvironmentScratchTarget(target, currentRoot)
+						? `Blocked: file path '${target}' is under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${currentRoot}) instead (for example .tmp-notes.md).`
+						: `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`,
 			);
 		}
 		for (const content of extractEditContent(input)) {

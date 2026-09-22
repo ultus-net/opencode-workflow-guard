@@ -697,6 +697,18 @@ const unresolvableMv = await call("bash", { command: "mv $D/foo.txt ./bar.txt" }
 check("mv source with unresolvable $VAR names the variable cause", blocked(unresolvableMv) && String(unresolvableMv).includes("unresolvable variable reference"));
 const unresolvableGit = await call("bash", { command: "git -C $OTHER_REPO commit -m x" }, { sessionID: "s-active" });
 check("git repoDir with unresolvable $VAR names the variable cause", blocked(unresolvableGit) && String(unresolvableGit).includes("unresolvable variable reference"));
+// Scratch-directory cause attribution: /tmp/opencode is the environment's
+// designated scratch space, but the workspace boundary is workspace-absolute
+// and does not cover it; the message explains that instead of reading as a
+// guard bug (6 of the device audit's boundary blocks were this class).
+const scratchWrite = await call("write", { filePath: "/tmp/opencode/scratch.txt", content: "x" }, { sessionID: "s-active" });
+check("scratch-dir write attributes the environment scratch cause", blocked(scratchWrite) && String(scratchWrite).includes("environment scratch directory") && String(scratchWrite).includes("/tmp/opencode") && !String(scratchWrite).includes("unresolvable variable reference"));
+const scratchRedirect = await call("bash", { command: "echo x > /tmp/opencode/out.md" }, { sessionID: "s-active" });
+check("scratch-dir redirect attributes the environment scratch cause", blocked(scratchRedirect) && String(scratchRedirect).includes("environment scratch directory"));
+const scratchPatch = await call("apply_patch", { patchText: "*** Add File: /tmp/opencode/scratch.ts\n+scratch\n" }, { sessionID: "s-active" });
+check("scratch-dir apply_patch attributes the environment scratch cause", blocked(scratchPatch) && String(scratchPatch).includes("environment scratch directory"));
+const otherOutsideWrite = await call("write", { filePath: "/var/tmp/elsewhere.txt", content: "x" }, { sessionID: "s-active" });
+check("non-scratch outside path keeps the generic escape message", blocked(otherOutsideWrite) && String(otherOutsideWrite).includes("escapes workspace root") && !String(otherOutsideWrite).includes("scratch directory"));
 check("allow apply_patch within workspace", !(await call("apply_patch", { patchText: "*** Update File: src/app.ts\n" }, { sessionID: "s-active" })));
 check("block apply_patch escaping workspace", blocked(await call("apply_patch", { patchText: "*** Update File: ../../secret.env\n" }, { sessionID: "s-active" })));
 

@@ -63,6 +63,23 @@ export function hasUnresolvableVariable(targetPath: string): boolean {
 	return expandShellTargetPath(targetPath) === null;
 }
 
+/**
+ * The OpenCode harness designates this directory as the agents' scratch
+ * space ("pre-created and approved for external access"), but the workspace
+ * boundary is workspace-absolute and does not cover it. Targets under it get
+ * a cause-attributed block message so agents stop treating the block as a
+ * guard bug and write scratch as untracked files inside the workspace
+ * instead. Message-only: the boundary decision itself is unchanged.
+ */
+export const OPENCODE_SCRATCH_DIR = "/tmp/opencode";
+
+export function isEnvironmentScratchTarget(targetPath: string, root: string): boolean {
+	const expanded = expandShellTargetPath(targetPath);
+	if (expanded === null) return false;
+	const resolved = resolve(root, expanded);
+	return resolved === OPENCODE_SCRATCH_DIR || resolved.startsWith(OPENCODE_SCRATCH_DIR + "/");
+}
+
 export function isPathOutsideWorkspace(targetPath: string, root: string): boolean {
 	if (!targetPath) return false;
 	const expanded = expandShellTargetPath(targetPath);
@@ -418,6 +435,9 @@ export async function guardShellMutation(
 				// (that override covers live-system commands, not the boundary).
 				if (hasUnresolvableVariable(target)) {
 					return `Blocked: shell mutation '${mutation.what}' targets '${target}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${root}). Use a literal workspace-relative path.`;
+				}
+				if (isEnvironmentScratchTarget(target, root)) {
+					return `Blocked: shell mutation '${mutation.what}' targets '${target}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${root}) instead (for example .tmp-notes.md).`;
 				}
 				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${root}). All changes must stay within the workspace.`;
 			}
