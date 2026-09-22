@@ -2608,13 +2608,17 @@ spawnSync("git", ["switch", "-c", "feature/rubric-fallthrough"], { cwd: rubricNo
 writeFileSync(join(rubricNoOrigin, "fallthrough.txt"), "branch marker\n");
 spawnSync("git", ["add", "fallthrough.txt"], { cwd: rubricNoOrigin });
 spawnSync("git", ["commit", "-qm", "branch change"], { cwd: rubricNoOrigin });
+// An uncommitted tracked edit discriminates the fallbacks: main...HEAD is
+// committed-only and must NOT include it, while the HEAD~1 fallback (commit
+// vs worktree) would — so the assertion proves the base loop won.
+writeFileSync(join(rubricNoOrigin, "fallthrough.txt"), "branch marker\nuncommitted worktree edit\n");
 const rubricFallthrough = await customPlugin.tool?.guard_review_rubric?.execute(
 	{ directory: rubricNoOrigin },
 	{ sessionID: "s-rubric-fallthrough", worktree: rubricNoOrigin, directory: rubricNoOrigin } as any,
 );
 check(
 	"rubric default bases fall through to the local main when no origin exists",
-	typeof rubricFallthrough === "string" && rubricFallthrough.includes("diff --git") && rubricFallthrough.includes("fallthrough.txt") && rubricFallthrough.includes("branch marker"),
+	typeof rubricFallthrough === "string" && rubricFallthrough.includes("diff --git") && rubricFallthrough.includes("fallthrough.txt") && rubricFallthrough.includes("branch marker") && !rubricFallthrough.includes("uncommitted worktree edit"),
 );
 rmSync(rubricNoOrigin, { recursive: true, force: true });
 

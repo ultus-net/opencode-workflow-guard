@@ -318,7 +318,7 @@ export function createCustomTools(options: {
 		guard_review_rubric: tool({
 			description: "Get the secondary-review rubric for the current branch diff across 5 core review axes (test integrity, task completeness, cleanliness, security, platform). The orchestrator should call this before finalizing work or creating a PR, then spawn a reviewer subagent with the rubric as the prompt, which records its verdict via record_review.",
 			args: {
-				base: tool.schema.string().optional().describe("Base ref to diff against (default: origin/main, origin/master, main)"),
+				base: tool.schema.string().optional().describe("Base ref to diff against (default: origin/main, origin/master, main, master)"),
 				directory: tool.schema.string().optional().describe("Target repository directory (defaults to active session directory or workspace root)"),
 			},
 			execute: async (args, toolContext) => {
