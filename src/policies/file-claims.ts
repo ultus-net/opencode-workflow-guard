@@ -73,11 +73,13 @@ export function fileClaimConflictReason(paths: string[], sessionID: string): str
  * provably stale and is released with an audited takeover. Without an SDK
  * client, or when the owner record cannot be read, nothing is released:
  * fail-closed keeps live two-session protection intact. Clock skew between
- * this process and the server is not expected (local service); negative skew
- * fails closed. Concurrent claimants can emit duplicate takeover audits
- * (append-only, harmless). Release is per-claim: only the path whose claim is
- * provably stale is dropped, re-read AFTER the lookup round-trip so an owner
- * that re-claimed (and refreshed) the path meanwhile keeps its live claim.
+ * this process and the server is not expected for a local (same-host)
+ * service: negative skew fails closed; forward skew could make fresh claims
+ * look stale and is accepted for that deployment. Concurrent claimants can
+ * emit duplicate takeover audits (append-only, harmless). Release is
+ * per-claim: only claims whose ts is provably stale are dropped, re-read
+ * AFTER the lookup round-trip so an owner that re-claimed (and refreshed) a
+ * path meanwhile keeps its live claim.
  */
 export async function releaseStaleFileClaims(paths: string[], claimantSessionID: string): Promise<void> {
 	const canonical = [...new Set(paths.map((path) => canonicalPath(path)))];
