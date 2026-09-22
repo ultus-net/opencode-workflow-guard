@@ -4640,8 +4640,11 @@ for (let i = 0; i < 12; i++) {
 	hgit(["switch", "main"]);
 	hgit(["merge", "--ff-only", `feature/merged-${i}`]);
 }
+// End on a merged, non-base current branch: the current-branch filter must
+// exclude it from the merged list independently of the base filter.
+hgit(["switch", "feature/merged-11"]);
 const cappedStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: hygieneRepo }, { sessionID: "s-hygiene-capped", worktree: hygieneRepo, directory: hygieneRepo } as any)));
-check("hygiene branch list is capped while the count reflects reality", cappedStatus.gitHygiene.mergedLocalBranchCount === 13 && cappedStatus.gitHygiene.mergedLocalBranches.length === 10);
+check("hygiene branch list is capped, counts reality, and excludes the merged current branch", cappedStatus.gitHygiene.mergedLocalBranchCount === 12 && cappedStatus.gitHygiene.mergedLocalBranches.length === 10 && !cappedStatus.gitHygiene.mergedLocalBranches.includes("feature/merged-11") && cappedStatus.gitHygiene.mergedLocalBranches.includes("feature/merged-10"));
 rmSync(hygieneRepo, { recursive: true, force: true });
 const hygieneNonGit = mkdtempSync(join(tmpdir(), "wg-hygiene-nongit-"));
 const nonGitStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: hygieneNonGit }, { sessionID: "s-hygiene-nongit", worktree: hygieneNonGit, directory: hygieneNonGit } as any)));
