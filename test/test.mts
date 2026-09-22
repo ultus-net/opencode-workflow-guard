@@ -3008,6 +3008,17 @@ check("checkInteractiveTtyCommand permits top long-form batch flag", !checkInter
 check("checkInteractiveTtyCommand permits hyphenated top-like filename", !checkInteractiveTtyCommand("ls top-level-dir").isInteractive);
 check("top batch mode does not hide another interactive monitor", checkInteractiveTtyCommand("top -b -n 1; htop").isInteractive);
 check("top batch mode does not hide a later interactive top", checkInteractiveTtyCommand("top -b -n 1; top").isInteractive);
+check("checkInteractiveTtyCommand permits top as an argument value", !checkInteractiveTtyCommand("az keyvault secret show --vault-name jcs-pim-vault-nz --name top").isInteractive);
+check("checkInteractiveTtyCommand permits an unquoted top argument", !checkInteractiveTtyCommand("echo top").isInteractive);
+check("checkInteractiveTtyCommand still detects a monitor after a pipe", checkInteractiveTtyCommand("cat file | top").isInteractive);
+check("checkInteractiveTtyCommand still detects a wrapped monitor", checkInteractiveTtyCommand("sudo top").isInteractive);
+check("checkInteractiveTtyCommand still detects busybox top", checkInteractiveTtyCommand("busybox top").isInteractive);
+check("checkInteractiveTtyCommand detects eval-wrapped monitor", checkInteractiveTtyCommand("eval top").isInteractive);
+check("checkInteractiveTtyCommand detects shell -c monitor", checkInteractiveTtyCommand("bash -c top").isInteractive);
+check("checkInteractiveTtyCommand detects shell -lc quoted monitor", checkInteractiveTtyCommand("sh -lc 'htop'").isInteractive);
+check("checkInteractiveTtyCommand permits a quoted separator before a monitor name", !checkInteractiveTtyCommand('echo "run; top"').isInteractive);
+check("checkInteractiveTtyCommand detects timeout-wrapped monitor", checkInteractiveTtyCommand("timeout 5 top").isInteractive);
+check("checkInteractiveTtyCommand detects a backgrounded-wrapper monitor", checkInteractiveTtyCommand("sudo -b top").isInteractive);
 check("checkInteractiveTtyCommand detects sudo", checkInteractiveTtyCommand("sudo apt-get update").isInteractive);
 check("checkInteractiveTtyCommand detects git rebase -i", checkInteractiveTtyCommand("git rebase -i HEAD~2").isInteractive);
 check("checkInteractiveTtyCommand detects npm init without -y", checkInteractiveTtyCommand("npm init").isInteractive);
@@ -3022,6 +3033,7 @@ check("shell tool blocks less", blocked(await shell("less package.json")));
 check("shell tool blocks top", blocked(await shell("top")));
 check("shell tool allows top batch mode", !(await shell("top -b -n 1")));
 check("shell tool allows top long-form batch flag", !(await shell("top --batch -n 1")));
+check("shell tool allows top as an argument value", !(await shell("az keyvault secret show --vault-name jcs-pim-vault-nz --name top")));
 check("shell tool blocks npm init without flag", blocked(await shell("npm init")));
 check("shell tool allows npm init -y", !(await shell("npm init -y")));
 

@@ -84,23 +84,43 @@ const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice:
 
 const MONITOR_ADVICE = "Use ps aux, uptime, or batch flags (e.g. top -b -n 1) instead of interactive monitors.";
 const PAGER_ADVICE = "Use cat, head, or grep with non-interactive pipes instead of interactive pagers.";
-// Process monitoring tokens are matched on whitespace/segment boundaries so that
-// an unrelated word such as `desktop`, a hyphenated filename like `top-level-dir`,
-// or a quoted argument like `echo "top"` is not mistaken for the `top` command.
-const ALWAYS_INTERACTIVE_MONITOR_RE = /(?:^|[;&|\s])(?:htop|btop|atop|glances)(?:$|[;&|\s])/i;
-const TOP_COMMAND_RE = /(?:^|[;&|\s])top(?:$|[;&|\s])/i;
+// Monitor tokens are only interactive when they are the command of a
+// segment: a `top` in an argument (a secret name, a grep pattern, `echo
+// top`) is data, not the monitor. Wrappers are stripped first, so `sudo top`
+// and `timeout 5 top` are still caught, and `eval top` / `sh -c top` recurse
+// like the pager check. `top` in batch mode stays allowed. Indirection that
+// this does not model (`watch top`, `xargs top`, `man top`, shell loop bodies
+// such as `while true; do top; done`) is a known, documented limitation.
+const INTERACTIVE_MONITORS = new Set(["top", "htop", "btop", "atop", "glances"]);
 const TOP_BATCH_FLAG_RE = /(?:^|\s)(?:--batch|-[A-Za-z]*b[A-Za-z]*)(?:\s|$)/i;
 
-function checkProcessMonitorCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
-	for (const segment of command.split(/[;&|\n]+/)) {
-		if (ALWAYS_INTERACTIVE_MONITOR_RE.test(segment)) {
-			return { isInteractive: true, name: "interactive process monitor", advice: MONITOR_ADVICE };
+function containsMonitorCommand(command: string, depth = 0): boolean {
+	if (depth >= 16) return false;
+	for (const segment of splitShellSegments(command)) {
+		const words = unwrapShellWords(segment);
+		while (words[0] === "--") words.shift();
+		const executable = basename(words[0] ?? "").toLowerCase();
+		const candidate = executable === "busybox" ? basename(words[1] ?? "").toLowerCase() : executable;
+		if (INTERACTIVE_MONITORS.has(candidate)) {
+			// Batch mode is the monitor's own flag, not a wrapper's (e.g. `sudo -b
+			// top` backgrounds sudo; it does not put `top` in batch mode).
+			const monitorIndex = executable === candidate ? 0 : 1;
+			if (candidate === "top" && TOP_BATCH_FLAG_RE.test(words.slice(monitorIndex + 1).join(" "))) continue;
+			return true;
 		}
-		if (TOP_COMMAND_RE.test(segment) && !TOP_BATCH_FLAG_RE.test(segment)) {
-			return { isInteractive: true, name: "interactive process monitor", advice: MONITOR_ADVICE };
+		if (executable === "eval" && words.length > 1 && containsMonitorCommand(words.slice(1).join(" "), depth + 1)) return true;
+		if (/^(?:ba|z|da|k)?sh$/i.test(executable)) {
+			const commandFlag = words.findIndex((word, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(word));
+			if (commandFlag >= 0 && words[commandFlag + 1] && containsMonitorCommand(words[commandFlag + 1]!, depth + 1)) return true;
 		}
 	}
-	return { isInteractive: false };
+	return false;
+}
+
+function checkProcessMonitorCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
+	return containsMonitorCommand(command)
+		? { isInteractive: true, name: "interactive process monitor", advice: MONITOR_ADVICE }
+		: { isInteractive: false };
 }
 
 function containsPagerCommand(command: string, depth = 0): boolean {
