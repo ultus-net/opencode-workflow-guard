@@ -55,7 +55,7 @@ import { EDIT_TOOL_NAMES, fetchParentSession, fetchParentSessionID, effectiveTod
 import { currentGitBranch, isProtectedBranchName } from "../policies/git.ts";
 import { checkCompletionClaims } from "../policies/completion.ts";
 import { releaseFileClaims } from "../policies/file-claims.ts";
-import { beginReadObservation, recordSuccessfulRead, clearReadFingerprints } from "../policies/stale-write.ts";
+import { beginReadObservation, recordMutationObservation, recordSuccessfulRead, clearReadFingerprints } from "../policies/stale-write.ts";
 import { editTargets, runPostEditValidators, snapshotFile } from "../policies/post-edit-validation.ts";
 import { audit, summarizeInput } from "./audit.ts";
 import { asRecord, showBlockToast, isSensitiveEnvKey } from "./utils.ts";
@@ -281,6 +281,9 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		const pending = toolLifecycle.takePostEditSnapshots(event.sessionID, event.id);
 		if (!pending) return;
 		await runWithRuntimeState(pending.root, client, async () => {
+			// Seed the session's observation of the bytes it just mutated so a
+			// follow-up edit needs no redundant re-read (V1 parity).
+			for (const before of pending.snapshots) recordMutationObservation(before.path, event.sessionID, before.digest);
 			const reports = await Promise.all(pending.snapshots.map((before) => runPostEditValidators(pending.root, before)));
 			const report = reports.filter((value): value is string => Boolean(value)).join("\n\n");
 			if (!report) return;
