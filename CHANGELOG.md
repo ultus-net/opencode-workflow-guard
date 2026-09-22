@@ -1,5 +1,39 @@
 # Changelog
 
+## 1.15.1
+
+### Patch Changes
+
+- 14a07f1: Branch creation freshness gate honors explicit fresh start points
+
+    `git switch -c <name> origin/main` (and `git checkout -b <name> origin/main`)
+    no longer fails when the current branch is behind the remote default: a start
+    point that already contains `origin/HEAD` makes the new branch fresh by
+    construction, so the HEAD-based staleness check does not apply to it.
+    Classifiable start points are the literal ref or SHA operand of the creation
+    flag (including `-c<name>`-style attached forms and valueless flags around
+    them); variables, quoted or otherwise indeterminate tokens, and unknown or
+    value-taking flags fail closed to the previous check. Creations without a
+    start point are unchanged.
+
+    Block reasons now name what was actually checked — the current branch and its
+    distance from the remote default — and remedies that work under the guard
+    (rebase or ff-merge the branch, or branch from the remote default directly),
+    instead of suggesting `git pull` on main, which does not address a stale
+    non-main branch and previously kept the block in place even after the local
+    `main` ref was updated.
+
+- 2cbeab1: TUI companion: drop the duplicate home-footer badge on OpenCode 2
+
+    The V2 companion claimed both `home.footer.status` and `prompt.footer.status`,
+    and OpenCode 2 mounts both footers on the home screen, so the
+    `Workflow Guard 🛡️` badge rendered twice there (once in the prompt footer row
+    next to the location path, once in the bottom status bar next to the version).
+    The companion now claims only `prompt.footer.status`, which is mounted on every
+    screen (home and session composers), so the badge renders exactly once; the
+    home footer bar returns to its builtin contents (MCP/plugin indicators,
+    version).
+
 ## 1.15.0
 
 ### Minor Changes
