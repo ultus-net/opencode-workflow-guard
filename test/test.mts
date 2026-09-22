@@ -2,6 +2,7 @@ import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSy
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
 import { getRalphMaxIterations, runWithRuntimeState } from "../src/lib/state.ts";
@@ -74,6 +75,7 @@ import {
 	checkLockfileSync,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
+	loadedPluginVersion,
 	isReviewRequired,
 	getOperationProfile,
 	isRecoveryCheckpointsEnabled,
@@ -4529,6 +4531,26 @@ const unavailableMemory = await (memoryUnavailablePlugin.tool as any).project_me
 check("project-memory initialization failure leaves core guard hooks active", typeof memoryUnavailablePlugin["tool.execute.before"] === "function" && unavailableMemory.includes("core guard enforcement remains active"));
 if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDataHome;
+
+// Loaded plugin version visibility: OpenCode resolves configured bare plugin
+// names through Node's parent-directory lookup from its configuration
+// location, so the loaded copy can silently differ from a globally
+// npm-installed one (observed on-device: npm i -g updates ignored while a
+// home-level pnpm node_modules copy kept loading). The version is therefore
+// surfaced in guard_status and in the startup app log.
+console.log("- Loaded plugin version visibility -");
+const expectedVersion = String((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version);
+check("loadedPluginVersion reads the adjacent package manifest", loadedPluginVersion() === expectedVersion);
+check("loadedPluginVersion fails soft for an unreadable manifest", loadedPluginVersion(pathToFileURL(join(root, "wg-version-none", "src", "workflow-guard.ts")).href) === undefined);
+const versionStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: root }, { sessionID: "s-version", worktree: root, directory: root } as any)));
+check("guard_status exposes the loaded plugin version", versionStatus.pluginVersion === expectedVersion);
+const versionLogs: string[] = [];
+await WorkflowGuard({
+	directory: root,
+	worktree: root,
+	client: { app: { log: async (opts: { body: { message: string } }) => { versionLogs.push(opts.body.message); } } } as any,
+} as any);
+check("startup app log states the loaded plugin version", versionLogs.some((message) => message.startsWith(`Workflow Guard v${expectedVersion} plugin initialized for ${root}; `) && message.includes("managed config")));
 
 console.log("- live control-plane paths (tier port: config-path facts) -");
 const liveBase = mkdtempSync(join(tmpdir(), "wg-lcp-base-"));

@@ -42,6 +42,7 @@ import { branchHasDocumentationChange } from "../policies/docs.ts";
 import { restoreRecoveryCheckpoint } from "./checkpoint.ts";
 import { audit, getRecentAuditEntries } from "./audit.ts";
 import { guardToolCallImpl } from "./guard-dispatcher.ts";
+import { loadedPluginVersion } from "./version.ts";
 import { discoverPlanningSources } from "../policies/planning.ts";
 import { secretIn } from "../policies/secrets.ts";
 import { currentGitBranch, onProtectedBranch } from "../policies/git.ts";
@@ -206,7 +207,7 @@ export function createCustomTools(options: {
 			}),
 		} : {}),
 		guard_status: tool({
-			description: "Inspect active guardrails, current branch protection, mutation count, outstanding verification/review requirements, and ralph status. Proactively call at session start and before completing tasks or creating PRs.",
+			description: "Inspect active guardrails, current branch protection, mutation count, outstanding verification/review requirements, and ralph status. The result includes pluginVersion, the version of the loaded guard package, so a stale installation is visible. Proactively call at session start and before completing tasks or creating PRs.",
 			args: {
 				directory: tool.schema.string().optional().describe("Target repository directory to inspect (defaults to active session directory or workspace root)"),
 			},
@@ -250,7 +251,7 @@ export function createCustomTools(options: {
 					recommendedActions.push("All operational requirements are satisfied for task finalization and PR creation.");
 				}
 				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
-				return JSON.stringify({ workspaceRoot: root, branch, onProtectedBranch: isProtected, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) } }, null, 2);
+				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) } }, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),

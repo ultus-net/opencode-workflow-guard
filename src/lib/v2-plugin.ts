@@ -59,6 +59,7 @@ import { beginReadObservation, recordMutationObservation, recordSuccessfulRead, 
 import { editTargets, runPostEditValidators, snapshotFile } from "../policies/post-edit-validation.ts";
 import { audit, summarizeInput } from "./audit.ts";
 import { asRecord, showBlockToast, isSensitiveEnvKey } from "./utils.ts";
+import { loadedPluginVersion } from "./version.ts";
 import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, recordUserMessage } from "../policies/continuation.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, nextRecoveryRun } from "./checkpoint.ts";
 import { buildCompactionContext, guardToolCall } from "../workflow-guard.ts";
@@ -175,7 +176,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	}
 
 	try {
-		console.log(`[workflow-guard] info: Workflow Guard plugin initialized for ${effectiveRoot}; provenance is plugin-local in V2`);
+		console.log(`[workflow-guard] info: Workflow Guard v${loadedPluginVersion() ?? "unknown"} plugin initialized for ${effectiveRoot}; provenance is plugin-local in V2`);
 	} catch {}
 
 	const toolLifecycle = new ToolInvocationLifecycle();

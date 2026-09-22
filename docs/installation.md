@@ -40,6 +40,8 @@ If you only want the server guard without the TUI companion, add the package to 
 
 OpenCode automatically installs configured npm plugins and their dependencies at startup. The npm package contains both server and TUI entrypoints, but OpenCode activates them from separate configuration files. See [OpenCode's npm plugin documentation](https://opencode.ai/docs/plugins/#from-npm) and [plugin installation behavior](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
 
+A configured bare package name is resolved through Node's parent-directory lookup from OpenCode's configuration location: any `node_modules` above that location that contains a copy of the package (a pnpm-managed home directory, a manual `npm install`, or a workspace dependency) is loaded instead, shadowing both OpenCode's own plugin cache and a global `npm install -g` — updating the wrong copy leaves an old version running while the update appears to succeed, and OpenCode's own plugin-update check can fail with only a server-log record (`NpmInstallFailedError`). Update the copy that actually loads (for a pnpm-managed home directory: `pnpm add opencode-workflow-guard@<version>` in that directory, or remove the dependency so OpenCode manages its own copy), then restart the background service (`opencode service restart`) — the plugin loads there, so a TUI-only restart is not enough. Verify what loaded: `guard_status` reports the loaded version as `pluginVersion`, the startup app log states `Workflow Guard v<version> plugin initialized`, and the server log records the resolved module path in its `loading plugin` entry.
+
 ---
 
 ### 2. Manual Local-File Installation (Server Plugin)
