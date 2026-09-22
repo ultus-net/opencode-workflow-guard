@@ -335,29 +335,152 @@ export function checkMergeConflicts(root: string): {
 	return { hasConflicts: false };
 }
 
-export function checkBranchBaseIsUpToDate(root: string): {
+const BRANCH_CREATION_VALUELESS_FLAGS = new Set([
+	"-f",
+	"--force",
+	"--discard-changes",
+	"-m",
+	"--merge",
+	"-q",
+	"--quiet",
+	"--no-track",
+]);
+
+// Classifies the optional start-point operand of an already-matched branch
+// creation invocation (`git switch -c|--create` / `git checkout -b`). Returns
+// the explicit start point when present, `{ start: undefined }` when the
+// invocation creates a branch from the current HEAD, and `undefined` when the
+// shape cannot be confidently classified — the caller must then fail closed to
+// the HEAD-based staleness check. Indeterminate tokens (variables, quotes,
+// unknown or value-taking flags) are never classified.
+export function branchCreationStartPoint(rest: string): { start?: string } | undefined {
+	const tokens = rest.split(/\s+/).filter(Boolean);
+	let sawCreate = false;
+	let named = false;
+	for (const token of tokens) {
+		const indeterminate = /[$`"']/.test(token);
+		if (!sawCreate) {
+			if (token === "switch" || token === "checkout") continue;
+			if (token === "-c" || token === "--create" || token === "-b") {
+				sawCreate = true;
+				continue;
+			}
+			if (token.startsWith("--create=")) {
+				sawCreate = true;
+				named = true;
+				continue;
+			}
+			if (!token.startsWith("--") && token.length > 2 && (token.startsWith("-c") || token.startsWith("-b"))) {
+				sawCreate = true;
+				named = true;
+				continue;
+			}
+			if (token.startsWith("-")) {
+				if (BRANCH_CREATION_VALUELESS_FLAGS.has(token)) continue;
+				return undefined;
+			}
+			return undefined;
+		}
+		if (!named) {
+			if (token.startsWith("-")) {
+				if (BRANCH_CREATION_VALUELESS_FLAGS.has(token)) continue;
+				return undefined;
+			}
+			if (indeterminate) return undefined;
+			named = true;
+			continue;
+		}
+		if (token.startsWith("-")) {
+			if (BRANCH_CREATION_VALUELESS_FLAGS.has(token)) continue;
+			return undefined;
+		}
+		if (indeterminate) return undefined;
+		return { start: token };
+	}
+	return sawCreate ? { start: undefined } : undefined;
+}
+
+// A branch created from an explicit start point that already contains the
+// remote default is fresh by construction, so the current branch's staleness
+// is irrelevant for it; every provided start point must resolve and contain
+// the base, and any missing start point keeps the HEAD-based check. Start
+// points that cannot be resolved fail closed. Block reasons name what was
+// actually checked and remedies that work under the guard.
+function evaluateBranchCreationStarts(
+	root: string,
+	base: string,
+	startPoints: ReadonlyArray<string>,
+): { isBehind: true; baseRef: string; reason: string } | undefined {
+	for (const startPoint of startPoints) {
+		const resolved = spawnSync("git", ["rev-parse", "--verify", "--quiet", startPoint], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (resolved.status !== 0 || !resolved.stdout.trim()) {
+			return {
+				isBehind: true,
+				baseRef: base,
+				reason: `the explicit start point '${startPoint}' could not be resolved as a commit, so freshness cannot be classified (fail closed). Use a literal branch name or ref as the start point.`,
+			};
+		}
+		const startSha = resolved.stdout.trim();
+		const contains = spawnSync("git", ["merge-base", "--is-ancestor", base, startSha], {
+			cwd: root,
+			encoding: "utf8",
+			timeout: 5_000,
+		});
+		if (contains.status !== 0) {
+			const behind = spawnSync("git", ["rev-list", `${startSha}..${base}`, "--count"], {
+				cwd: root,
+				encoding: "utf8",
+				timeout: 5_000,
+			});
+			const behindCount = parseInt((behind.stdout ?? "").trim(), 10);
+			return {
+				isBehind: true,
+				baseRef: base,
+				reason: `the explicit start point '${startPoint}' is ${isNaN(behindCount) ? "" : `${behindCount} `}commit(s) behind ${base}. Create the branch from ${base}, or from any ref that contains it, instead.`,
+			};
+		}
+	}
+	return undefined;
+}
+
+export function checkBranchBaseIsUpToDate(
+	root: string,
+	startPoints?: ReadonlyArray<string | undefined>,
+): {
 	isBehind: boolean;
 	count?: number;
 	baseRef?: string;
 	reason?: string;
 } {
+	const classified = startPoints && startPoints.length > 0 ? startPoints : undefined;
 	for (const base of ["origin/HEAD", "origin/main", "origin/master"]) {
 		const res = spawnSync("git", ["rev-list", `HEAD..${base}`, "--count"], {
 			cwd: root,
 			encoding: "utf8",
 			timeout: 5_000,
 		});
-		if (res.status === 0 && res.stdout.trim()) {
-			const count = parseInt(res.stdout.trim(), 10);
-			if (!isNaN(count) && count > 0) {
-				return {
-					isBehind: true,
-					count,
-					baseRef: base,
-					reason: `Local base branch is ${count} commit(s) behind remote (${base}). Run 'git pull' or 'git fetch' on main before creating a fresh feature branch to prevent upstream conflicts.`,
-				};
-			}
+		if (res.status !== 0 || !res.stdout.trim()) continue;
+		const count = parseInt(res.stdout.trim(), 10);
+		if (isNaN(count)) continue;
+		const explicit = (classified ?? []).filter((startPoint): startPoint is string => startPoint !== undefined);
+		if (explicit.length > 0) {
+			const startBlock = evaluateBranchCreationStarts(root, base, explicit);
+			if (startBlock) return startBlock;
 		}
+		if (count > 0 && (!classified || classified.some((startPoint) => startPoint === undefined))) {
+			const branch = currentGitBranch(root) || "detached HEAD";
+			return {
+				isBehind: true,
+				count,
+				baseRef: base,
+				reason: `current branch '${branch}' is ${count} commit(s) behind remote default (${base}), so a branch created from it starts stale. Update this branch first (git rebase ${base} or git merge --ff-only ${base}), or create the new branch from ${base} directly.`,
+			};
+		}
+		return { isBehind: false };
 	}
 	return { isBehind: false };
 }
