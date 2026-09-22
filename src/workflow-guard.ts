@@ -196,6 +196,7 @@ import {
 	getCurrentGitCommitHash,
 	getGitStatusSummary,
 	getGitWorktreeFingerprint,
+	getTrackedWorktreeFingerprint,
 } from "./lib/verify.ts";
 
 export {
@@ -206,6 +207,7 @@ export {
 	getCurrentGitCommitHash,
 	getGitStatusSummary,
 	getGitWorktreeFingerprint,
+	getTrackedWorktreeFingerprint,
 };
 
 // ── Secondary review rubric ──────────────────────────────────────────────────
@@ -219,6 +221,7 @@ import {
 	isValidBranchName,
 	createGitWorktree,
 	cleanupGitWorktree,
+	resolveWorktreeTimeoutMs,
 } from "./lib/worktree.ts";
 
 export {
@@ -227,6 +230,7 @@ export {
 	isValidBranchName,
 	createGitWorktree,
 	cleanupGitWorktree,
+	resolveWorktreeTimeoutMs,
 };
 
 // ── Policy modules ───────────────────────────────────────────────────────────

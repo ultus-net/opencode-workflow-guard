@@ -127,6 +127,8 @@ OpenCode's model/provider request timeout is separate from Workflow Guard. In Op
 
 Workflow Guard enforces secondary review approval (`requireReview`) by default during PR creation (`gh pr create` and `az repos pr create`). Before a pull request can be opened, an agent must invoke a secondary review subagent and record passing review approval using `record_review` evaluated against `guard_review_rubric`.
 
+The recorded verdict is bound to the reviewed repository content (commit hash + tracked-content worktree fingerprint of the directory it was recorded against), and the PR preflight accepts any approval whose binding matches the tree the PR would publish. A review recorded by a subagent rooted in a linked git worktree therefore satisfies a `pr create` run from that worktree, even from a different session than the one that spawned the reviewer. Review freshness is scoped to tracked content: deleting an untracked scratch file does not invalidate an approval, but any tracked edit or new commit does. Because reviewer agents are frequently configured with read-only toolsets that exclude `record_review`, the tool accepts recorders of any session type and binds the verdict to the recording session's directory; the audit trail records who recorded it and where it is bound.
+
 To opt out of the PR secondary review gate for a project, set `requireReview: false` in `.opencode/workflow-guard.json`:
 
 ```json

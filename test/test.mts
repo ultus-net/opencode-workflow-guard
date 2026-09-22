@@ -27,6 +27,8 @@ import {
 	getCurrentGitCommitHash,
 	getGitStatusSummary,
 	getGitWorktreeFingerprint,
+	getTrackedWorktreeFingerprint,
+	resolveWorktreeTimeoutMs,
 	getVerifyCacheFilePath,
 	persistVerifyCache,
 	loadVerifyCache,
@@ -1718,10 +1720,10 @@ check("evidence freshness requires exact subject and post-mutation observation",
 const missingProvenanceEvidence = verificationEvidence({ passed: true, command: "npm test", output: "ok", timestamp: 123, workspaceRoot: "/tmp/ws" }, "s-evidence");
 check("evidence freshness fails closed when Git provenance is unavailable", !isEvidenceFresh(missingProvenanceEvidence, { workspace: "/tmp/ws", sessionID: "s-evidence" }, 0) && !isEvidenceFresh(verificationEvidenceResult, { workspace: "/tmp/ws", sessionID: "s-evidence" }, 0));
 await call("edit", { filePath: join(root, "after-review.ts"), content: "changed" }, { sessionID: "s-active" });
-check("new mutation invalidates prior review approval", getLastReviewResult() === undefined);
+check("mutations no longer erase review approval state (freshness is re-evaluated against content)", getLastReviewResult() !== undefined);
 recordReviewResult("reviewer-subagent", "Child review passed all axes.", true, "s-reviewed-child");
 recordMutation("s-reviewed-parent", "s-reviewed-child");
-check("actor mutation invalidates child-targeted global review", getLastReviewResult() === undefined);
+check("actor mutation no longer erases child-targeted review evidence", getLastReviewResult()?.targetSessionID === "s-reviewed-child");
 
 const fingerprintRepo = mkdtempSync(join(tmpdir(), "wg-review-fingerprint-"));
 spawnSync("git", ["init", "-b", "feature/review"], { cwd: fingerprintRepo });
@@ -1744,6 +1746,30 @@ writeFileSync(join(commitlessRepo, "seed.txt"), "v2\n");
 check("commitless repo content change updates review fingerprint", getGitWorktreeFingerprint(commitlessRepo) !== commitlessBefore);
 rmSync(commitlessRepo, { recursive: true, force: true });
 rmSync(fingerprintRepo, { recursive: true, force: true });
+
+// Review evidence binds to tracked content only: untracked scratch files are
+// not part of the reviewed diff, so creating or deleting them must keep the
+// approval fresh, while the full fingerprint still covers untracked contents
+// for verification evidence.
+const trackedFpRepo = mkdtempSync(join(tmpdir(), "wg-review-tracked-fp-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: trackedFpRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: trackedFpRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: trackedFpRepo });
+writeFileSync(join(trackedFpRepo, "tracked.txt"), "tracked\n");
+spawnSync("git", ["add", "tracked.txt"], { cwd: trackedFpRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: trackedFpRepo });
+const trackedFpBase = getTrackedWorktreeFingerprint(trackedFpRepo);
+check("tracked-content fingerprint is available for a git worktree", typeof trackedFpBase === "string" && trackedFpBase.length === 64);
+writeFileSync(join(trackedFpRepo, ".tmp-review-final.diff"), "scratch\n");
+check("untracked scratch creation does not change the tracked-content fingerprint", getTrackedWorktreeFingerprint(trackedFpRepo) === trackedFpBase);
+const fullFpWithScratch = getGitWorktreeFingerprint(trackedFpRepo);
+writeFileSync(join(trackedFpRepo, ".tmp-review-final.diff"), "scratch v2\n");
+check("full fingerprint still binds untracked contents for verification evidence", getGitWorktreeFingerprint(trackedFpRepo) !== fullFpWithScratch);
+rmSync(join(trackedFpRepo, ".tmp-review-final.diff"));
+check("untracked scratch deletion does not change the tracked-content fingerprint", getTrackedWorktreeFingerprint(trackedFpRepo) === trackedFpBase);
+writeFileSync(join(trackedFpRepo, "tracked.txt"), "tracked edit\n");
+check("tracked-content fingerprint changes on a tracked edit", getTrackedWorktreeFingerprint(trackedFpRepo) !== trackedFpBase);
+rmSync(trackedFpRepo, { recursive: true, force: true });
 
 // 9. Secret-File READ Blocks (Policy 17)
 console.log("- Policy 17: Secret-File READ Blocks -");
@@ -2190,6 +2216,17 @@ try {
 	rmSync(whyRemoteRoot, { recursive: true, force: true });
 }
 
+// record_review binds verdicts to tracked repository content, so its tool
+// tests need a real git worktree rather than the non-git test root.
+const reviewToolRepo = join(root, "wg-review-tool-repo");
+mkdirSync(reviewToolRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: reviewToolRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: reviewToolRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: reviewToolRepo });
+writeFileSync(join(reviewToolRepo, "code.txt"), "reviewed\n");
+spawnSync("git", ["add", "code.txt"], { cwd: reviewToolRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: reviewToolRepo });
+
 fakeParents.set("s-reviewer-tool", "s-active");
 const unrelatedClient = {
 	session: {
@@ -2208,15 +2245,15 @@ await (defaultExport?.server ?? WorkflowGuard)({
 });
 const reviewToolResult = await customPlugin.tool?.record_review?.execute(
 	{ reviewer: "subagent-1", summary: "Test integrity: real assertions. Task completeness: done. Cleanliness: no stubs. Security: clean. Platform fit: ok.", passed: true },
-	{ sessionID: "s-reviewer-tool", agent: "reviewer", worktree: root, directory: root } as any,
+	{ sessionID: "s-reviewer-tool", agent: "reviewer", worktree: reviewToolRepo, directory: reviewToolRepo } as any,
 );
-check("record_review resolves subagent lineage through its own plugin client", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED"));
+check("record_review resolves subagent lineage through its own plugin client", typeof reviewToolResult === "string" && reviewToolResult.includes("APPROVED") && reviewToolResult.includes(reviewToolRepo));
 setSdkClient(fakeClient);
 
 fakeParents.set("s-reviewer-changes", "s-active");
 const changesReviewResult = await customPlugin.tool?.record_review?.execute(
 	{ reviewer: "subagent-changes", summary: "Test integrity: gap found. Task completeness: needs work. Cleanliness: ok. Security: ok. Platform: ok.", passed: false },
-	{ sessionID: "s-reviewer-changes", agent: "reviewer", worktree: root, directory: root } as any,
+	{ sessionID: "s-reviewer-changes", agent: "reviewer", worktree: reviewToolRepo, directory: reviewToolRepo } as any,
 );
 const changesReviewAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "record_review.verdict" && entry.sessionID === "s-reviewer-changes");
 check("record_review audit distinguishes changes-requested verdict without persisting summary", typeof changesReviewResult === "string" && changesReviewResult.includes("CHANGES REQUESTED") && changesReviewAudit?.reason === "changes_requested" && !JSON.stringify(changesReviewAudit).includes("gap found"));
@@ -2228,7 +2265,7 @@ await customPlugin.tool?.record_review?.execute(
 		summary: "Test integrity: covered. Task completeness: done. Cleanliness: clean. Security: safe. Platform: compatible.\nP2: first durable issue\nP3: second durable issue",
 		passed: true,
 	},
-	{ sessionID: "s-reviewer-followups", agent: "reviewer", worktree: root, directory: root } as any,
+	{ sessionID: "s-reviewer-followups", agent: "reviewer", worktree: reviewToolRepo, directory: reviewToolRepo } as any,
 );
 const durableReviewFollowups = JSON.parse(String(await customPlugin.tool?.guard_review_followups?.execute({}, {} as any))) as Array<{ severity?: string; summary?: string }>;
 check("record_review persists multiple P2/P3 findings independently", durableReviewFollowups.some((item) => item.severity === "P2" && item.summary?.includes("first durable issue")) && durableReviewFollowups.some((item) => item.severity === "P3" && item.summary?.includes("second durable issue")));
@@ -2269,11 +2306,25 @@ check(
 const rubricOptionFlag = await customPlugin.tool?.guard_review_rubric?.execute({ base: "--output=injected" }, {} as any);
 check("guard_review_rubric sanitizes option flags in base ref", typeof rubricOptionFlag === "string" && !existsSync(join(root, "injected")));
 
+// Reviewer-type agents often lack record_review in their toolset entirely, so
+// the tool accepts recorders of any session type: the verdict binds to the
+// recording session's directory and the audit trail captures the recorder
+// lineage (recorderRole). The decision is documented in the changelog.
 const mainReviewToolResult = await customPlugin.tool?.record_review?.execute(
-	{ reviewer: "self", summary: "self approval", passed: true },
-	{ sessionID: "s-active", agent: "main", worktree: root, directory: root } as any,
+	{ reviewer: "root-relay", summary: "Test integrity: verified. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.", passed: true },
+	{ sessionID: "s-active", agent: "main", worktree: reviewToolRepo, directory: reviewToolRepo } as any,
 );
-check("record_review rejects self-approval from main session", typeof mainReviewToolResult === "string" && mainReviewToolResult.includes("rejected"));
+check(
+	"record_review accepts a root-session recorder and binds the verdict to its directory",
+	typeof mainReviewToolResult === "string" && mainReviewToolResult.includes("APPROVED") && mainReviewToolResult.includes(reviewToolRepo),
+);
+const rootRecorderAudit = getRecentAuditEntries(30).find((entry) => entry.tool === "record_review.verdict" && entry.sessionID === "s-active");
+check(
+	"record_review audit includes the binding key and recorder lineage",
+	(rootRecorderAudit?.evidence as { binding?: { workspace?: string; recorderRole?: string } })?.binding?.workspace === reviewToolRepo &&
+		(rootRecorderAudit?.evidence as { binding?: { recorderRole?: string } })?.binding?.recorderRole === "root",
+);
+resetReviewState();
 
 // Secondary Review Approval Handoff & Durable Cache Tests
 console.log("- Secondary Review Approval Handoff & Durability -");
@@ -2363,6 +2414,122 @@ check("worktree created for handoff test", typeof handoffWorktreeRes === "string
 check("worktree and main repo recognized as same git repository", isSameGitRepo(join(getWorktreeStorageDir(handoffRepo), "feat-handoff-worktree"), handoffRepo));
 
 rmSync(handoffRepo, { recursive: true, force: true });
+resetReviewState();
+
+// 5. Review binding across sessions and linked worktrees (regression): a
+// review recorded by a subagent rooted in a LINKED WORKTREE must satisfy the
+// PR preflight even when the PR is created from a DIFFERENT session, and must
+// stay valid across innocuous untracked-file cleanup.
+console.log("- Review Binding Across Sessions & Linked Worktrees -");
+const flowRepo = join(root, "wg-flow-repo");
+mkdirSync(flowRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: flowRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: flowRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: flowRepo });
+writeFileSync(join(flowRepo, "seed.txt"), "base\n");
+spawnSync("git", ["add", "seed.txt"], { cwd: flowRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: flowRepo });
+mkdirSync(join(flowRepo, ".opencode"), { recursive: true });
+writeFileSync(join(flowRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: true }));
+const prevWorktreeDirFlow = process.env.WORKFLOW_GUARD_WORKTREE_DIR;
+process.env.WORKFLOW_GUARD_WORKTREE_DIR = join(root, "wg-flow-worktrees");
+const flowWorktreeRes = createGitWorktree("fix/flow-branch", "HEAD", flowRepo);
+check("flow: linked worktree created", flowWorktreeRes.success && typeof flowWorktreeRes.worktreePath === "string");
+const flowWt = flowWorktreeRes.worktreePath!;
+writeFileSync(join(flowWt, "seed.txt"), "worktree change\n");
+spawnSync("git", ["add", "seed.txt"], { cwd: flowWt });
+spawnSync("git", ["commit", "-qm", "worktree change"], { cwd: flowWt });
+writeFileSync(join(flowWt, ".tmp-review-final.diff"), "scratch\n");
+
+const flowPlugin = await WorkflowGuard({
+	directory: root,
+	worktree: root,
+	client: fakeClient as any,
+	project: {} as any,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+// The orchestrator session moved itself into the linked worktree
+// (tools.opencode.session_move): its file tools are rooted at the worktree.
+setSessionWorkspace("s-flow-orch", flowWt);
+fakeParents.set("s-flow-reviewer", "s-flow-orch");
+fakeParents.set("s-flow-pr", "s-flow-orch");
+todo("s-flow-orch", item("drive the flow", "in_progress"));
+const flowCtx = (sessionID: string) => ({ sessionID, worktree: flowWt, directory: flowWt }) as any;
+
+const flowReview = await flowPlugin.tool?.record_review?.execute(
+	{ reviewer: "secondary-reviewer", summary: "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.", passed: true },
+	{ ...flowCtx("s-flow-reviewer"), agent: "general" },
+);
+check("flow: review recorded from a subagent rooted in the linked worktree binds to it", typeof flowReview === "string" && flowReview.includes("APPROVED") && flowReview.includes(flowWt));
+
+const flowStatus = JSON.parse(String(await flowPlugin.tool?.guard_status?.execute({ directory: flowWt }, flowCtx("s-flow-orch"))));
+check("flow: guard_status reports fresh lastReview for the linked worktree", flowStatus.lastReview?.fresh === true && !flowStatus.outstandingRequirements.includes("review"));
+
+const flowPrevPath = process.env.PATH;
+const flowBin = join(root, "wg-flow-bin");
+mkdirSync(flowBin, { recursive: true });
+writeFileSync(join(flowBin, "gh"), "#!/bin/sh\nexit 1\n");
+writeFileSync(join(flowBin, "az"), "#!/bin/sh\nexit 1\n");
+chmodSync(join(flowBin, "gh"), 0o755);
+chmodSync(join(flowBin, "az"), 0o755);
+process.env.PATH = `${flowBin}:${flowPrevPath ?? ""}`;
+const flowPrBody = "gh pr create --title 'fix: flow' --body 'Changelog: flow'";
+try {
+	const flowPrParent = await call("bash", { command: flowPrBody, workdir: flowWt }, flowCtx("s-flow-orch"));
+	check("flow: PR from the reviewer's parent session is allowed", !blocked(flowPrParent));
+	const flowPrOther = await call("bash", { command: flowPrBody, workdir: flowWt }, flowCtx("s-flow-pr"));
+	check("flow: PR from a DIFFERENT session in the same worktree is allowed (content binding, not session identity)", !blocked(flowPrOther));
+	if (blocked(flowPrOther)) console.log("   blocked:", flowPrOther);
+
+	// Untracked scratch cleanup must not invalidate the approval
+	const flowRm = await call("bash", { command: "rm -f .tmp-review-final.diff", workdir: flowWt }, flowCtx("s-flow-orch"));
+	check("flow: untracked scratch deletion is a permitted cleanup", !blocked(flowRm));
+	const flowStatusAfterRm = JSON.parse(String(await flowPlugin.tool?.guard_status?.execute({ directory: flowWt }, flowCtx("s-flow-orch"))));
+	check("flow: review stays fresh after untracked scratch deletion", flowStatusAfterRm.lastReview?.fresh === true && !flowStatusAfterRm.outstandingRequirements.includes("review"));
+	const flowPrAfterRm = await call("bash", { command: flowPrBody, workdir: flowWt }, flowCtx("s-flow-pr"));
+	check("flow: PR still allowed after innocuous untracked-file mutations", !blocked(flowPrAfterRm));
+
+	// Tracked content changes still invalidate (the gate is not weakened)
+	writeFileSync(join(flowWt, "seed.txt"), "post-review tracked edit\n");
+	const flowStatusAfterEdit = JSON.parse(String(await flowPlugin.tool?.guard_status?.execute({ directory: flowWt }, flowCtx("s-flow-orch"))));
+	check("flow: tracked edit after review makes the approval stale", flowStatusAfterEdit.outstandingRequirements.includes("review"));
+	const flowPrAfterEdit = await call("bash", { command: flowPrBody, workdir: flowWt }, flowCtx("s-flow-orch"));
+	check("flow: PR blocked after tracked content changed post-review", blocked(flowPrAfterEdit) && String(flowPrAfterEdit).includes("tracked content changed after review"));
+	spawnSync("git", ["checkout", "--", "seed.txt"], { cwd: flowWt });
+} finally {
+	process.env.PATH = flowPrevPath;
+}
+
+// Reviewer-type agents cannot call record_review themselves (their toolset has
+// no record_review), so the orchestrator relays the verdict from its own
+// session; the verdict must still bind to the reviewed worktree.
+const relayedReview = await flowPlugin.tool?.record_review?.execute(
+	{ reviewer: "relayed-reviewer", summary: "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.", passed: true },
+	{ ...flowCtx("s-flow-orch"), agent: "reviewer" },
+);
+check("flow: relayed verdict from a root session binds to the reviewed worktree", typeof relayedReview === "string" && relayedReview.includes("APPROVED") && relayedReview.includes(flowWt));
+
+// A verdict recorded against a non-git directory can never bind to a PR
+// preflight; it must fail loudly instead of silently not binding.
+const flowNonGit = join(root, "wg-flow-nongit");
+mkdirSync(flowNonGit, { recursive: true });
+const flowBadReview = await flowPlugin.tool?.record_review?.execute(
+	{ reviewer: "unbindingable", summary: "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.", passed: true },
+	{ ...flowCtx("s-flow-reviewer"), worktree: flowNonGit, directory: flowNonGit },
+);
+check(
+	"flow: verdict against a non-git directory returns an explicit bind error",
+	typeof flowBadReview === "string" && flowBadReview.includes("rejected") && flowBadReview.includes("cannot be bound") && !flowBadReview.includes("APPROVED"),
+);
+
+rmSync(flowNonGit, { recursive: true, force: true });
+rmSync(flowBin, { recursive: true, force: true });
+rmSync(flowRepo, { recursive: true, force: true });
+if (prevWorktreeDirFlow === undefined) delete process.env.WORKFLOW_GUARD_WORKTREE_DIR;
+else process.env.WORKFLOW_GUARD_WORKTREE_DIR = prevWorktreeDirFlow;
+rmSync(join(root, "wg-flow-worktrees"), { recursive: true, force: true });
 resetReviewState();
 
 // Event hook handles permission events
@@ -3019,6 +3186,39 @@ if (hookEnvCreate.worktreePath) {
 delete process.env.GIT_INDEX_FILE;
 delete process.env.GIT_DIR;
 check("getCleanGitEnv strips git context variables", typeof getCleanGitEnv().GIT_INDEX_FILE === "undefined");
+
+// Partial-failure rollback: git creates the branch ref before the worktree
+// checkout, so a failure after that point must not leave the branch behind,
+// must not delete a branch that already existed, must leave a pre-existing
+// target path intact, and must report the git exit status rather than only
+// stderr progress text.
+const storageBaseForRollback = getWorktreeStorageDir(worktreeBaseRepo);
+mkdirSync(storageBaseForRollback, { recursive: true });
+const rollbackBranch = "feat/rollback-partial";
+const rollbackCollision = join(storageBaseForRollback, "feat-rollback-partial");
+writeFileSync(rollbackCollision, "path collision\n");
+const rollbackRes = createGitWorktree(rollbackBranch, "HEAD", worktreeBaseRepo);
+check(
+	"partial worktree add failure reports git exit status, not only stderr progress",
+	rollbackRes.success === false && /exit status/.test(String(rollbackRes.error)),
+);
+check(
+	"partial worktree add failure rolls back the created branch",
+	spawnSync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${rollbackBranch}`], { cwd: worktreeBaseRepo }).status !== 0,
+);
+check("partial worktree add failure leaves a pre-existing target path intact", existsSync(rollbackCollision) && readFileSync(rollbackCollision, "utf8") === "path collision\n");
+const preservedBranch = "feat/preserve-on-fail";
+spawnSync("git", ["branch", preservedBranch], { cwd: worktreeBaseRepo });
+writeFileSync(join(storageBaseForRollback, "feat-preserve-on-fail"), "blocker\n");
+createGitWorktree(preservedBranch, "HEAD", worktreeBaseRepo);
+check(
+	"a pre-existing branch is not deleted when worktree add fails",
+	spawnSync("git", ["show-ref", "--verify", "--quiet", `refs/heads/${preservedBranch}`], { cwd: worktreeBaseRepo }).status === 0,
+);
+process.env.WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS = "2500";
+check("resolveWorktreeTimeoutMs honors WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS", resolveWorktreeTimeoutMs() === 2500);
+delete process.env.WORKFLOW_GUARD_WORKTREE_TIMEOUT_MS;
+check("resolveWorktreeTimeoutMs falls back to the 15s default", resolveWorktreeTimeoutMs() === 15_000);
 
 rmSync(worktreeBaseRepo, { recursive: true, force: true });
 delete process.env.WORKFLOW_GUARD_WORKTREE_DIR;

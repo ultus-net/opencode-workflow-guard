@@ -3,7 +3,7 @@ import { resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { findGitRoot, getCachedProjectConfig, isSameGitRepo, loadProjectConfig, projectRootKey } from "./project-config.ts";
-import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint } from "./verify.ts";
+import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import type {
 	TodoSdkClient,
 	ProjectConfig,
@@ -103,15 +103,14 @@ export function recordMutation(sessionID?: string, actorSessionID?: string): voi
 		sessionMutationTimestamps.set(id, lastMutationTimestamp);
 		sessionMutationCounts.set(id, (sessionMutationCounts.get(id) ?? 0) + 1);
 		sessionVerifyResults.delete(id);
-		sessionReviews.delete(id);
 	}
-	if (!lastReview?.targetSessionID || lastReview.targetSessionID === sessionID || lastReview.targetSessionID === actorSessionID) {
-		lastReview = undefined;
-		try {
-			const p = getReviewCacheFilePath();
-			if (existsSync(p)) unlinkSync(p);
-		} catch {}
-	}
+	// Review evidence is intentionally NOT erased here. Recorded approvals bind
+	// to the reviewed tracked content (commit hash + tracked worktree
+	// fingerprint), so freshness is re-evaluated against content at
+	// consumption time. Erasing on any mutation made an unrelated untracked
+	// scratch-file deletion (or a mutation in a sibling worktree) invalidate a
+	// valid approval and let a re-record silently fail to stick; any change to
+	// the reviewed tracked content still makes the evidence stale.
 }
 
 export function getMutationCount(sessionID?: string): number {
@@ -194,7 +193,7 @@ export function recordReviewResult(
 	passed: boolean,
 	targetSessionID?: string,
 	workspace?: string,
-): void {
+): ReviewResult {
 	const root = projectRootKey(workspace ?? getWorkspaceRoot());
 	lastReview = {
 		reviewer,
@@ -205,12 +204,15 @@ export function recordReviewResult(
 		workspace: root,
 		commitHash: getCurrentGitCommitHash(root),
 		gitStatus: getGitStatusSummary(root),
-		worktreeFingerprint: getGitWorktreeFingerprint(root),
+		// Bind to tracked repository content only: the review covered the
+		// reviewed diff, and untracked scratch files are not part of it.
+		worktreeFingerprint: getTrackedWorktreeFingerprint(root),
 	};
 	if (targetSessionID) sessionReviews.set(targetSessionID, lastReview);
 	if (passed) {
 		persistReviewCache(lastReview);
 	}
+	return lastReview;
 }
 
 export function getLastReviewResult(): typeof lastReview {
