@@ -2352,6 +2352,31 @@ check(
 const rubricOptionFlag = await customPlugin.tool?.guard_review_rubric?.execute({ base: "--output=injected" }, {} as any);
 check("guard_review_rubric sanitizes option flags in base ref", typeof rubricOptionFlag === "string" && !existsSync(join(root, "injected")));
 
+// Regression: the rubric must embed the real branch diff. The git argv
+// previously placed `--` before the revision, so the revision parsed as a
+// pathspec and every rubric carried an empty diff block.
+const rubricDiffRepo = join(root, "wg-review-rubric-diff");
+mkdirSync(rubricDiffRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: rubricDiffRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: rubricDiffRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: rubricDiffRepo });
+writeFileSync(join(rubricDiffRepo, "seed.txt"), "base\n");
+spawnSync("git", ["add", "seed.txt"], { cwd: rubricDiffRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: rubricDiffRepo });
+spawnSync("git", ["switch", "-c", "feature/rubric-diff"], { cwd: rubricDiffRepo });
+writeFileSync(join(rubricDiffRepo, "added.txt"), "export const rubricDiffMarker = 42;\n");
+spawnSync("git", ["add", "added.txt"], { cwd: rubricDiffRepo });
+spawnSync("git", ["commit", "-m", "add rubric marker"], { cwd: rubricDiffRepo });
+const rubricWithDiff = await customPlugin.tool?.guard_review_rubric?.execute(
+	{ base: "main", directory: rubricDiffRepo },
+	{ sessionID: "s-rubric-diff", worktree: rubricDiffRepo, directory: rubricDiffRepo } as any,
+);
+check(
+	"guard_review_rubric embeds the real branch diff content",
+	typeof rubricWithDiff === "string" && rubricWithDiff.includes("rubricDiffMarker") && rubricWithDiff.includes("added.txt"),
+);
+rmSync(rubricDiffRepo, { recursive: true, force: true });
+
 // Reviewer-type agents often lack record_review in their toolset entirely, so
 // the tool accepts recorders of any session type: the verdict binds to the
 // recording session's directory and the audit trail captures the recorder
