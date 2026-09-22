@@ -330,6 +330,13 @@ export function isReviewRequired(root: string): boolean {
 	return cfg.requireReview !== false;
 }
 
+export function isSubagentReviewRequired(root: string): boolean {
+	const env = process.env.WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW?.toLowerCase();
+	if (env === "0" || env === "false" || env === "off") return false;
+	if (env === "1" || env === "true" || env === "on") return true;
+	return getProjectConfig(root).requireSubagentReview === true;
+}
+
 export function isDocumentationRequired(root: string): boolean {
 	if (process.env.WORKFLOW_GUARD_REQUIRE_DOCS === "1") return true;
 	const cfg = getProjectConfig(root);
