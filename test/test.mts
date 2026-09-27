@@ -1831,6 +1831,10 @@ check("dynamic shell syntax detects IFS construction", dynamicShellSyntaxIn("git
 check("dynamic shell syntax detects ambiguous whitespace", dynamicShellSyntaxIn("git\rpush") !== undefined && dynamicShellSyntaxIn("git\u00a0push") !== undefined);
 check("dynamic shell syntax detects malformed quote boundaries", dynamicShellSyntaxIn("echo 'unterminated") !== undefined && dynamicShellSyntaxIn("echo trailing\\") !== undefined);
 check("dynamic shell syntax preserves quoted literals", dynamicShellSyntaxIn("printf '%s' '$(literal) `literal` <(literal) $IFS'") === undefined);
+const substitutionBlock = await guardToolDecision("bash", { command: "echo $(dangerous)" }, { sessionID: "s-dynamic-syntax" });
+check("substitution block names the construct and remedy", substitutionBlock.status === "blocked" && substitutionBlock.code === "dynamic_shell_syntax" && substitutionBlock.message.includes("process substitution") && substitutionBlock.message.includes("guard_why"));
+const quotingBlock = await guardToolDecision("bash", { command: "echo 'unterminated" }, { sessionID: "s-dynamic-syntax" });
+check("malformed quoting block names the construct and remedy", quotingBlock.status === "blocked" && quotingBlock.code === "dynamic_shell_syntax" && quotingBlock.message.includes("balanced quoting"));
 check(
 	"runVerify terminates timed-out verification commands safely",
 	!verifyTimeout.passed && verifyTimeout.output.includes("timed out"),

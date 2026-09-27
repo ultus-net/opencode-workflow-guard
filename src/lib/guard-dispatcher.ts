@@ -80,6 +80,29 @@ import {
 
 export const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
+// dynamic_shell_syntax is fail-closed by design; naming the construct and a
+// remedy keeps agents from retrying near-identical commands. Keyed by the
+// construct strings returned by dynamicShellSyntaxIn; unknown constructs fall
+// back to the generic template.
+const DYNAMIC_SHELL_SYNTAX_GUIDANCE: Record<string, { detail: string; remedy: string }> = {
+	"dynamic command/process substitution": {
+		detail: "($( ... ), backticks, <( ) / >( ))",
+		remedy: "Rewrite the step with literal values or as separate literal commands, then simulate the result with guard_why if unsure.",
+	},
+	"dynamic IFS expansion": {
+		detail: "(${IFS} token construction)",
+		remedy: "Build the command from literal words separated by spaces instead of injecting field separators.",
+	},
+	"ambiguous shell whitespace": {
+		detail: "(carriage return or Unicode whitespace)",
+		remedy: "Re-run with plain spaces between literal words.",
+	},
+	"malformed shell quoting": {
+		detail: "(unbalanced or improperly nested quotes/escapes)",
+		remedy: "Re-run with simple, balanced quoting around literal values.",
+	},
+};
+
 const READ_ONLY_ROLES = new Set([
 	"reviewer",
 	"planner",
@@ -339,7 +362,10 @@ export async function guardToolCallImpl(
 
 	for (const raw of extractCommands(input)) {
 		const dynamicSyntax = dynamicShellSyntaxIn(raw);
-		if (dynamicSyntax) return block("shell-safety", "dynamic_shell_syntax", `Blocked: command contains ${dynamicSyntax} that cannot be safely classified without executing shell expansion.`);
+		if (dynamicSyntax) {
+			const guidance = DYNAMIC_SHELL_SYNTAX_GUIDANCE[dynamicSyntax];
+			return block("shell-safety", "dynamic_shell_syntax", `Blocked: command contains ${dynamicSyntax}${guidance ? ` ${guidance.detail}` : ""} that cannot be safely classified without executing shell expansion.${guidance ? ` ${guidance.remedy}` : ""}`);
+		}
 		const command = normalize(raw);
 		const ttyCheck = checkInteractiveTtyCommand(command);
 		if (ttyCheck.isInteractive) {
