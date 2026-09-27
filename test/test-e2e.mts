@@ -298,6 +298,8 @@ spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
 writeFileSync(join(testDir, ".opencode", "workflow-guard.json"), JSON.stringify({
 	protectedBranches: ["e2e-config-probe-branch"],
 	requireReview: false,
+	learning: true,
+	recoveryCheckpoints: true,
 }, null, 2) + "\n");
 
 const runtimeEnv: NodeJS.ProcessEnv = {
@@ -402,6 +404,16 @@ if (isOpenCodeV2) {
 	// builtins are not visible to ctx.tool.list() during plugin setup, so
 	// todowriteEnriched is reported but not asserted.
 	check("V2 setup registers custom guard tools", (headlessAccountability?.tools ?? []).includes("guard_status") && (headlessAccountability?.tools ?? []).includes("guard_why"));
+	const expectedGuardTools = [
+		"guard_status", "guard_why", "guard_audit", "guard_next_tasks", "record_review",
+		"guard_review_rubric", "guard_review_followups", "guard_review_followup_resolve",
+		"guard_worktree_create", "guard_worktree_cleanup",
+		"project_memory_record", "project_memory_search", "project_memory_export", "project_memory_import",
+		"learning_checkpoint", "learning_profile", "learning_record", "guard_recovery_restore",
+	];
+	const missingGuardTools = expectedGuardTools.filter((id) => !(headlessAccountability?.tools ?? []).includes(id));
+	check("V2 setup registers the full config-gated guard tool surface", missingGuardTools.length === 0);
+	if (missingGuardTools.length > 0) console.log("  missing guard tools: " + missingGuardTools.join(", "));
 	console.log(`  note: builtin todowrite description enriched under V2: ${headlessAccountability?.todowriteEnriched === true ? "yes" : "unknown at setup time"}`);
 }
 
