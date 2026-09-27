@@ -1304,24 +1304,24 @@ check("a no-op shell redirect (identical bytes) does not seed an observation", s
 // Path-spelling alias convergence: an observation seeded through one
 // absolute spelling of a file must authorize the mutation requested through
 // a symlink-aliased spelling of the same file (canonicalPath convergence).
-const aliasDir = mkdtempSync(join(tmpdir(), "wg-stale-alias-"));
-const aliasRealDir = join(aliasDir, "real");
-mkdirSync(aliasRealDir);
-symlinkSync(aliasRealDir, join(aliasDir, "alias"));
-const aliasRealPath = join(aliasRealDir, "aliased.ts");
+const staleAliasDir = mkdtempSync(join(tmpdir(), "wg-stale-alias-"));
+const staleAliasRealDir = join(staleAliasDir, "real");
+mkdirSync(staleAliasRealDir);
+symlinkSync(staleAliasRealDir, join(staleAliasDir, "alias"));
+const aliasRealPath = join(staleAliasRealDir, "aliased.ts");
 writeFileSync(aliasRealPath, "observed");
 todo("s-stale-alias", item("edit aliased file", "in_progress"));
-await staleBefore?.({ tool: "read", sessionID: "s-stale-alias", callID: "alias-read", worktree: aliasDir } as any, { args: { filePath: aliasRealPath } });
+await staleBefore?.({ tool: "read", sessionID: "s-stale-alias", callID: "alias-read", worktree: staleAliasDir } as any, { args: { filePath: aliasRealPath } });
 await staleAfter?.({ tool: "read", sessionID: "s-stale-alias", callID: "alias-read", args: { filePath: aliasRealPath } }, { title: "aliased.ts", output: "observed", metadata: {} });
 let aliasWriteAllowed = true;
 try {
-	await staleBefore?.({ tool: "write", sessionID: "s-stale-alias", callID: "alias-write", worktree: aliasDir } as any, { args: { filePath: join(aliasDir, "alias", "aliased.ts"), content: "next" } });
+	await staleBefore?.({ tool: "write", sessionID: "s-stale-alias", callID: "alias-write", worktree: staleAliasDir } as any, { args: { filePath: join(staleAliasDir, "alias", "aliased.ts"), content: "next" } });
 } catch {
 	aliasWriteAllowed = false;
 }
 check("a read observed through one path spelling authorizes the write through its symlink alias", aliasWriteAllowed);
 await staleAfter?.({ tool: "write", sessionID: "s-stale-alias", callID: "alias-write", args: {} }, { title: "write", output: "written", metadata: {} });
-rmSync(aliasDir, { recursive: true, force: true });
+rmSync(staleAliasDir, { recursive: true, force: true });
 const staleAlternateRoot = mkdtempSync(join(tmpdir(), "wg-stale-root-"));
 writeFileSync(join(staleAlternateRoot, "relative.ts"), "observed");
 todo("s-stale-root", item("edit relative file", "in_progress"));
