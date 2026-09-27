@@ -731,6 +731,34 @@ check("tee -- flag separator outside workspace is blocked", blocked(await call("
 check("multi-target tee with an outside path is blocked", blocked(await call("bash", { command: "echo x | tee in.txt /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
 check("tee --append within workspace is allowed with todos", !(await call("bash", { command: "echo x | tee --append src/a.ts" }, { sessionID: "s-active" })));
 
+// Regression (device audit, workspace_escape): symlink aliases of the
+// workspace itself. An absolute target that is lexically outside the root
+// but canonically inside (the alias resolves back into the workspace) must
+// be accepted, while symlinks inside the workspace pointing outside stay
+// blocked. Machine-independent: the alias is built inside the fixture
+// instead of relying on host aliasing such as /home -> /var/home.
+const aliasDir = mkdtempSync(join(tmpdir(), "wg-boundary-alias-"));
+mkdirSync(join(aliasDir, "real"), { recursive: true });
+symlinkSync(aliasDir, join(aliasDir, "alias"), "dir");
+writeFileSync(join(aliasDir, "real", "existing.txt"), "keep\n");
+symlinkSync("/etc", join(aliasDir, "real", "escape"));
+setWorkspaceRoot(join(aliasDir, "real"));
+check("write through symlink alias of the workspace is allowed (new file)", !(await call("write", { filePath: join(aliasDir, "alias", "real", "new-file.txt"), content: "x" }, { sessionID: "s-active" })));
+// The write gate also applies stale-write protection (existing files need a
+// prior session read), so seed the observation by reading through the alias.
+// Plugin setup latches the process root to its directory/worktree
+// (workflow-guard.ts setWorkspaceRoot on setup), so re-latch the alias
+// workspace root before the gated checks.
+const boundaryAliasPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
+setWorkspaceRoot(join(aliasDir, "real"));
+await boundaryAliasPlugin["tool.execute.before"]?.({ tool: "read", sessionID: "s-active", callID: "alias-read" }, { args: { filePath: join(aliasDir, "alias", "real", "existing.txt") } } as any);
+await boundaryAliasPlugin["tool.execute.after"]?.({ tool: "read", sessionID: "s-active", callID: "alias-read", args: { filePath: join(aliasDir, "alias", "real", "existing.txt") } } as any, { title: "existing.txt", output: "keep", metadata: {} } as any);
+check("write through symlink alias of the workspace is allowed (existing file)", !(await call("write", { filePath: join(aliasDir, "alias", "real", "existing.txt"), content: "updated" }, { sessionID: "s-active" })));
+check("write through escaping symlink to an outside file stays blocked", blocked(await call("write", { filePath: join(aliasDir, "real", "escape", "passwd"), content: "x" }, { sessionID: "s-active" })));
+check("new file through an escaping symlink stays blocked", blocked(await call("write", { filePath: join(aliasDir, "real", "escape", "wg-escape-new.txt"), content: "x" }, { sessionID: "s-active" })));
+rmSync(aliasDir, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
 console.log("- Compaction focus preservation & TUI toast -");
 const boundedCompaction = buildCompactionContext("## Operational Guard State\n- critical", ["## Active Tasks\n" + "a".repeat(10_000), "## Project Memory\nshould-not-fit"], 500);
 check("compaction packer enforces its total context budget", boundedCompaction.length === 500);
