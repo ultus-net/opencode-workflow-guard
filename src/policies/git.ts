@@ -346,6 +346,24 @@ const BRANCH_CREATION_VALUELESS_FLAGS = new Set([
 	"--no-track",
 ]);
 
+// Shell redirections never determine the branch start point. Exact tokens
+// cover separated operators (`2> /dev/null`); the attached pattern covers
+// operators fused with their target (`2>/dev/null`, `2>&1`, `&>/dev/null`).
+// Valid refs cannot contain `<` or `>`, so no start point can be mistaken
+// for a redirection token.
+const BRANCH_REDIRECTION_OPERATORS = new Set([
+	"<",
+	">",
+	"<<",
+	">>",
+	"<<<",
+	"<&",
+	">&",
+	"&>",
+	"&>>",
+]);
+const BRANCH_REDIRECTION_ATTACHED_RE = /^(?:&|\d{1,2})?(?:>>|>|<<<|<<|>&|<&|<)[^<>]*$/;
+
 // Classifies the optional start-point operand of an already-matched branch
 // creation invocation (`git switch -c|--create` / `git checkout -b`). Returns
 // the explicit start point when present, `{ start: undefined }` when the
@@ -357,7 +375,15 @@ export function branchCreationStartPoint(rest: string): { start?: string } | und
 	const tokens = rest.split(/\s+/).filter(Boolean);
 	let sawCreate = false;
 	let named = false;
-	for (const token of tokens) {
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i]!;
+		if (BRANCH_REDIRECTION_OPERATORS.has(token) || /^\d{1,2}(?:>>|>|<<<|<<|>&|<&|<)$/.test(token)) {
+			// Separated redirection: its target word follows and is equally
+			// irrelevant to the start point.
+			i += 1;
+			continue;
+		}
+		if (BRANCH_REDIRECTION_ATTACHED_RE.test(token)) continue;
 		const indeterminate = /[$`"']/.test(token);
 		if (!sawCreate) {
 			if (token === "switch" || token === "checkout") continue;

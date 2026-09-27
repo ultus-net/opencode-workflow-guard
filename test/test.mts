@@ -3154,6 +3154,27 @@ check("git checkout -b origin/main with a stale branch is allowed", !blocked(awa
 check("wrapper git switch -c origin/main keeps the fresh start point exemption", !blocked(await shell("env git switch -c wg-wrapper-fresh origin/main")));
 check("variable start point fails closed on a stale branch", blocked(await shell("git switch -c wg-start-var $WG_REF")));
 check("plain git branch is not treated as guarded branch creation", !blocked(await shell("git branch wg-plain-branch origin/main")));
+// Redirection tokens are never start points (audit regression: `git switch
+// -c feat/x 2>&1` classified the trailing `2>` left by `&`-segment splitting
+// as an explicit start point and failed closed).
+const redirStale = await shell("git switch -c wg-redir-stale 2>/dev/null");
+check(
+	"redirect to /dev/null is not a start point on a stale branch (still stale-blocked)",
+	blocked(redirStale) && (redirStale as string).includes("'feat/conflict-branch'") && !(redirStale as string).includes("'2>'"),
+);
+spawnSync("git", ["switch", "-c", "wg-redir-base", "origin/main"], { cwd: conflictRepo });
+check("attached stderr redirect is not a start point on a fresh branch", !blocked(await shell("git switch -c wg-redir-null 2>/dev/null")));
+check("separated stdout redirect is not a start point on a fresh branch", !blocked(await shell("git checkout -b wg-redir-out > /dev/null")));
+check("fd duplication 2>&1 left by &-segment splitting is not a start point", !blocked(await shell("git switch -c wg-redir-dup 2>&1")));
+check("separated fd stderr redirect is not a start point on a fresh branch", !blocked(await shell("git switch -c wg-redir-sep 2> /dev/null")));
+check("explicit start point before a redirect stays effective", !blocked(await shell("git switch -c wg-redir-after origin/main 2>&1")));
+spawnSync("git", ["switch", "feat/conflict-branch"], { cwd: conflictRepo });
+const staleShaRedirect = await shell(`git switch -c wg-stale-redir ${staleStartSha} >/dev/null`);
+check(
+	"explicit stale start point is still classified behind a redirect",
+	blocked(staleShaRedirect) && (staleShaRedirect as string).includes("start point") && (staleShaRedirect as string).includes(staleStartSha),
+);
+check("variable start point behind a redirect still fails closed", blocked(await shell("git switch -c wg-var-redir $WG_REF 2>/dev/null")));
 
 // Lockfile synchronization tests
 const lockRepo = mkdtempSync(join(tmpdir(), "wg-lock-repo-"));
