@@ -311,6 +311,10 @@ const runtimeEnv: NodeJS.ProcessEnv = {
 delete runtimeEnv.OPENCODE_PID;
 delete runtimeEnv.OPENCODE_PURE;
 delete runtimeEnv.OPENCODE;
+// The learning config key must stay load-bearing: an inherited
+// WORKFLOW_GUARD_LEARNING=1 would register the learning tools without the
+// sentinel config file being read (review P2, tool-surface iteration).
+delete runtimeEnv.WORKFLOW_GUARD_LEARNING;
 if (isOpenCodeV2) {
 	// V2 runs a shared managed service on a fixed default port. Each run uses
 	// its own isolated XDG dirs, so pick a run-unique port to keep concurrent
