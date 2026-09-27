@@ -4,7 +4,6 @@ import { dirname, join, resolve } from "node:path";
 import type { ShellMutation } from "../lib/types.ts";
 import {
 	getWorkspaceRoot,
-	getWorkspaceRootReal,
 	recordMutation,
 } from "../lib/state.ts";
 import { prepareRedirectResidue, shellWords, unwrapShellCommand } from "../lib/shell.ts";
@@ -89,7 +88,15 @@ export function isPathOutsideWorkspace(targetPath: string, root: string): boolea
 	if (resolved !== root && !resolved.startsWith(normalizedRoot)) {
 		return true;
 	}
-	const realRootVal = getWorkspaceRootReal();
+	// The boundary is resolved against the workspace THIS call declares (the
+	// `root` argument), never against a process-global latched root: concurrent
+	// loops share one guard process, and a latched root must not redefine
+	// another session's boundary. Symlink-awareness is preserved (ancestor
+	// walk below) by canonicalizing the declared root itself.
+	let realRootVal = root;
+	try {
+		realRootVal = realpathSync(root);
+	} catch {}
 	try {
 		const real = realpathSync(resolved);
 		const realRoot = realRootVal.endsWith("/") ? realRootVal : realRootVal + "/";

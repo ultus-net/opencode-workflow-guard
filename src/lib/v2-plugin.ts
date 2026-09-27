@@ -25,8 +25,8 @@ import { findGitRoot, reloadProjectConfig } from "./project-config.ts";
 import {
 	setWorkspaceRoot,
 	setSdkClient,
-	getSessionWorkspace,
-	setSessionWorkspace,
+	getSessionBoundWorkspace,
+	registerSessionWorkspaceFromToolCall,
 	runWithRuntimeState,
 	getSessionMutationCount,
 	sessionVerifyResults,
@@ -193,10 +193,14 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				// wrap it so the V2 registry receives a real StandardSchemaV1.
 				input: z.object(definition.args as unknown as z.ZodRawShape),
 				execute: async (rawInput: unknown, toolContext: { sessionID: string; id: string }) => {
+					// Only a session-bound workspace counts as the tool's own
+					// context; an unbound entry is a plugin-instance bootstrap
+					// and must not be presented to the tools as one.
+					const boundWorktree = getSessionBoundWorkspace(toolContext.sessionID);
 					const result = await (definition.execute as (input: unknown, context: unknown) => Promise<unknown>)(rawInput, {
 						sessionID: toolContext.sessionID,
-						worktree: getSessionWorkspace(toolContext.sessionID) ?? effectiveRoot,
-						directory: effectiveRoot,
+						...(boundWorktree ? { worktree: boundWorktree } : {}),
+						directory: boundWorktree ?? effectiveRoot,
 					});
 					const text = typeof result === "string" ? result : (result as { output?: string } | undefined)?.output;
 					return {
@@ -218,7 +222,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 
 	// ── Deterministic enforcement ──
 	await ctx.tool.hook("execute.before", (event) => {
-		const toolWorktree = getSessionWorkspace(event.sessionID) || effectiveRoot;
+		const toolWorktree = getSessionBoundWorkspace(event.sessionID) || effectiveRoot;
 		return runWithRuntimeState(toolWorktree, client, async () => {
 			const args = event.input;
 			const reason = await guardToolCall(event.tool, args, {
@@ -239,11 +243,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			const record = asRecord(args);
 			const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 			const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-			const candidatePath = workdir ?? filePath ?? toolWorktree;
-			if (candidatePath) {
-				const gitRoot = findGitRoot(candidatePath);
-				if (gitRoot) setSessionWorkspace(event.sessionID, gitRoot);
-			}
+			registerSessionWorkspaceFromToolCall(event.sessionID, { workdir, filePath, toolWorktree });
 			if (event.tool === "read") {
 				const target = editTargets(args, toolWorktree)[0];
 				if (target) {

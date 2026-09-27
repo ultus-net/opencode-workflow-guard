@@ -7,6 +7,7 @@ import {
 	getLastReviewResultForWorkspace,
 	getLiveControlPlaneRoots,
 	getSdkClient,
+	getSessionBoundWorkspace,
 	getWorkspaceRoot,
 	isDocumentationRequired,
 	isReviewRequired,
@@ -114,7 +115,15 @@ export async function guardToolCallImpl(
 	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string; simulate?: boolean },
 ): Promise<PolicyDecision> {
 	const logPolicyBlock = (message: string) => logBlock(message, context?.simulate);
-	const currentRoot = getWorkspaceRoot();
+	// The workspace for THIS decision comes from the call's own context (the
+	// hook's per-call worktree/directory) or, failing that, the session's own
+	// bound workspace — never from one process-global slot: concurrent loops
+	// share this process, and the last-active instance must not re-anchor
+	// another session's policy evaluation.
+	const currentRoot = context?.worktree
+		|| context?.directory
+		|| getSessionBoundWorkspace(context?.sessionID)
+		|| getWorkspaceRoot();
 	const allow = (): PolicyDecision => ({ status: "allowed", code: "allowed", message: "Allowed by current guardrails." });
 	const block = (policy: string, code: string, message: string): PolicyDecision => ({ status: "blocked", policy, code, message });
 	const needsApproval = (policy: string, code: string, message: string): PolicyDecision => ({ status: "needs_approval", policy, code, message });

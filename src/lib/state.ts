@@ -1,5 +1,5 @@
-import { realpathSync, existsSync, unlinkSync } from "node:fs";
-import { resolve } from "node:path";
+import { existsSync, unlinkSync } from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { findGitRoot, getCachedProjectConfig, isSameGitRepo, loadProjectConfig, projectRootKey } from "./project-config.ts";
@@ -13,34 +13,19 @@ import type {
 } from "./types.ts";
 
 export let workspaceRoot = process.cwd();
-export let workspaceRootReal = workspaceRoot;
 interface RuntimeState {
 	workspaceRoot: string;
-	workspaceRootReal: string;
 	sdkClient: TodoSdkClient | undefined;
 	projectConfig: ProjectConfig;
 }
 const runtimeState = new AsyncLocalStorage<RuntimeState>();
 
-try {
-	workspaceRootReal = realpathSync(workspaceRoot);
-} catch {}
-
 export function setWorkspaceRoot(root: string): void {
 	workspaceRoot = root;
-	try {
-		workspaceRootReal = realpathSync(root);
-	} catch {
-		workspaceRootReal = root;
-	}
 }
 
 export function getWorkspaceRoot(): string {
 	return runtimeState.getStore()?.workspaceRoot ?? workspaceRoot;
-}
-
-export function getWorkspaceRootReal(): string {
-	return runtimeState.getStore()?.workspaceRootReal ?? workspaceRootReal;
 }
 
 export let sdkClient: TodoSdkClient | undefined;
@@ -54,14 +39,9 @@ export function getSdkClient(): TodoSdkClient | undefined {
 }
 
 export function runWithRuntimeState<T>(root: string, client: unknown, fn: () => T): T {
-	let realRoot = root;
-	try {
-		realRoot = realpathSync(root);
-	} catch {}
 	return runtimeState.run(
 		{
 			workspaceRoot: root,
-			workspaceRootReal: realRoot,
 			sdkClient: client as TodoSdkClient | undefined,
 			projectConfig: loadProjectConfig(root),
 		},
@@ -76,16 +56,92 @@ const workspaceMutationCounts = new Map<string, number>();
 export const sessionMutationTimestamps = new Map<string, number>();
 export const sessionMutationCounts = new Map<string, number>();
 export const sessionWorkspaces = new Map<string, string>();
+// Sessions whose workspace was registered from their OWN context (tool-call
+// arguments or a host-provided per-call worktree). A session registered only
+// from the plugin-instance default is deliberately left unmarked: concurrent
+// loops share this process, and a value derived from the last-active plugin
+// instance must never outrank the call's own context or the host fallback.
+const sessionWorkspaceBound = new Set<string>();
 
 export function setSessionWorkspace(sessionID: string, workspace: string): void {
 	if (!sessionID || !workspace) return;
 	const gitRoot = findGitRoot(workspace);
 	sessionWorkspaces.set(sessionID, gitRoot ?? projectRootKey(workspace));
+	sessionWorkspaceBound.add(sessionID);
 }
 
 export function getSessionWorkspace(sessionID?: string): string | undefined {
 	if (!sessionID) return undefined;
 	return sessionWorkspaces.get(sessionID);
+}
+
+/**
+ * The session's workspace only when it was registered from the session's own
+ * context (tool-call arguments or a host-provided per-call worktree), never a
+ * plugin-instance-default bootstrap. Policy decisions that bind evidence or
+ * confine boundaries must consult this variant: two concurrent loops share one
+ * guard process, and an unbound bootstrap entry may have been derived from
+ * another session's plugin instance.
+ */
+export function getSessionBoundWorkspace(sessionID?: string): string | undefined {
+	if (!sessionID) return undefined;
+	return sessionWorkspaceBound.has(sessionID) ? sessionWorkspaces.get(sessionID) : undefined;
+}
+
+/**
+ * Register a session's workspace from a tool call's own context. Candidates in
+ * priority order: tool-argument paths (workdir/filePath — the call's own
+ * target), then a host-provided per-call worktree/directory. A session that is
+ * already registered is never re-anchored from the plugin-instance fallback:
+ * under concurrent loops that fallback can belong to a different session's
+ * workspace, which is exactly how workspaces cross-contaminate. Only a
+ * session with no registration at all is bootstrapped from the fallback, and
+ * such a bootstrap stays unbound (never used to bind review evidence).
+ */
+export function registerSessionWorkspaceFromToolCall(
+	sessionID: string | undefined,
+	call: { workdir?: string; filePath?: string; hostWorktree?: string; toolWorktree: string },
+): void {
+	if (!sessionID) return;
+	const rawCandidate = call.workdir ?? call.filePath ?? call.hostWorktree;
+	if (rawCandidate) {
+		const candidatePath = isAbsolute(rawCandidate) ? rawCandidate : resolve(call.toolWorktree, rawCandidate);
+		const gitRoot = findGitRoot(candidatePath);
+		if (gitRoot) {
+			sessionWorkspaces.set(sessionID, gitRoot);
+			sessionWorkspaceBound.add(sessionID);
+		}
+		return;
+	}
+	if (sessionWorkspaces.has(sessionID)) return;
+	const gitRoot = findGitRoot(call.toolWorktree);
+	sessionWorkspaces.set(sessionID, gitRoot ?? projectRootKey(call.toolWorktree));
+}
+
+/**
+ * The session's workspace resolved from its own bindings only: a directly
+ * registered bound workspace, else the nearest bound parent workspace
+ * (subagent sessions inherit their parent's binding for relay flows). Returns
+ * undefined when neither exists — callers that must not guess (review verdict
+ * binding) treat that as "resolve nothing, ask for an explicit directory".
+ */
+export async function resolveSessionBoundWorkspace(sessionID?: string): Promise<string | undefined> {
+	if (!sessionID) return undefined;
+	const direct = getSessionBoundWorkspace(sessionID);
+	if (direct) return direct;
+	try {
+		const client = getSdkClient();
+		const session = client?.session;
+		const get = session?.get;
+		if (typeof get === "function") {
+			const result = await get.call(session, { path: { id: sessionID } });
+			const parent = (result as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
+			if (typeof parent === "string" && parent && sessionWorkspaceBound.has(parent)) {
+				return sessionWorkspaces.get(parent);
+			}
+		}
+	} catch {}
+	return undefined;
 }
 
 export let lastVerify: VerifyResult | undefined;
@@ -228,10 +284,28 @@ export function getLastReviewResult(): typeof lastReview {
 
 export function getLastReviewResultForWorkspace(root: string): typeof lastReview {
 	const workspace = projectRootKey(root);
-	const candidates = [lastReview, ...sessionReviews.values()].filter(
-		(result): result is ReviewResult => result?.workspace != null && (projectRootKey(result.workspace) === workspace || isSameGitRepo(result.workspace, root)),
+	const all = [lastReview, ...sessionReviews.values()].filter(
+		(result): result is ReviewResult & { workspace: string } => result?.workspace != null,
 	);
-	const latest = candidates.reduce<ReviewResult | undefined>((best, result) => !best || result.timestamp > best.timestamp ? result : best, undefined);
+	// Exact worktree binding wins: concurrent loops sharing one repository
+	// (different worktrees) must consume their own approvals independently —
+	// a newer sibling-worktree review must never displace this worktree's
+	// between record_review and PR creation.
+	const exact = all.filter((result) => projectRootKey(result.workspace) === workspace);
+	let preferred = exact;
+	if (preferred.length === 0) {
+		const sameRepo = all.filter((result) => isSameGitRepo(result.workspace, root));
+		if (sameRepo.length > 0) {
+			// Among same-repo candidates, prefer the review whose tracked
+			// content matches THIS worktree (the PR preflight consumes the
+			// approval bound to the tree it would publish); recency only
+			// breaks ties.
+			const prFingerprint = getTrackedWorktreeFingerprint(root);
+			const contentMatched = prFingerprint ? sameRepo.filter((result) => result.worktreeFingerprint === prFingerprint) : [];
+			preferred = contentMatched.length > 0 ? contentMatched : sameRepo;
+		}
+	}
+	const latest = preferred.reduce<ReviewResult | undefined>((best, result) => !best || result.timestamp > best.timestamp ? result : best, undefined);
 	if (latest) return latest;
 	const diskCached = loadReviewCache();
 	if (diskCached?.workspace && (projectRootKey(diskCached.workspace) === workspace || isSameGitRepo(diskCached.workspace, root))) {
@@ -254,41 +328,36 @@ export async function resolveEffectiveWorkspace(options: {
 	directory?: string;
 	fallback?: string;
 }): Promise<string> {
+	// Intended precedence. Custom tools (resolveCallWorkspace) consult the
+	// explicit argument and the host per-call context BEFORE calling this, so
+	// inside this function the remaining order is: bound session workspace >
+	// host fallback > unbound bootstrap hint > global latch/cwd. A future
+	// direct caller passing a per-call `fallback` should apply the same
+	// host-context-first step that resolveCallWorkspace does.
 	if (options.directory) {
 		const gitRoot = findGitRoot(options.directory);
 		return gitRoot ?? projectRootKey(options.directory);
 	}
+	// 1. The session's own binding (direct, or inherited from a bound parent
+	// for relay flows) wins over every ambient fallback. Concurrent loops
+	// share one guard process; a fallback derived from the last-active
+	// plugin instance must never re-anchor another session's context.
+	const bound = await resolveSessionBoundWorkspace(options.sessionID);
+	if (bound) return bound;
 	const fallbackRoot = options.fallback ? projectRootKey(options.fallback) : undefined;
 	const isFallbackFsRoot = fallbackRoot ? resolve(fallbackRoot) === resolve(fallbackRoot, "..") : true;
 
+	// 2. The call's own host-provided per-call worktree/directory.
 	if (fallbackRoot && !isFallbackFsRoot) {
-		if (options.sessionID) {
-			const sessionWs = sessionWorkspaces.get(options.sessionID);
-			if (sessionWs && isSameGitRepo(sessionWs, fallbackRoot)) {
-				return sessionWs;
-			}
-		}
 		return fallbackRoot;
 	}
 
-	if (options.sessionID) {
-		const sessionWs = sessionWorkspaces.get(options.sessionID);
-		if (sessionWs) return sessionWs;
-		try {
-			const client = getSdkClient();
-			const session = client?.session;
-			const get = session?.get;
-			if (typeof get === "function") {
-				const result = await get.call(session, { path: { id: options.sessionID } });
-				const parent = (result as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
-				if (typeof parent === "string" && parent && sessionWorkspaces.has(parent)) {
-					const parentWs = sessionWorkspaces.get(parent)!;
-					sessionWorkspaces.set(options.sessionID, parentWs);
-					return parentWs;
-				}
-			}
-		} catch {}
-	}
+	// 3. Unbound bootstrap hint: the session was registered only from the
+	// plugin-instance default, so it carries no per-session authority and
+	// loses to any real fallback (step 2). It is still better than the raw
+	// global latch when the fallback is absent or the filesystem root.
+	const hintRoot = options.sessionID ? sessionWorkspaces.get(options.sessionID) : undefined;
+	if (hintRoot) return hintRoot;
 	const activeRoot = getWorkspaceRoot();
 	if (activeRoot && resolve(activeRoot) !== resolve(activeRoot, "..")) {
 		const gitRoot = findGitRoot(activeRoot);

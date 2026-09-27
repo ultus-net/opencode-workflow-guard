@@ -1,5 +1,6 @@
 import { tool } from "@opencode-ai/plugin";
 import { spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 import type { AuditEntry, LearningEvidenceKind } from "./types.ts";
 import type { ProjectMemoryStore } from "./project-memory.ts";
 import {
@@ -31,10 +32,11 @@ import {
 	recordMutation,
 	recordReviewResult,
 	resolveEffectiveWorkspace,
+	resolveSessionBoundWorkspace,
 	runWithRuntimeState,
 } from "./state.ts";
 import { getRalphOutcome } from "../policies/continuation.ts";
-import { loadProjectConfig, projectRootKey } from "./project-config.ts";
+import { findGitRoot, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
 import { createGitWorktree, cleanupGitWorktree } from "./worktree.ts";
@@ -121,6 +123,27 @@ export function createCustomTools(options: {
 	client: unknown;
 }) {
 	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client } = options;
+	// Resolve the workspace for a tool call from the CALL's own context: an
+	// explicit argument first, then the host-provided per-call worktree or
+	// directory (even when unusable — the call declared its target), then the
+	// session's bound workspace. The plugin-instance default (`effectiveRoot`)
+	// is only the last resort — concurrent loops share one guard process, so
+	// an instance-derived root must never re-anchor another session's tool
+	// execution.
+	const resolveCallWorkspace = async (
+		toolContext: { sessionID?: string; worktree?: string; directory?: string } | undefined,
+		explicitDirectory?: string,
+	): Promise<string> => {
+		if (explicitDirectory) {
+			return findGitRoot(explicitDirectory) ?? projectRootKey(explicitDirectory);
+		}
+		const hostContext = toolContext?.worktree || toolContext?.directory;
+		const hostIsFilesystemRoot = hostContext ? resolve(hostContext) === resolve(hostContext, "..") : true;
+		if (hostContext && !hostIsFilesystemRoot) {
+			return findGitRoot(hostContext) ?? projectRootKey(hostContext);
+		}
+		return resolveEffectiveWorkspace({ sessionID: toolContext?.sessionID, fallback: effectiveRoot });
+	};
 	return {
 		...(isRecoveryCheckpointsEnabled(effectiveRoot) ? {
 			guard_recovery_restore: tool({
@@ -131,7 +154,7 @@ export function createCustomTools(options: {
 					const parent = await fetchParentSession(toolContext.sessionID);
 					if (!parent.ok) return "[workflow-guard] Recovery rejected: could not confirm this is a root session.";
 					if (parent.parentID) return "[workflow-guard] Recovery rejected: only root sessions can restore their checkpoints.";
-					const result = restoreRecoveryCheckpoint(effectiveRoot, toolContext.sessionID, args.run);
+					const result = restoreRecoveryCheckpoint(await resolveCallWorkspace(toolContext), toolContext.sessionID, args.run);
 					return result.ok ? `[workflow-guard] Restored recovery checkpoint for run ${args.run}.` : `[workflow-guard] Recovery rejected: ${result.error}`;
 				},
 			}),
@@ -139,8 +162,8 @@ export function createCustomTools(options: {
 		guard_next_tasks: tool({
 			description: "Load durable repository task context when deciding what to work on next or planning upcoming steps. Proactively call at session start or during planning to discover roadmap, plan, tasks, backlog, and TODO.md files.",
 			args: {},
-			execute: async () => {
-				const sources = discoverPlanningSources(effectiveRoot);
+			execute: async (_args, toolContext) => {
+				const sources = discoverPlanningSources(await resolveCallWorkspace(toolContext));
 				return sources.length > 0 ? JSON.stringify({ sources }, null, 2) : JSON.stringify({ sources: [], message: "No TODO, roadmap, plan, tasks, or backlog Markdown files found." });
 			},
 		}),
@@ -158,7 +181,7 @@ export function createCustomTools(options: {
 					if (!(["fact", "decision", "constraint", "lesson"] as string[]).includes(args.kind)) return "[workflow-guard] Project memory rejected: invalid kind.";
 					const detectedSecret = secretIn(args.content);
 					if (detectedSecret) return `[workflow-guard] Project memory rejected: possible secret detected (${detectedSecret}).`;
-					return JSON.stringify(recordProjectMemory(projectMemory, { kind: args.kind as "fact" | "decision" | "constraint" | "lesson", content: args.content, source: "agent", sessionID: toolContext.sessionID, commit: getCurrentGitCommitHash(effectiveRoot), paths: args.paths, supersedes: args.supersedes || undefined }));
+					return JSON.stringify(recordProjectMemory(projectMemory, { kind: args.kind as "fact" | "decision" | "constraint" | "lesson", content: args.content, source: "agent", sessionID: toolContext.sessionID, commit: getCurrentGitCommitHash(await resolveCallWorkspace(toolContext)), paths: args.paths, supersedes: args.supersedes || undefined }));
 				},
 			}),
 			project_memory_export: tool({
@@ -181,7 +204,7 @@ export function createCustomTools(options: {
 				execute: async (args, toolContext) => {
 					const valid = args.opportunities.slice(0, 20).filter((candidate): candidate is typeof candidate & { type: "design" | "debugging" | "new-concept" } => (candidate.type === "design" || candidate.type === "debugging" || candidate.type === "new-concept") && candidate.concept.length > 0 && candidate.concept.length <= 100 && candidate.relevance >= 0 && candidate.relevance <= 1 && candidate.consequence >= 0 && candidate.consequence <= 1);
 					const used = learningInterventions.get(toolContext.sessionID) ?? 0;
-					const selected = selectLearningOpportunity(loadLearnerProfile(), valid, { interventionsThisSession: used, maxInterventionsPerSession: getLearningInterventionBudget(effectiveRoot) });
+					const selected = selectLearningOpportunity(loadLearnerProfile(), valid, { interventionsThisSession: used, maxInterventionsPerSession: getLearningInterventionBudget(await resolveCallWorkspace(toolContext)) });
 					if (!selected) return JSON.stringify({ intervene: false, reason: "No opportunity selected or session learning budget reached." });
 					learningInterventions.set(toolContext.sessionID, used + 1);
 					return JSON.stringify({ intervene: true, opportunity: selected, guidance: "Ask one question, use the answer as task context, briefly reconcile if useful, then continue building." });
@@ -194,10 +217,11 @@ export function createCustomTools(options: {
 					const validKinds = new Set(["exposed", "developing", "demonstrated", "independent", "critique", "needs-reinforcement"]);
 					if (!validKinds.has(args.kind)) return "[workflow-guard] Learning evidence rejected: invalid evidence kind.";
 					if (args.concept.length < 1 || args.concept.length > 100 || args.summary.length < 1 || args.summary.length > 1000) return "[workflow-guard] Learning evidence rejected: concept must be 1-100 characters and summary 1-1000 characters.";
+					const learningWorkspace = await resolveCallWorkspace(toolContext);
 					try {
 						updateLearnerProfile((profile) => {
 							if (!profile.concepts[args.concept] && Object.keys(profile.concepts).length >= 500) throw new Error("concept-limit");
-							recordLearningEvidence(profile, { concept: args.concept, kind: args.kind as LearningEvidenceKind, summary: args.summary, timestamp: Date.now(), sessionID: toolContext.sessionID, project: effectiveRoot });
+							recordLearningEvidence(profile, { concept: args.concept, kind: args.kind as LearningEvidenceKind, summary: args.summary, timestamp: Date.now(), sessionID: toolContext.sessionID, project: learningWorkspace });
 						});
 					} catch (error) {
 						if ((error as Error).message === "concept-limit") return "[workflow-guard] Learning evidence rejected: learner profile concept limit reached.";
@@ -208,12 +232,12 @@ export function createCustomTools(options: {
 			}),
 		} : {}),
 		guard_status: tool({
-			description: "Inspect active guardrails, current branch protection, mutation count, outstanding verification/review requirements, and ralph status. The result includes pluginVersion, the version of the loaded guard package, so a stale installation is visible, and a read-only gitHygiene snapshot (local branches already merged into the mainline, prunable worktree admin entries, base-behind distance). Proactively call at session start and before completing tasks or creating PRs.",
+			description: "Inspect active guardrails, current branch protection, mutation count, outstanding verification/review requirements, and ralph status. The result includes pluginVersion, the version of the loaded guard package, so a stale installation is visible, and a read-only gitHygiene snapshot (local branches already merged into the mainline, prunable worktree admin entries, base-behind distance). Proactively call at session start and before completing tasks or creating PRs. Concurrent loops share one guard process, so pass 'directory' explicitly when inspecting a root other than this session's own workspace.",
 			args: {
-				directory: tool.schema.string().optional().describe("Target repository directory to inspect (defaults to active session directory or workspace root)"),
+				directory: tool.schema.string().optional().describe("Target repository directory to inspect (defaults to this session's own workspace binding, never another concurrent session's root)"),
 			},
 			execute: async (args, toolContext) => {
-				const root = await resolveEffectiveWorkspace({ sessionID: toolContext.sessionID, directory: args?.directory, fallback: toolContext.worktree || toolContext.directory || effectiveRoot });
+				const root = await resolveCallWorkspace(toolContext, args?.directory);
 				const branch = currentGitBranch(root) ?? "unknown"; const isProtected = onProtectedBranch(root); const lastV = getLastVerifyResultForWorkspace(root); const lastR = getLastReviewResultForWorkspace(root); const lastMut = getWorkspaceMutationTimestamp(root); const cfg = loadProjectConfig(root);
 				const subject = { workspace: projectRootKey(root), commitHash: getCurrentGitCommitHash(root), worktreeFingerprint: getGitWorktreeFingerprint(root) };
 				const verifyEvidence = lastV ? verificationEvidence(lastV) : undefined;
@@ -256,14 +280,14 @@ export function createCustomTools(options: {
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),
-		guard_why: tool({ description: "Simulate and return the structured policy decision for a specific tool call or command. Proactively use before executing questionable or complex commands to check if they would be blocked by guard policies.", args: { tool: tool.schema.string().describe("Tool name (e.g. bash, edit, write, read, apply_patch)"), input: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Tool input arguments") }, execute: async (args, toolContext) => JSON.stringify(await runWithRuntimeState(effectiveRoot, client, () => guardToolCallImpl(args.tool, args.input ?? {}, { sessionID: toolContext.sessionID, worktree: toolContext.worktree, directory: toolContext.directory, simulate: true })), null, 2) }),
+		guard_why: tool({ description: "Simulate and return the structured policy decision for a specific tool call or command. Proactively use before executing questionable or complex commands to check if they would be blocked by guard policies.", args: { tool: tool.schema.string().describe("Tool name (e.g. bash, edit, write, read, apply_patch)"), input: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Tool input arguments") }, execute: async (args, toolContext) => JSON.stringify(await runWithRuntimeState(await resolveCallWorkspace(toolContext), client, () => guardToolCallImpl(args.tool, args.input ?? {}, { sessionID: toolContext.sessionID, worktree: toolContext.worktree, directory: toolContext.directory, simulate: true })), null, 2) }),
 		record_review: tool({
 			description: "Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric (test integrity, task completeness, cleanliness, security, platform). Projects with requireSubagentReview enabled only accept APPROVALS recorded from a subagent session (one with a parent session), never from the root session itself.",
 			args: {
 				reviewer: tool.schema.string().describe("Identifier/name of the reviewer subagent"),
 				summary: tool.schema.string().describe("Review findings summary across the 5 core review axes"),
 				passed: tool.schema.boolean().describe("True if change is approved, false if changes requested"),
-				directory: tool.schema.string().optional().describe("Target repository directory being reviewed (defaults to parent session's repository or active directory)"),
+				directory: tool.schema.string().optional().describe("Target repository directory being reviewed. Pass it explicitly whenever the recorder session has no workspace binding: concurrent loops share one guard process, and a verdict is never bound to a guessed root."),
 			},
 			execute: async (args, toolContext) => {
 				const auditVerdict = (verdict: "approved" | "changes_requested" | "rejected", reason: string, binding?: NonNullable<AuditEntry["evidence"]>["binding"]) => audit({ ts: new Date().toISOString(), sessionID: toolContext.sessionID, tool: "record_review.verdict", decision: verdict === "rejected" ? "block" : "allow", phase: "event", reason, evidence: { reviewVerdict: verdict, ...(binding ? { binding } : {}) } });
@@ -277,7 +301,19 @@ export function createCustomTools(options: {
 				// hash + tracked worktree fingerprint); the recorder's lineage is
 				// captured in the audit trail. The review-before-PR requirement
 				// itself is unchanged.
-				const reviewWorkspace = await resolveEffectiveWorkspace({ sessionID: toolContext.sessionID, directory: args.directory, fallback: toolContext.worktree || toolContext.directory || effectiveRoot });
+				// Binding is never guessed: an explicit directory, the session's
+				// own workspace binding (direct or inherited from a bound
+				// parent), or a host-provided per-call worktree. When none of
+				// those exist the verdict is rejected instead of silently bound
+				// to a latched root — concurrent loops share one guard process,
+				// and a latched root can belong to another loop's repository.
+				const hostProvidesWorkspace = Boolean(toolContext?.worktree);
+				const sessionBinding = await resolveSessionBoundWorkspace(toolContext?.sessionID);
+				if (!args.directory && !sessionBinding && !hostProvidesWorkspace) {
+					auditVerdict("rejected", "review_binding_unresolved", { recorderSessionID: toolContext?.sessionID });
+					return "[workflow-guard] Review rejected: the reviewed workspace could not be resolved from this call (no explicit 'directory', no session workspace binding, no per-call worktree). Concurrent loops share one guard process, so a verdict is never bound to a guessed root. Call record_review with 'directory' set to the reviewed repository worktree.";
+				}
+				const reviewWorkspace = await resolveCallWorkspace(toolContext, args.directory);
 				const bindingFingerprint = getTrackedWorktreeFingerprint(reviewWorkspace);
 				if (!bindingFingerprint) {
 					auditVerdict("rejected", "review_workspace_unbindingable", { workspace: reviewWorkspace, recorderSessionID: toolContext.sessionID });
@@ -325,7 +361,7 @@ export function createCustomTools(options: {
 			execute: async (args, toolContext) => {
 				const sanitizedBase = typeof args.base === "string" && !args.base.startsWith("-") && !/[\s;'"\0]/.test(args.base) ? args.base : undefined;
 				const bases = sanitizedBase ? [sanitizedBase] : ["origin/main", "origin/master", "main", "master"];
-				const rubricWorkspace = await resolveEffectiveWorkspace({ sessionID: toolContext?.sessionID, directory: args?.directory, fallback: toolContext?.worktree || toolContext?.directory || effectiveRoot });
+				const rubricWorkspace = await resolveCallWorkspace(toolContext, args?.directory);
 				let diffText = "";
 				// Revision before the trailing `--` (LL-001) so the base ref is
 				// always parsed as a revision, never as a pathspec.
@@ -338,16 +374,20 @@ export function createCustomTools(options: {
 			description: "Create an isolated git worktree directory for concurrent subagent execution. Proactively call when launching parallel tasks/subagents to prevent file collision and maintain branch isolation.", args: { branch: tool.schema.string().describe("Branch name for the isolated worktree (e.g. 'feat/subagent-task')"), baseBranch: tool.schema.string().optional().describe("Base branch to branch off of (defaults to HEAD)") },
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree creation with no active todo item. Break the request down with todowrite first, then create worktrees.";
-				const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot; const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", toolRoot); if (!res.success) return `[workflow-guard] Failed to create worktree: ${res.error}`;
-				recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID); return `[workflow-guard] Worktree created successfully at: ${res.worktreePath}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
+				const toolRoot = await resolveCallWorkspace(toolContext); const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", toolRoot); if (!res.success) return `[workflow-guard] Failed to create worktree: ${res.error}`;
+				const mutationRoot = await resolveCallWorkspace(toolContext);
+				await runWithRuntimeState(mutationRoot, client, async () => recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID));
+				return `[workflow-guard] Worktree created successfully at: ${res.worktreePath}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
 			},
 		}),
 		guard_worktree_cleanup: tool({
 			description: "Commit a final snapshot and remove an isolated git worktree directory. Call to clean up worktrees created with guard_worktree_create after subagent tasks complete.", args: { worktreePath: tool.schema.string().describe("Path of the worktree directory to clean up") },
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree cleanup with no active todo item. Break the request down with todowrite first, then clean up worktrees.";
-				const toolRoot = toolContext.worktree || toolContext.directory || effectiveRoot; const res = cleanupGitWorktree(args.worktreePath, toolRoot); if (!res.success) return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
-				recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID); return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
+				const toolRoot = await resolveCallWorkspace(toolContext); const res = cleanupGitWorktree(args.worktreePath, toolRoot); if (!res.success) return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
+				const mutationRoot = await resolveCallWorkspace(toolContext);
+				await runWithRuntimeState(mutationRoot, client, async () => recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID));
+				return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
 			},
 		}),
 	};
