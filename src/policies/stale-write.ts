@@ -74,7 +74,7 @@ export function staleWriteReason(path: string, sessionID: string): string | unde
 	const observed = reads.get(sessionID)?.get(canonical);
 	if (!observed) {
 		if (!current) return undefined;
-		return `Blocked: existing file '${canonical}' has not been read by this session. Re-read it before editing or overwriting it.`;
+		return `Blocked: existing file '${canonical}' has not been read by this session. Re-read it before editing or overwriting it. If another session may own it, coordinate before writing.`;
 	}
 	if (!current || !equal(observed, current)) {
 		return `Blocked: file '${canonical}' changed since this session read it. Re-read it before editing or overwriting it.`;

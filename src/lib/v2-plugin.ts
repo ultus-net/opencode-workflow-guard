@@ -48,7 +48,7 @@ import {
 } from "./project-memory.ts";
 import { secretIn } from "../policies/secrets.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./custom-tools.ts";
-import { isReadOnlyRole } from "./guard-dispatcher.ts";
+import { isReadOnlyRole, SHELL_TOOL_NAMES } from "./guard-dispatcher.ts";
 import { ToolInvocationLifecycle } from "./tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./tool-outcomes.ts";
 import { EDIT_TOOL_NAMES, fetchParentSession, fetchParentSessionID, effectiveTodos } from "../policies/todo.ts";
@@ -56,7 +56,9 @@ import { currentGitBranch, isProtectedBranchName } from "../policies/git.ts";
 import { checkCompletionClaims } from "../policies/completion.ts";
 import { releaseFileClaims } from "../policies/file-claims.ts";
 import { beginReadObservation, recordMutationObservation, recordSuccessfulRead, clearReadFingerprints } from "../policies/stale-write.ts";
-import { editTargets, runPostEditValidators, snapshotFile } from "../policies/post-edit-validation.ts";
+import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "../policies/post-edit-validation.ts";
+import { extractCommands, splitShellSegments } from "./shell.ts";
+import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, redirectMutationsIn } from "../policies/boundary.ts";
 import { audit, summarizeInput } from "./audit.ts";
 import { asRecord, showBlockToast, isSensitiveEnvKey } from "./utils.ts";
 import { loadedPluginVersion } from "./version.ts";
@@ -255,6 +257,31 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				const snapshots = editTargets(args, toolWorktree).map(snapshotFile);
 				if (snapshots.length) toolLifecycle.setPostEditSnapshots(event.sessionID, event.id, toolWorktree, snapshots);
 			}
+			if (SHELL_TOOL_NAMES.has(event.tool)) {
+				// An allowed shell redirect authors the target's bytes exactly
+				// like edit/write (LL-003), so pre-register each redirect
+				// target's pre-state and seed the session's freshness
+				// observation after the call succeeds. Observation only: shell
+				// writes never run the post-edit validators. (V1 parity.)
+				const shellWorkdir = typeof record?.workdir === "string" ? record.workdir : undefined;
+				const shellCwd = shellWorkdir ? resolve(toolWorktree, shellWorkdir) : toolWorktree;
+				const snapshots: FileSnapshot[] = [];
+				for (const command of extractCommands(args)) {
+					for (const segment of splitShellSegments(command)) {
+						for (const mutation of redirectMutationsIn(segment)) {
+							const target = mutation.target ?? "";
+							if (!target || target === "/dev/null") continue;
+							const expanded = expandShellTargetPath(target);
+							if (!expanded) continue;
+							const resolvedTarget = resolve(shellCwd, expanded);
+							if (resolvedTarget === OPENCODE_SCRATCH_DIR || resolvedTarget.startsWith(OPENCODE_SCRATCH_DIR + "/")) continue;
+							if (isPathOutsideWorkspace(resolvedTarget, toolWorktree)) continue;
+							snapshots.push(snapshotFile(resolvedTarget));
+						}
+					}
+				}
+				if (snapshots.length) toolLifecycle.setShellWriteSnapshots(event.sessionID, event.id, toolWorktree, snapshots);
+			}
 		});
 	});
 
@@ -279,6 +306,14 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			if (observation) recordSuccessfulRead(observation, event.sessionID);
 		}
 		if (event.status === "error") return;
+		const shellPending = toolLifecycle.takeShellWriteSnapshots(event.sessionID, event.id);
+		if (shellPending) {
+			// Seed the session's observation of the bytes its shell redirect
+			// authored (LL-003); observation-only, validators are not run for
+			// shell writes, and the digest gate keeps no-op calls from
+			// seeding. (V1 parity.)
+			for (const before of shellPending.snapshots) recordMutationObservation(before.path, event.sessionID, before.digest);
+		}
 		const pending = toolLifecycle.takePostEditSnapshots(event.sessionID, event.id);
 		if (!pending) return;
 		await runWithRuntimeState(pending.root, client, async () => {

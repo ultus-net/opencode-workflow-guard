@@ -173,7 +173,7 @@ export function teeTargetsIn(segment: string): string[] {
 	return targets;
 }
 
-function redirectMutationsIn(segment: string): ShellMutation[] {
+export function redirectMutationsIn(segment: string): ShellMutation[] {
 	const mutations: ShellMutation[] = [];
 	// Redirect detection runs on the quote-stripped residue: quoted data
 	// spans are command data and their ">" characters are not redirects,

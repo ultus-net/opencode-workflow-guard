@@ -1256,6 +1256,72 @@ try {
 	noopEditBlocked = String(error).includes("has not been read");
 }
 check("a no-op mutation does not seed an observation for a later edit", noopEditBlocked);
+// LL-003 extension: an allowed shell redirect authors the target's bytes
+// exactly like edit/write, so the follow-up edit/write of the file it wrote
+// needs no redundant read. Seeding stays byte-change-gated: a /dev/null
+// redirect seeds nothing and an identical-bytes rewrite seeds nothing.
+const shellSession = "s-stale-shell";
+todo(shellSession, item("write scratch file via shell redirect", "in_progress"));
+const shellAuthoredPath = join(staleDir, "shell-authored.ts");
+await staleBefore?.({ tool: "bash", sessionID: shellSession, callID: "shell-write" }, { args: { command: "echo x > shell-authored.ts" } });
+writeFileSync(shellAuthoredPath, "x\n");
+await staleAfter?.({ tool: "bash", sessionID: shellSession, callID: "shell-write", args: {} }, { title: "bash", output: "x", metadata: {} });
+let shellAuthoredWriteAllowed = true;
+try {
+	await staleBefore?.({ tool: "write", sessionID: shellSession, callID: "shell-write-followup" }, { args: { filePath: shellAuthoredPath, content: "next" } });
+} catch {
+	shellAuthoredWriteAllowed = false;
+}
+check("an allowed shell redirect seeds the observation so its authored file can be written without a read", shellAuthoredWriteAllowed);
+await staleAfter?.({ tool: "write", sessionID: shellSession, callID: "shell-write-followup", args: {} }, { title: "write", output: "written", metadata: {} });
+const shellUnrelatedSession = "s-stale-shell-unrelated";
+todo(shellUnrelatedSession, item("edit file untouched by shell", "in_progress"));
+const shellUnrelatedPath = join(staleDir, "shell-untouched.ts");
+writeFileSync(shellUnrelatedPath, "observed");
+await staleBefore?.({ tool: "bash", sessionID: shellUnrelatedSession, callID: "shell-devnull" }, { args: { command: "echo x > /dev/null" } });
+await staleAfter?.({ tool: "bash", sessionID: shellUnrelatedSession, callID: "shell-devnull", args: {} }, { title: "bash", output: "x", metadata: {} });
+let shellUnrelatedWriteBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: shellUnrelatedSession, callID: "shell-untouched-write" }, { args: { filePath: shellUnrelatedPath, content: "next" } });
+} catch (error) {
+	shellUnrelatedWriteBlocked = String(error).includes("has not been read");
+}
+check("a shell redirect to /dev/null seeds nothing, so an unobserved file stays blocked", shellUnrelatedWriteBlocked);
+const shellNoopSession = "s-stale-shell-noop";
+todo(shellNoopSession, item("no-op shell redirect", "in_progress"));
+const shellNoopPath = join(staleDir, "shell-noop.ts");
+writeFileSync(shellNoopPath, "x\n");
+await staleBefore?.({ tool: "bash", sessionID: shellNoopSession, callID: "shell-noop" }, { args: { command: "echo x > shell-noop.ts" } });
+writeFileSync(shellNoopPath, "x\n");
+await staleAfter?.({ tool: "bash", sessionID: shellNoopSession, callID: "shell-noop", args: {} }, { title: "bash", output: "x", metadata: {} });
+let shellNoopWriteBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: shellNoopSession, callID: "shell-noop-write" }, { args: { filePath: shellNoopPath, content: "changed" } });
+} catch (error) {
+	shellNoopWriteBlocked = String(error).includes("has not been read");
+}
+check("a no-op shell redirect (identical bytes) does not seed an observation", shellNoopWriteBlocked);
+// Path-spelling alias convergence: an observation seeded through one
+// absolute spelling of a file must authorize the mutation requested through
+// a symlink-aliased spelling of the same file (canonicalPath convergence).
+const aliasDir = mkdtempSync(join(tmpdir(), "wg-stale-alias-"));
+const aliasRealDir = join(aliasDir, "real");
+mkdirSync(aliasRealDir);
+symlinkSync(aliasRealDir, join(aliasDir, "alias"));
+const aliasRealPath = join(aliasRealDir, "aliased.ts");
+writeFileSync(aliasRealPath, "observed");
+todo("s-stale-alias", item("edit aliased file", "in_progress"));
+await staleBefore?.({ tool: "read", sessionID: "s-stale-alias", callID: "alias-read", worktree: aliasDir } as any, { args: { filePath: aliasRealPath } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale-alias", callID: "alias-read", args: { filePath: aliasRealPath } }, { title: "aliased.ts", output: "observed", metadata: {} });
+let aliasWriteAllowed = true;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale-alias", callID: "alias-write", worktree: aliasDir } as any, { args: { filePath: join(aliasDir, "alias", "aliased.ts"), content: "next" } });
+} catch {
+	aliasWriteAllowed = false;
+}
+check("a read observed through one path spelling authorizes the write through its symlink alias", aliasWriteAllowed);
+await staleAfter?.({ tool: "write", sessionID: "s-stale-alias", callID: "alias-write", args: {} }, { title: "write", output: "written", metadata: {} });
+rmSync(aliasDir, { recursive: true, force: true });
 const staleAlternateRoot = mkdtempSync(join(tmpdir(), "wg-stale-root-"));
 writeFileSync(join(staleAlternateRoot, "relative.ts"), "observed");
 todo("s-stale-root", item("edit relative file", "in_progress"));

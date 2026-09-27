@@ -78,7 +78,7 @@ import {
 	validateTodoLifecycle,
 } from "../policies/todo.ts";
 
-const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
+export const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
 const READ_ONLY_ROLES = new Set([
 	"reviewer",
