@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.15.3
+
+### Patch Changes
+
+- d786bd5: Accept workspace-symlink-aliased absolute paths in the workspace boundary: a target that lexically looks outside the workspace root (for example `/home/hunter/...` where `/home` is a symlink to `var/home` and the workspace root lives under `/var/home/hunter/...`) is no longer blocked as `workspace_escape` when its canonical resolution is inside the root. Symlinks inside the workspace that point outside stay blocked (including new files under them, via the nearest-existing-ancestor walk), and indeterminate canonicalization still fails closed to the lexical verdict.
+- 35871df: Fix branch-creation staleness classification when the command carries shell redirections: `git switch -c feat/x 2>&1` (or `2>/dev/null`, `> /dev/null`) no longer misclassifies the redirection token as an explicit start point and fails closed; redirections are ignored and the HEAD-based or explicit start-point check applies as intended.
+- 93bc6bf: Expand the provider-free e2e harness to verify guard policy decisions via `guard_why` simulate (protected-branch push, secret-file reads, workspace boundary escape, interactive TTY shell-safety), project configuration loading from `.opencode/workflow-guard.json`, and the full config-gated 18-tool registration surface through the real OpenCode runtime. Test-only change; no runtime behavior changes.
+- c8021fd: Dynamic shell syntax blocks now name the detected construct and a concrete remedy instead of a generic message: command/process substitution ($( ), backticks, <( ) / >( )) points to rewriting with literal values or separate literal commands and to simulating with guard_why, malformed quoting points to simple balanced quoting, and the IFS/ambiguous-whitespace variants name their construct. The fail-closed decision, block code, and all detectors are unchanged.
+- 0c21118: Seed stale-write freshness observations from allowed shell redirect writes: a file the session just created or rewrote via `cmd > file` can be edited without a redundant re-read, extending the existing edit/write seeding (LL-003) to shell writers. Redirects to `/dev/null`, the `/tmp/opencode` scratch directory, or outside the workspace seed nothing, identical-byte (no-op) redirects do not seed, and the not-read block message now also suggests coordinating when another session may own the file.
+
 ## 1.15.2
 
 ### Patch Changes
