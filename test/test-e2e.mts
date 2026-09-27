@@ -289,6 +289,16 @@ check("local plugin adapter and source copied successfully", existsSync(localAda
 spawnSync("git", ["init", "-b", "feat/install-verification"], { cwd: testDir });
 spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: testDir });
 spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
+// Project configuration loads from .opencode/workflow-guard.json[c]; sentinel
+// values prove the real runtime reads project config (guard_status echoes it)
+// instead of silently falling back to defaults. Both fields are behaviorally
+// inert for every harness probe: no PR is created, record_review is not
+// called, and verifyCommand is left unset so the all-done verification gate
+// still finds no configured command in this configless test project.
+writeFileSync(join(testDir, ".opencode", "workflow-guard.json"), JSON.stringify({
+	protectedBranches: ["e2e-config-probe-branch"],
+	requireReview: false,
+}, null, 2) + "\n");
 
 const runtimeEnv: NodeJS.ProcessEnv = {
 	...process.env,
@@ -385,6 +395,7 @@ check("headless guard_why simulates secret read policy via read tool", whyProbe(
 check("headless guard_why simulates secret read policy via shell", whyProbe("secrets-shell")?.policy === "secrets" && whyProbe("secrets-shell")?.code === "secret_read" && whyProbe("secrets-shell")?.status === "blocked");
 check("headless guard_why simulates workspace boundary policy via write tool", whyProbe("boundary-write")?.policy === "boundary" && whyProbe("boundary-write")?.code === "workspace_escape" && whyProbe("boundary-write")?.status === "blocked");
 check("headless guard_why simulates interactive tty shell-safety policy", whyProbe("shell-tty")?.policy === "shell-safety" && whyProbe("shell-tty")?.code === "interactive_tty" && whyProbe("shell-tty")?.status === "blocked");
+check("headless guard_status reports project config loaded from .opencode/workflow-guard.json", headlessAccountability?.status?.projectConfig?.protectedBranches?.[0] === "e2e-config-probe-branch" && headlessAccountability?.status?.projectConfig?.requireReview === false);
 if (isOpenCodeV2) {
 	// The V2 adapter runs the shipped setup(ctx) for real; verify the
 	// registered tool surface. Builtin description enrichment is best-effort:
