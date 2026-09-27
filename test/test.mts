@@ -731,6 +731,34 @@ check("tee -- flag separator outside workspace is blocked", blocked(await call("
 check("multi-target tee with an outside path is blocked", blocked(await call("bash", { command: "echo x | tee in.txt /tmp/wg-outside-tee" }, { sessionID: "s-active" })));
 check("tee --append within workspace is allowed with todos", !(await call("bash", { command: "echo x | tee --append src/a.ts" }, { sessionID: "s-active" })));
 
+// Regression (device audit, workspace_escape): symlink aliases of the
+// workspace itself. An absolute target that is lexically outside the root
+// but canonically inside (the alias resolves back into the workspace) must
+// be accepted, while symlinks inside the workspace pointing outside stay
+// blocked. Machine-independent: the alias is built inside the fixture
+// instead of relying on host aliasing such as /home -> /var/home.
+const aliasDir = mkdtempSync(join(tmpdir(), "wg-boundary-alias-"));
+mkdirSync(join(aliasDir, "real"), { recursive: true });
+symlinkSync(aliasDir, join(aliasDir, "alias"), "dir");
+writeFileSync(join(aliasDir, "real", "existing.txt"), "keep\n");
+symlinkSync("/etc", join(aliasDir, "real", "escape"));
+setWorkspaceRoot(join(aliasDir, "real"));
+check("write through symlink alias of the workspace is allowed (new file)", !(await call("write", { filePath: join(aliasDir, "alias", "real", "new-file.txt"), content: "x" }, { sessionID: "s-active" })));
+// The write gate also applies stale-write protection (existing files need a
+// prior session read), so seed the observation by reading through the alias.
+// Plugin setup latches the process root to its directory/worktree
+// (workflow-guard.ts setWorkspaceRoot on setup), so re-latch the alias
+// workspace root before the gated checks.
+const boundaryAliasPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);
+setWorkspaceRoot(join(aliasDir, "real"));
+await boundaryAliasPlugin["tool.execute.before"]?.({ tool: "read", sessionID: "s-active", callID: "alias-read" }, { args: { filePath: join(aliasDir, "alias", "real", "existing.txt") } } as any);
+await boundaryAliasPlugin["tool.execute.after"]?.({ tool: "read", sessionID: "s-active", callID: "alias-read", args: { filePath: join(aliasDir, "alias", "real", "existing.txt") } } as any, { title: "existing.txt", output: "keep", metadata: {} } as any);
+check("write through symlink alias of the workspace is allowed (existing file)", !(await call("write", { filePath: join(aliasDir, "alias", "real", "existing.txt"), content: "updated" }, { sessionID: "s-active" })));
+check("write through escaping symlink to an outside file stays blocked", blocked(await call("write", { filePath: join(aliasDir, "real", "escape", "passwd"), content: "x" }, { sessionID: "s-active" })));
+check("new file through an escaping symlink stays blocked", blocked(await call("write", { filePath: join(aliasDir, "real", "escape", "wg-escape-new.txt"), content: "x" }, { sessionID: "s-active" })));
+rmSync(aliasDir, { recursive: true, force: true });
+setWorkspaceRoot(root);
+
 console.log("- Compaction focus preservation & TUI toast -");
 const boundedCompaction = buildCompactionContext("## Operational Guard State\n- critical", ["## Active Tasks\n" + "a".repeat(10_000), "## Project Memory\nshould-not-fit"], 500);
 check("compaction packer enforces its total context budget", boundedCompaction.length === 500);
@@ -1228,6 +1256,72 @@ try {
 	noopEditBlocked = String(error).includes("has not been read");
 }
 check("a no-op mutation does not seed an observation for a later edit", noopEditBlocked);
+// LL-003 extension: an allowed shell redirect authors the target's bytes
+// exactly like edit/write, so the follow-up edit/write of the file it wrote
+// needs no redundant read. Seeding stays byte-change-gated: a /dev/null
+// redirect seeds nothing and an identical-bytes rewrite seeds nothing.
+const shellSession = "s-stale-shell";
+todo(shellSession, item("write scratch file via shell redirect", "in_progress"));
+const shellAuthoredPath = join(staleDir, "shell-authored.ts");
+await staleBefore?.({ tool: "bash", sessionID: shellSession, callID: "shell-write" }, { args: { command: "echo x > shell-authored.ts" } });
+writeFileSync(shellAuthoredPath, "x\n");
+await staleAfter?.({ tool: "bash", sessionID: shellSession, callID: "shell-write", args: {} }, { title: "bash", output: "x", metadata: {} });
+let shellAuthoredWriteAllowed = true;
+try {
+	await staleBefore?.({ tool: "write", sessionID: shellSession, callID: "shell-write-followup" }, { args: { filePath: shellAuthoredPath, content: "next" } });
+} catch {
+	shellAuthoredWriteAllowed = false;
+}
+check("an allowed shell redirect seeds the observation so its authored file can be written without a read", shellAuthoredWriteAllowed);
+await staleAfter?.({ tool: "write", sessionID: shellSession, callID: "shell-write-followup", args: {} }, { title: "write", output: "written", metadata: {} });
+const shellUnrelatedSession = "s-stale-shell-unrelated";
+todo(shellUnrelatedSession, item("edit file untouched by shell", "in_progress"));
+const shellUnrelatedPath = join(staleDir, "shell-untouched.ts");
+writeFileSync(shellUnrelatedPath, "observed");
+await staleBefore?.({ tool: "bash", sessionID: shellUnrelatedSession, callID: "shell-devnull" }, { args: { command: "echo x > /dev/null" } });
+await staleAfter?.({ tool: "bash", sessionID: shellUnrelatedSession, callID: "shell-devnull", args: {} }, { title: "bash", output: "x", metadata: {} });
+let shellUnrelatedWriteBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: shellUnrelatedSession, callID: "shell-untouched-write" }, { args: { filePath: shellUnrelatedPath, content: "next" } });
+} catch (error) {
+	shellUnrelatedWriteBlocked = String(error).includes("has not been read");
+}
+check("a shell redirect to /dev/null seeds nothing, so an unobserved file stays blocked", shellUnrelatedWriteBlocked);
+const shellNoopSession = "s-stale-shell-noop";
+todo(shellNoopSession, item("no-op shell redirect", "in_progress"));
+const shellNoopPath = join(staleDir, "shell-noop.ts");
+writeFileSync(shellNoopPath, "x\n");
+await staleBefore?.({ tool: "bash", sessionID: shellNoopSession, callID: "shell-noop" }, { args: { command: "echo x > shell-noop.ts" } });
+writeFileSync(shellNoopPath, "x\n");
+await staleAfter?.({ tool: "bash", sessionID: shellNoopSession, callID: "shell-noop", args: {} }, { title: "bash", output: "x", metadata: {} });
+let shellNoopWriteBlocked = false;
+try {
+	await staleBefore?.({ tool: "write", sessionID: shellNoopSession, callID: "shell-noop-write" }, { args: { filePath: shellNoopPath, content: "changed" } });
+} catch (error) {
+	shellNoopWriteBlocked = String(error).includes("has not been read");
+}
+check("a no-op shell redirect (identical bytes) does not seed an observation", shellNoopWriteBlocked);
+// Path-spelling alias convergence: an observation seeded through one
+// absolute spelling of a file must authorize the mutation requested through
+// a symlink-aliased spelling of the same file (canonicalPath convergence).
+const staleAliasDir = mkdtempSync(join(tmpdir(), "wg-stale-alias-"));
+const staleAliasRealDir = join(staleAliasDir, "real");
+mkdirSync(staleAliasRealDir);
+symlinkSync(staleAliasRealDir, join(staleAliasDir, "alias"));
+const aliasRealPath = join(staleAliasRealDir, "aliased.ts");
+writeFileSync(aliasRealPath, "observed");
+todo("s-stale-alias", item("edit aliased file", "in_progress"));
+await staleBefore?.({ tool: "read", sessionID: "s-stale-alias", callID: "alias-read", worktree: staleAliasDir } as any, { args: { filePath: aliasRealPath } });
+await staleAfter?.({ tool: "read", sessionID: "s-stale-alias", callID: "alias-read", args: { filePath: aliasRealPath } }, { title: "aliased.ts", output: "observed", metadata: {} });
+let aliasWriteAllowed = true;
+try {
+	await staleBefore?.({ tool: "write", sessionID: "s-stale-alias", callID: "alias-write", worktree: staleAliasDir } as any, { args: { filePath: join(staleAliasDir, "alias", "aliased.ts"), content: "next" } });
+} catch {
+	aliasWriteAllowed = false;
+}
+check("a read observed through one path spelling authorizes the write through its symlink alias", aliasWriteAllowed);
+await staleAfter?.({ tool: "write", sessionID: "s-stale-alias", callID: "alias-write", args: {} }, { title: "write", output: "written", metadata: {} });
+rmSync(staleAliasDir, { recursive: true, force: true });
 const staleAlternateRoot = mkdtempSync(join(tmpdir(), "wg-stale-root-"));
 writeFileSync(join(staleAlternateRoot, "relative.ts"), "observed");
 todo("s-stale-root", item("edit relative file", "in_progress"));
@@ -1737,6 +1831,10 @@ check("dynamic shell syntax detects IFS construction", dynamicShellSyntaxIn("git
 check("dynamic shell syntax detects ambiguous whitespace", dynamicShellSyntaxIn("git\rpush") !== undefined && dynamicShellSyntaxIn("git\u00a0push") !== undefined);
 check("dynamic shell syntax detects malformed quote boundaries", dynamicShellSyntaxIn("echo 'unterminated") !== undefined && dynamicShellSyntaxIn("echo trailing\\") !== undefined);
 check("dynamic shell syntax preserves quoted literals", dynamicShellSyntaxIn("printf '%s' '$(literal) `literal` <(literal) $IFS'") === undefined);
+const substitutionBlock = await guardToolDecision("bash", { command: "echo $(dangerous)" }, { sessionID: "s-dynamic-syntax" });
+check("substitution block names the construct and remedy", substitutionBlock.status === "blocked" && substitutionBlock.code === "dynamic_shell_syntax" && substitutionBlock.message.includes("process substitution") && substitutionBlock.message.includes("guard_why"));
+const quotingBlock = await guardToolDecision("bash", { command: "echo 'unterminated" }, { sessionID: "s-dynamic-syntax" });
+check("malformed quoting block names the construct and remedy", quotingBlock.status === "blocked" && quotingBlock.code === "dynamic_shell_syntax" && quotingBlock.message.includes("balanced quoting"));
 check(
 	"runVerify terminates timed-out verification commands safely",
 	!verifyTimeout.passed && verifyTimeout.output.includes("timed out"),
@@ -3154,6 +3252,27 @@ check("git checkout -b origin/main with a stale branch is allowed", !blocked(awa
 check("wrapper git switch -c origin/main keeps the fresh start point exemption", !blocked(await shell("env git switch -c wg-wrapper-fresh origin/main")));
 check("variable start point fails closed on a stale branch", blocked(await shell("git switch -c wg-start-var $WG_REF")));
 check("plain git branch is not treated as guarded branch creation", !blocked(await shell("git branch wg-plain-branch origin/main")));
+// Redirection tokens are never start points (audit regression: `git switch
+// -c feat/x 2>&1` classified the trailing `2>` left by `&`-segment splitting
+// as an explicit start point and failed closed).
+const redirStale = await shell("git switch -c wg-redir-stale 2>/dev/null");
+check(
+	"redirect to /dev/null is not a start point on a stale branch (still stale-blocked)",
+	blocked(redirStale) && (redirStale as string).includes("'feat/conflict-branch'") && !(redirStale as string).includes("'2>'"),
+);
+spawnSync("git", ["switch", "-c", "wg-redir-base", "origin/main"], { cwd: conflictRepo });
+check("attached stderr redirect is not a start point on a fresh branch", !blocked(await shell("git switch -c wg-redir-null 2>/dev/null")));
+check("separated stdout redirect is not a start point on a fresh branch", !blocked(await shell("git checkout -b wg-redir-out > /dev/null")));
+check("fd duplication 2>&1 left by &-segment splitting is not a start point", !blocked(await shell("git switch -c wg-redir-dup 2>&1")));
+check("separated fd stderr redirect is not a start point on a fresh branch", !blocked(await shell("git switch -c wg-redir-sep 2> /dev/null")));
+check("explicit start point before a redirect stays effective", !blocked(await shell("git switch -c wg-redir-after origin/main 2>&1")));
+spawnSync("git", ["switch", "feat/conflict-branch"], { cwd: conflictRepo });
+const staleShaRedirect = await shell(`git switch -c wg-stale-redir ${staleStartSha} >/dev/null`);
+check(
+	"explicit stale start point is still classified behind a redirect",
+	blocked(staleShaRedirect) && (staleShaRedirect as string).includes("start point") && (staleShaRedirect as string).includes(staleStartSha),
+);
+check("variable start point behind a redirect still fails closed", blocked(await shell("git switch -c wg-var-redir $WG_REF 2>/dev/null")));
 
 // Lockfile synchronization tests
 const lockRepo = mkdtempSync(join(tmpdir(), "wg-lock-repo-"));

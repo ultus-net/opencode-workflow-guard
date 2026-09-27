@@ -7,6 +7,9 @@ function invocationKey(sessionID: string, callID: string): string {
 
 export class ToolInvocationLifecycle {
 	private readonly postEditSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
+	// Shell-redirect pre-state snapshots: they seed freshness observations
+	// only and must never run the post-edit validators.
+	private readonly shellWriteSnapshots = new Map<string, { root: string; snapshots: FileSnapshot[] }>();
 	private readonly startedAt = new Map<string, number>();
 	private readonly readObservations = new Map<string, ReadObservation>();
 	private readonly recoveryRuns = new Map<string, number>();
@@ -44,6 +47,17 @@ export class ToolInvocationLifecycle {
 		return snapshots;
 	}
 
+	setShellWriteSnapshots(sessionID: string, callID: string, root: string, snapshots: FileSnapshot[]): void {
+		this.shellWriteSnapshots.set(invocationKey(sessionID, callID), { root, snapshots });
+	}
+
+	takeShellWriteSnapshots(sessionID: string, callID: string): { root: string; snapshots: FileSnapshot[] } | undefined {
+		const key = invocationKey(sessionID, callID);
+		const snapshots = this.shellWriteSnapshots.get(key);
+		this.shellWriteSnapshots.delete(key);
+		return snapshots;
+	}
+
 	setRecoveryRun(sessionID: string, run: number): void {
 		this.recoveryRuns.set(sessionID, run);
 	}
@@ -56,7 +70,7 @@ export class ToolInvocationLifecycle {
 
 	clearSession(sessionID: string): void {
 		const prefix = `${sessionID}\0`;
-		for (const map of [this.startedAt, this.readObservations, this.postEditSnapshots]) {
+		for (const map of [this.startedAt, this.readObservations, this.postEditSnapshots, this.shellWriteSnapshots]) {
 			for (const key of map.keys()) {
 				if (key.startsWith(prefix)) map.delete(key);
 			}

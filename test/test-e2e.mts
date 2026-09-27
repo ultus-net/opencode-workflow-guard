@@ -220,12 +220,24 @@ const runV2Probes = async (ctx: any) => {
 \tconst guardWhy = byId("guard_why");
 \tconst pick = (r: any) => (typeof r?.content === "string" ? r.content : JSON.stringify(r));
 \tconst statusRes = guardStatus ? await guardStatus.execute({}, headlessToolContext) : undefined;
-\tconst whyRes = guardWhy ? await guardWhy.execute({ tool: "bash", input: { command: "git push origin main" } }, headlessToolContext) : undefined;
+\tconst whyProbes: Record<string, { tool: string; input: Record<string, unknown> }> = {
+\t\tgit: { tool: "bash", input: { command: "git push origin main" } },
+\t\t"secrets-read": { tool: "read", input: { filePath: ".env" } },
+\t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
+\t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
+\t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t};
+\tconst whyResults: Record<string, any> = {};
+\tfor (const [name, probe] of Object.entries(whyProbes)) {
+\t\tconst res = guardWhy ? await guardWhy.execute(probe, headlessToolContext) : undefined;
+\t\twhyResults[name] = res === undefined ? null : JSON.parse(pick(res));
+\t}
 \twriteFileSync(${JSON.stringify(accountabilityMarker)}, JSON.stringify({
 \t\ttools: tools.map((t: any) => t.id),
 \t\ttodowriteEnriched: Boolean(todowrite?.description?.includes("Workflow Guard lifecycle")),
 \t\tstatus: JSON.parse(pick(statusRes)),
-\t\twhy: JSON.parse(pick(whyRes)),
+\t\twhy: whyResults.git,
+\t\twhyProbes: whyResults,
 \t}) + "\\n");
 \twriteFileSync(${JSON.stringify(initializedMarker)}, "initialized\\n");
 };
@@ -235,8 +247,19 @@ const runV1Probes = async (ctx: any) => {
 \tconst directory = ctx?.location?.directory ?? ctx?.directory ?? process.cwd();
 \tconst toolCtx = { sessionID: "headless-e2e", directory, worktree: directory };
 \tconst status = await hooks.tool?.guard_status?.execute({}, toolCtx);
-\tconst why = await hooks.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, toolCtx);
-\twriteFileSync(${JSON.stringify(accountabilityMarker)}, JSON.stringify({ status: JSON.parse(String(status)), why: JSON.parse(String(why)) }) + "\\n");
+\tconst whyProbes: Record<string, { tool: string; input: Record<string, unknown> }> = {
+\t\tgit: { tool: "bash", input: { command: "git push origin main" } },
+\t\t"secrets-read": { tool: "read", input: { filePath: ".env" } },
+\t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
+\t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
+\t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t};
+\tconst whyResults: Record<string, any> = {};
+\tfor (const [name, probe] of Object.entries(whyProbes)) {
+\t\tconst res = await hooks.tool?.guard_why?.execute(probe, toolCtx);
+\t\twhyResults[name] = res === undefined ? null : JSON.parse(String(res));
+\t}
+\twriteFileSync(${JSON.stringify(accountabilityMarker)}, JSON.stringify({ status: JSON.parse(String(status)), why: whyResults.git, whyProbes: whyResults }) + "\\n");
 \twriteFileSync(${JSON.stringify(initializedMarker)}, "initialized\\n");
 \treturn hooks;
 };
@@ -266,6 +289,18 @@ check("local plugin adapter and source copied successfully", existsSync(localAda
 spawnSync("git", ["init", "-b", "feat/install-verification"], { cwd: testDir });
 spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: testDir });
 spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: testDir });
+// Project configuration loads from .opencode/workflow-guard.json[c]; sentinel
+// values prove the real runtime reads project config (guard_status echoes it)
+// instead of silently falling back to defaults. Both fields are behaviorally
+// inert for every harness probe: no PR is created, record_review is not
+// called, and verifyCommand is left unset so the all-done verification gate
+// still finds no configured command in this configless test project.
+writeFileSync(join(testDir, ".opencode", "workflow-guard.json"), JSON.stringify({
+	protectedBranches: ["e2e-config-probe-branch"],
+	requireReview: false,
+	learning: true,
+	recoveryCheckpoints: true,
+}, null, 2) + "\n");
 
 const runtimeEnv: NodeJS.ProcessEnv = {
 	...process.env,
@@ -276,6 +311,10 @@ const runtimeEnv: NodeJS.ProcessEnv = {
 delete runtimeEnv.OPENCODE_PID;
 delete runtimeEnv.OPENCODE_PURE;
 delete runtimeEnv.OPENCODE;
+// The learning config key must stay load-bearing: an inherited
+// WORKFLOW_GUARD_LEARNING=1 would register the learning tools without the
+// sentinel config file being read (review P2, tool-surface iteration).
+delete runtimeEnv.WORKFLOW_GUARD_LEARNING;
 if (isOpenCodeV2) {
 	// V2 runs a shared managed service on a fixed default port. Each run uses
 	// its own isolated XDG dirs, so pick a run-unique port to keep concurrent
@@ -357,12 +396,28 @@ try {
 	headlessAccountability = JSON.parse(readFileSync(accountabilityMarker, "utf8"));
 } catch {}
 check("headless OpenCode runtime exposes structured guard status and why without TUI", headlessAccountability?.status?.workspaceRoot === testDir && headlessAccountability?.why?.policy === "git" && headlessAccountability?.why?.code === "protected_branch_push");
+const whyProbe = (name: string): any => headlessAccountability?.whyProbes?.[name];
+check("headless guard_why simulates secret read policy via read tool", whyProbe("secrets-read")?.policy === "secrets" && whyProbe("secrets-read")?.code === "secret_read" && whyProbe("secrets-read")?.status === "blocked");
+check("headless guard_why simulates secret read policy via shell", whyProbe("secrets-shell")?.policy === "secrets" && whyProbe("secrets-shell")?.code === "secret_read" && whyProbe("secrets-shell")?.status === "blocked");
+check("headless guard_why simulates workspace boundary policy via write tool", whyProbe("boundary-write")?.policy === "boundary" && whyProbe("boundary-write")?.code === "workspace_escape" && whyProbe("boundary-write")?.status === "blocked");
+check("headless guard_why simulates interactive tty shell-safety policy", whyProbe("shell-tty")?.policy === "shell-safety" && whyProbe("shell-tty")?.code === "interactive_tty" && whyProbe("shell-tty")?.status === "blocked");
+check("headless guard_status reports project config loaded from .opencode/workflow-guard.json", headlessAccountability?.status?.projectConfig?.protectedBranches?.[0] === "e2e-config-probe-branch" && headlessAccountability?.status?.projectConfig?.requireReview === false);
 if (isOpenCodeV2) {
 	// The V2 adapter runs the shipped setup(ctx) for real; verify the
 	// registered tool surface. Builtin description enrichment is best-effort:
 	// builtins are not visible to ctx.tool.list() during plugin setup, so
 	// todowriteEnriched is reported but not asserted.
 	check("V2 setup registers custom guard tools", (headlessAccountability?.tools ?? []).includes("guard_status") && (headlessAccountability?.tools ?? []).includes("guard_why"));
+	const expectedGuardTools = [
+		"guard_status", "guard_why", "guard_audit", "guard_next_tasks", "record_review",
+		"guard_review_rubric", "guard_review_followups", "guard_review_followup_resolve",
+		"guard_worktree_create", "guard_worktree_cleanup",
+		"project_memory_record", "project_memory_search", "project_memory_export", "project_memory_import",
+		"learning_checkpoint", "learning_profile", "learning_record", "guard_recovery_restore",
+	];
+	const missingGuardTools = expectedGuardTools.filter((id) => !(headlessAccountability?.tools ?? []).includes(id));
+	check("V2 setup registers the full config-gated guard tool surface", missingGuardTools.length === 0);
+	if (missingGuardTools.length > 0) console.log("  missing guard tools: " + missingGuardTools.join(", "));
 	console.log(`  note: builtin todowrite description enriched under V2: ${headlessAccountability?.todowriteEnriched === true ? "yes" : "unknown at setup time"}`);
 }
 

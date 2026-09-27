@@ -15,12 +15,14 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { join } from "node:path";
 import { loadedPluginVersion } from "./lib/version.ts";
-import { editTargets, runPostEditValidators, snapshotFile } from "./policies/post-edit-validation.ts";
+import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
+import { extractCommands, splitShellSegments } from "./lib/shell.ts";
+import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, redirectMutationsIn } from "./policies/boundary.ts";
 import { beginReadObservation, clearReadFingerprints, recordMutationObservation, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
 import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
-import { guardToolCallImpl, isReadOnlyRole } from "./lib/guard-dispatcher.ts";
+import { guardToolCallImpl, isReadOnlyRole, SHELL_TOOL_NAMES } from "./lib/guard-dispatcher.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./lib/custom-tools.ts";
 import type { PolicyDecision, TodoSdkClient } from "./lib/types.ts";
 export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
@@ -503,6 +505,32 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					const snapshots = editTargets(args, toolWorktree).map(snapshotFile);
 					if (snapshots.length) toolLifecycle.setPostEditSnapshots(input.sessionID, input.callID, toolWorktree, snapshots);
 				}
+				if (SHELL_TOOL_NAMES.has(input.tool)) {
+					// An allowed shell redirect authors the target's bytes exactly
+					// like edit/write (LL-003), so pre-register each redirect
+					// target's pre-state and seed the session's freshness
+					// observation after the call succeeds. Observation only: shell
+					// writes never run the post-edit validators.
+					const record = asRecord(args);
+					const shellWorkdir = typeof record?.workdir === "string" ? record.workdir : undefined;
+					const shellCwd = shellWorkdir ? resolve(toolWorktree, shellWorkdir) : toolWorktree;
+					const snapshots: FileSnapshot[] = [];
+					for (const command of extractCommands(args)) {
+						for (const segment of splitShellSegments(command)) {
+							for (const mutation of redirectMutationsIn(segment)) {
+								const target = mutation.target ?? "";
+								if (!target || target === "/dev/null") continue;
+								const expanded = expandShellTargetPath(target);
+								if (!expanded) continue;
+								const resolvedTarget = resolve(shellCwd, expanded);
+								if (resolvedTarget === OPENCODE_SCRATCH_DIR || resolvedTarget.startsWith(OPENCODE_SCRATCH_DIR + "/")) continue;
+								if (isPathOutsideWorkspace(resolvedTarget, toolWorktree)) continue;
+								snapshots.push(snapshotFile(resolvedTarget));
+							}
+						}
+					}
+					if (snapshots.length) toolLifecycle.setShellWriteSnapshots(input.sessionID, input.callID, toolWorktree, snapshots);
+				}
 			});
 		},
 
@@ -525,6 +553,14 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 			if (input.tool === "read") {
 				const observation = toolLifecycle.takeReadObservation(input.sessionID, input.callID);
 				if (observation) recordSuccessfulRead(observation, input.sessionID);
+			}
+			const shellPending = toolLifecycle.takeShellWriteSnapshots(input.sessionID, input.callID);
+			if (shellPending) {
+				// An allowed shell redirect authored these bytes (LL-003): seed
+				// the session's observation so a follow-up edit needs no
+				// redundant re-read. The digest gate keeps no-op/failed calls
+				// from seeding; validators are intentionally not run here.
+				for (const before of shellPending.snapshots) recordMutationObservation(before.path, input.sessionID, before.digest);
 			}
 			const pending = toolLifecycle.takePostEditSnapshots(input.sessionID, input.callID);
 			if (!pending) return;

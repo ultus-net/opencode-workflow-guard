@@ -85,9 +85,15 @@ export function isPathOutsideWorkspace(targetPath: string, root: string): boolea
 	if (expanded === null) return true;
 	const resolved = resolve(root, expanded);
 	const normalizedRoot = root.endsWith("/") ? root : root + "/";
-	if (resolved !== root && !resolved.startsWith(normalizedRoot)) {
-		return true;
-	}
+	// A path is outside only when BOTH the lexical resolution and the
+	// canonical resolution are outside. The lexical verdict is therefore
+	// held instead of returned early: symlink aliases of the workspace
+	// itself (e.g. /home -> /var/home) resolve lexically outside but
+	// canonically inside, and must be accepted, while the canonical checks
+	// below keep blocking symlinks inside the workspace that point outside.
+	// When canonicalization is indeterminate (no existing ancestor), the
+	// lexical verdict stands (fail-closed).
+	const lexicallyOutside = resolved !== root && !resolved.startsWith(normalizedRoot);
 	// The boundary is resolved against the workspace THIS call declares (the
 	// `root` argument), never against a process-global latched root: concurrent
 	// loops share one guard process, and a latched root must not redefine
@@ -97,12 +103,14 @@ export function isPathOutsideWorkspace(targetPath: string, root: string): boolea
 	try {
 		realRootVal = realpathSync(root);
 	} catch {}
+	let canonicallyInside = false;
 	try {
 		const real = realpathSync(resolved);
 		const realRoot = realRootVal.endsWith("/") ? realRootVal : realRootVal + "/";
 		if (real !== realRootVal && !real.startsWith(realRoot)) {
 			return true;
 		}
+		canonicallyInside = true;
 	} catch {
 		let curr = resolved;
 		while (curr && curr !== "/" && curr !== ".") {
@@ -115,11 +123,15 @@ export function isPathOutsideWorkspace(targetPath: string, root: string): boolea
 				if (realParent !== realRootVal && !realParent.startsWith(realRoot)) {
 					return true;
 				}
+				canonicallyInside = true;
 				break;
 			} catch {}
 		}
 	}
-	return false;
+	// Relocated lexical verdict: reached only when canonicalization did not
+	// find the path outside, so a lexically-outside path that canonicalized
+	// inside (a symlink alias of the workspace) is no longer blocked here.
+	return lexicallyOutside && !canonicallyInside;
 }
 
 export function extractPatchPaths(patchText: string): string[] {
@@ -161,7 +173,7 @@ export function teeTargetsIn(segment: string): string[] {
 	return targets;
 }
 
-function redirectMutationsIn(segment: string): ShellMutation[] {
+export function redirectMutationsIn(segment: string): ShellMutation[] {
 	const mutations: ShellMutation[] = [];
 	// Redirect detection runs on the quote-stripped residue: quoted data
 	// spans are command data and their ">" characters are not redirects,
