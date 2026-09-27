@@ -220,12 +220,24 @@ const runV2Probes = async (ctx: any) => {
 \tconst guardWhy = byId("guard_why");
 \tconst pick = (r: any) => (typeof r?.content === "string" ? r.content : JSON.stringify(r));
 \tconst statusRes = guardStatus ? await guardStatus.execute({}, headlessToolContext) : undefined;
-\tconst whyRes = guardWhy ? await guardWhy.execute({ tool: "bash", input: { command: "git push origin main" } }, headlessToolContext) : undefined;
+\tconst whyProbes: Record<string, { tool: string; input: Record<string, unknown> }> = {
+\t\tgit: { tool: "bash", input: { command: "git push origin main" } },
+\t\t"secrets-read": { tool: "read", input: { filePath: ".env" } },
+\t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
+\t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
+\t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t};
+\tconst whyResults: Record<string, any> = {};
+\tfor (const [name, probe] of Object.entries(whyProbes)) {
+\t\tconst res = guardWhy ? await guardWhy.execute(probe, headlessToolContext) : undefined;
+\t\twhyResults[name] = res === undefined ? null : JSON.parse(pick(res));
+\t}
 \twriteFileSync(${JSON.stringify(accountabilityMarker)}, JSON.stringify({
 \t\ttools: tools.map((t: any) => t.id),
 \t\ttodowriteEnriched: Boolean(todowrite?.description?.includes("Workflow Guard lifecycle")),
 \t\tstatus: JSON.parse(pick(statusRes)),
-\t\twhy: JSON.parse(pick(whyRes)),
+\t\twhy: whyResults.git,
+\t\twhyProbes: whyResults,
 \t}) + "\\n");
 \twriteFileSync(${JSON.stringify(initializedMarker)}, "initialized\\n");
 };
@@ -235,8 +247,19 @@ const runV1Probes = async (ctx: any) => {
 \tconst directory = ctx?.location?.directory ?? ctx?.directory ?? process.cwd();
 \tconst toolCtx = { sessionID: "headless-e2e", directory, worktree: directory };
 \tconst status = await hooks.tool?.guard_status?.execute({}, toolCtx);
-\tconst why = await hooks.tool?.guard_why?.execute({ tool: "bash", input: { command: "git push origin main" } }, toolCtx);
-\twriteFileSync(${JSON.stringify(accountabilityMarker)}, JSON.stringify({ status: JSON.parse(String(status)), why: JSON.parse(String(why)) }) + "\\n");
+\tconst whyProbes: Record<string, { tool: string; input: Record<string, unknown> }> = {
+\t\tgit: { tool: "bash", input: { command: "git push origin main" } },
+\t\t"secrets-read": { tool: "read", input: { filePath: ".env" } },
+\t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
+\t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
+\t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t};
+\tconst whyResults: Record<string, any> = {};
+\tfor (const [name, probe] of Object.entries(whyProbes)) {
+\t\tconst res = await hooks.tool?.guard_why?.execute(probe, toolCtx);
+\t\twhyResults[name] = res === undefined ? null : JSON.parse(String(res));
+\t}
+\twriteFileSync(${JSON.stringify(accountabilityMarker)}, JSON.stringify({ status: JSON.parse(String(status)), why: whyResults.git, whyProbes: whyResults }) + "\\n");
 \twriteFileSync(${JSON.stringify(initializedMarker)}, "initialized\\n");
 \treturn hooks;
 };
@@ -357,6 +380,11 @@ try {
 	headlessAccountability = JSON.parse(readFileSync(accountabilityMarker, "utf8"));
 } catch {}
 check("headless OpenCode runtime exposes structured guard status and why without TUI", headlessAccountability?.status?.workspaceRoot === testDir && headlessAccountability?.why?.policy === "git" && headlessAccountability?.why?.code === "protected_branch_push");
+const whyProbe = (name: string): any => headlessAccountability?.whyProbes?.[name];
+check("headless guard_why simulates secret read policy via read tool", whyProbe("secrets-read")?.policy === "secrets" && whyProbe("secrets-read")?.code === "secret_read" && whyProbe("secrets-read")?.status === "blocked");
+check("headless guard_why simulates secret read policy via shell", whyProbe("secrets-shell")?.policy === "secrets" && whyProbe("secrets-shell")?.code === "secret_read" && whyProbe("secrets-shell")?.status === "blocked");
+check("headless guard_why simulates workspace boundary policy via write tool", whyProbe("boundary-write")?.policy === "boundary" && whyProbe("boundary-write")?.code === "workspace_escape" && whyProbe("boundary-write")?.status === "blocked");
+check("headless guard_why simulates interactive tty shell-safety policy", whyProbe("shell-tty")?.policy === "shell-safety" && whyProbe("shell-tty")?.code === "interactive_tty" && whyProbe("shell-tty")?.status === "blocked");
 if (isOpenCodeV2) {
 	// The V2 adapter runs the shipped setup(ctx) for real; verify the
 	// registered tool surface. Builtin description enrichment is best-effort:
