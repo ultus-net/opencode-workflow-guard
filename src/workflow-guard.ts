@@ -84,6 +84,9 @@ import {
 	sessionReviews,
 	setSessionWorkspace,
 	getSessionWorkspace,
+	getSessionBoundWorkspace,
+	registerSessionWorkspaceFromToolCall,
+	resolveSessionBoundWorkspace,
 	resolveEffectiveWorkspace,
 } from "./lib/state.ts";
 import { findGitRoot, isSameGitRepo, loadProjectConfig, reloadProjectConfig, stripJsonComments } from "./lib/project-config.ts";
@@ -116,6 +119,9 @@ export {
 	resetReviewState,
 	setSessionWorkspace,
 	getSessionWorkspace,
+	getSessionBoundWorkspace,
+	registerSessionWorkspaceFromToolCall,
+	resolveSessionBoundWorkspace,
 	resolveEffectiveWorkspace,
 	findGitRoot,
 	isSameGitRepo,
@@ -448,12 +454,16 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 		tool: createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client: ctx.client }),
 
 		"tool.execute.before": async (input, output) => {
-			const toolWorktree =
+			const hostWorktree =
 				(input as { worktree?: string })?.worktree ||
 				(input as { directory?: string })?.directory ||
 				(output as { worktree?: string })?.worktree ||
-				(output as { directory?: string })?.directory ||
-				effectiveRoot;
+				(output as { directory?: string })?.directory;
+			// Session-bound workspace before the plugin-instance fallback:
+			// concurrent loops share this process, and a fallback derived from
+			// the last-active instance must not re-anchor another session's
+			// policy context.
+			const toolWorktree = hostWorktree || getSessionBoundWorkspace(input.sessionID) || effectiveRoot;
 			const toolAgent =
 				(input as { agent?: string })?.agent ||
 				(output as { agent?: string })?.agent;
@@ -480,11 +490,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					const record = asRecord(args);
 					const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 					const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-					const candidatePath = workdir ?? filePath ?? toolWorktree;
-					if (candidatePath) {
-						const gitRoot = findGitRoot(candidatePath);
-						if (gitRoot) setSessionWorkspace(input.sessionID, gitRoot);
-					}
+					registerSessionWorkspaceFromToolCall(input.sessionID, { workdir, filePath, hostWorktree, toolWorktree });
 				}
 				if (input.tool === "read") {
 					const target = editTargets(args, toolWorktree)[0];

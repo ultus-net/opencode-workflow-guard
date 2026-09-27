@@ -193,16 +193,114 @@ export function prBodyHasLiteralLineBreakEscapes(command: string): boolean {
 	return false;
 }
 
+/**
+ * Top-level package.json sections whose change requires a matching lockfile
+ * update: the dependency maps (including peerDependenciesMeta) plus every
+ * other section a supported package manager records in its lockfile
+ * (engines/packageManager, overrides/resolutions, the pnpm section with
+ * pnpm.overrides and pnpm.patchedDependencies, the workspace graph, and the
+ * project name/version stored in the lockfile root). A scripts-only or
+ * metadata-only manifest edit regenerates the lockfile byte-identical —
+ * demanding a lockfile change for it is unsatisfiable and must not block PR
+ * creation.
+ */
+const LOCKFILE_RELEVANT_MANIFEST_KEYS = new Set([
+	"name",
+	"version",
+	"dependencies",
+	"devDependencies",
+	"optionalDependencies",
+	"peerDependencies",
+	"peerDependenciesMeta",
+	"engines",
+	"packageManager",
+	"overrides",
+	"resolutions",
+	"workspaces",
+	// pnpm-specific top-level section: pnpm.overrides and
+	// pnpm.patchedDependencies are recorded in pnpm-lock.yaml.
+	"pnpm",
+]);
+
+/** Order-insensitive JSON comparison: dependency maps are semantically
+ * unordered, so reordering keys alone is not a lockfile-relevant change. */
+function canonicalJsonValue(value: unknown): string {
+	if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "undefined";
+	if (Array.isArray(value)) return `[${value.map(canonicalJsonValue).join(",")}]`;
+	const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJsonValue(item)}`).join(",")}}`;
+}
+
+function manifestTouchesLockfileRelevantKeys(oldSource: string | undefined, newSource: string | undefined): boolean {
+	try {
+		const parse = (source: string | undefined): Record<string, unknown> | undefined => {
+			if (source === undefined) return undefined;
+			const parsed = JSON.parse(source) as unknown;
+			if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a manifest object");
+			return parsed as Record<string, unknown>;
+		};
+		const oldManifest = parse(oldSource);
+		const newManifest = parse(newSource);
+		const keys = new Set([...Object.keys(oldManifest ?? {}), ...Object.keys(newManifest ?? {})]);
+		for (const key of keys) {
+			if (!LOCKFILE_RELEVANT_MANIFEST_KEYS.has(key)) continue;
+			if (canonicalJsonValue(oldManifest?.[key]) !== canonicalJsonValue(newManifest?.[key])) return true;
+		}
+		return false;
+	} catch {
+		return true; // unreadable manifest: fail closed and keep demanding the lockfile
+	}
+}
+
+function manifestSourceAt(root: string, revision: string, manifestPath: string): string | undefined {
+	const res = spawnSync("git", ["show", `${revision}:${manifestPath}`], { cwd: root, encoding: "utf8", timeout: 10_000 });
+	if (res.status !== 0) return undefined;
+	return res.stdout;
+}
+
+function workingTreeManifestSource(root: string, manifestPath: string): string | undefined {
+	try {
+		return readFileSync(resolve(root, manifestPath), "utf8");
+	} catch {
+		return undefined; // deleted from the working tree
+	}
+}
+
+/**
+ * Whether a manifest change demands a lockfile update. package.json is
+ * compared section-by-section (scripts-only edits pass); Cargo.toml and
+ * go.mod have no dependency-section parser here, so any change to them
+ * conservatively demands the lockfile (unchanged behavior).
+ */
+function manifestChangeRequiresLockfile(root: string, mergeBaseCommit: string | undefined, manifestPath: string): boolean {
+	if (!/(?:^|\/)package\.json$/.test(manifestPath)) return true;
+	let oldSource: string | undefined;
+	if (mergeBaseCommit) {
+		// Absent at the merge base means the manifest was introduced on this
+		// branch (or is untracked): the pre-branch state had no manifest, so
+		// every lockfile-relevant key it has counts as new.
+		oldSource = manifestSourceAt(root, mergeBaseCommit, manifestPath);
+	} else {
+		oldSource = manifestSourceAt(root, "HEAD", manifestPath);
+	}
+	const newSource = workingTreeManifestSource(root, manifestPath);
+	if (oldSource === undefined && newSource === undefined) return true;
+	return manifestTouchesLockfileRelevantKeys(oldSource, newSource);
+}
+
 export function checkLockfileSync(root: string): { isOutOfSync: boolean; manifest?: string; lockfile?: string; reason?: string } {
 	try {
 		let modifiedFiles: string[] = [];
+		let mergeBaseCommit: string | undefined;
 		const baseCandidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
 		for (const base of baseCandidates) {
 			const mergeBase = spawnSync("git", ["merge-base", "HEAD", base], { cwd: root, encoding: "utf8", timeout: 10_000 });
 			if (mergeBase.status !== 0 || !mergeBase.stdout.trim()) continue;
-			const diff = spawnSync("git", ["diff", "--name-only", `${mergeBase.stdout.trim()}...HEAD`], { cwd: root, encoding: "utf8", timeout: 10_000 });
+			const baseCommit = mergeBase.stdout.trim();
+			const diff = spawnSync("git", ["diff", "--name-only", `${baseCommit}...HEAD`], { cwd: root, encoding: "utf8", timeout: 10_000 });
 			if (diff.status === 0 && diff.stdout.trim()) {
 				modifiedFiles = diff.stdout.split("\n").map((f) => f.trim()).filter(Boolean);
+				mergeBaseCommit = baseCommit;
 				break;
 			}
 		}
@@ -236,16 +334,19 @@ export function checkLockfileSync(root: string): { isOutOfSync: boolean; manifes
 		];
 
 		for (const item of manifestToLockfiles) {
-			const hasManifest = modifiedFiles.some((f) => item.manifest.test(f));
-			if (hasManifest) {
-				const hasLockfile = modifiedFiles.some((f) => item.lockfiles.test(f));
-				if (!hasLockfile) {
-					return {
-						isOutOfSync: true,
-						manifest: item.name,
-						reason: `Package manifest '${item.name}' was modified without updating its corresponding lockfile. Run the package manager install/lock command before opening a PR.`,
-					};
-				}
+			const manifestPaths = modifiedFiles.filter((f) => item.manifest.test(f));
+			if (manifestPaths.length === 0) continue;
+			const hasLockfile = modifiedFiles.some((f) => item.lockfiles.test(f));
+			if (hasLockfile) continue;
+			// Only a lockfile-relevant manifest change demands the lockfile: a
+			// scripts-only edit regenerates it byte-identical, so demanding one
+			// is unsatisfiable.
+			if (manifestPaths.some((manifestPath) => manifestChangeRequiresLockfile(root, mergeBaseCommit, manifestPath))) {
+				return {
+					isOutOfSync: true,
+					manifest: item.name,
+					reason: `Package manifest '${item.name}' was modified without updating its corresponding lockfile. Run the package manager install/lock command before opening a PR.`,
+				};
 			}
 		}
 	} catch {}

@@ -45,6 +45,8 @@ import {
 	persistReviewCache,
 	setSessionWorkspace,
 	getSessionWorkspace,
+	getSessionBoundWorkspace,
+	registerSessionWorkspaceFromToolCall,
 	resolveEffectiveWorkspace,
 	getLastReviewResultForWorkspace,
 	isSameGitRepo,
@@ -3168,6 +3170,219 @@ check("checkLockfileSync flags modified package.json missing lockfile", checkLoc
 writeFileSync(join(lockRepo, "package-lock.json"), "{\"name\":\"demo\",\"version\":\"1.1.0\",\"lockfileVersion\":3}\n");
 check("checkLockfileSync passes when lockfile is updated", !checkLockfileSync(lockRepo).isOutOfSync);
 rmSync(lockRepo, { recursive: true, force: true });
+
+// Lockfile synchronization tracks lockfile-relevant manifest sections, not
+// the mere presence of package.json in the branch diff. A scripts-only edit
+// (the documented curation act of adding a suite to a test script) regenerates
+// package-lock.json byte-identical, so demanding a lockfile change for it is
+// unsatisfiable; dependency/engines/packageManager changes still demand one.
+const scriptLockRepo = mkdtempSync(join(tmpdir(), "wg-lock-scripts-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: scriptLockRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: scriptLockRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: scriptLockRepo });
+const scriptManifestBase = { name: "demo", version: "1.0.0", scripts: { test: "node test.mjs" } };
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify(scriptManifestBase, null, 2) + "\n");
+writeFileSync(join(scriptLockRepo, "package-lock.json"), JSON.stringify({ name: "demo", version: "1.0.0", lockfileVersion: 3 }, null, 2) + "\n");
+// A nested manifest already present at the merge base, so its scripts-only
+// edit on the branch is a true edit (not a new manifest).
+mkdirSync(join(scriptLockRepo, "packages", "app"), { recursive: true });
+const nestedManifestBase = { name: "app", version: "0.0.0", scripts: { build: "node build.mjs" } };
+writeFileSync(join(scriptLockRepo, "packages", "app", "package.json"), JSON.stringify(nestedManifestBase, null, 2) + "\n");
+spawnSync("git", ["add", "-A"], { cwd: scriptLockRepo });
+spawnSync("git", ["commit", "-qm", "init"], { cwd: scriptLockRepo });
+spawnSync("git", ["switch", "-c", "feat/scripts-only"], { cwd: scriptLockRepo });
+const scriptManifestEdited = JSON.parse(JSON.stringify(scriptManifestBase)) as typeof scriptManifestBase;
+scriptManifestEdited.scripts.test = "node test.mjs && node test-ci.mjs";
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify(scriptManifestEdited, null, 2) + "\n");
+check("checkLockfileSync passes an uncommitted scripts-only manifest edit", !checkLockfileSync(scriptLockRepo).isOutOfSync);
+spawnSync("git", ["commit", "-qam", "curate test suite"], { cwd: scriptLockRepo });
+check("checkLockfileSync passes a committed scripts-only manifest edit", !checkLockfileSync(scriptLockRepo).isOutOfSync);
+// The observed false positive: a scripts-only edit alongside a lockfile that
+// npm rewrote byte-identical (present in the diff set, yet unchanged in
+// content — the old check demanded exactly this unsatisfiable combination).
+writeFileSync(join(scriptLockRepo, "package-lock.json"), readFileSync(join(scriptLockRepo, "package-lock.json"), "utf8"));
+check("checkLockfileSync passes a byte-identical lockfile rewrite next to a scripts-only edit", !checkLockfileSync(scriptLockRepo).isOutOfSync);
+// A nested manifest's scripts-only edit passes too.
+const nestedManifestEdited = JSON.parse(JSON.stringify(nestedManifestBase)) as typeof nestedManifestBase;
+nestedManifestEdited.scripts.build = "node build.mjs && node verify.mjs";
+writeFileSync(join(scriptLockRepo, "packages", "app", "package.json"), JSON.stringify(nestedManifestEdited, null, 2) + "\n");
+check("checkLockfileSync passes a scripts-only nested manifest edit", !checkLockfileSync(scriptLockRepo).isOutOfSync);
+// Contract pins: sections the lockfile records still demand the lockfile.
+const scriptsAfterNesting = scriptManifestEdited.scripts;
+const relevantManifest = { name: "demo", version: "1.0.0", scripts: scriptsAfterNesting };
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify({ ...relevantManifest, dependencies: { "left-pad": "^1.3.0" } }, null, 2) + "\n");
+check("checkLockfileSync flags a dependencies change without a lockfile update", checkLockfileSync(scriptLockRepo).isOutOfSync);
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify({ ...relevantManifest, engines: { node: ">=22" } }, null, 2) + "\n");
+check("checkLockfileSync flags an engines change without a lockfile update", checkLockfileSync(scriptLockRepo).isOutOfSync);
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify({ ...relevantManifest, packageManager: "pnpm@9.0.0" }, null, 2) + "\n");
+check("checkLockfileSync flags a packageManager change without a lockfile update", checkLockfileSync(scriptLockRepo).isOutOfSync);
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify({ ...relevantManifest, devDependencies: { typescript: "^5.0.0" } }, null, 2) + "\n");
+check("checkLockfileSync flags a devDependencies change without a lockfile update", checkLockfileSync(scriptLockRepo).isOutOfSync);
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify({ ...relevantManifest, pnpm: { overrides: { "left-pad": "^1.3.0" } } }, null, 2) + "\n");
+check("checkLockfileSync flags a pnpm-overrides change without a lockfile update", checkLockfileSync(scriptLockRepo).isOutOfSync);
+// And a relevant change WITH the lockfile updated passes.
+writeFileSync(join(scriptLockRepo, "package.json"), JSON.stringify({ ...relevantManifest, dependencies: { "left-pad": "^1.3.0" } }, null, 2) + "\n");
+writeFileSync(join(scriptLockRepo, "package-lock.json"), JSON.stringify({ name: "demo", version: "1.0.0", lockfileVersion: 3, dependencies: { "left-pad": "^1.3.0" } }, null, 2) + "\n");
+check("checkLockfileSync passes when the lockfile is updated alongside a relevant change", !checkLockfileSync(scriptLockRepo).isOutOfSync);
+rmSync(scriptLockRepo, { recursive: true, force: true });
+
+// Concurrent loops share ONE guard process: workspace resolution must come
+// from the call's own context or the session's own binding, never from the
+// last-active plugin instance. Two plugin instances in this process simulate
+// the two loops; instance B's roots must never re-anchor session A's context.
+const isoRepoA = mkdtempSync(join(tmpdir(), "wg-iso-a-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: isoRepoA });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: isoRepoA });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: isoRepoA });
+writeFileSync(join(isoRepoA, "seed.txt"), "loop a\n");
+spawnSync("git", ["add", "-A"], { cwd: isoRepoA });
+spawnSync("git", ["commit", "-qm", "init a"], { cwd: isoRepoA });
+spawnSync("git", ["switch", "-c", "feat/iso-a"], { cwd: isoRepoA });
+const isoRepoB = mkdtempSync(join(tmpdir(), "wg-iso-b-"));
+spawnSync("git", ["init", "-b", "loop/other-loop"], { cwd: isoRepoB });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: isoRepoB });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: isoRepoB });
+writeFileSync(join(isoRepoB, "seed.txt"), "loop b\n");
+spawnSync("git", ["add", "-A"], { cwd: isoRepoB });
+spawnSync("git", ["commit", "-qm", "init b"], { cwd: isoRepoB });
+const isoPluginA = await WorkflowGuard({ directory: isoRepoA, worktree: isoRepoA, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const isoPluginB = await WorkflowGuard({ directory: isoRepoB, worktree: isoRepoB, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const isoHookOf = (plugin: unknown) => (plugin as { "tool.execute.before"?: (input: unknown, output: unknown) => Promise<unknown> })["tool.execute.before"];
+// Session A binds to repoA from its OWN call context (an edit/read target
+// inside repoA delivered through the call arguments).
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-shared", tool: "read", callID: "c-iso-1" }, { args: { filePath: join(isoRepoA, "seed.txt") } });
+check("a session binds to its workspace from its own call context", getSessionBoundWorkspace("s-iso-shared") === isoRepoA);
+// The other loop's plugin instance must not re-anchor it from its own root.
+await isoHookOf(isoPluginB)?.({ sessionID: "s-iso-shared", tool: "bash", callID: "c-iso-2" }, { args: { command: "ls -la" } });
+check("an instance-derived fallback never re-anchors a bound session", getSessionBoundWorkspace("s-iso-shared") === isoRepoA);
+const isoStatus = JSON.parse(String(await isoPluginB.tool?.guard_status?.execute({}, { sessionID: "s-iso-shared" } as any)));
+check("guard_status resolves the session's own workspace under plugin-instance drift", isoStatus.workspaceRoot === isoRepoA && isoStatus.branch === "feat/iso-a");
+const isoStatusExplicit = JSON.parse(String(await isoPluginB.tool?.guard_status?.execute({ directory: isoRepoB }, { sessionID: "s-iso-shared" } as any)));
+check("guard_status honors an explicit directory over the session binding", isoStatusExplicit.workspaceRoot === isoRepoB && isoStatusExplicit.branch === "loop/other-loop");
+check("resolveEffectiveWorkspace keeps a bound session off a foreign fallback", (await resolveEffectiveWorkspace({ sessionID: "s-iso-shared", fallback: isoRepoB })) === isoRepoA);
+check("resolveEffectiveWorkspace keeps fallback semantics for an unbound session", (await resolveEffectiveWorkspace({ sessionID: "s-iso-unbound", fallback: isoRepoB })) === isoRepoB);
+// Policy decisions follow the call's own context: a boundary write inside the
+// session's repo passes even while the other loop's root is the fallback.
+todo("s-iso-shared", item("iso work", "in_progress"));
+const isoWrite = await guardToolDecision("write", { filePath: join(isoRepoA, "scratch.txt"), content: "safe" }, { sessionID: "s-iso-shared" });
+check("boundary checks use the session's own workspace, not the other loop's root", isoWrite.status === "allowed");
+if (isoWrite.status !== "allowed") console.log("   blocked:", isoWrite.message);
+// Review verdict binding is never guessed: no explicit directory, no session
+// binding, no per-call worktree — the verdict is rejected, not latched.
+const unboundReview = await isoPluginA.tool?.record_review?.execute(
+	{ reviewer: "no-binding", summary: "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.", passed: true },
+	{ sessionID: "s-iso-unbound-recorder" } as any,
+);
+check(
+	"record_review rejects a verdict it cannot bind instead of latching a root",
+	typeof unboundReview === "string" && unboundReview.includes("rejected") && unboundReview.includes("never bound to a guessed root") && !unboundReview.includes("APPROVED"),
+);
+const unboundReviewAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "record_review.verdict" && entry.sessionID === "s-iso-unbound-recorder");
+check("unbindingable verdict audited as review_binding_unresolved", unboundReviewAudit?.reason === "review_binding_unresolved");
+// A bound session records through the OTHER loop's plugin instance: the
+// verdict binds to the session's own workspace, not the instance root.
+const isoBoundReview = await isoPluginB.tool?.record_review?.execute(
+	{ reviewer: "drift-proof", summary: "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.", passed: true },
+	{ sessionID: "s-iso-shared" } as any,
+);
+check(
+	"record_review binds to the session's own workspace, not the other loop's instance root",
+	typeof isoBoundReview === "string" && isoBoundReview.includes("APPROVED") && isoBoundReview.includes(isoRepoA) && !isoBoundReview.includes(isoRepoB),
+);
+rmSync(isoRepoA, { recursive: true, force: true });
+rmSync(isoRepoB, { recursive: true, force: true });
+resetReviewState();
+setWorkspaceRoot(root);
+
+// Review bindings are consumed per WORKTREE, not per repository-recency: two
+// loops sharing one repo must not displace each other's approvals between
+// record_review and PR creation.
+const raceRepo = join(root, "wg-race-repo");
+mkdirSync(raceRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: raceRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: raceRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: raceRepo });
+writeFileSync(join(raceRepo, "seed.txt"), "base\n");
+spawnSync("git", ["add", "-A"], { cwd: raceRepo });
+spawnSync("git", ["commit", "-qm", "base"], { cwd: raceRepo });
+mkdirSync(join(raceRepo, ".opencode"), { recursive: true });
+writeFileSync(join(raceRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: true }));
+spawnSync("git", ["switch", "-c", "feat/race-a"], { cwd: raceRepo });
+writeFileSync(join(raceRepo, "a.txt"), "loop a change\n");
+spawnSync("git", ["add", "-A"], { cwd: raceRepo });
+spawnSync("git", ["commit", "-qm", "loop a change"], { cwd: raceRepo });
+const prevWorktreeDirRace = process.env.WORKFLOW_GUARD_WORKTREE_DIR;
+process.env.WORKFLOW_GUARD_WORKTREE_DIR = join(root, "wg-race-worktrees");
+const raceWtRes = createGitWorktree("feat/race-b", "HEAD", raceRepo);
+check("race: sibling worktree created", raceWtRes.success && typeof raceWtRes.worktreePath === "string");
+const raceWt = raceWtRes.worktreePath!;
+writeFileSync(join(raceWt, "b.txt"), "loop b change\n");
+spawnSync("git", ["add", "-A"], { cwd: raceWt });
+spawnSync("git", ["commit", "-qm", "loop b change"], { cwd: raceWt });
+const raceSummary = "Test integrity: covered. Task completeness: complete. Cleanliness: clean. Security: safe. Platform: compatible.";
+// Loop A records first; loop B records a NEWER review for the sibling
+// worktree. Each worktree must keep consuming its OWN approval.
+resetReviewState();
+recordReviewResult("reviewer-A", raceSummary, true, "s-race-a", raceRepo);
+recordReviewResult("reviewer-B", raceSummary, true, "s-race-b", raceWt);
+check("loop A consumes its own worktree review, not the newer sibling review", getLastReviewResultForWorkspace(raceRepo)?.reviewer === "reviewer-A");
+check("loop B consumes its own worktree review", getLastReviewResultForWorkspace(raceWt)?.reviewer === "reviewer-B");
+resetReviewState();
+recordReviewResult("reviewer-B", raceSummary, true, "s-race-b", raceWt);
+recordReviewResult("reviewer-A", raceSummary, true, "s-race-a", raceRepo);
+check("loop A keeps its own review when it was recorded first", getLastReviewResultForWorkspace(raceRepo)?.reviewer === "reviewer-A");
+check("loop B keeps its own review when it was recorded last", getLastReviewResultForWorkspace(raceWt)?.reviewer === "reviewer-B");
+// Preflight consumption with the remote state stubbed off: loop A's PR must
+// pass while the sibling loop's newer review exists, and must FAIL with a
+// worktree-mismatch cause when only the sibling review is present.
+const racePrevPath = process.env.PATH;
+const raceBin = join(root, "wg-race-bin");
+mkdirSync(raceBin, { recursive: true });
+writeFileSync(join(raceBin, "gh"), "#!/bin/sh\nexit 1\n");
+writeFileSync(join(raceBin, "az"), "#!/bin/sh\nexit 1\n");
+chmodSync(join(raceBin, "gh"), 0o755);
+chmodSync(join(raceBin, "az"), 0o755);
+process.env.PATH = `${raceBin}:${racePrevPath ?? ""}`;
+const racePrBody = "gh pr create --title 'fix: race' --body 'Changelog: race'";
+try {
+	const racePrA = await call("bash", { command: racePrBody, workdir: raceRepo }, { sessionID: "s-race-a", worktree: raceRepo, directory: raceRepo });
+	check("loop A's PR passes preflight while the sibling loop's newer review exists", !blocked(racePrA));
+	if (blocked(racePrA)) console.log("   blocked:", racePrA);
+	const racePrB = await call("bash", { command: racePrBody, workdir: raceWt }, { sessionID: "s-race-b", worktree: raceWt, directory: raceWt });
+	check("loop B's PR passes preflight independently", !blocked(racePrB));
+	if (blocked(racePrB)) console.log("   blocked:", racePrB);
+	// Negative control: only the sibling review present -> the mismatch is
+	// named instead of displacing the other loop's evidence.
+	resetReviewState();
+	recordReviewResult("reviewer-B", raceSummary, true, "s-race-b", raceWt);
+	const racePrOnlyB = await call("bash", { command: racePrBody, workdir: raceRepo }, { sessionID: "s-race-a", worktree: raceRepo, directory: raceRepo });
+	check(
+		"loop A's PR is blocked on the sibling review alone, naming the worktree mismatch",
+		blocked(racePrOnlyB) && String(racePrOnlyB).includes("does not match the current worktree contents"),
+	);
+	// Same-repo fallback still rescues content-identical trees: a review
+	// recorded from a worktree whose tracked content equals this one applies,
+	// even when a NEWER sibling review does not match this content.
+	const raceWtSameContentRes = createGitWorktree("feat/race-same", "feat/race-a", raceRepo);
+	const raceWtSame = raceWtSameContentRes.worktreePath!;
+	resetReviewState();
+	recordReviewResult("reviewer-same", raceSummary, true, "s-race-same", raceRepo);
+	recordReviewResult("reviewer-B", raceSummary, true, "s-race-b", raceWt);
+	check(
+		"a same-repo review whose tracked content matches this worktree is preferred over a newer mismatching one",
+		getLastReviewResultForWorkspace(raceWtSame)?.reviewer === "reviewer-same",
+	);
+	rmSync(raceWtSame, { recursive: true, force: true });
+} finally {
+	process.env.PATH = racePrevPath;
+}
+if (prevWorktreeDirRace === undefined) delete process.env.WORKFLOW_GUARD_WORKTREE_DIR;
+else process.env.WORKFLOW_GUARD_WORKTREE_DIR = prevWorktreeDirRace;
+rmSync(join(root, "wg-race-worktrees"), { recursive: true, force: true });
+rmSync(raceBin, { recursive: true, force: true });
+rmSync(raceRepo, { recursive: true, force: true });
+resetReviewState();
+setWorkspaceRoot(root);
 
 // 14. Documentation Review & Synchronization Guard (Policy 21)
 console.log("- Policy 21: Documentation Review & Synchronization Guard -");
