@@ -2,9 +2,9 @@
 
 [![npm](https://img.shields.io/npm/v/opencode-workflow-guard.svg)](https://www.npmjs.com/package/opencode-workflow-guard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://img.shields.io/badge/tests-415%2B%20passing-brightgreen.svg)](test/test.mts)
+[![Tests](https://img.shields.io/badge/tests-1100%2B%20passing-brightgreen.svg)](test/test.mts)
 
-Deterministic policy and enforcement layer for OpenCode. Workflow Guard enforces workflow and safety invariants through **hard plugin hooks**, not prompt instructions that LLMs can ignore.
+Deterministic policy and enforcement layer for OpenCode. Workflow Guard enforces safe engineering discipline through **hard plugin hooks**, not prompt instructions that LLMs can ignore, and pairs enforcement with a proactive workflow-tool surface for planning, review, worktree isolation, technical debt, and policy simulation.
 
 Workflow Guard is deliberately **not an agent harness**: it can constrain actions, record and explain decisions, and supply bounded context, but it does not plan, prioritize, delegate, or autonomously sequence the agent's work. Bounded continuation may resume an existing session with unfinished owned todos; it never chooses the next task or creates new work.
 
@@ -34,7 +34,7 @@ For the optional TUI badge, configure `"opencode-workflow-guard"` in `tui.json`.
 
 ```bash
 npm run typecheck    # Strict TypeScript check (0 errors)
-npm test             # Run 415+ unit and adversarial tests
+npm test             # Run 1100+ unit and adversarial tests
 npm run test:all     # Typecheck + unit + install/load checks
 WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # Also run policy probes with OpenCode's most recently selected model
 ```
@@ -54,11 +54,27 @@ For complete policy specifications and override rules, see [docs/policies.md](do
 
 ---
 
+## Proactive Workflow Tools
+
+Enforcement is only half the surface. The plugin also registers first-class agent tools (same tool names on OpenCode 1.x and 2.x) so disciplined workflow is the path of least resistance:
+
+* **Task Planning:** `guard_next_tasks` surfaces durable repository planning context (`TODO.md`, `ROADMAP.md`, `PLAN.md`, `TASKS.md`, `BACKLOG.md`, their `docs/` counterparts, and plans under `docs/plans/`) at session start or during planning; `guard_status` reports active guardrails, branch protection, mutation counts, outstanding verification/review gates, a read-only git-hygiene snapshot, and the loaded `pluginVersion`.
+* **Review & Verification:** before PR creation, a secondary reviewer subagent evaluates the diff against `guard_review_rubric` (five core axes: test integrity, task completeness, cleanliness, security, platform) and records its verdict with `record_review`; approvals are bound to the reviewed worktree content.
+* **Worktree Isolation:** `guard_worktree_create` and `guard_worktree_cleanup` give parallel subagents isolated linked worktrees so concurrent mutations never collide.
+* **Technical Debt:** `guard_review_followups` lists open P2/P3 durable review follow-ups; `guard_review_followup_resolve` closes them after the underlying issue is fixed and verified.
+* **Policy Simulation:** `guard_why` returns the structured policy decision for a tool call or command without performing it; `guard_audit` shows recent audited policy entries.
+* **Project Memory** (on by default): `project_memory_search`, `project_memory_record`, `project_memory_export`, and `project_memory_import` maintain durable facts, decisions, constraints, and lessons; secret content is rejected, and export promotes records to the repo-local `.opencode/memory/project-memory.jsonl`.
+* **Socratic Learning** (off by default): `learning_checkpoint`, `learning_profile`, and `learning_record` maintain a global evidence-based learner profile with a per-session intervention budget.
+
+The context modules — project memory, Socratic learning, and recovery checkpoints (`guard_recovery_restore`) — are independently gated and can be disabled without weakening policy enforcement; see [docs/installation.md](docs/installation.md). Full tool specifications live in [docs/policies.md](docs/policies.md#custom-tools).
+
+---
+
 ## Documentation Index
 
 | Guide | Description |
 |---|---|
-| [**Policy Reference**](docs/policies.md) | Comprehensive specification of all 24 enforced policies, invariants, and override semantics |
+| [**Policy Reference**](docs/policies.md) | Comprehensive specification of all 24 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
 | [**Installation & Configuration**](docs/installation.md) | Setup options, global vs. local install, worktree isolation, and project configuration |
 | [**Managed Deployment**](docs/managed-deployment.md) | Administrator-managed OpenCode policy, platform locations, and startup diagnostics |
 | [**Troubleshooting**](docs/troubleshooting.md) | Diagnosing policy blocks, common false positives, and emergency override procedures |
