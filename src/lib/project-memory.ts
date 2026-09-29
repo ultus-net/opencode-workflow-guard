@@ -150,6 +150,21 @@ function databaseIsActive(path: string, directory: string): boolean {
 	return active;
 }
 
+function reapStaleActiveMarkers(directory: string): void {
+	const databaseNames = new Set(readdirSync(directory).filter((entry) => entry.endsWith(".sqlite")));
+	for (const name of readdirSync(directory)) {
+		const markerSeparator = name.lastIndexOf(".active.");
+		if (markerSeparator < 0) continue;
+		const databaseName = name.slice(0, markerSeparator);
+		if (!databaseNames.has(databaseName)) continue;
+		const pid = Number(name.slice(markerSeparator + ".active.".length).split(".", 1)[0]);
+		if (!Number.isInteger(pid) || pid <= 0) continue;
+		try { process.kill(pid, 0); } catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ESRCH") rmSync(join(directory, name), { force: true });
+		}
+	}
+}
+
 export function maintainProjectMemoryStorage(store: ProjectMemoryStore, directory = getProjectMemoryDir(), options: MaintenanceOptions = {}): void {
 	const now = options.now ?? Date.now();
 	const maintenanceMarker = `${store.path}.maintenance`;
@@ -173,6 +188,7 @@ export function maintainProjectMemoryStorage(store: ProjectMemoryStore, director
 		store.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
 		store.db.exec("PRAGMA optimize");
 		store.db.exec("VACUUM");
+		reapStaleActiveMarkers(directory);
 		try { utimesSync(store.path, now / 1000, now / 1000); } catch {}
 		writeFileSync(maintenanceMarker, "", { mode: 0o600 });
 		try { utimesSync(maintenanceMarker, now / 1000, now / 1000); } catch {}
