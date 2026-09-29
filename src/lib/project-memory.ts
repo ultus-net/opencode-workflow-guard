@@ -151,10 +151,13 @@ function databaseIsActive(path: string, directory: string): boolean {
 }
 
 function reapStaleActiveMarkers(directory: string): void {
+	const databaseNames = new Set(readdirSync(directory).filter((entry) => entry.endsWith(".sqlite")));
 	for (const name of readdirSync(directory)) {
-		const markerIndex = name.indexOf(".sqlite.active.");
-		if (markerIndex < 0) continue;
-		const pid = Number(name.slice(markerIndex + ".sqlite.active.".length).split(".", 1)[0]);
+		const markerSeparator = name.lastIndexOf(".active.");
+		if (markerSeparator < 0) continue;
+		const databaseName = name.slice(0, markerSeparator);
+		if (!databaseNames.has(databaseName)) continue;
+		const pid = Number(name.slice(markerSeparator + ".active.".length).split(".", 1)[0]);
 		if (!Number.isInteger(pid) || pid <= 0) continue;
 		try { process.kill(pid, 0); } catch (error) {
 			if ((error as NodeJS.ErrnoException).code === "ESRCH") rmSync(join(directory, name), { force: true });
