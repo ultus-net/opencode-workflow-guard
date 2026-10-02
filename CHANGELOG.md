@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.15.6
+
+### Patch Changes
+
+- 0467945: Settings tamper now flags `patch` and `perl -i` / `perl -pi` in-place editors when their target is protected OpenCode config (`opencode.json`, `.config/opencode/**`, `.opencode/**`). Previously `V_LIST` in `src/policies/tamper.ts` omitted these verbs, so they could rewrite guarded settings without tripping the tamper policy. Regression tests cover the blocked targets and the allowed normal-file cases.
+
 ## 1.15.5
 
 ### Patch Changes
