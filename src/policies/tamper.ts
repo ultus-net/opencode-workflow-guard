@@ -11,7 +11,7 @@ export const PROTECTED_PATH_REASON =
 	"these manually in configuration or the UI.";
 
 const GT = String.fromCharCode(62);
-const V_LIST = ["sed\\s+-i", "tee", "mv", "cp", "rm", "chmod", "chown", "ln", "install", "truncate", "dd"].join("|");
+const V_LIST = ["sed\\s+-i", "tee", "mv", "cp", "rm", "chmod", "chown", "ln", "install", "truncate", "dd", "patch", "perl\\s+-[^\\s]*i"].join("|");
 const C_LIST = ["open" + "code\\.jsonc?", "\\.config\\/open" + "code", "\\.open" + "code\\/"].join("|");
 const U_LIST = ["\\.config\\/open" + "code\\/(?:plugins|ui)\\/"].join("|");
 
