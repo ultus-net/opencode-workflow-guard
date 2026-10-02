@@ -632,6 +632,11 @@ check("tee allowed with todos", !(await call("bash", { command: "echo x | tee sr
 check("sed -i needs todos", blocked(await call("bash", { command: "sed -i 's/a/b/' src/a.ts" }, { sessionID: "s-empty" })));
 check("sed -i allowed with todos", !(await call("bash", { command: "sed -i 's/a/b/' src/a.ts" }, { sessionID: "s-active" })));
 check("sed -i on opencode.json blocked (tamper)", blocked(await call("bash", { command: "sed -i 's/a/b/' opencode.json" }, { sessionID: "s-active" })));
+check("patch to opencode.json blocked (tamper)", blocked(await call("bash", { command: "patch opencode.json < x.diff" }, { sessionID: "s-active" })));
+check("patch to ~/.config/opencode blocked (tamper)", blocked(await call("bash", { command: "patch /var/home/x/.config/opencode/opencode.jsonc < x.diff" }, { sessionID: "s-active" })));
+check("patch to a normal file allowed with todos", !(await call("bash", { command: "patch src/a.ts < x.diff" }, { sessionID: "s-active" })));
+check("perl -pi on opencode.json blocked (tamper)", blocked(await call("bash", { command: "perl -pi -e 's/a/b/' opencode.json" }, { sessionID: "s-active" })));
+check("perl -pi on a normal file allowed with todos", !(await call("bash", { command: "perl -pi -e 's/a/b/' src/a.ts" }, { sessionID: "s-active" })));
 check("git apply needs todos (patch via shell)", blocked(await call("bash", { command: "git apply patch.diff" }, { sessionID: "s-empty" })));
 check("git apply allowed with todos", !(await call("bash", { command: "git apply patch.diff" }, { sessionID: "s-active" })));
 check("non-mutating shell unaffected (ls, cat)", !(await call("bash", { command: "ls -la && cat file" }, { sessionID: "s-empty" })));
