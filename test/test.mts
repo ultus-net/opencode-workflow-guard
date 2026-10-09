@@ -1711,7 +1711,38 @@ try {
 	liveAllowThrow = (err as Error).message;
 }
 check("shell call proceeds after the lookup clears the floor", liveAllowThrow === "");
+
+// Unrelated success does not clear debt; idle preserves it; delete clears it.
+const liveDocsSession2 = "s-live-docs-int2";
+const livePart2 = (callID: string, status: "error" | "completed", tool = "bash") => ({
+	type: "tool",
+	sessionID: liveDocsSession2,
+	callID,
+	tool,
+	state: { status, error: status === "error" ? `boom-${callID}` : undefined, time: { start: 1, end: 2 } },
+} as const);
+for (const id of ["ld2-e1", "ld2-e2", "ld2-e3"]) {
+	await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties: { part: livePart2(id, "error") } } } as any);
+}
+await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties: { part: livePart2("ld2-ok", "completed", "bash") } } } as any);
+check("an unrelated successful tool does not clear research debt", liveDocsFailureCount(liveDocsSession2) === 3);
+let unrelatedBlock = "";
+try {
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "edit", sessionID: liveDocsSession2, callID: "ld2-block" } as any, { args: { filePath: join(root, "x.txt"), content: "y" } } as any);
+} catch (err) {
+	unrelatedBlock = (err as Error).message;
+}
+check("mutation still blocks after an unrelated success", unrelatedBlock.includes("Blocked:"));
+await liveDocsPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: liveDocsSession2 } } } as any);
+check("session idle does not clear research debt", liveDocsFailureCount(liveDocsSession2) === 3);
+await liveDocsPlugin.event?.({ event: { type: "session.deleted", properties: { info: { id: liveDocsSession2 } } } } as any);
+check("session deletion clears research debt", liveDocsFailureCount(liveDocsSession2) === 0);
+
+// Regex narrowing: bare file-set phrases and benign wording stay unmatched.
+check("bare file-set phrasing is not a sweeping claim", !checkSweepingClaims("all files under src compile.").sweeping && !checkSweepingClaims("check the whole file.").sweeping);
+check("repo-level phrasing still matches", checkSweepingClaims("the entire repository follows this convention.").sweeping && checkSweepingClaims("all packages depend on it.").sweeping);
 clearLiveDocsFloor(liveDocsSession);
+clearLiveDocsFloor("s-live-docs-int2");
 
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};

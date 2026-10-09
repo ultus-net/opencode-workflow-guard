@@ -124,7 +124,7 @@ export function liveDocsGatingReason(sessionID: string, toolName: string, thresh
 	return floor.gatingReason(sessionID, toolName, threshold);
 }
 
-/** Drop a session's floor state (session idle/deletion). */
+/** Drop a session's floor state (session deletion). */
 export function clearLiveDocsFloor(sessionID: string): void {
 	floor.clearSession(sessionID);
 }

@@ -27,11 +27,12 @@ import { sessionReadFileCount } from "./stale-write.ts";
 
 /**
  * A sweeping claim is an explicit whole-repo/whole-set assertion. Kept narrow
- * to high-signal phrasings so casual wording ("check the whole file") does not
- * trip it; "the whole file"/"all tests" are deliberately excluded.
+ * to high-signal phrasings so casual wording ("check the whole file", "all
+ * files under src") does not trip it; bare file/file-set quantifiers are
+ * deliberately excluded and only whole-repo nouns are matched.
  */
 const SWEEPING_CLAIM_RE =
-	/\b(?:the\s+)?(?:entire|whole|all|every)\s+(?:codebase|repository|repo|project|application|packages?|modules?|components?|sources?|files?)\b|\b(?:throughout|across)\s+the\s+(?:codebase|repository|repo|project|code|app|application)\b|\bno\s+other\s+(?:place|occurrence|usage|reference|references|callers?|usages?)\b|\bnothing\s+else\s+(?:uses?|references?|calls?|depends\s+on)\b|\bnot\s+used\s+anywhere\s+else\b/i;
+	/\b(?:the\s+)?(?:entire|whole|all|every)\s+(?:codebase|repository|repo|project|application|packages?|modules?|components?|sources?)\b|\b(?:throughout|across)\s+the\s+(?:codebase|repository|repo|project|code|app|application)\b|\bno\s+other\s+(?:place|occurrence|usage|reference|references|callers?|usages?)\b|\bnothing\s+else\s+(?:uses?|references?|calls?|depends\s+on)\b|\bnot\s+used\s+anywhere\s+else\b/i;
 
 /** Distinct files that must be touched before a sweeping claim is "backed". */
 export const MIN_SWEEPING_READ_COVERAGE = 2;
