@@ -77,6 +77,8 @@ import {
 	checkLockfileSync,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
+	isLiveDocsRequired,
+	getLiveDocFailureThreshold,
 	loadedPluginVersion,
 	isReviewRequired,
 	getOperationProfile,
@@ -123,6 +125,17 @@ import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheck
 import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 import { scanSessionTodos, toolPartName } from "../src/lib/v2-todo.ts";
 import { effectiveTodosWithOwner } from "../src/policies/todo.ts";
+import {
+	LiveDocsResearchFloor,
+	clearLiveDocsFloor,
+	isResearchTool,
+	liveDocsFailureCount,
+	liveDocsGatingReason,
+	recordLiveDocsFailure,
+	recordResearchLookup,
+} from "../src/policies/live-docs.ts";
+import { MIN_SWEEPING_READ_COVERAGE, checkSweepingClaims } from "../src/policies/sweeping-claims.ts";
+import { beginReadObservation, clearReadFingerprints, recordSuccessfulRead, sessionReadFileCount } from "../src/policies/stale-write.ts";
 
 let pass = 0;
 let fail = 0;
@@ -1619,6 +1632,86 @@ check("terminal call deduplication remains stable within its bounded window", bo
 for (let i = 0; i <= 4096; i++) boundedTracker.recordFallbackCompleted("s-fallback-bounded", `fallback-${i}`, "bash");
 check("fallback call deduplication evicts old calls from its bounded window", boundedTracker.recordFallbackCompleted("s-fallback-bounded", "fallback-0", "bash")?.status === "completed");
 check("invalid tool timing is omitted", new ToolOutcomeTracker().record({ type: "tool", sessionID: "s-timing", callID: "timing", tool: "bash", state: { status: "completed", time: { start: Number.NaN, end: Number.POSITIVE_INFINITY } } })?.durationMs === undefined);
+
+// ── Policy 25: live-documentation research floor ──
+console.log("- live-docs research floor -");
+check("recognises builtin research tools", isResearchTool("websearch") && isResearchTool("webfetch"));
+check("recognises MCP documentation tools", isResearchTool("context7_resolve-library-id") && isResearchTool("mcp__context7__get-library-docs"));
+check("does not treat unrelated tools as research", !isResearchTool("bash") && !isResearchTool("edit") && !isResearchTool("read"));
+
+const floorUnit = new LiveDocsResearchFloor();
+floorUnit.recordFailure("s-unit");
+floorUnit.recordFailure("s-unit");
+check("research floor accrues failures below threshold", floorUnit.gatingReason("s-unit", "edit", 3) === undefined);
+floorUnit.recordFailure("s-unit");
+check("research floor blocks a mutation at threshold with no lookup", typeof floorUnit.gatingReason("s-unit", "edit", 3) === "string");
+check("research floor never blocks a research tool", floorUnit.gatingReason("s-unit", "websearch", 3) === undefined);
+floorUnit.recordResearch("s-unit");
+check("successful lookup clears the floor", floorUnit.gatingReason("s-unit", "bash", 3) === undefined);
+check("floor disabled when threshold is non-positive", floorUnit.gatingReason("s-unit", "edit", 0) === undefined);
+
+// Module-level helpers share state; a fresh session isolates the check.
+recordLiveDocsFailure("s-live-helpers");
+recordLiveDocsFailure("s-live-helpers");
+recordLiveDocsFailure("s-live-helpers");
+check("module helper exposes failures-since-research", liveDocsFailureCount("s-live-helpers") === 3);
+check("module helper gates mutation above threshold", typeof liveDocsGatingReason("s-live-helpers", "apply_patch", 3) === "string");
+recordResearchLookup("s-live-helpers");
+check("module helper clears debt after a lookup", liveDocsFailureCount("s-live-helpers") === 0 && liveDocsGatingReason("s-live-helpers", "edit", 3) === undefined);
+clearLiveDocsFloor("s-live-helpers");
+
+const prevRequireLive = process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS;
+const prevThreshold = process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
+delete process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS;
+delete process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
+check("live-docs research floor is enabled by default", isLiveDocsRequired(root) === true);
+check("live-docs failure threshold defaults to 3", getLiveDocFailureThreshold(root) === 3);
+process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS = "0";
+check("env override can disable the research floor", isLiveDocsRequired(root) === false);
+delete process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS;
+process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD = "5";
+check("env override can raise the research threshold", getLiveDocFailureThreshold(root) === 5);
+delete process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
+if (prevRequireLive === undefined) delete process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS; else process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS = prevRequireLive;
+if (prevThreshold === undefined) delete process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD; else process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD = prevThreshold;
+
+const liveDocsPlugin = await pluginFn({ directory: root, client: fakeClient as any, project: {} as any, worktree: root, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const liveDocsSession = "s-live-docs-int";
+const livePart = (callID: string, status: "error" | "completed", tool = "bash") => ({
+	type: "tool",
+	sessionID: liveDocsSession,
+	callID,
+	tool,
+	state: { status, error: status === "error" ? `boom-${callID}` : undefined, time: { start: 1, end: 2 } },
+} as const);
+for (const id of ["ld-e1", "ld-e2", "ld-e3"]) {
+	await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties: { part: livePart(id, "error") } } } as any);
+}
+check("three failures accrue research debt in the entrypoint", liveDocsFailureCount(liveDocsSession) === 3);
+let liveBlockMessage = "";
+try {
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "bash", sessionID: liveDocsSession, callID: "ld-block" } as any, { args: { command: "ls" } } as any);
+} catch (err) {
+	liveBlockMessage = (err as Error).message;
+}
+check("repeated failures with no lookup block a shell call", liveBlockMessage.includes("Blocked:") && liveBlockMessage.includes("websearch"));
+let researchThrow = "";
+try {
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "websearch", sessionID: liveDocsSession, callID: "ld-research" } as any, { args: { query: "node fs api" } } as any);
+} catch (err) {
+	researchThrow = (err as Error).message;
+}
+check("research tool is never blocked by the floor", researchThrow === "");
+await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties: { part: livePart("ld-research", "completed", "websearch") } } } as any);
+check("successful lookup clears research debt in the entrypoint", liveDocsFailureCount(liveDocsSession) === 0);
+let liveAllowThrow = "";
+try {
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "bash", sessionID: liveDocsSession, callID: "ld-after" } as any, { args: { command: "ls" } } as any);
+} catch (err) {
+	liveAllowThrow = (err as Error).message;
+}
+check("shell call proceeds after the lookup clears the floor", liveAllowThrow === "");
+clearLiveDocsFloor(liveDocsSession);
 
 // TUI companion plugin registers prompt status indicator slots
 let registeredSlots: Record<string, Function> = {};
@@ -4580,6 +4673,45 @@ await loggingPlugin["experimental.text.complete"]?.(
 const claimLogAudit = getRecentAuditEntries(50).find((e) => e.tool === "experimental.text.complete" && e.sessionID === "s-claim-log");
 check("claims-vs-evidence mismatch is an info observation, not a block warning", appLogs.some((entry) => entry?.body?.level === "info" && String(entry?.body?.message).includes("completion claim mismatch")) && !appLogs.some((entry) => entry?.body?.level === "warn"));
 check("claims-vs-evidence observation remains an allowed audit event", claimLogAudit?.decision === "allow");
+
+// ── Policy 26: sweeping repo claims vs read coverage (observability) ──
+console.log("- sweeping-claims grounding (observability) -");
+check("benign text does not trigger a sweeping claim", !checkSweepingClaims("I refactored the module.").sweeping);
+check("whole-codebase phrasing is detected", checkSweepingClaims("The entire codebase uses this pattern.").sweeping);
+check("no-other-callers phrasing is detected", checkSweepingClaims("No other callers reference this function.").sweeping);
+check(
+	"a sweeping claim with thin read coverage is flagged",
+	typeof checkSweepingClaims("Nothing else uses this helper.", { sessionID: "s-sweep-thin" }).reason === "string",
+);
+const sweepCoverageDir = mkdtempSync(join(tmpdir(), "wg-sweep-coverage-"));
+for (let i = 0; i < MIN_SWEEPING_READ_COVERAGE; i++) {
+	const p = join(sweepCoverageDir, `f${i}.txt`);
+	writeFileSync(p, `content ${i}`);
+	const obs = beginReadObservation(p);
+	if (obs) recordSuccessfulRead(obs, "s-sweep-backed");
+}
+check("read coverage counts distinct files", sessionReadFileCount("s-sweep-backed") === MIN_SWEEPING_READ_COVERAGE);
+const backed = checkSweepingClaims("The whole repository follows this convention.", { sessionID: "s-sweep-backed" });
+check("a sweeping claim backed by read coverage is not flagged", backed.sweeping && backed.reason === undefined);
+clearReadFingerprints("s-sweep-backed");
+clearReadFingerprints("s-sweep-thin");
+rmSync(sweepCoverageDir, { recursive: true, force: true });
+
+// Hook integration: sweeping mismatch is journaled, not blocked.
+const sweepAuditBefore = getRecentAuditEntries(50).filter((e) => e.tool === "experimental.text.complete" && String(e.reason).includes("Sweeping claim")).length;
+appLogs.length = 0;
+await loggingPlugin["experimental.text.complete"]?.(
+	{ sessionID: "s-sweep-hook", messageID: "m3", partID: "p3" } as any,
+	{ text: "The entire codebase relies on this invariant." } as any,
+);
+const sweepAuditAfter = getRecentAuditEntries(50).filter((e) => e.tool === "experimental.text.complete" && String(e.reason).includes("Sweeping claim")).length;
+check("sweeping-claim mismatch is journaled via the hook", sweepAuditAfter > sweepAuditBefore);
+check(
+	"sweeping-claim mismatch is an info observation, not a block warning",
+	appLogs.some((entry) => entry?.body?.level === "info" && String(entry?.body?.message).includes("sweeping claim mismatch")) &&
+		!appLogs.some((entry) => entry?.body?.level === "warn"),
+);
+clearReadFingerprints("s-sweep-hook");
 
 // tool.definition enriches todowrite's description with the gate note
 const defPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);

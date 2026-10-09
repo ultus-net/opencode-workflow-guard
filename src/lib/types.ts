@@ -51,6 +51,16 @@ export interface ProjectConfig {
 	requireSubagentReview?: boolean;
 	requireDocumentation?: boolean;
 	/**
+	 * Policy 25 (live-documentation research floor). Enabled by default: after
+	 * `liveDocFailureThreshold` failed tool calls with no live-documentation
+	 * lookup since the last failure, mutating/shell tools are blocked until the
+	 * session consults a current source. Set `false` in project config, or
+	 * `WORKFLOW_GUARD_REQUIRE_LIVE_DOCS=0` in the environment, to disable.
+	 */
+	requireLiveDocs?: boolean;
+	/** Failure count at which the research floor engages (default 3). */
+	liveDocFailureThreshold?: number;
+	/**
 	 * Absolute paths of the LIVE control plane (runtime `~/.config/opencode`,
 	 * the guard's own install). When set, config-path protection classifies by
 	 * runtime consumption instead of filename segments: only targets under a

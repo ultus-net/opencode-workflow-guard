@@ -75,6 +75,8 @@ import {
 	isReviewRequired,
 	isSubagentReviewRequired,
 	isDocumentationRequired,
+	isLiveDocsRequired,
+	getLiveDocFailureThreshold,
 	getSubagentMutationBudget,
 	isLearningEnabled,
 	isProjectMemoryEnabled,
@@ -112,6 +114,8 @@ export {
 	isReviewRequired,
 	isSubagentReviewRequired,
 	isDocumentationRequired,
+	isLiveDocsRequired,
+	getLiveDocFailureThreshold,
 	getSubagentMutationBudget,
 	isLearningEnabled,
 	getLearningInterventionBudget,
@@ -327,6 +331,20 @@ import { checkCompletionClaims } from "./policies/completion.ts";
 
 export { checkCompletionClaims };
 
+import { checkSweepingClaims } from "./policies/sweeping-claims.ts";
+
+export { checkSweepingClaims };
+
+import {
+	clearLiveDocsFloor,
+	isResearchTool,
+	liveDocsGatingReason,
+	recordLiveDocsFailure,
+	recordResearchLookup,
+} from "./policies/live-docs.ts";
+
+export { isResearchTool, liveDocsGatingReason };
+
 export { sendDesktopNotification } from "./policies/shell-safety.ts";
 export { checkInteractiveTtyCommand, checkPackageHygiene, escapeAppleScriptString };
 
@@ -486,6 +504,33 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 						? "\n\n[Workflow Guard Circuit Breaker: Repeated failures detected in this session. Stop attempting alternative workarounds or shell laundering. Address the required step above directly, or inspect policy details with guard_status or guard_why.]"
 						: "";
 					throw new Error(`[workflow-guard] ${reason}${circuitBreakerSuffix}`);
+				}
+				// Policy 25: after repeated failures with no live lookup since,
+				// block the guess-and-retry surfaces (mutations and shell) until
+				// the session grounds itself in current documentation. Research
+				// tools are never gated; an allowed research call records the
+				// lookup after it succeeds.
+				if (
+					input.sessionID &&
+					(EDIT_TOOL_NAMES.has(input.tool) || SHELL_TOOL_NAMES.has(input.tool))
+				) {
+					const threshold = getLiveDocFailureThreshold(toolWorktree);
+					if (isLiveDocsRequired(toolWorktree)) {
+						const researchReason = liveDocsGatingReason(input.sessionID, input.tool, threshold);
+						if (researchReason !== undefined) {
+							await emitBlockFeedback(researchReason);
+							audit({
+								ts: new Date().toISOString(),
+								sessionID: input.sessionID,
+								callID: input.callID,
+								tool: input.tool,
+								decision: "block",
+								phase: "decision",
+								reason: "live_docs_research_floor",
+							});
+							throw new Error(`[workflow-guard] ${researchReason}`);
+						}
+					}
 				}
 				toolLifecycle.start(input.sessionID, input.callID);
 				if (input.sessionID) {
@@ -718,6 +763,20 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 						input: { claim: check.claim, evidenceState: check.evidenceState },
 					});
 				}
+				// Policy 26: journal sweeping repository claims unsupported by
+				// read coverage. Observability only - never mutates output.text.
+				const sweeping = checkSweepingClaims(text, { sessionID });
+				if (sweeping.sweeping && sweeping.reason) {
+					logObservation(ctx.client, `[workflow-guard] sweeping claim mismatch: ${sweeping.reason}`);
+					audit({
+						ts: new Date().toISOString(),
+						sessionID,
+						tool: "experimental.text.complete",
+						decision: "allow",
+						reason: `Sweeping claim '${sweeping.claim}' with ${sweeping.readFileCount} file(s) read`,
+						input: { claim: sweeping.claim, readFileCount: sweeping.readFileCount },
+					});
+				}
 			} catch {}
 		},
 
@@ -784,6 +843,14 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 			if (event?.type === "message.part.updated") {
 				const outcome = toolOutcomes.record((event.properties as { part?: ToolOutcomePart })?.part ?? {});
 				if (outcome) {
+					// Policy 25 research floor: a failed call accrues debt; a
+					// successful live-source lookup clears it. Unrelated
+					// successes intentionally do not clear it.
+					if (outcome.status === "error") {
+						recordLiveDocsFailure(outcome.sessionID);
+					} else if (isResearchTool(outcome.tool)) {
+						recordResearchLookup(outcome.sessionID);
+					}
 					audit({
 						ts: new Date().toISOString(),
 						sessionID: outcome.sessionID,
@@ -853,6 +920,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					clearReadFingerprints(sessionID);
 					toolLifecycle.clearSession(sessionID);
 					toolLifecycle.takeRecoveryRun(sessionID);
+					clearLiveDocsFloor(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
 				}
 			}

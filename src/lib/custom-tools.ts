@@ -89,6 +89,7 @@ export function buildWorkflowGuardSystemGuidance(options: {
 	sections.push(
 		"- Technical Debt: Inspect open P2/P3 review follow-ups with `guard_review_followups` during planning; resolve fixed items with `guard_review_followup_resolve`.",
 		"- Policy Simulation: If uncertain whether a command or file edit is permitted, simulate it with `guard_why`.",
+		"- Live Documentation: Verify APIs, flags, and library behavior against current sources with `websearch`/`webfetch` rather than guessing from training data. After repeated tool failures with no lookup, Workflow Guard blocks further mutations and shell commands until you consult a live source; grounding clears the block.",
 	);
 
 	if (options.projectMemoryEnabled) {

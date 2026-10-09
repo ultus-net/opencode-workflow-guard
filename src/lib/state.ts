@@ -412,6 +412,33 @@ export function isDocumentationRequired(root: string): boolean {
 	return cfg.requireDocumentation === true;
 }
 
+/**
+ * Policy 25 (live-documentation research floor): enabled by default. The env
+ * override mirrors `isReviewRequired`; project config can opt out. The floor
+ * engages after `getLiveDocFailureThreshold` failed tool calls with no live
+ * lookup since the last failure.
+ */
+export function isLiveDocsRequired(root: string): boolean {
+	const env = process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS?.toLowerCase();
+	if (env === "0" || env === "false" || env === "off") return false;
+	if (env === "1" || env === "true" || env === "on") return true;
+	const cfg = getProjectConfig(root);
+	return cfg.requireLiveDocs !== false;
+}
+
+export function getLiveDocFailureThreshold(root: string): number {
+	const env = process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
+	if (env !== undefined) {
+		const parsed = Number.parseInt(env, 10);
+		if (Number.isInteger(parsed) && parsed >= 1) return parsed;
+	}
+	const cfg = getProjectConfig(root);
+	if (typeof cfg.liveDocFailureThreshold === "number" && Number.isInteger(cfg.liveDocFailureThreshold) && cfg.liveDocFailureThreshold >= 1) {
+		return cfg.liveDocFailureThreshold;
+	}
+	return 3;
+}
+
 export function getOperationProfile(root: string): "interactive" | "autonomous" {
 	return getProjectConfig(root).profile === "autonomous" ? "autonomous" : "interactive";
 }
