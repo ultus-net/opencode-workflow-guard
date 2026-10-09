@@ -1728,11 +1728,13 @@ await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties
 check("an unrelated successful tool does not clear research debt", liveDocsFailureCount(liveDocsSession2) === 3);
 let unrelatedBlock = "";
 try {
-	await liveDocsPlugin["tool.execute.before"]?.({ tool: "edit", sessionID: liveDocsSession2, callID: "ld2-block" } as any, { args: { filePath: join(root, "x.txt"), content: "y" } } as any);
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "bash", sessionID: liveDocsSession2, callID: "ld2-block" } as any, { args: { command: "ls" } } as any);
 } catch (err) {
 	unrelatedBlock = (err as Error).message;
 }
-check("mutation still blocks after an unrelated success", unrelatedBlock.includes("Blocked:"));
+// The floor reason names websearch; the no-active-todo/edit gate would not, so
+// this asserts Policy 25 (not an unrelated gate) actually fired.
+check("mutation still blocks after an unrelated success", unrelatedBlock.includes("Blocked:") && unrelatedBlock.includes("websearch"));
 await liveDocsPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: liveDocsSession2 } } } as any);
 check("session idle does not clear research debt", liveDocsFailureCount(liveDocsSession2) === 3);
 await liveDocsPlugin.event?.({ event: { type: "session.deleted", properties: { info: { id: liveDocsSession2 } } } } as any);

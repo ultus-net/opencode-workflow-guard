@@ -28,8 +28,9 @@ import { sessionReadFileCount } from "./stale-write.ts";
 /**
  * A sweeping claim is an explicit whole-repo/whole-set assertion. Kept narrow
  * to high-signal phrasings so casual wording ("check the whole file", "all
- * files under src") does not trip it; bare file/file-set quantifiers are
- * deliberately excluded and only whole-repo nouns are matched.
+ * files under src") does not trip it; bare file quantifiers are deliberately
+ * excluded and only named set nouns (codebase, repository, project, packages,
+ * modules, components, sources) are matched.
  */
 const SWEEPING_CLAIM_RE =
 	/\b(?:the\s+)?(?:entire|whole|all|every)\s+(?:codebase|repository|repo|project|application|packages?|modules?|components?|sources?)\b|\b(?:throughout|across)\s+the\s+(?:codebase|repository|repo|project|code|app|application)\b|\bno\s+other\s+(?:place|occurrence|usage|reference|references|callers?|usages?)\b|\bnothing\s+else\s+(?:uses?|references?|calls?|depends\s+on)\b|\bnot\s+used\s+anywhere\s+else\b/i;
