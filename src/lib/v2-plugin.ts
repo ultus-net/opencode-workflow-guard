@@ -65,6 +65,8 @@ import { loadedPluginVersion } from "./version.ts";
 import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, recordUserMessage } from "../policies/continuation.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, nextRecoveryRun } from "./checkpoint.ts";
 import { buildCompactionContext, guardToolCall } from "../workflow-guard.ts";
+import { registerPluginInstance, releasePluginInstance } from "./plugin-instance.ts";
+import { claimToolCall, releaseToolCallClaim } from "./call-claims.ts";
 
 type V2Context = Plugin.Context;
 
@@ -154,6 +156,20 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	}
 
 	const client = createV2SdkClient(ctx);
+	// Load-once guard: OpenCode 2 merges plugin arrays, so the same package
+	// named in global and project config loads this module twice. A duplicate
+	// stays inert (no hooks, no tools, no second workspace latch) and leaves a
+	// warn-level record; see lib/plugin-instance.ts.
+	const instance = registerPluginInstance({ workspaceRoot: effectiveRoot });
+	if (instance.duplicate) {
+		try {
+			console.warn(
+				`[workflow-guard] warn: duplicate plugin load for ${instance.workspaceRoot} (module ${instance.modulePath}); ` +
+					"this instance stays inert. Configure the guard in one location only.",
+			);
+		} catch {}
+		return () => releasePluginInstance(instance.key);
+	}
 	setWorkspaceRoot(effectiveRoot);
 	setSdkClient(client);
 	reloadProjectConfig(effectiveRoot);
@@ -224,6 +240,10 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 
 	// ── Deterministic enforcement ──
 	await ctx.tool.hook("execute.before", (event) => {
+		// One policy decision per tool call even if a second instance with a
+		// different module path (global cache copy plus a source checkout)
+		// registered too. The owner evaluates; the other defers.
+		if (!claimToolCall(instance.key, event.sessionID, event.id, event.tool)) return;
 		const toolWorktree = getSessionBoundWorkspace(event.sessionID) || effectiveRoot;
 		return runWithRuntimeState(toolWorktree, client, async () => {
 			const args = event.input;
@@ -234,6 +254,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				agent: event.agent,
 			});
 			if (reason !== undefined) {
+				releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
 				await showBlockToast(reason);
 				const failureCount = event.sessionID ? toolOutcomes.getFailureCount(event.sessionID) : 0;
 				const circuitBreakerSuffix = failureCount >= 2
@@ -286,6 +307,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	});
 
 	await ctx.tool.hook("execute.after", async (event) => {
+		releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
 		const startedAt = toolLifecycle.finish(event.sessionID, event.id);
 		const outcome = toolOutcomes.recordFallbackCompleted(event.sessionID, event.id, event.tool, startedAt === undefined ? undefined : Date.now() - startedAt);
 		if (outcome) {
@@ -508,7 +530,10 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		}
 	})();
 
-	return () => controller.abort();
+	return () => {
+		controller.abort();
+		releasePluginInstance(instance.key);
+	};
 };
 
 // ── Event handling ────────────────────────────────────────────────────────────

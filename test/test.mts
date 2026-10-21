@@ -123,6 +123,8 @@ import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheck
 import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 import { scanSessionTodos, toolPartName } from "../src/lib/v2-todo.ts";
 import { effectiveTodosWithOwner } from "../src/policies/todo.ts";
+import { resetPluginInstancesForTesting } from "../src/lib/plugin-instance.ts";
+import { claimToolCall, releaseToolCallClaim, resetToolCallClaimsForTesting } from "../src/lib/call-claims.ts";
 
 let pass = 0;
 let fail = 0;
@@ -4982,6 +4984,97 @@ const unavailableMemory = await (memoryUnavailablePlugin.tool as any).project_me
 check("project-memory initialization failure leaves core guard hooks active", typeof memoryUnavailablePlugin["tool.execute.before"] === "function" && unavailableMemory.includes("core guard enforcement remains active"));
 if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDataHome;
+
+// ── V2 load-once guard: one policy decision per call, one duplicate record ──
+// OpenCode 2 merges plugin arrays, so naming the guard in both global and
+// project config loads the same entrypoint twice under two ids. The second
+// setup must register nothing and leave a warn-level audit record; otherwise
+// every tool call is evaluated and audited twice, and two instances prime the
+// process-global workspace latch from two roots in the same tick.
+console.log("- V2 duplicate load guard -");
+resetPluginInstancesForTesting();
+resetToolCallClaimsForTesting();
+const v2DuplicateRoot = mkdtempSync(join(tmpdir(), "wg-v2-dup-"));
+const prevDuplicateDataHome = process.env.XDG_DATA_HOME;
+process.env.XDG_DATA_HOME = join(v2DuplicateRoot, "data");
+const makeV2Context = (directory: string) => {
+	const state = {
+		transforms: 0,
+		addedTools: [] as string[],
+		beforeHooks: [] as Array<(event: unknown) => unknown>,
+		afterHooks: [] as Array<(event: unknown) => unknown>,
+	};
+	const editor = {
+		list: () => [],
+		get: () => undefined,
+		namespace: () => {},
+		add: (tool: { name: string }) => { state.addedTools.push(tool.name); },
+		update: () => {},
+		remove: () => {},
+	};
+	const registration = { dispose: async () => {} };
+	const ctx = {
+		location: { directory },
+		options: {},
+		tool: {
+			transform: async (callback: (input: unknown) => void) => { state.transforms++; callback(editor); return registration; },
+			reload: async () => {},
+			list: async () => [],
+			hook: async (name: string, callback: (event: unknown) => unknown) => {
+				if (name === "execute.before") state.beforeHooks.push(callback);
+				if (name === "execute.after") state.afterHooks.push(callback);
+				return registration;
+			},
+		},
+		session: {
+			get: async () => ({}),
+			context: async () => [],
+			prompt: async () => {},
+			synthetic: async () => {},
+			hook: async () => registration,
+		},
+		permission: { hook: async () => registration },
+		shell: { hook: async () => registration },
+		event: { subscribe: async function* () {} },
+		app: { log: async () => {} },
+	};
+	return { ctx, state };
+};
+const v2Owner = makeV2Context(v2DuplicateRoot);
+const v2OwnerCleanup = (await defaultExport.setup(v2Owner.ctx as any)) as (() => void) | undefined;
+const v2Duplicate = makeV2Context(v2DuplicateRoot);
+const v2DuplicateCleanup = (await defaultExport.setup(v2Duplicate.ctx as any)) as (() => void) | undefined;
+check("the first V2 instance registers its tool transform", v2Owner.state.transforms === 1 && v2Owner.state.addedTools.includes("guard_status"));
+check("a duplicate V2 instance registers no tool transform", v2Duplicate.state.transforms === 0);
+check("a duplicate V2 instance registers no execute hooks", v2Duplicate.state.beforeHooks.length === 0 && v2Duplicate.state.afterHooks.length === 0);
+const duplicateAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "plugin.instance" && entry.reason === "duplicate_plugin_load");
+check("a duplicate V2 load writes an audit record naming the instance key", duplicateAudit !== undefined && String((duplicateAudit.input as any)?.instanceKey).includes(v2DuplicateRoot));
+check("the first V2 instance records exactly one plugin_loaded entry", getRecentAuditEntries(50).filter((entry) => entry.tool === "plugin.instance" && entry.reason === "plugin_loaded").length === 1);
+let duplicateDecisions = 0;
+for (const callback of v2Owner.state.beforeHooks) {
+	await callback({ tool: "read", sessionID: "s-v2-dup", agent: "build", messageID: "msg-v2-dup", id: "call-v2-dup", input: { filePath: join(v2DuplicateRoot, "seed.txt") } });
+	duplicateDecisions++;
+}
+for (const callback of v2Duplicate.state.beforeHooks) {
+	await callback({ tool: "read", sessionID: "s-v2-dup", agent: "build", messageID: "msg-v2-dup", id: "call-v2-dup", input: { filePath: join(v2DuplicateRoot, "seed.txt") } });
+	duplicateDecisions++;
+}
+const duplicateDecisionAudits = getRecentAuditEntries(50).filter((entry) => entry.tool === "read" && entry.phase === "decision" && entry.callID === "call-v2-dup");
+check("a duplicated load produces one policy decision per tool call", duplicateDecisions === 1 && duplicateDecisionAudits.length === 1);
+v2DuplicateCleanup?.();
+v2OwnerCleanup?.();
+// A second copy with a DISTINCT module path (cache copy plus source checkout)
+// cannot be made inert by keying alone; the claim table keeps one decision.
+resetToolCallClaimsForTesting();
+check("the first copy claims a tool call for its module path", claimToolCall("module-a", "s-v2-claim", "call-claim", "read") === true);
+check("a second module copy defers on the same tool call", claimToolCall("module-b", "s-v2-claim", "call-claim", "read") === false);
+releaseToolCallClaim("module-a", "s-v2-claim", "call-claim", "read");
+check("a settled call can be claimed by the next copy", claimToolCall("module-b", "s-v2-claim", "call-claim", "read") === true);
+check("claims without a call id are never shared across instances", claimToolCall("module-a", "s-v2-claim", undefined, "read") === true && claimToolCall("module-b", "s-v2-claim", undefined, "read") === true);
+resetToolCallClaimsForTesting();
+if (prevDuplicateDataHome === undefined) delete process.env.XDG_DATA_HOME;
+else process.env.XDG_DATA_HOME = prevDuplicateDataHome;
+rmSync(v2DuplicateRoot, { recursive: true, force: true });
 
 // Loaded plugin version visibility: OpenCode resolves configured bare plugin
 // names through Node's parent-directory lookup from its configuration
