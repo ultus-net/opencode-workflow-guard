@@ -67,6 +67,7 @@ import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, nextRecoveryRun }
 import { buildCompactionContext, guardToolCall } from "../workflow-guard.ts";
 import { registerPluginInstance, releasePluginInstance } from "./plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim } from "./call-claims.ts";
+import { evaluatePermissionSeat } from "./permission-seat.ts";
 
 type V2Context = Plugin.Context;
 
@@ -478,22 +479,52 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		} catch {}
 	});
 
-	// ── Permission journaling ──
-	await ctx.permission.hook("evaluate", (event) => {
+	// ── Permission seat: deny before the tool starts ──
+	// `evaluate` sees normalized `action`/`resources` and runs before the tool,
+	// so it is the earliest hard stop for shell commands, file mutations, and
+	// guarded MCP calls. It cannot see raw tool input, so the raw-argument work
+	// (todo lifecycle, stale-write, post-edit snapshots) stays in
+	// `execute.before`. See lib/permission-seat.ts for the split and the limits.
+	await ctx.permission.hook("evaluate", async (event) => {
+		const configuredEffect = event.effect;
 		try {
+			const seat = await evaluatePermissionSeat(
+				{
+					sessionID: event.sessionID,
+					agent: event.agent,
+					action: event.action,
+					resources: event.resources,
+					effect: configuredEffect,
+				},
+				{ workspaceRoot: effectiveRoot, client },
+			);
+			if (seat.decision) {
+				event.effect = "deny";
+				event.message = seat.decision.message;
+			}
 			audit({
 				ts: new Date().toISOString(),
 				sessionID: event.sessionID,
 				tool: "permission.ask",
-				decision: event.effect === "deny" ? "block" : "allow",
+				decision: seat.effect === "deny" ? "block" : "allow",
+				phase: "decision",
+				reason: seat.decision?.code,
+				policyDecision: seat.decision,
 				input: {
 					action: event.action,
 					resources: event.resources,
 					agent: event.agent,
-					effect: event.effect,
+					configuredEffect,
+					mappedTool: seat.mappedTool,
 				},
 			});
-		} catch {}
+		} catch (error) {
+			// Fail closed: a seat that cannot evaluate must not become a pass.
+			try {
+				event.effect = "deny";
+				event.message = `[workflow-guard permission.evaluate] Blocked: the guard could not evaluate this permission request (${(error as Error)?.message ?? "unknown error"}).`;
+			} catch {}
+		}
 	});
 
 	// ── Shell env scrubbing ──

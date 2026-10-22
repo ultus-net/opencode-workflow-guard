@@ -5039,6 +5039,7 @@ const makeV2Context = (directory: string) => {
 		addedTools: [] as string[],
 		beforeHooks: [] as Array<(event: unknown) => unknown>,
 		afterHooks: [] as Array<(event: unknown) => unknown>,
+		permissionHooks: [] as Array<(event: unknown) => unknown>,
 	};
 	const editor = {
 		list: () => [],
@@ -5069,7 +5070,12 @@ const makeV2Context = (directory: string) => {
 			synthetic: async () => {},
 			hook: async () => registration,
 		},
-		permission: { hook: async () => registration },
+		permission: {
+			hook: async (name: string, callback: (event: unknown) => unknown) => {
+				if (name === "evaluate") state.permissionHooks.push(callback);
+				return registration;
+			},
+		},
 		shell: { hook: async () => registration },
 		event: { subscribe: async function* () {} },
 		app: { log: async () => {} },
@@ -5083,6 +5089,53 @@ const v2DuplicateCleanup = (await defaultExport.setup(v2Duplicate.ctx as any)) a
 check("the first V2 instance registers its tool transform", v2Owner.state.transforms === 1 && v2Owner.state.addedTools.includes("guard_status"));
 check("a duplicate V2 instance registers no tool transform", v2Duplicate.state.transforms === 0);
 check("a duplicate V2 instance registers no execute hooks", v2Duplicate.state.beforeHooks.length === 0 && v2Duplicate.state.afterHooks.length === 0);
+check("a duplicate V2 instance registers no permission seat", v2Duplicate.state.permissionHooks.length === 0);
+
+// ── Permission seat: evaluate denies, execute.before still aborts ──
+// `evaluate` sees normalized action/resources before the tool runs, so a deny
+// here means the tool never starts. `execute.before` still aborts with the
+// specific remediation message, because it is the only seat that sees raw
+// tool input. Both canaries must fail closed with attributable messages.
+console.log("- V2 permission seat -");
+const permissionEvent = (action: string, resources: string[], sessionID = "s-perm-seat") => ({
+	sessionID,
+	agent: "build",
+	action,
+	resources,
+	effect: "allow" as "allow" | "deny" | "ask",
+	message: undefined as string | undefined,
+});
+const seatShell = permissionEvent("shell", ["git push origin main"]);
+await v2Owner.state.permissionHooks[0]?.(seatShell);
+check("evaluate denies a protected-branch push before the tool runs", seatShell.effect === "deny" && /protected branch|main/i.test(String(seatShell.message)));
+if (seatShell.effect !== "deny") console.log("   evaluate message:", seatShell.message);
+const seatSecret = permissionEvent("read", [".env"]);
+await v2Owner.state.permissionHooks[0]?.(seatSecret);
+check("evaluate denies a secret read", seatSecret.effect === "deny" && /secret|credential/i.test(String(seatSecret.message)));
+const seatBoundary = permissionEvent("edit", [join(v2DuplicateRoot, "..", "outside.txt")]);
+await v2Owner.state.permissionHooks[0]?.(seatBoundary);
+check("evaluate denies a boundary-escaping edit", seatBoundary.effect === "deny" && /workspace/i.test(String(seatBoundary.message)));
+const seatAllowed = permissionEvent("shell", ["ls -la"]);
+await v2Owner.state.permissionHooks[0]?.(seatAllowed);
+check("evaluate leaves an ordinary command allowed", seatAllowed.effect === "allow");
+const seatUnmapped = permissionEvent("external_directory", ["/tmp/*"]);
+await v2Owner.state.permissionHooks[0]?.(seatUnmapped);
+check("evaluate leaves unmapped host actions to the host", seatUnmapped.effect === "allow");
+const predefinedDeny = { ...permissionEvent("shell", ["ls"]), effect: "deny" as const };
+await v2Owner.state.permissionHooks[0]?.(predefinedDeny);
+check("an explicit configured deny stays final and untouched", predefinedDeny.effect === "deny" && predefinedDeny.message === undefined);
+const seatAuditEntries = getRecentAuditEntries(60).filter((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.decision === "block");
+const seatAudit = seatAuditEntries.find((entry) => entry.policyDecision?.status === "blocked");
+check("evaluate denials are journaled with the policy decision", seatAudit !== undefined);
+const configuredDenyAudit = seatAuditEntries.find((entry) => (entry.input as any)?.configuredEffect === "deny");
+check("a configured deny is journaled as such without inventing a guard decision", configuredDenyAudit !== undefined && configuredDenyAudit.policyDecision === undefined);
+let executeBeforeDenied = false;
+try {
+	await v2Owner.state.beforeHooks[0]?.({ tool: "write", sessionID: "s-perm-seat", agent: "build", messageID: "msg-perm", id: "call-perm", input: { filePath: join(root, "..", "outside.txt"), content: "x" } });
+} catch (error) {
+	executeBeforeDenied = String((error as Error)?.message).includes("[workflow-guard]");
+}
+check("execute.before still aborts with the guard's remediation message", executeBeforeDenied);
 const duplicateAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "plugin.instance" && entry.reason === "duplicate_plugin_load");
 check("a duplicate V2 load writes an audit record naming the instance key", duplicateAudit !== undefined && String((duplicateAudit.input as any)?.instanceKey).includes(v2DuplicateRoot));
 check("the first V2 instance records exactly one plugin_loaded entry", getRecentAuditEntries(50).filter((entry) => entry.tool === "plugin.instance" && entry.reason === "plugin_loaded").length === 1);

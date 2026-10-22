@@ -116,6 +116,9 @@ It is a policy and enforcement layer, not an agent harness. Policies may constra
 ### 14. Audit Trail & Permission Journaling
 - Every block/allow decision is appended to `~/.local/state/opencode/workflow-guard/workflow-guard.jsonl` (XDG_STATE_HOME respected) with a timestamp, session id, tool name, decision, subagent/parent session attribution, and reason - a durable record.
 - Permission prompts are journaled at request time via the typed `permission.ask` plugin hook, and `permission.replied` outcomes (including rejections) are preserved instead of being labeled as allows.
+- On OpenCode 2, the V2 plugin also *decides* at that seat: `ctx.permission.hook("evaluate")` maps the host's normalized `action`/`resources` back onto the policy core and sets `effect = "deny"` with an attributable message, so the tool never starts. Shell resources feed the shell, git, destructive, and workspace policies. `read` resources feed the secret policy. `edit`/`write`/`patch`/`apply_patch` resources feed the boundary, tamper, secret, protected-branch, and todo policies. Guarded MCP servers (`GitHub`, `Azure DevOps`) feed the MCP policy.
+- The seat can only tighten. An explicit configured `deny` is final and never reaches the hook, and an unmapped host action (`external_directory`, `glob`, `grep`, `webfetch`, `websearch`, `question`, `subagent`) is left to host policy. If the seat itself throws, it fails closed with a deny instead of becoming a pass.
+- `execute.before` is kept as the second, last-resort seat: it sees raw tool input, so todo lifecycle, stale-write observations, and post-edit snapshots stay there, and its thrown message carries the specific remediation text to the model.
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
 ### 15. Compaction State & Policy Context Preservation
