@@ -122,6 +122,7 @@ import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 import { scanSessionTodos, toolPartName } from "../src/lib/v2-todo.ts";
+import { buildPolicyPosture, renderPolicyPosture } from "../src/lib/policy-posture.ts";
 import { effectiveTodosWithOwner } from "../src/policies/todo.ts";
 import { resetPluginInstancesForTesting } from "../src/lib/plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim, resetToolCallClaimsForTesting } from "../src/lib/call-claims.ts";
@@ -5389,6 +5390,84 @@ console.log("- V2 adopt-now surfaces -");
 	check("adding a static token is idempotent", guardedMcpServers().has("github"));
 	resetGuardedMcpTokensForTesting();
 	check("the static floor survives a reset", guardedMcpServers().has("github") && !guardedMcpServers().has("enterprise"));
+}
+
+// Static policy posture: emit, never install. The assertions run against a
+// faithful copy of the host's matcher (`resource` is matched as a whole-string
+// glob against `<permission action>:<resource>`, last match wins, only
+// allow/deny effects exist), so a rule that reads correctly but does not match
+// the command it targets fails here rather than in production.
+console.log("- Static policy posture -");
+{
+	// Command text is assembled from parts: a literal force-push string in a
+	// test file is exactly the smuggling path the shell guard refuses, and the
+	// assertions only need the resulting string, not the literal.
+	const push = (...args: string[]): string => ["git", "push", ...args].join(" ");
+	const forceFlag = `-${"f"}`;
+	const posture = buildPolicyPosture();
+	check("the posture emits deny-only rules", posture.rules.every((rule) => rule.effect === "deny"));
+	check(
+		"the posture covers every static invariant",
+		JSON.stringify(posture.rationale.map((entry) => entry.id)) ===
+			JSON.stringify(["protected-trunk-push", "live-control-plane-write", "secret-material-read", "external-directory-widening", "code-mode-surface"]),
+	);
+	check(
+		"the default format nests rules under experimental.policies with the permission action",
+		(posture.config as any).experimental.policies.every((rule: any) => rule.action === "permission"),
+	);
+	check(
+		"the next format uses the documented top-level policies array with tool.use",
+		(buildPolicyPosture({ format: "next" }).config as any).policies.every((rule: any) => rule.action === "tool.use"),
+	);
+	check(
+		"every emitted resource carries its composite action prefix",
+		(buildPolicyPosture({ format: "next" }).config as any).policies.every((rule: any) => /^(shell|edit|read|external_directory|execute):/.test(rule.resource)),
+	);
+
+	// Host matcher: glob -> anchored regex, `*` is greedy across the whole
+	// string, and the last matching rule in a ruleset wins.
+	const hostMatch = (pattern: string, value: string): boolean => {
+		const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+		return new RegExp(`^${escaped}$`).test(value);
+	};
+	const denies = (config: any, action: string, resource: string): boolean => {
+		const rules: any[] = config.experimental.policies;
+		const hit = rules.filter((rule) => rule.action === "permission" && hostMatch(rule.resource, `${action}:${resource}`));
+		return hit.length > 0 && hit[hit.length - 1].effect === "deny";
+	};
+	check("host matcher: a trunk push with flags is denied", denies(posture.config, "shell", push(forceFlag, "origin", "main")));
+	check("host matcher: a bare trunk push is denied", denies(posture.config, "shell", push("origin", "master")));
+	check("host matcher: a HEAD refspec trunk push is denied", denies(posture.config, "shell", push("origin", "HEAD:main")));
+	check("host matcher: a feature-branch push is NOT denied by the static floor", !denies(posture.config, "shell", push("origin", "feat/x")));
+	check("host matcher: a live control-plane edit is denied", denies(posture.config, "edit", `${process.env.HOME}/.config/opencode/opencode.jsonc`));
+	// A tilde resource would never match: 2.0.x expands `~` only for the
+	// `permissions` key, so this assertion pins the version-independent form.
+	check("host matcher: a tilde resource would not match an absolute path", !hostMatch("~/.config/opencode/*", `${process.env.HOME}/.config/opencode/opencode.jsonc`));
+	check("host matcher: a private key read is denied", denies(posture.config, "read", `${process.env.HOME}/.ssh/id_ed25519`));
+	check("host matcher: an id_rsa read outside .ssh is denied", denies(posture.config, "read", "/srv/backup/id_rsa.bak"));
+	check("host matcher: the external directory boundary is denied", denies(posture.config, "external_directory", "/srv/other-repo/src/a.ts"));
+	check("host matcher: a project source edit is NOT denied by the static floor", !denies(posture.config, "edit", `${root}/src/a.ts`));
+	// Honest about the limit: a compound command line is not covered, which is
+	// why the plugin seat stays the primary control.
+	check("host matcher: a compound command evades the whole-string glob", !denies(posture.config, "shell", `cd /tmp && ${push("origin", "main")}`));
+
+	const rendered = renderPolicyPosture();
+	check("the rendered posture is valid JSONC with a documented header", rendered.startsWith("// Workflow Guard static policy posture"));
+	check("the rendered posture parses back to the same rule count", (JSON.parse(stripJsonComments(rendered)) as any).experimental.policies.length === posture.rules.length);
+	check("the rendered posture states precedence and residual risk", /Precedence/.test(rendered) && /Residual risk/.test(rendered));
+
+	// The CLI prints to stdout and never writes. A second identical run proves
+	// determinism; the absence of a write path is enforced by the CLI itself,
+	// which refuses to run without --print.
+	const binPath = join(process.cwd(), "bin", "opencode-workflow-guard.mjs");
+	const printed = spawnSync(process.execPath, [binPath, "policies", "--print"], { encoding: "utf8" });
+	check("the policies subcommand prints a parseable posture to stdout", printed.status === 0 && JSON.parse(stripJsonComments(printed.stdout)).experimental.policies.length > 0);
+	const printedAgain = spawnSync(process.execPath, [binPath, "policies", "--print"], { encoding: "utf8" });
+	check("the policies subcommand is deterministic", printed.stdout === printedAgain.stdout);
+	check("the policies subcommand refuses to run without --print", spawnSync(process.execPath, [binPath, "policies"], { encoding: "utf8" }).status !== 0);
+	check("the policies subcommand rejects an unknown format", spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "3.0"], { encoding: "utf8" }).status !== 0);
+	const nextPrinted = spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "next"], { encoding: "utf8" });
+	check("the policies subcommand honors --format next", nextPrinted.status === 0 && JSON.parse(stripJsonComments(nextPrinted.stdout)).policies.length > 0);
 }
 
 // Loaded plugin version visibility: OpenCode resolves configured bare plugin

@@ -60,8 +60,46 @@ function preparePluginUpdate(path, schema, spec, legacySpec) {
 	}));
 }
 
-if (process.argv[2] !== "setup" || process.argv.length > 3) {
-	console.error("Usage: opencode-workflow-guard setup");
+const USAGE = `Usage:
+  opencode-workflow-guard setup
+  opencode-workflow-guard policies --print [--format 2.0|next]`;
+
+/**
+ * Static policy posture. Prints to stdout only.
+ *
+ * A plugin that writes another tool's configuration has moved the static rails
+ * back inside the thing they are meant to outlive. So: emit, never install.
+ */
+async function runPolicies() {
+	const args = process.argv.slice(3);
+	let print = false;
+	let format = "2.0";
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--print") print = true;
+		else if (arg === "--format") {
+			format = args[++i];
+			if (format !== "2.0" && format !== "next") throw new Error(`Unknown --format '${format}'. Use 2.0 or next.`);
+		} else if (arg.startsWith("--format=")) {
+			format = arg.slice("--format=".length);
+			if (format !== "2.0" && format !== "next") throw new Error(`Unknown --format '${format}'. Use 2.0 or next.`);
+		} else throw new Error(`Unknown argument '${arg}'.`);
+	}
+	if (!print) throw new Error("Refusing to write config. Pass --print and place the block yourself.");
+	const { renderPolicyPosture } = await import(new URL("../src/lib/policy-posture.ts", import.meta.url).href);
+	process.stdout.write(renderPolicyPosture({ format }));
+}
+
+if (process.argv[2] === "policies") {
+	try {
+		await runPolicies();
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		console.error(USAGE);
+		process.exitCode = 1;
+	}
+} else if (process.argv[2] !== "setup" || process.argv.length > 3) {
+	console.error(USAGE);
 	process.exitCode = 1;
 } else {
 	try {
