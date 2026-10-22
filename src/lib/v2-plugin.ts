@@ -298,7 +298,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			const record = asRecord(args);
 			const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 			const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-			registerSessionWorkspaceFromToolCall(event.sessionID, {
+			await registerSessionWorkspaceFromToolCall(event.sessionID, {
 				workdir,
 				filePath,
 				toolWorktree,

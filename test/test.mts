@@ -47,6 +47,7 @@ import {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	registerSessionWorkspaceFromToolCall,
+	resolveInheritedWorkspace,
 	resolveEffectiveWorkspace,
 	getLastReviewResultForWorkspace,
 	isSameGitRepo,
@@ -3473,6 +3474,34 @@ todo("s-iso-widen", item("boundary probe", "in_progress"));
 const crossWrite = await guardToolDecision("write", { filePath: join(isoRepoB, "escape.txt"), content: "x" }, { sessionID: "s-iso-widen" });
 check("a foreign write is refused after a foreign read", crossWrite.status === "blocked" && crossWrite.policy === "boundary");
 if (crossWrite.status !== "blocked") console.log("   decision:", JSON.stringify(crossWrite));
+// A subagent has no direct binding, but its policy root inherits the nearest
+// bound ancestor's workspace. Registration must use that same inherited root,
+// or the child's first foreign read rebinds it into another repository while
+// the parent stays confined: one allowed read moves the child's write
+// boundary, which is the Task 3 defect one level down.
+fakeParents.set("s-iso-child", "s-iso-widen");
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-child", tool: "read", callID: "c-child-1" }, { args: { filePath: join(isoRepoB, "seed.txt") } });
+check(
+	"a subagent's foreign read does not rebind it out of the parent's workspace",
+	getSessionBoundWorkspace("s-iso-child") === undefined &&
+		getSessionWorkspace("s-iso-child") !== isoRepoB &&
+		(await resolveInheritedWorkspace("s-iso-child")) === isoRepoA,
+);
+const childRefusalAudit = getRecentAuditEntries(30).find((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_refused" && entry.sessionID === "s-iso-child");
+check(
+	"a subagent's refused widening is journaled against the inherited root",
+	childRefusalAudit?.decision === "block" &&
+		(childRefusalAudit.input as any)?.from === isoRepoA &&
+		(childRefusalAudit.input as any)?.to === isoRepoB,
+);
+check("resolveInheritedWorkspace reports the parent's root for a subagent", (await resolveInheritedWorkspace("s-iso-child")) === isoRepoA);
+// The real hook runs the child's decision under the plugin instance root, which
+// for a relay flow is the parent's repository. A write into the foreign repo
+// must still be refused there.
+const childEscapeWrite = await guardToolDecision("write", { filePath: join(isoRepoB, "child-escape.txt"), content: "x" }, { sessionID: "s-iso-child", worktree: isoRepoA });
+check("a subagent's foreign write stays blocked by the inherited boundary", childEscapeWrite.status === "blocked" && childEscapeWrite.policy === "boundary");
+if (childEscapeWrite.status !== "blocked") console.log("   decision:", JSON.stringify(childEscapeWrite));
+fakeParents.delete("s-iso-child");
 // An explicit host-declared worktree is still a legitimate widening statement:
 // worktree isolation and relay flows set it, and a subagent must be able to
 // bind to the linked worktree it was given.
@@ -5489,6 +5518,13 @@ console.log("- Static policy posture -");
 		"every emitted resource carries its composite action prefix",
 		(buildPolicyPosture({ format: "next" }).config as any).policies.every((rule: any) => /^(shell|edit|read|external_directory|execute):/.test(rule.resource)),
 	);
+	// `rules` stays unprefixed and `config` holds the enveloped form, so a
+	// caller reading `rules` cannot accidentally feed the host a substring.
+	check(
+		"posture.rules stays unprefixed while posture.config is enveloped",
+		posture.rules.every((rule) => !rule.resource.startsWith(`${rule.action}:`)) &&
+			(posture.config as any).experimental.policies.every((rule: any) => /^(shell|edit|read|external_directory|execute):/.test(rule.resource)),
+	);
 
 	// Host matcher: glob -> anchored regex, `*` is greedy across the whole
 	// string, and the last matching rule in a ruleset wins.
@@ -5603,6 +5639,16 @@ console.log("- setup config writer -");
 	writeFileSync(target, `{\n  "plugin": ["opencode-workflow-guard/tui", "${spec}"]\n}\n`);
 	const migrated = preparePluginUpdate(target, "https://opencode.ai/config.json", spec, "opencode-workflow-guard/tui");
 	check("writer: a legacy TUI spec is replaced, not duplicated", JSON.stringify(JSON.parse(stripJsonComments(migrated!)).plugin) === JSON.stringify([spec]));
+
+	// `tui.json` keeps the singular key on both majors; `--major 2` must not
+	// rewrite it to `plugins`, which that schema ignores (the TUI plugin would
+	// then silently never load).
+	writeFileSync(target, '{\n  "$schema": "https://opencode.ai/tui.json"\n}\n');
+	const tuiForced = preparePluginUpdate(target, "https://opencode.ai/tui.json", spec, undefined, 2, "plugin");
+	check("writer: --major 2 still writes the singular key into tui.json", tuiForced !== undefined && JSON.parse(stripJsonComments(tuiForced)).plugin?.[0] === spec && JSON.parse(stripJsonComments(tuiForced)).plugins === undefined);
+	writeFileSync(target, tuiForced!);
+	const tuiExisting = preparePluginUpdate(target, "https://opencode.ai/tui.json", spec, undefined, 2, "plugin");
+	check("writer: an already-configured tui.json is not rewritten", tuiExisting === undefined);
 
 	writeFileSync(target, '{\n  "plugins": "not-an-array"\n}\n');
 	let threw = false;

@@ -17,6 +17,19 @@
  * decides: a `plugins` key means 2.x, a `plugin` key means 1.x. A fresh config
  * defaults to 2, because this package's host dependency is pinned to a 2.x
  * release.
+ *
+ * `tui.json` is the exception. Its schema is singular `plugin` on both majors:
+ * OpenCode 2 reads `tui.json` with that key and migrates it into
+ * `cli.json.plugins`. Writing `plugins` there on 2.x produces a file the TUI
+ * schema ignores, so the TUI plugin silently never loads. Callers pass
+ * `key` to pin the TUI array's key independently of the server config.
+ *
+ * Evidence for that migration, since no TUI schema is vendored here: the
+ * installed 2.0.15 binary's cli-config migration step reads
+ * `join(config, "tui.json")`, decodes it with a schema whose only plugin field
+ * is singular `plugin`, and emits `plugins` into `cli.json`. The unit tests
+ * therefore pin the writer's key choice; the host behavior itself is
+ * host-version-dependent and is re-checked by `npm run test:install`.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -43,7 +56,7 @@ export function matchesPackageSpec(entry, spec) {
  * unchanged config is never rewritten. Throws on an unparseable document or a
  * non-array plugin key rather than clobbering a config it does not understand.
  */
-export function preparePluginUpdate(path, schema, spec, legacySpec, explicitMajor) {
+export function preparePluginUpdate(path, schema, spec, legacySpec, explicitMajor, key) {
 	const source = existsSync(path)
 		? readFileSync(path, "utf8")
 		: `{
@@ -54,23 +67,23 @@ export function preparePluginUpdate(path, schema, spec, legacySpec, explicitMajo
 	if (errors.length > 0 || !config || typeof config !== "object" || Array.isArray(config)) {
 		throw new Error(`Cannot update invalid config: ${path}`);
 	}
-	const key = pluginKeyFor(config, explicitMajor);
-	if (config[key] !== undefined && !Array.isArray(config[key])) {
-		throw new Error(`Cannot update ${path}: "${key}" must be an array`);
+	const targetKey = key ?? pluginKeyFor(config, explicitMajor);
+	if (config[targetKey] !== undefined && !Array.isArray(config[targetKey])) {
+		throw new Error(`Cannot update ${path}: "${targetKey}" must be an array`);
 	}
-	const plugins = config[key] ?? [];
+	const plugins = config[targetKey] ?? [];
 	const hasSpec = plugins.some((entry) => matchesPackageSpec(entry, PACKAGE_NAME));
 	const updatedPlugins = legacySpec
 		? plugins.filter((entry) => !matchesPackageSpec(entry, legacySpec))
 		: plugins;
 	if (updatedPlugins.length !== plugins.length) {
 		if (!hasSpec) updatedPlugins.push(spec);
-		return applyEdits(source, modify(source, [key], updatedPlugins, {
+		return applyEdits(source, modify(source, [targetKey], updatedPlugins, {
 			formattingOptions: { insertSpaces: true, tabSize: 2 },
 		}));
 	}
 	if (hasSpec) return undefined;
-	return applyEdits(source, modify(source, [key, plugins.length], spec, {
+	return applyEdits(source, modify(source, [targetKey, plugins.length], spec, {
 		formattingOptions: { insertSpaces: true, tabSize: 2 },
 	}));
 }

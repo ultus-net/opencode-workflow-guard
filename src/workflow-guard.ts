@@ -88,6 +88,7 @@ import {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	registerSessionWorkspaceFromToolCall,
+	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
 	resolveEffectiveWorkspace,
 } from "./lib/state.ts";
@@ -123,6 +124,7 @@ export {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	registerSessionWorkspaceFromToolCall,
+	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
 	resolveEffectiveWorkspace,
 	findGitRoot,
@@ -492,7 +494,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					const record = asRecord(args);
 					const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 					const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-					registerSessionWorkspaceFromToolCall(input.sessionID, {
+					await registerSessionWorkspaceFromToolCall(input.sessionID, {
 						workdir,
 						filePath,
 						hostWorktree,

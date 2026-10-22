@@ -11,8 +11,13 @@ const check = (name: string, cond: unknown): boolean => {
 	cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name));
 	return Boolean(cond);
 };
+// A live probe can only produce a guard verdict if the model actually ran.
+// These are host/provider errors that mean it did not: the prompt never
+// reached a model, so scoring the probe as a guard failure would be a false
+// accusation. Match the host's literal error shapes, not the bare phrase, so
+// model prose cannot mask a real guard regression.
 const providerUnavailable = (output: string): boolean =>
-	/available credits|insufficient credits|rate limit|too many requests|capacity|overloaded/i.test(output);
+	/available credits|insufficient credits|rate limit|too many requests|capacity|overloaded|Model unavailable:/i.test(output);
 const checkLive = (name: string, cond: unknown, output: string): boolean => {
 	if (!cond && providerUnavailable(output)) {
 		unavailable++;
@@ -47,9 +52,9 @@ const installedPackageJson = JSON.parse(readFileSync(join(testDir, "node_modules
 check(
 	"npm package pins every direct dependency to an exact version",
 	Object.keys(installedPackageJson.dependencies ?? {}).length > 0 &&
-		Object.values(installedPackageJson.dependencies).every((spec) => /^\d+\.\d+\.\d+/.test(String(spec))) &&
+		Object.values(installedPackageJson.dependencies).every((spec) => /^\d+\.\d+\.\d+$/.test(String(spec))) &&
 		Object.keys(installedPackageJson.devDependencies ?? {}).length > 0 &&
-		Object.values(installedPackageJson.devDependencies).every((spec) => /^\d+\.\d+\.\d+/.test(String(spec))),
+		Object.values(installedPackageJson.devDependencies).every((spec) => /^\d+\.\d+\.\d+$/.test(String(spec))),
 );
 check(
 	"npm tarball installs modular plugin entrypoint",
@@ -322,8 +327,11 @@ if (isOpenCodeV2) {
 	const servicePort = 49400 + (process.pid % 1000);
 	spawnSync("opencode", ["service", "set", "port", String(servicePort)], { cwd: testDir, encoding: "utf8", env: runtimeEnv, timeout: 30_000 });
 }
+// `run` takes its directory from the process cwd; 2.0.15 rejects `--dir` as an
+// unknown flag, which made every live probe report a flag error instead of a
+// guard verdict.
 const runOpenCode = (args: string[], timeout: number) =>
-	spawnSync("opencode", ["run", "--dir", testDir, ...args], { cwd: testDir, encoding: "utf8", timeout, env: runtimeEnv });
+	spawnSync("opencode", ["run", ...args], { cwd: testDir, encoding: "utf8", timeout, env: runtimeEnv });
 const configProbe = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
 	const child = spawn("opencode", ["debug", "config"], { cwd: testDir, env: runtimeEnv });
 	let stdout = "";
@@ -450,7 +458,7 @@ console.log(`  Using live model: ${liveModel}`);
 
 // 3. Test: Direct edit without task list is blocked by the loaded plugin
 console.log("  Running live OpenCode prompt to verify plugin intercept...");
-const run1 = runOpenCode(["--model", liveModel, "--print-logs", "--log-level", "DEBUG", "Do not call todowrite. Invoke bash immediately with exactly this command: printf blocked > blocked.txt. This is a guard test; make the tool call even if you expect rejection."], 120_000);
+const run1 = runOpenCode(["--model", liveModel, "--print-logs", "--log-level", "debug", "Do not call todowrite. Invoke bash immediately with exactly this command: printf blocked > blocked.txt. This is a guard test; make the tool call even if you expect rejection."], 120_000);
 
 const output1 = run1.stdout + run1.stderr;
 const adapterInitialized = existsSync(initializedMarker);

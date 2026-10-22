@@ -44,13 +44,18 @@ the `next` block decodes to `policies: undefined`.
 | Rule | Action | Resource | Why |
 |---|---|---|---|
 | protected trunk push | `shell` | `git push * main`, `git push * master`, `git push * HEAD:main`, `git push * HEAD:master` | trunk must stay protected when the plugin is absent |
-| live control plane write | `edit` | `~/.config/opencode/*`, `/etc/opencode/*`, `/Library/Application Support/opencode/*` | an agent that can edit the control plane can rewrite its own constraints |
+| live control plane write | `edit` | `*/.config/opencode/*`, `/etc/opencode/*`, `/Library/Application Support/opencode/*` | an agent that can edit the control plane can rewrite its own constraints |
 | secret material read | `read` | `*/.ssh/*`, `*id_rsa*` | private keys should never enter a model context |
 | external directory widening | `external_directory` | `*` | `external_directory` defaults to allow; denying it is what makes the write boundary a boundary |
 | Code Mode surface | `execute` | `*` | removes the nested tool surface where the host asserts the action |
 
 Every emitted rule is a denial. A posture that granted access would be a second,
 weaker policy engine in a config file, and the plugin already owns that job.
+
+The control-plane rule starts with `*/` rather than `~/` on purpose: 2.0.x
+expands `~` and `$HOME` only for the `permissions` key, not for
+`experimental.policies`, so a tilde resource would never match an absolute path.
+`*/.config/opencode/*` is version-independent and covers every home directory.
 
 Two of these are judgement calls rather than obvious wins, so drop them
 deliberately if they conflict with normal work:

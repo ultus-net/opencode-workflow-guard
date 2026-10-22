@@ -19,7 +19,7 @@ verified it.
 
 | Guard | OpenCode qualified | Hook seats exercised | Notes |
 |---|---|---|---|
-| 1.16.x | 2.0.15 | `permission.hook("evaluate")`, `tool.hook("execute.before"/"execute.after")`, `session.hook("context")`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client | Unit and package-loader verified. Live model-driven probes: NOT RUN (no provider in the verification environment). |
+| 1.16.x | 2.0.15 | `permission.hook("evaluate")`, `tool.hook("execute.before"/"execute.after")`, `session.hook("context")`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client | Unit and package-loader verified. Live model-driven probes reached the provider and were classified `live unavailable` (`Model unavailable: openrouter/openrouter/auto`), so no guard verdict was produced. |
 | 1.16.x | 1.18.32 (`@opencode-ai/plugin`) | V1 `PluginModule` loader, native todo endpoint | Compatibility export only; unit-tested, no live host probe. |
 | 1.16.x | 2.1.x (`todowrite` behind `experimental.todo`) | Todo capability probe and gate inversion | **NOT RUN.** Only synthetic registry/session data is covered. The 2.1.x acceptance in the implementation plan remains open. |
 
@@ -75,6 +75,12 @@ interchangeable: OpenCode 2's config schema drops a singular `plugin` key
 without an error, so writing the wrong one produces a config that looks
 configured and loads nothing. The writer refuses to clobber an unparseable
 config or a non-array plugin key.
+
+`tui.json` is the exception to the key rule. Its schema reads singular `plugin`
+on both majors, and OpenCode 2 migrates that key into `cli.json.plugins`. So
+`--major 2` writes `plugins` to the server config and still writes `plugin` to
+`tui.json`; a plural key there is silently ignored and the TUI badge never
+loads.
 
 ### Configure The Guard In One Location Only
 

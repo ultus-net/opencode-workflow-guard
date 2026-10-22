@@ -108,7 +108,11 @@ export interface StaticPolicyRule {
 
 export interface PolicyPosture {
 	format: PolicyPostureFormat;
-	/** Rules with the `<action>:<resource>` composite resource the host matches. */
+	/**
+	 * Rules as `{ action, resource }` pairs with the resource unprefixed. The
+	 * host builds the `<action>:<resource>` string when it matches; `config`
+	 * holds the enveloped form that is actually pasted into a config file.
+	 */
 	rules: StaticPolicyRule[];
 	/** Config fragment, ready to print. Never written by the plugin. */
 	config: Record<string, unknown>;

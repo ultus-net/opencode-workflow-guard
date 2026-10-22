@@ -3,9 +3,8 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { preparePluginUpdate } from "../src/lib/config-writer.mjs";
+import { preparePluginUpdate, PACKAGE_NAME } from "../src/lib/config-writer.mjs";
 
-const PACKAGE_NAME = "opencode-workflow-guard";
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const SERVER_SPEC = `${PACKAGE_NAME}@${PACKAGE_VERSION}`;
 const TUI_SPEC = SERVER_SPEC;
@@ -86,7 +85,9 @@ if (process.argv[2] === "policies") {
 		const serverPath = existingConfig(base, "opencode");
 		const tuiPath = existingConfig(base, "tui");
 		const serverUpdate = preparePluginUpdate(serverPath, "https://opencode.ai/config.json", SERVER_SPEC, undefined, explicitMajor);
-		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC, LEGACY_TUI_SPEC, explicitMajor);
+		// `tui.json` keeps the singular `plugin` key on both majors: OpenCode 2
+		// reads that key and migrates it into `cli.json.plugins`.
+		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC, LEGACY_TUI_SPEC, explicitMajor, "plugin");
 		const serverBefore = existsSync(serverPath) ? readFileSync(serverPath, "utf8") : undefined;
 		const tuiBefore = existsSync(tuiPath) ? readFileSync(tuiPath, "utf8") : undefined;
 		mkdirSync(base, { recursive: true });

@@ -9,4 +9,5 @@ export declare function preparePluginUpdate(
 	spec: string,
 	legacySpec?: string,
 	explicitMajor?: number,
+	key?: "plugin" | "plugins",
 ): string | undefined;

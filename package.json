@@ -36,6 +36,9 @@
     "guard",
     "workflow"
   ],
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "test": "node test/run-test.mjs",
     "test:install": "node test/test-e2e.mts",
