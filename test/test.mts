@@ -121,9 +121,9 @@ import { isProjectMemoryFreshAsync } from "../src/lib/project-memory.ts";
 import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
-import { scanSessionTodos, toolPartName } from "../src/lib/v2-todo.ts";
+import { scanSessionTodos, toolPartName, detectTodoCapability, recordedTodoCapability, recordTodoCapability, reportTodoGateFailOpen, resetTodoCapabilityForTesting } from "../src/lib/v2-todo.ts";
 import { buildPolicyPosture, renderPolicyPosture } from "../src/lib/policy-posture.ts";
-import { effectiveTodosWithOwner } from "../src/policies/todo.ts";
+import { effectiveTodosWithOwner, completionClaimMismatch } from "../src/policies/todo.ts";
 import { resetPluginInstancesForTesting } from "../src/lib/plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim, resetToolCallClaimsForTesting } from "../src/lib/call-claims.ts";
 import { pruneToolsForReadOnlyRole, READ_ONLY_PRUNED_TOOLS } from "../src/lib/read-only-tools.ts";
@@ -282,6 +282,70 @@ check("V2: legacy name field is still accepted", Array.isArray(legacy) && legacy
 const inFlight = await scanSessionTodos(ctxWith([todoPart([item("x")], "pending")]), "s-v2");
 check("V2: in-flight todowrite reports an empty list, not unknown", Array.isArray(inFlight) && inFlight.length === 0);
 check("V2: toolPartName prefers tool and falls back to name", toolPartName({ tool: "shell" }) === "shell" && toolPartName({ name: "bash" }) === "bash" && toolPartName({}) === undefined);
+
+// ── Capability probe: the registry answers "can this host plan at all?" ──
+// The 2.0.x inference ("no todowrite in history means no capability") becomes
+// wrong on 2.1.x, where a registered tool plus an empty history means the
+// session never planned. These assertions invert that baseline.
+const emptyHistory = ctxWith([{ content: [{ type: "tool", tool: "edit", state: { status: "completed" } }] }]);
+check("capability: an empty history with a registered todowrite is a definitive empty list", JSON.stringify(await scanSessionTodos(emptyHistory, "s-cap", "available")) === "[]");
+check("capability: an empty history without the tool stays unknown", (await scanSessionTodos(emptyHistory, "s-cap", "unavailable")) === undefined);
+check("capability: an unread registry stays unknown rather than unavailable", (await scanSessionTodos(emptyHistory, "s-cap", "unknown")) === undefined);
+check("capability: default remains unknown so existing callers are unchanged", (await scanSessionTodos(emptyHistory, "s-cap")) === undefined);
+check("capability: a registry listing todowrite reports available", (await detectTodoCapability({ tool: { list: async () => [{ name: "todowrite" }, { name: "edit" }] } })) === "available");
+check("capability: a registry without todowrite reports unavailable", (await detectTodoCapability({ tool: { list: async () => [{ name: "edit" }, { name: "shell" }] } })) === "unavailable");
+check("capability: a 2.1.x tool id with a name field still counts", (await detectTodoCapability({ tool: { list: async () => [{ id: "todowrite", name: "todowrite" }] } })) === "available");
+check("capability: a throwing registry reports unknown, never unavailable", (await detectTodoCapability({ tool: { list: async () => { throw new Error("rpc"); } } })) === "unknown");
+check("capability: a host without a tool domain reports unknown", (await detectTodoCapability({})) === "unknown");
+check("capability: a non-array registry answer reports unknown", (await detectTodoCapability({ tool: { list: async () => ({ nope: true }) } })) === "unknown");
+
+// The recorded capability is process-global (two module copies must agree)
+// and the fail-open warning fires once per session, not once per mutation.
+resetTodoCapabilityForTesting();
+check("capability: the recorded value starts unknown", recordedTodoCapability() === "unknown");
+check("capability: recordTodoCapability returns the previous value", recordTodoCapability("unavailable") === "unknown" && recordedTodoCapability() === "unavailable");
+check("capability: a first fail-open report is recorded", reportTodoGateFailOpen("s-warn", "unavailable") === true);
+check("capability: a repeated fail-open report for the same session is suppressed", reportTodoGateFailOpen("s-warn", "unavailable") === false);
+check("capability: a different session warns again", reportTodoGateFailOpen("s-warn-2", "unavailable") === true);
+resetTodoCapabilityForTesting();
+
+// Completion laundering: a completion transition with no mutation in the
+// interval is recorded as a mismatch, and is never a block.
+const launderingPrevious = [item("write the fix", "in_progress"), item("run tests", "pending")];
+const launderingClaim = [item("write the fix", "completed"), item("run tests", "completed")];
+check(
+	"laundering: completing tasks with no mutation since the last write is a mismatch",
+	JSON.stringify(completionClaimMismatch(launderingPrevious, launderingClaim, 0, 0)) === JSON.stringify(["write the fix", "run tests"]),
+);
+check("laundering: a mutation in the interval suppresses the signal", completionClaimMismatch(launderingPrevious, launderingClaim, 3, 3).length === 0);
+check("laundering: a first write with prior mutations is not a mismatch", completionClaimMismatch(undefined, launderingClaim, undefined, 4).length === 0);
+check("laundering: a first write with no mutations at all is a mismatch", completionClaimMismatch(undefined, launderingClaim, undefined, 0).length === 2);
+check("laundering: a completion that was already completed is not a transition", completionClaimMismatch([item("a", "completed")], [item("a", "completed")], 0, 0).length === 0);
+check("laundering: a pending-to-pending rewrite is not a transition", completionClaimMismatch([item("a", "pending")], [item("a", "pending")], 0, 0).length === 0);
+check("laundering: a new completed task is not a transition from previous state", completionClaimMismatch([item("a", "pending")], [item("a", "pending"), item("b", "completed")], 0, 0).length === 0);
+
+// The plan's failing baseline, inverted: on 2.1.x with `experimental.todo:
+// true`, a mutation with no todo list must be blocked. On 2.0.x the same state
+// is a legitimate fail-open. Drive both through the real dispatcher by
+// swapping only the adapter's todo endpoint.
+const v2TodoClient = (capability: "available" | "unavailable") => ({
+	session: {
+		todo: async ({ path }: { path: { id: string } }) => ({ data: await scanSessionTodos(emptyHistory, path.id, capability) }),
+		get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: undefined } }),
+	},
+});
+setSdkClient(v2TodoClient("available"));
+recordTodoCapability("available");
+const gatedMutation = await call("edit", { filePath: join(root, "v2-cap-gated.ts"), content: "x" }, { sessionID: "s-v2-cap" });
+check("capability: a mutation with no todo is BLOCKED when the host can plan", blocked(gatedMutation) && String(gatedMutation).includes("no active todo item"));
+setSdkClient(v2TodoClient("unavailable"));
+recordTodoCapability("unavailable");
+const failedOpenMutation = await call("edit", { filePath: join(root, "v2-cap-open.ts"), content: "x" }, { sessionID: "s-v2-cap" });
+check("capability: the same mutation fails open when the host cannot plan", !blocked(failedOpenMutation));
+check("capability: the fail-open path is journaled once for the session", getRecentAuditEntries(20).filter((entry) => entry.reason === "todo_gate_fail_open_unavailable").length === 1);
+setSdkClient(fakeClient);
+resetTodoCapabilityForTesting();
+
 
 console.log("- Policy 1: parent-chain walk tolerates unknown links (V2) -");
 const walkTodos = new Map<string, TestTodo[] | undefined>();
@@ -5468,6 +5532,34 @@ console.log("- Static policy posture -");
 	check("the policies subcommand rejects an unknown format", spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "3.0"], { encoding: "utf8" }).status !== 0);
 	const nextPrinted = spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "next"], { encoding: "utf8" });
 	check("the policies subcommand honors --format next", nextPrinted.status === 0 && JSON.parse(stripJsonComments(nextPrinted.stdout)).policies.length > 0);
+}
+
+// Todo capability wiring: setup probes the host registry once, records it for
+// guard_status, and the adapter passes it into history reconstruction. A host
+// that registers todowrite (2.1.x + experimental.todo) must be reported as
+// available; one that does not (2.0.x) must be reported as unavailable.
+console.log("- V2 todo capability wiring -");
+{
+	const capabilityRoot = mkdtempSync(join(tmpdir(), "wg-v2-cap-"));
+	const prevCapDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = join(capabilityRoot, "data");
+	resetTodoCapabilityForTesting();
+	const withTool = makeV2Context(capabilityRoot, { registeredTools: [{ id: "todowrite", description: "todo" }] });
+	const withCleanup = (await defaultExport.setup(withTool.ctx as any)) as (() => void) | undefined;
+	check("setup records available when the host registers todowrite", recordedTodoCapability() === "available");
+	check("setup journals the probed capability", getRecentAuditEntries(20).some((entry) => entry.reason === "todo_capability_available"));
+	withCleanup?.();
+
+	resetTodoCapabilityForTesting();
+	const withoutTool = makeV2Context(capabilityRoot, { registeredTools: [{ id: "edit", description: "edit" }] });
+	const withoutCleanup = (await defaultExport.setup(withoutTool.ctx as any)) as (() => void) | undefined;
+	check("setup records unavailable when the host has no todowrite", recordedTodoCapability() === "unavailable");
+	check("setup journals the unavailable capability", getRecentAuditEntries(20).some((entry) => entry.reason === "todo_capability_unavailable"));
+	withoutCleanup?.();
+	resetTodoCapabilityForTesting();
+	if (prevCapDataHome === undefined) delete process.env.XDG_DATA_HOME;
+	else process.env.XDG_DATA_HOME = prevCapDataHome;
+	rmSync(capabilityRoot, { recursive: true, force: true });
 }
 
 // Loaded plugin version visibility: OpenCode resolves configured bare plugin

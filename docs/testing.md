@@ -53,4 +53,6 @@ npm run test:all
 | **Completion Claims & Tool Honesty** | Verifies the claims-vs-evidence detector (missing/failing/stale/fresh states), `experimental.text.complete` journaling, and `tool.definition` enrichment idempotence. |
 | **Compaction & TUI Feedback** | Verifies active task injection in `experimental.session.compacting`, the static TUI badge, guard block warning toasts, and clean error propagation. |
 | **Runtime Instance Isolation** | Verifies concurrent plugin instances keep workspace root and SDK client state isolated via `runWithRuntimeState`. |
+| **V2 Todo Capability** | Verifies the `todowrite` registry probe (`available` / `unavailable` / `unknown`), that an empty history gates only when planning is possible, the once-per-session fail-open warning and audit record, `todoCapability` in `guard_status`, and the completion-laundering signal (recorded, never enforced). |
+| **Static Policy Posture** | Verifies the emitted posture is deny-only, targets the right host shape (2.0 `experimental.policies` vs. the newer `policies`/`tool.use`), and matches the intended commands under a replica of the host's whole-string glob matcher, including the compound-command evasion it does not cover. |
 | **Modular Exports & Shape** | Verifies V1 `PluginModule` `{ id, server }` structure, modular policy imports, and `output.args` hook contract. |

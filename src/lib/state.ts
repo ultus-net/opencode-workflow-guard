@@ -56,6 +56,11 @@ const workspaceMutationCounts = new Map<string, number>();
 export const sessionMutationTimestamps = new Map<string, number>();
 export const sessionMutationCounts = new Map<string, number>();
 export const sessionWorkspaces = new Map<string, string>();
+// Mutation count at each session's previous `todowrite`, so the completion
+// laundering signal can tell whether anything changed between two writes.
+// Process-global like the mutation counts themselves: a subagent's write and
+// its parent's evidence share the same accounting.
+export const sessionTodoMutationBaseline = new Map<string, number>();
 // Sessions whose workspace was registered from their OWN context (tool-call
 // arguments or a host-provided per-call worktree). A session registered only
 // from the plugin-instance default is deliberately left unmarked: concurrent

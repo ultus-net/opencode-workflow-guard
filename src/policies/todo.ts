@@ -94,6 +94,55 @@ export function hasActiveTodo(todos: TodoItem[]): boolean {
 	return todos.some((todo) => ACTIVE_TODO_STATUSES.has(String(todo.status ?? "")));
 }
 
+/**
+ * Completion-claim laundering signal (observed, never enforced).
+ *
+ * A `todowrite` call replaces the whole list, so a model can flip every item to
+ * `completed` without doing any work. Todos are never evidence and never
+ * authority: the verification and review gates decide whether the work is done.
+ * This function answers one narrower question, for the audit trail: did the
+ * session mark work complete without mutating anything since the previous
+ * todo write?
+ *
+ * Mirrors Policy 24 (`policies/completion.ts`): it records a mismatch, it never
+ * blocks. Blocking here would be wrong, because a session can legitimately
+ * complete read-only tasks (a review, an investigation) without mutating.
+ *
+ * `mutationDelta` is the change in the session's mutation count since the last
+ * todowrite for this session. `undefined` means there is no baseline (first
+ * todowrite in the session), in which case a completion claiming work is
+ * reported only when the session has never mutated at all.
+ */
+export function completionClaimMismatch(
+	previousTodos: TodoItem[] | undefined,
+	nextTodos: TodoItem[],
+	mutationDelta: number | undefined,
+	totalMutations: number,
+): string[] {
+	const priorStatus = new Map<string, string>();
+	for (const todo of previousTodos ?? []) {
+		priorStatus.set(String(todo.content ?? "").trim(), String(todo.status ?? ""));
+	}
+	const transitions = nextTodos.filter((todo) => {
+		const content = String(todo.content ?? "").trim();
+		const now = String(todo.status ?? "");
+		if (now !== "completed") return false;
+		// No prior list: every completed item is a first claim, so it counts.
+		if (previousTodos === undefined) return true;
+		const before = priorStatus.get(content);
+		return before !== undefined && before !== "completed";
+	});
+	if (transitions.length === 0) return [];
+	// A first-write completion counts as a mismatch only when the session has
+	// never mutated, which is the blatant case. With a baseline, any mutation
+	// activity since the previous write is enough to suppress the signal,
+	// because mapping edits to individual tasks is not something this layer can
+	// do honestly.
+	const mutated = mutationDelta === undefined ? totalMutations > 0 : mutationDelta > 0;
+	if (mutated) return [];
+	return transitions.map((todo) => String(todo.content ?? "").trim()).filter(Boolean);
+}
+
 export function validateTodoLifecycle(
 	newTodos: TodoItem[],
 	existingTodos: TodoItem[] | undefined,

@@ -128,8 +128,14 @@ export function createCustomTools(options: {
 	 * Removal stays with the guard's snapshot-then-remove flow regardless.
 	 */
 	hostWorktree?: HostWorktreePort;
+	/**
+	 * Probed todo capability for this host, reported in `guard_status`.
+	 * Omitted on V1, which has a native todo endpoint and therefore always can
+	 * plan; V2 passes its registry probe so a fail-open gate is visible.
+	 */
+	todoCapability?: () => string;
 }) {
-	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree } = options;
+	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree, todoCapability } = options;
 	// Resolve the workspace for a tool call from the CALL's own context: an
 	// explicit argument first, then the host-provided per-call worktree or
 	// directory (even when unusable — the call declared its target), then the
@@ -283,7 +289,7 @@ export function createCustomTools(options: {
 					recommendedActions.push("All operational requirements are satisfied for task finalization and PR creation.");
 				}
 				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
-				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
+				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, todoCapability: todoCapability ? todoCapability() : "available", outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),

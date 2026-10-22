@@ -8,6 +8,7 @@ import {
 	getLiveControlPlaneRoots,
 	getSdkClient,
 	getSessionBoundWorkspace,
+	getSessionMutationCount,
 	getWorkspaceRoot,
 	isDocumentationRequired,
 	isReviewRequired,
@@ -16,6 +17,7 @@ import {
 	recordMutation,
 	recordVerifyResult,
 	sessionMutationTimestamps,
+	sessionTodoMutationBaseline,
 	sessionVerifyResults,
 } from "./state.ts";
 import {
@@ -74,9 +76,11 @@ import {
 	effectiveTodos,
 	fetchSessionTodos,
 	hasActiveTodo,
+	completionClaimMismatch,
 	subagentMutationBudgetReason,
 	validateTodoLifecycle,
 } from "../policies/todo.ts";
+import { recordedTodoCapability, reportTodoGateFailOpen } from "./v2-todo.ts";
 
 export const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
@@ -191,6 +195,32 @@ export async function guardToolCallImpl(
 			if (err) {
 				logPolicyBlock(`[workflow-guard] ${err}`);
 				return block("todo", "todo_lifecycle", err);
+			}
+			// Completion laundering signal. Recorded, never enforced: a task
+			// can legitimately complete without a mutation, and the
+			// verification gate is what decides finalization. Simulation is
+			// skipped so a permission-seat probe cannot shift the baseline.
+			if (context?.sessionID && !context.simulate) {
+				const baseline = sessionTodoMutationBaseline.get(context.sessionID);
+				const total = getSessionMutationCount(context.sessionID);
+				const mismatches = completionClaimMismatch(
+					existingTodos,
+					newTodos,
+					baseline === undefined ? undefined : Math.max(0, total - baseline),
+					total,
+				);
+				if (mismatches.length > 0) {
+					audit({
+						ts: new Date().toISOString(),
+						sessionID: context.sessionID,
+						tool: "todowrite",
+						decision: "allow",
+						phase: "event",
+						reason: "completion_claim_mismatch",
+						input: { tasks: mismatches, mutationCount: total },
+					});
+				}
+				sessionTodoMutationBaseline.set(context.sessionID, total);
 			}
 			const allDone = newTodos.length > 0 && newTodos.every((t) => {
 				const s = String(t.status ?? "");
@@ -308,6 +338,23 @@ export async function guardToolCallImpl(
 		if (todos !== undefined && !hasActiveTodo(todos)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: no active todo item (session ${context?.sessionID ?? "?"})`);
 			return block("todo", "no_active_todo", "Blocked: no active todo item. First break the request down with the todowrite tool (create items with status 'pending' or 'in_progress'), then work them through, marking each completed via todowrite as you finish it. When every item is completed, create a fresh todo list before starting new work.");
+		}
+		if (todos === undefined) {
+			// Fail-open, but never silent: once per session, record that the
+			// gate did not enforce and why. A rails policy that quietly stops
+			// enforcing is indistinguishable from one that was removed.
+			const capability = recordedTodoCapability();
+			if (reportTodoGateFailOpen(context?.sessionID, capability)) {
+				audit({
+					ts: new Date().toISOString(),
+					sessionID: context?.sessionID,
+					tool: "todo.gate",
+					decision: "allow",
+					phase: "event",
+					reason: `todo_gate_fail_open_${capability}`,
+					input: { [toolName]: true },
+				});
+			}
 		}
 		if (context?.sessionID) {
 			const reason = await subagentMutationBudgetReason(context.sessionID, currentRoot);

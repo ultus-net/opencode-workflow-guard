@@ -22,7 +22,7 @@ import { Message } from "@opencode/ai";
 import { z } from "zod";
 import { join, resolve } from "node:path";
 import type { TodoSdkClient } from "./types.ts";
-import { scanSessionTodos, toolPartName } from "./v2-todo.ts";
+import { detectTodoCapability, recordTodoCapability, recordedTodoCapability, scanSessionTodos, toolPartName } from "./v2-todo.ts";
 import { findGitRoot, reloadProjectConfig } from "./project-config.ts";
 import {
 	setWorkspaceRoot,
@@ -97,7 +97,7 @@ function createV2SdkClient(ctx: V2Context): TodoSdkClient {
 			},
 		},
 		session: {
-			todo: async ({ path }) => ({ data: await scanSessionTodos(ctx, path.id) }),
+			todo: async ({ path }) => ({ data: await scanSessionTodos(ctx, path.id, recordedTodoCapability()) }),
 			get: async ({ path }) => {
 				const session = await ctx.session.get({ sessionID: path.id });
 				return { data: { parentID: (session as { parentID?: string }).parentID, title: (session as { title?: string }).title } };
@@ -213,7 +213,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	const toolOutcomes = new ToolOutcomeTracker();
 
 	// ── Custom tools + builtin description enrichment ──
-	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree: createHostWorktreePort(ctx) });
+	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree: createHostWorktreePort(ctx), todoCapability: () => recordedTodoCapability() });
 	await ctx.tool.transform((editor) => {
 		for (const [name, definition] of Object.entries(customTools)) {
 			editor.add({
@@ -623,6 +623,24 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		} catch {}
 	};
 	await seedMcpInventory();
+
+	// ── Todo capability probe ──
+	// Ask the host's registry whether `todowrite` exists, instead of inferring
+	// it from history. On 2.0.x the answer is no, so the mutation gate fails
+	// open; on 2.1.x with `experimental.todo: true` the answer is yes, so a
+	// session that never planned is gated. Probe once: the registry is fixed
+	// for the life of the process.
+	try {
+		const capability = await detectTodoCapability(ctx);
+		recordTodoCapability(capability);
+		audit({
+			ts: new Date().toISOString(),
+			tool: "todo.capability",
+			decision: "allow",
+			phase: "event",
+			reason: `todo_capability_${capability}`,
+		});
+	} catch {}
 
 	// ── Event stream ──
 	const controller = new AbortController();
