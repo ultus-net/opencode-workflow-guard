@@ -6,9 +6,11 @@
  * - `ctx.tool.transform` for custom tools and tool-description enrichment
  * - `ctx.tool.hook("execute.before"/"execute.after")` for deterministic enforcement
  * - `ctx.session.hook("context"/"compaction"/"prompt")` for system guidance,
- *   compaction context, and recovery checkpoints
- * - `ctx.permission.hook("evaluate")` for permission journaling
+ *   read-only tool pruning, compaction context, and recovery checkpoints
+ * - `ctx.command.transform` for the server-side `/guard-status` command
+ * - `ctx.permission.hook("evaluate")` for the pre-execution deny seat
  * - `ctx.shell.hook("create.before")` for env scrubbing
+ * - `ctx.mcp.list()` plus `mcp.tools.changed` for the guarded-server inventory
  * - `ctx.event.subscribe()` for tool outcomes, session lifecycle, and claims-vs-evidence
  *
  * The V1 SDK client surface (`TodoSdkClient`) is satisfied by an adapter so
@@ -68,6 +70,10 @@ import { buildCompactionContext, guardToolCall } from "../workflow-guard.ts";
 import { registerPluginInstance, releasePluginInstance } from "./plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim } from "./call-claims.ts";
 import { evaluatePermissionSeat } from "./permission-seat.ts";
+import { pruneToolsForReadOnlyRole } from "./read-only-tools.ts";
+import { registerGuardStatusCommand } from "./guard-command.ts";
+import { createHostWorktreePort } from "./host-worktree.ts";
+import { listHostMcpServerNames, recordHostMcpServers } from "./mcp-inventory.ts";
 
 type V2Context = Plugin.Context;
 
@@ -125,12 +131,14 @@ const SUBAGENT_SUFFIX =
 // host's tool registry; `ToolEditor.update` ignores missing IDs, so extra
 // candidates are harmless no-ops.
 //
-// V2.0.10 builtin surface (docs + binary): read, glob, grep, edit, write,
-// patch, shell, webfetch, websearch, question, skill, subagent, execute.
-// - There is no builtin `todowrite` (the V1 name). Todowrite tool parts seen
-//   in V2 sessions come from ACP agents that supply their own tools; those
-//   are not in the server registry, so this enrichment cannot reach them.
-//   The candidate is kept for hosts that do register a todowrite tool.
+// Version boundary for the builtin surface:
+// - V2.0.x (docs + binary, up to and including 2.0.15): read, glob, grep,
+//   edit, write, patch, shell, webfetch, websearch, question, skill, subagent,
+//   execute. There is no builtin `todowrite`; todowrite parts in V2 sessions
+//   come from ACP agents that supply their own tools, which are not in the
+//   server registry, so this enrichment cannot reach them.
+// - V2.1.x adds a builtin `todowrite` behind the `experimental.todo` config
+//   key, so the candidate below reaches a real registry entry there.
 // - The V1 subagent tool `task` was renamed to `subagent`; both are kept as
 //   candidates for the same reason.
 const ENRICHMENT_TARGETS: Array<{ candidates: string[]; suffix: string; marker: string }> = [
@@ -144,7 +152,10 @@ const ENRICHMENT_TARGETS: Array<{ candidates: string[]; suffix: string; marker: 
 export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	const hostRoot = ctx.location?.directory || process.cwd();
 	const hostIsFilesystemRoot = resolve(hostRoot) === resolve(hostRoot, "..");
-	const projectDirectory = (ctx.location as { project?: { directory?: string; canonical?: string } })?.project?.directory;
+	// `location.project` is required by the host's `Location.Info` schema
+	// (`@opencode/schema/dist/location.d.ts`), so the optional read is only a
+	// runtime guard for harnesses and stubs that construct a partial context.
+	const projectDirectory = ctx.location.project?.directory;
 	let effectiveRoot = hostIsFilesystemRoot && projectDirectory && resolve(projectDirectory) !== resolve(projectDirectory, "..")
 		? projectDirectory
 		: hostRoot;
@@ -202,7 +213,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	const toolOutcomes = new ToolOutcomeTracker();
 
 	// ── Custom tools + builtin description enrichment ──
-	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client });
+	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree: createHostWorktreePort(ctx) });
 	await ctx.tool.transform((editor) => {
 		for (const [name, definition] of Object.entries(customTools)) {
 			editor.add({
@@ -237,6 +248,26 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				});
 			}
 		}
+	});
+
+	// ── /guard-status command ──
+	// Reachable from every V2 client without the optional TUI companion. The
+	// report is produced by the same guard_status implementation the tool uses,
+	// then delivered as a synthetic message so it costs no model turn.
+	await registerGuardStatusCommand(ctx, {
+		runStatus: async (sessionID) => {
+			const boundWorktree = getSessionBoundWorkspace(sessionID);
+			const result = await (customTools.guard_status as unknown as {
+				execute: (input: unknown, context: unknown) => Promise<unknown>;
+			}).execute({}, {
+				sessionID,
+				...(boundWorktree ? { worktree: boundWorktree } : {}),
+				directory: boundWorktree ?? effectiveRoot,
+			});
+			return typeof result === "string" ? result : JSON.stringify(result);
+		},
+		effectiveRoot,
+		client,
 	});
 
 	// ── Deterministic enforcement ──
@@ -367,6 +398,25 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	// ── Session request hooks ──
 	await ctx.session.hook("context", (event) => {
 		try {
+			// A read-only role must not be able to *choose* a mutating tool. The
+			// execute.before seat still denies it, but pruning the per-request
+			// tool snapshot removes the call before the model plans it. Pruning
+			// is a narrowing only: tools supplied outside the host snapshot
+			// (ACP agents, nested Code Mode calls) still meet the backstop.
+			if (event.agent && isReadOnlyRole(event.agent)) {
+				const removed = pruneToolsForReadOnlyRole(event.tools as Record<string, unknown> | undefined);
+				if (removed.length > 0) {
+					audit({
+						ts: new Date().toISOString(),
+						sessionID: event.sessionID,
+						tool: "session.context",
+						decision: "block",
+						phase: "decision",
+						reason: "read_only_role_tools_pruned",
+						input: { agent: event.agent, removed },
+					});
+				}
+			}
 			const existing = Array.isArray(event.system)
 				? event.system.map((part) => (typeof part === "string" ? part : (part as { text?: string }).text ?? "")).join("\n")
 				: "";
@@ -485,6 +535,11 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	// guarded MCP calls. It cannot see raw tool input, so the raw-argument work
 	// (todo lifecycle, stale-write, post-edit snapshots) stays in
 	// `execute.before`. See lib/permission-seat.ts for the split and the limits.
+	//
+	// Flow limit, documented by the host: an explicit configured `deny` is
+	// resolved before this hook runs, so the hook never sees it. A guard audit
+	// therefore cannot explain a configured deny; only host config can. The
+	// hook runs for allow/ask, and a denial here is always a tightening.
 	await ctx.permission.hook("evaluate", async (event) => {
 		const configuredEffect = event.effect;
 		try {
@@ -546,6 +601,29 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		} catch {}
 	});
 
+	// ── MCP inventory ──
+	// Seed the guarded token set from host-declared servers, then refresh it
+	// whenever the host reports that a server's tools changed. Widen-only:
+	// removal adds nothing, so a renamed or dropped server can never unguard a
+	// tool that still names a live system. The static defaults in
+	// policies/mcp.ts stay the floor.
+	const seedMcpInventory = async () => {
+		try {
+			const added = recordHostMcpServers(await listHostMcpServerNames(ctx));
+			if (added.length > 0) {
+				audit({
+					ts: new Date().toISOString(),
+					tool: "mcp.inventory",
+					decision: "allow",
+					phase: "event",
+					reason: "host_mcp_servers_widened",
+					input: { added },
+				});
+			}
+		} catch {}
+	};
+	await seedMcpInventory();
+
 	// ── Event stream ──
 	const controller = new AbortController();
 	void (async () => {
@@ -558,6 +636,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 						client,
 						toolLifecycle,
 						toolOutcomes,
+						refreshMcpInventory: seedMcpInventory,
 					});
 				} catch {}
 			}
@@ -579,6 +658,8 @@ interface V2EventState {
 	client: unknown;
 	toolLifecycle: ToolInvocationLifecycle;
 	toolOutcomes: ToolOutcomeTracker;
+	/** Re-read the host MCP roster after `mcp.tools.changed`. */
+	refreshMcpInventory?: () => Promise<void>;
 }
 
 async function handleV2Event(
@@ -586,6 +667,14 @@ async function handleV2Event(
 	state: V2EventState,
 ): Promise<void> {
 	const { effectiveRoot, client, toolLifecycle, toolOutcomes } = state;
+
+	if (event.type === "mcp.tools.changed") {
+		// The host's server roster or one server's tool list changed. Re-read it
+		// so a newly connected live-system server is guarded before its tools
+		// are callable. Widen-only: this can add tokens, never remove them.
+		await state.refreshMcpInventory?.();
+		return;
+	}
 
 	if (event.type === "session.message.content.updated") {
 		const data = event.data as { sessionID?: unknown; content?: unknown } | undefined;
@@ -707,8 +796,24 @@ async function handleV2Event(
 		});
 		return;
 	}
+	// `command.executed` exists in the V2 event stream (`data: { name, sessionID,
+	// arguments, messageID }`) and carries what the V1 audit wanted: the slash
+	// command name, its arguments, and the session. It is journaled here rather
+	// than dropped, so a command that mutates workspace state stays attributable.
+	if (event.type === "command.executed") {
+		const data = event.data as { sessionID?: unknown; name?: unknown; arguments?: unknown } | undefined;
+		audit({
+			ts: new Date().toISOString(),
+			sessionID: typeof data?.sessionID === "string" ? data.sessionID : undefined,
+			tool: "command.executed",
+			decision: "allow",
+			phase: "event",
+			reason: typeof data?.name === "string" ? data.name : undefined,
+			input: summarizeInput({ name: data?.name, arguments: data?.arguments }),
+		});
+		return;
+	}
 	// Note on V1 events without a V2 counterpart:
-	// - `command.executed`: no V2 event stream equivalent (audit-only in V1; dropped).
 	// - `permission.updated`: replaced by `permission.asked`/`permission.replied` above.
 	// - `session.created`: exists in the V2 union but needed no V1 behavior beyond
 	//   the audit above; session state resets happen on `session.deleted`.

@@ -125,6 +125,11 @@ import { scanSessionTodos, toolPartName } from "../src/lib/v2-todo.ts";
 import { effectiveTodosWithOwner } from "../src/policies/todo.ts";
 import { resetPluginInstancesForTesting } from "../src/lib/plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim, resetToolCallClaimsForTesting } from "../src/lib/call-claims.ts";
+import { pruneToolsForReadOnlyRole, READ_ONLY_PRUNED_TOOLS } from "../src/lib/read-only-tools.ts";
+import { createHostWorktreePort } from "../src/lib/host-worktree.ts";
+import { validateHostWorktreeDirectory } from "../src/lib/worktree.ts";
+import { guardedTokensFromServerName, listHostMcpServerNames, recordHostMcpServers } from "../src/lib/mcp-inventory.ts";
+import { addGuardedMcpTokens, guardedMcpServers, mcpMutationTool, resetGuardedMcpTokensForTesting } from "../src/policies/mcp.ts";
 
 let pass = 0;
 let fail = 0;
@@ -5033,13 +5038,28 @@ resetToolCallClaimsForTesting();
 const v2DuplicateRoot = mkdtempSync(join(tmpdir(), "wg-v2-dup-"));
 const prevDuplicateDataHome = process.env.XDG_DATA_HOME;
 process.env.XDG_DATA_HOME = join(v2DuplicateRoot, "data");
-const makeV2Context = (directory: string) => {
+const makeV2Context = (directory: string, options?: {
+	projectID?: string;
+	registeredTools?: Array<{ id: string; description?: string }>;
+	mcpServers?: string[];
+	worktreeApi?: {
+		create: (input: any) => Promise<{ directory?: string } | undefined>;
+		list: (input: any) => Promise<ReadonlyArray<{ directory?: string }> | undefined>;
+		refresh?: (input: any) => Promise<unknown>;
+	};
+}) => {
 	const state = {
 		transforms: 0,
 		addedTools: [] as string[],
 		beforeHooks: [] as Array<(event: unknown) => unknown>,
 		afterHooks: [] as Array<(event: unknown) => unknown>,
 		permissionHooks: [] as Array<(event: unknown) => unknown>,
+		contextHooks: [] as Array<(event: unknown) => unknown>,
+		commands: [] as Array<{ name: string; description?: string; execute: (input: unknown) => Promise<void> }>,
+		syntheticMessages: [] as string[],
+		prompts: [] as string[],
+		worktreeCalls: [] as string[],
+		mcpListCalls: 0,
 	};
 	const editor = {
 		list: () => [],
@@ -5050,25 +5070,48 @@ const makeV2Context = (directory: string) => {
 		remove: () => {},
 	};
 	const registration = { dispose: async () => {} };
+	const registeredTools = options?.registeredTools ?? [];
 	const ctx = {
-		location: { directory },
+		location: { directory, ...(options?.projectID ? { project: { id: options.projectID, directory, canonical: directory } } : {}) },
 		options: {},
 		tool: {
 			transform: async (callback: (input: unknown) => void) => { state.transforms++; callback(editor); return registration; },
 			reload: async () => {},
-			list: async () => [],
+			list: async () => registeredTools,
 			hook: async (name: string, callback: (event: unknown) => unknown) => {
 				if (name === "execute.before") state.beforeHooks.push(callback);
 				if (name === "execute.after") state.afterHooks.push(callback);
 				return registration;
 			},
 		},
+		command: {
+			list: async () => ({ data: [] }),
+			transform: async (callback: (editor: { add: (definition: never) => void }) => void) => {
+				callback({ add: (definition: never) => { state.commands.push(definition); } });
+				return registration;
+			},
+			reload: async () => {},
+		},
+		mcp: {
+			list: async () => {
+				state.mcpListCalls++;
+				return options?.mcpServers === undefined ? undefined : { data: options.mcpServers.map((name) => ({ name, status: { type: "connected" } })) };
+			},
+		},
+		worktree: options?.worktreeApi ? {
+			create: async (input: unknown) => { state.worktreeCalls.push("create"); return options.worktreeApi!.create(input); },
+			list: async (input: unknown) => { state.worktreeCalls.push("list"); return options.worktreeApi!.list(input); },
+			refresh: async (input: unknown) => { state.worktreeCalls.push("refresh"); return options.worktreeApi!.refresh?.(input); },
+		} : undefined,
 		session: {
 			get: async () => ({}),
 			context: async () => [],
-			prompt: async () => {},
-			synthetic: async () => {},
-			hook: async () => registration,
+			prompt: async (input: { text?: string }) => { state.prompts.push(String(input?.text ?? "")); },
+			synthetic: async (input: { text?: string }) => { state.syntheticMessages.push(String(input?.text ?? "")); },
+			hook: async (name: string, callback: (event: unknown) => unknown) => {
+				if (name === "context") state.contextHooks.push(callback);
+				return registration;
+			},
 		},
 		permission: {
 			hook: async (name: string, callback: (event: unknown) => unknown) => {
@@ -5164,6 +5207,189 @@ resetToolCallClaimsForTesting();
 if (prevDuplicateDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDuplicateDataHome;
 rmSync(v2DuplicateRoot, { recursive: true, force: true });
+
+// ── V2 adopt-now surfaces: command, read-only pruning, worktrees, MCP ──
+// Four additive V2 API adoptions, each tested for its narrowing direction:
+// the command adds an operator surface, pruning removes tools, worktree cleanup
+// only accepts host-declared directories, and the MCP inventory only widens.
+console.log("- V2 adopt-now surfaces -");
+
+// /guard-status: registered server-side, delivered without a model turn.
+{
+	resetPluginInstancesForTesting();
+	const cmdRoot = mkdtempSync(join(tmpdir(), "wg-v2-cmd-"));
+	const prevCmdDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = join(cmdRoot, "data");
+	const cmdCtx = makeV2Context(cmdRoot);
+	const cmdCleanup = (await defaultExport.setup(cmdCtx.ctx as any)) as (() => void) | undefined;
+	const guardStatusCommand = cmdCtx.state.commands.find((command) => command.name === "guard-status");
+	check("the V2 plugin registers a server-side guard-status command", guardStatusCommand !== undefined);
+	check("guard-status carries an operator-facing description", /status/i.test(String(guardStatusCommand?.description)));
+	await guardStatusCommand?.execute({ sessionID: "s-v2-cmd" } as any);
+	check("guard-status delivers the report as a synthetic message", cmdCtx.state.syntheticMessages.length === 1 && cmdCtx.state.syntheticMessages[0].includes("pluginVersion"));
+	check("guard-status costs no model turn on the normal path", cmdCtx.state.prompts.length === 0);
+	check("guard-status is journaled in the audit trail", getRecentAuditEntries(20).some((entry) => entry.tool === "command.guard-status" && entry.reason === "guard_status_command"));
+	cmdCleanup?.();
+	if (prevCmdDataHome === undefined) delete process.env.XDG_DATA_HOME;
+	else process.env.XDG_DATA_HOME = prevCmdDataHome;
+	rmSync(cmdRoot, { recursive: true, force: true });
+}
+
+// Read-only roles: mutating tools leave the per-request snapshot.
+{
+	const snapshot = {
+		read: { description: "read", input: {} },
+		glob: { description: "glob", input: {} },
+		grep: { description: "grep", input: {} },
+		webfetch: { description: "webfetch", input: {} },
+		write: { description: "write", input: {} },
+		edit: { description: "edit", input: {} },
+		patch: { description: "patch", input: {} },
+		apply_patch: { description: "apply_patch", input: {} },
+		shell: { description: "shell", input: {} },
+		execute: { description: "execute", input: {} },
+		todowrite: { description: "todowrite", input: {} },
+		subagent: { description: "subagent", input: {} },
+	};
+	const removed = pruneToolsForReadOnlyRole(snapshot as any);
+	check("read-only pruning removes every mutating tool", READ_ONLY_PRUNED_TOOLS.every((id) => !(id in snapshot)));
+	check("read-only pruning keeps the read-only tools", ["read", "glob", "grep", "webfetch"].every((id) => id in snapshot));
+	check("read-only pruning reports what it removed", removed.includes("write") && removed.includes("shell") && removed.includes("execute") && !removed.includes("read"));
+	const emptySnapshot: Record<string, unknown> = { read: {} };
+	check("read-only pruning is a no-op on an already narrow snapshot", pruneToolsForReadOnlyRole(emptySnapshot).length === 0 && "read" in emptySnapshot);
+	check("read-only pruning tolerates a missing snapshot", pruneToolsForReadOnlyRole(undefined).length === 0);
+
+	resetPluginInstancesForTesting();
+	const roRoot = mkdtempSync(join(tmpdir(), "wg-v2-ro-"));
+	const prevRoDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = join(roRoot, "data");
+	const roCtx = makeV2Context(roRoot);
+	const roCleanup = (await defaultExport.setup(roCtx.ctx as any)) as (() => void) | undefined;
+	const roEvent = {
+		sessionID: "s-v2-ro",
+		agent: "reviewer",
+		model: { providerID: "p", id: "m" },
+		system: [] as Array<{ type: string; text: string }>,
+		messages: [],
+		options: {},
+		tools: { read: { description: "read", input: {} }, write: { description: "write", input: {} }, shell: { description: "shell", input: {} } },
+	};
+	await roCtx.state.contextHooks[0]?.(roEvent);
+	check("the context hook prunes mutating tools for a read-only role", !("write" in roEvent.tools) && !("shell" in roEvent.tools) && "read" in roEvent.tools);
+	check("read-only pruning is journaled with the removed tool ids", getRecentAuditEntries(20).some((entry) => entry.tool === "session.context" && entry.reason === "read_only_role_tools_pruned" && Array.isArray((entry.input as any)?.removed)));
+	const buildEvent = {
+		sessionID: "s-v2-build",
+		agent: "build",
+		model: { providerID: "p", id: "m" },
+		system: [] as Array<{ type: string; text: string }>,
+		messages: [],
+		options: {},
+		tools: { read: { description: "read", input: {} }, write: { description: "write", input: {} } },
+	};
+	await roCtx.state.contextHooks[0]?.(buildEvent);
+	check("the context hook leaves a write-capable role's tools intact", "write" in buildEvent.tools);
+	roCleanup?.();
+	if (prevRoDataHome === undefined) delete process.env.XDG_DATA_HOME;
+	else process.env.XDG_DATA_HOME = prevRoDataHome;
+	rmSync(roRoot, { recursive: true, force: true });
+}
+
+// Host worktrees: creation may use the host, removal may not.
+{
+	const unavailablePort = createHostWorktreePort({ location: { directory: root } });
+	check("the host worktree port is unavailable without a host API", !unavailablePort.available && unavailablePort.projectID === undefined);
+	check("an unavailable port reports an error instead of guessing a directory", (await unavailablePort.create({ branch: "feat/x" })).directory === undefined);
+	check("an unavailable port lists nothing rather than an empty roster", (await unavailablePort.list()) === undefined);
+
+	const throwingPort = createHostWorktreePort({
+		location: { project: { id: "proj-1" } },
+		worktree: {
+			create: async () => { throw new Error("boom"); },
+			list: async () => { throw new Error("boom"); },
+		},
+	});
+	check("a throwing host create degrades to a reportable error", (await throwingPort.create({ branch: "feat/x" })).error?.includes("boom") === true);
+	check("a throwing host list degrades to unknown", (await throwingPort.list()) === undefined);
+	await throwingPort.refresh();
+
+	const recordingPort = createHostWorktreePort({
+		location: { project: { id: "proj-1" } },
+		worktree: {
+			create: async (input: any) => ({ directory: `${input.branch}-dir` }),
+			list: async () => [{ directory: "/wt/a" }, { directory: undefined }, { directory: "/wt/b" }],
+			refresh: async () => {},
+		},
+	});
+	check("the host worktree port is available when the host supplies a project id", recordingPort.available && recordingPort.projectID === "proj-1");
+	check("host create passes the project id and a collision-safe name", (await recordingPort.create({ branch: "feat/x" })).directory === "feat/x-dir");
+	check("host list drops entries without a directory", JSON.stringify(await recordingPort.list()) === JSON.stringify(["/wt/a", "/wt/b"]));
+
+	// Validation is independent of the host: a declared directory must be a
+	// registered worktree of THIS repo and must not be the primary tree.
+	// A dedicated repo keeps this block independent of the earlier worktree
+	// fixture, which has already been torn down by this point.
+	const hostWtRepo = join(root, "wg-v2-host-wt");
+	mkdirSync(hostWtRepo, { recursive: true });
+	const hwtGit = (args: string[]): string => {
+		const res = spawnSync("git", args, { cwd: hostWtRepo, encoding: "utf8" });
+		if (res.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${res.stderr}`);
+		return res.stdout;
+	};
+	hwtGit(["init", "-q", "-b", "main"]);
+	hwtGit(["config", "user.email", "test@test.local"]);
+	hwtGit(["config", "user.name", "Test Runner"]);
+	writeFileSync(join(hostWtRepo, "seed.txt"), "seed\n");
+	hwtGit(["add", "seed.txt"]);
+	hwtGit(["commit", "-qm", "seed"]);
+	check("host worktree validation rejects a missing directory", !validateHostWorktreeDirectory(join(root, "..", "nope-not-here"), hostWtRepo).ok);
+	check("host worktree validation rejects the primary working tree", !validateHostWorktreeDirectory(hostWtRepo, hostWtRepo).ok);
+	const hostValidated = createGitWorktree("feat/host-validated", "HEAD", hostWtRepo);
+	check("host worktree validation accepts a registered non-primary worktree", hostValidated.success && validateHostWorktreeDirectory(hostValidated.worktreePath!, hostWtRepo).ok === true);
+	if (hostValidated.worktreePath) {
+		// A host-declared directory outside the guard's storage is cleanable, but
+		// only because the host listed it AND git registers it.
+		const outsideStorage = join(root, "wg-v2-host-wt-outside");
+		rmSync(outsideStorage, { recursive: true, force: true });
+		// Detached: the branch is already checked out in the guard worktree.
+		hwtGit(["worktree", "add", "-q", "--detach", outsideStorage, "feat/host-validated"]);
+		const hostCleanup = cleanupGitWorktree(outsideStorage, hostWtRepo, { hostWorktrees: [outsideStorage] });
+		check("cleanup removes a host-declared worktree outside guard storage", hostCleanup.success && !existsSync(outsideStorage));
+		const unlistedPath = join(root, "wg-v2-host-wt-unlisted");
+		rmSync(unlistedPath, { recursive: true, force: true });
+		hwtGit(["worktree", "add", "-q", "--detach", unlistedPath, "feat/host-validated"]);
+		const unlistedCleanup = cleanupGitWorktree(unlistedPath, hostWtRepo);
+		check("cleanup still refuses a registered path outside storage that the host did not declare", !unlistedCleanup.success && existsSync(unlistedPath));
+		hwtGit(["worktree", "remove", "--force", unlistedPath]);
+		cleanupGitWorktree(hostValidated.worktreePath, hostWtRepo);
+	}
+	rmSync(hostWtRepo, { recursive: true, force: true });
+}
+
+// MCP inventory: host-declared servers widen the guarded set, never narrow it.
+{
+	resetGuardedMcpTokensForTesting();
+	check("a static guarded server name yields its tokens", guardedTokensFromServerName("github").includes("github"));
+	check("a multi-word guarded server name yields normalized tokens", JSON.stringify(guardedTokensFromServerName("Azure DevOps")) === JSON.stringify(["azure", "devops"]));
+	check("an unrelated server name yields nothing", guardedTokensFromServerName("linear").length === 0);
+	check("an unknown MCP roster is not an empty roster", (await listHostMcpServerNames({})) === undefined);
+	check("a host without the MCP API reports unknown", (await listHostMcpServerNames({ mcp: {} })) === undefined);
+	check("a bare-array MCP roster is accepted", JSON.stringify(await listHostMcpServerNames({ mcp: { list: async () => ["github-enterprise"] } })) === JSON.stringify(["github-enterprise"]));
+	check("a throwing MCP list degrades to unknown", (await listHostMcpServerNames({ mcp: { list: async () => { throw new Error("x"); } } })) === undefined);
+
+	const added = recordHostMcpServers(["github-enterprise", "linear"]);
+	check("host servers contribute only guarded tokens", added.includes("enterprise") && !added.includes("linear"));
+	check("recordHostMcpServers tolerates an unknown roster", recordHostMcpServers(undefined).length === 0);
+	check("a host-declared server token is added to the effective set", guardedMcpServers().has("enterprise"));
+	check("a host-declared guarded server widens the MCP mutation policy", mcpMutationTool("enterprise_create_issue") === "GitHub/Azure DevOps");
+	check("an unrelated server stays unguarded", mcpMutationTool("linear_create_issue") === undefined);
+	// Removal is a no-op, not a narrowing.
+	recordHostMcpServers([]);
+	check("an empty roster never narrows the guarded set", guardedMcpServers().has("enterprise") && guardedMcpServers().has("github"));
+	addGuardedMcpTokens(["GitHub"]);
+	check("adding a static token is idempotent", guardedMcpServers().has("github"));
+	resetGuardedMcpTokensForTesting();
+	check("the static floor survives a reset", guardedMcpServers().has("github") && !guardedMcpServers().has("enterprise"));
+}
 
 // Loaded plugin version visibility: OpenCode resolves configured bare plugin
 // names through Node's parent-directory lookup from its configuration

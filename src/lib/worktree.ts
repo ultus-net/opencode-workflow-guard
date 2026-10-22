@@ -197,6 +197,40 @@ export function createGitWorktree(
 	}
 }
 
+/**
+ * Validate a worktree directory the HOST created before the guard accepts it.
+ *
+ * The host is a widening authority only in the sense that it may choose the
+ * directory (its configured `worktree.directory`). It is never an authority
+ * that the directory is safe: the guard re-checks the filesystem and the git
+ * registration itself, and refuses the primary working tree. A host adapter
+ * that returns a bogus path therefore fails closed.
+ */
+export function validateHostWorktreeDirectory(
+	directory: string,
+	root = getWorkspaceRoot(),
+): { ok: boolean; error?: string } {
+	if (!directory || typeof directory !== "string") {
+		return { ok: false, error: "Host worktree create returned no directory." };
+	}
+	const resolved = resolve(directory);
+	if (!existsSync(resolved)) {
+		return { ok: false, error: `Host declared worktree '${directory}' does not exist.` };
+	}
+	const registered = registeredWorktreePaths(root);
+	if (!registered) {
+		return { ok: false, error: "Failed to list registered worktrees - cannot validate the host worktree." };
+	}
+	const resolvedRegistered = registered.map((path) => resolve(path));
+	if (!resolvedRegistered.includes(resolved)) {
+		return { ok: false, error: `Host declared worktree '${directory}' is not a registered worktree of this repository.` };
+	}
+	if (resolvedRegistered[0] === resolved) {
+		return { ok: false, error: "Host declared the primary working tree as a worktree - refusing." };
+	}
+	return { ok: true };
+}
+
 function registeredWorktreePaths(root: string): string[] | undefined {
 	const res = spawnSync("git", ["worktree", "list", "--porcelain"], {
 		cwd: root,
@@ -215,23 +249,37 @@ function registeredWorktreePaths(root: string): string[] | undefined {
 export function cleanupGitWorktree(
 	worktreePath: string,
 	root = getWorkspaceRoot(),
+	options?: {
+		/**
+		 * Directories the HOST declares as its worktrees for this project
+		 * (`ctx.worktree.list`). This is the only way cleanup may reach a
+		 * worktree outside the guard's own storage directory: the host is the
+		 * authority that the directory belongs to its inventory, and the
+		 * registration and primary-tree checks below still apply. Omitting the
+		 * list keeps the original storage-only behaviour.
+		 */
+		hostWorktrees?: readonly string[];
+	},
 ): { success: boolean; error?: string } {
 	try {
 		const resolved = resolve(worktreePath);
 		const storageBase = resolve(getWorktreeStorageDir(root));
+		const hostOwned = Boolean(options?.hostWorktrees?.some((path) => resolve(path) === resolved));
+		const withinStorage = resolved === storageBase || resolved.startsWith(storageBase + sep);
+		if (!withinStorage && !hostOwned) {
+			return {
+				success: false,
+				error: `Refusing to clean up '${worktreePath}': path is outside the worktree storage directory (${storageBase}) and is not a host-declared worktree.`,
+			};
+		}
 		if (!existsSync(worktreePath)) {
 			// A registered worktree whose directory is gone (manual removal, a
 			// crashed add, external cleanup) still holds a stale admin entry that
 			// keeps it in `git worktree list` as prunable, and must still be
-			// cleanable. Anything outside storage or unregistered is refused.
-			// The primary working tree is never at risk: prune only removes
-			// admin dirs under .git/worktrees/<id>, which the main tree lacks.
-			if (resolved !== storageBase && !resolved.startsWith(storageBase + sep)) {
-				return {
-					success: false,
-					error: `Refusing to clean up '${worktreePath}': path is outside the worktree storage directory (${storageBase}).`,
-				};
-			}
+			// cleanable. Anything outside storage (unless the host declares it)
+			// or unregistered is refused. The primary working tree is never at
+			// risk: prune only removes admin dirs under .git/worktrees/<id>,
+			// which the main tree lacks.
 			const registeredMissing = registeredWorktreePaths(root);
 			if (!registeredMissing) {
 				return { success: false, error: "Failed to list registered worktrees - aborting cleanup." };
@@ -252,15 +300,10 @@ export function cleanupGitWorktree(
 		}
 
 		// Ownership validation: the path must live under the configured worktree
-		// storage directory AND be a registered worktree of this repository. This
-		// refuses arbitrary directories, other repos' worktrees, and the primary
-		// working tree - cleanup must never be an unrestricted delete primitive.
-		if (resolved !== storageBase && !resolved.startsWith(storageBase + sep)) {
-			return {
-				success: false,
-				error: `Refusing to clean up '${worktreePath}': path is outside the worktree storage directory (${storageBase}).`,
-			};
-		}
+		// storage directory (or be declared by the host) AND be a registered
+		// worktree of this repository. This refuses arbitrary directories, other
+		// repos' worktrees, and the primary working tree - cleanup must never be
+		// an unrestricted delete primitive.
 		const registered = registeredWorktreePaths(root);
 		if (!registered) {
 			return { success: false, error: "Failed to list registered worktrees - aborting cleanup." };

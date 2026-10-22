@@ -2,12 +2,23 @@
  * V2 todo reconstruction shared by the plugin entrypoint and its V1 SDK
  * adapter.
  *
- * OpenCode V2 exposes no todo endpoint, and its builtin tool registry has no
- * `todowrite` (the V1 name). Todo state therefore only exists when an ACP agent
- * supplies its own `todowrite` tool. This module reads that state from session
- * message history and distinguishes "definitively empty" from "cannot
- * determine", which the policy layer relies on to decide whether to enforce the
- * active-todo gate.
+ * Version boundary, because the two generations need different treatment:
+ *
+ * - **OpenCode 2.0.x** exposes no todo endpoint and its builtin tool registry
+ *   has no `todowrite` (the V1 name). Todo state only exists when an ACP agent
+ *   supplies its own `todowrite` tool, so the list is reconstructed from
+ *   session message history.
+ * - **OpenCode 2.1.x** reintroduces a builtin `todowrite` behind the
+ *   `experimental.todo` config key. When that tool is registered, a session
+ *   with no todo part has never planned, which must gate mutations rather than
+ *   fail open. `todoCapability` in this module reports which case applies, and
+ *   the caller decides whether history reconstruction is authoritative.
+ *
+ * This module reads that state from session message history and distinguishes
+ * "definitively empty" from "cannot determine", which the policy layer relies
+ * on to decide whether to enforce the active-todo gate. Todos are never
+ * evidence: a `todowrite` call replaces the whole list, so a model can mark
+ * everything completed without doing the work.
  */
 
 import type { TodoItem } from "./types.ts";

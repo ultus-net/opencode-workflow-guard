@@ -39,7 +39,8 @@ import { getRalphOutcome } from "../policies/continuation.ts";
 import { findGitRoot, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
-import { createGitWorktree, cleanupGitWorktree } from "./worktree.ts";
+import { createGitWorktree, cleanupGitWorktree, validateHostWorktreeDirectory } from "./worktree.ts";
+import type { HostWorktreePort } from "./host-worktree.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
 import { restoreRecoveryCheckpoint } from "./checkpoint.ts";
 import { audit, getRecentAuditEntries } from "./audit.ts";
@@ -121,8 +122,14 @@ export function createCustomTools(options: {
 	portableMemoryPath: string;
 	learningInterventions: Map<string, number>;
 	client: unknown;
+	/**
+	 * Host worktree port. When present and available, creation goes through the
+	 * host so the worktree lands in its configured directory and inventory.
+	 * Removal stays with the guard's snapshot-then-remove flow regardless.
+	 */
+	hostWorktree?: HostWorktreePort;
 }) {
-	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client } = options;
+	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree } = options;
 	// Resolve the workspace for a tool call from the CALL's own context: an
 	// explicit argument first, then the host-provided per-call worktree or
 	// directory (even when unusable — the call declared its target), then the
@@ -374,17 +381,58 @@ export function createCustomTools(options: {
 			description: "Create an isolated git worktree directory for concurrent subagent execution. Proactively call when launching parallel tasks/subagents to prevent file collision and maintain branch isolation.", args: { branch: tool.schema.string().describe("Branch name for the isolated worktree (e.g. 'feat/subagent-task')"), baseBranch: tool.schema.string().optional().describe("Base branch to branch off of (defaults to HEAD)") },
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree creation with no active todo item. Break the request down with todowrite first, then create worktrees.";
-				const toolRoot = await resolveCallWorkspace(toolContext); const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", toolRoot); if (!res.success) return `[workflow-guard] Failed to create worktree: ${res.error}`;
+				const toolRoot = await resolveCallWorkspace(toolContext);
+				// Host first: it honors the operator's configured worktree directory
+				// and keeps the worktree in host inventory. The result is validated
+				// independently (registered worktree of THIS repo, not the primary
+				// tree); any failure falls back to the guard's git path.
+				//
+				// The host path is used only for the default base. The host create
+				// input's `from` is an absolute directory path, not a git ref, so an
+				// explicit `baseBranch` cannot be expressed there; honoring it via
+				// the git path is better than silently ignoring it.
+				let createdPath: string | undefined;
+				let hostNote = "";
+				const requestedBase = args.baseBranch ?? "HEAD";
+				if (hostWorktree?.available && requestedBase === "HEAD") {
+					const hostResult = await hostWorktree.create({ branch: args.branch });
+					if (hostResult.directory) {
+						const validation = validateHostWorktreeDirectory(hostResult.directory, toolRoot);
+						if (validation.ok) {
+							createdPath = resolve(hostResult.directory);
+							hostNote = " (created by the host worktree strategy)";
+						} else {
+							hostNote = ` Host worktree creation was rejected by the guard (${validation.error}); used the guard's git path instead.`;
+						}
+					} else if (hostResult.error) {
+						hostNote = ` Host worktree creation failed (${hostResult.error}); used the guard's git path instead.`;
+					}
+				}
+				if (!createdPath) {
+					const res = createGitWorktree(args.branch, requestedBase, toolRoot);
+					if (!res.success) return `[workflow-guard] Failed to create worktree: ${res.error}${hostNote}`;
+					createdPath = res.worktreePath;
+				}
 				const mutationRoot = await resolveCallWorkspace(toolContext);
 				await runWithRuntimeState(mutationRoot, client, async () => recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID));
-				return `[workflow-guard] Worktree created successfully at: ${res.worktreePath}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
+				return `[workflow-guard] Worktree created successfully at: ${createdPath}${hostNote}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
 			},
 		}),
 		guard_worktree_cleanup: tool({
 			description: "Commit a final snapshot and remove an isolated git worktree directory. Call to clean up worktrees created with guard_worktree_create after subagent tasks complete.", args: { worktreePath: tool.schema.string().describe("Path of the worktree directory to clean up") },
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree cleanup with no active todo item. Break the request down with todowrite first, then clean up worktrees.";
-				const toolRoot = await resolveCallWorkspace(toolContext); const res = cleanupGitWorktree(args.worktreePath, toolRoot); if (!res.success) return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
+				const toolRoot = await resolveCallWorkspace(toolContext);
+				// Removal never delegates to the host: its `remove` takes a `force`
+				// flag and has no snapshot step, so it can destroy uncommitted work
+				// the guard's snapshot-then-remove flow preserves. The host list is
+				// used only to authorize a directory outside the guard's storage.
+				const hostWorktrees = hostWorktree?.available ? await hostWorktree.list() : undefined;
+				const res = cleanupGitWorktree(args.worktreePath, toolRoot, { hostWorktrees });
+				if (!res.success) return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
+				// Tell the host its inventory is stale, or it keeps listing the
+				// removed directory until something else refreshes it.
+				await hostWorktree?.refresh();
 				const mutationRoot = await resolveCallWorkspace(toolContext);
 				await runWithRuntimeState(mutationRoot, client, async () => recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID));
 				return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;
