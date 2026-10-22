@@ -12,10 +12,12 @@ const LEGACY_TUI_SPEC = "opencode-workflow-guard/tui";
 
 const USAGE = `Usage:
   opencode-workflow-guard setup [--major 1|2]
-  opencode-workflow-guard policies --print [--format 2.0|next]
+  opencode-workflow-guard policies --print [--format both|2.0|next]
 
 setup writes \`plugins\` for OpenCode 2 (the default) and \`plugin\` for OpenCode 1.
-An existing config's key wins unless --major is passed.`;
+An existing config's key wins unless --major is passed.
+\`policies\` defaults to both, which the 2.0.x and 2.1.x hosts each read under
+their own key. Pass --format to pin one host.`;
 
 function configHome() {
 	return process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -41,17 +43,18 @@ function restoreConfig(path, previous) {
  */
 async function runPolicies() {
 	const args = process.argv.slice(3);
+	const formats = ["both", "2.0", "next"];
 	let print = false;
-	let format = "2.0";
+	let format = "both";
 	for (let i = 0; i < args.length; i++) {
 		const arg = args[i];
 		if (arg === "--print") print = true;
 		else if (arg === "--format") {
 			format = args[++i];
-			if (format !== "2.0" && format !== "next") throw new Error(`Unknown --format '${format}'. Use 2.0 or next.`);
+			if (!formats.includes(format)) throw new Error(`Unknown --format '${format}'. Use both, 2.0 or next.`);
 		} else if (arg.startsWith("--format=")) {
 			format = arg.slice("--format=".length);
-			if (format !== "2.0" && format !== "next") throw new Error(`Unknown --format '${format}'. Use 2.0 or next.`);
+			if (!formats.includes(format)) throw new Error(`Unknown --format '${format}'. Use both, 2.0 or next.`);
 		} else throw new Error(`Unknown argument '${arg}'.`);
 	}
 	if (!print) throw new Error("Refusing to write config. Pass --print and place the block yourself.");

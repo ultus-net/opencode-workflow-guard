@@ -6,4 +6,8 @@ Probe the host's `todowrite` capability instead of inferring it from session his
 
 Also add a completion-laundering audit signal. Marking a task `completed` with no mutation since the previous `todowrite` writes a `completion_claim_mismatch` record. It never blocks: the verification and review gates remain the authority, and read-only tasks complete legitimately without a mutation.
 
-Live acceptance on OpenCode 2.1.x is NOT RUN here, because the installed host is 2.0.15 and has no `todowrite` to probe. The capability probe, the gate inversion, and the fail-open path are covered by unit tests with synthetic session and registry data.
+Live acceptance on OpenCode 2.1.3: `ctx.tool.list()` at setup exposes
+`todowrite` when `experimental.todo: true` is set and omits it when the flag is
+false, so the probe reports `available` and `unavailable` against the real host
+registry rather than synthetic data. The capability probe, the gate inversion,
+and the fail-open path are also covered by unit tests.

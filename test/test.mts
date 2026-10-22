@@ -5507,12 +5507,24 @@ console.log("- Static policy posture -");
 			JSON.stringify(["protected-trunk-push", "live-control-plane-write", "secret-material-read", "external-directory-widening", "code-mode-surface"]),
 	);
 	check(
-		"the default format nests rules under experimental.policies with the permission action",
-		(posture.config as any).experimental.policies.every((rule: any) => rule.action === "permission"),
+		"the default format emits both host envelopes",
+		Boolean((posture.config as any).experimental.policies) && Boolean((posture.config as any).policies),
 	);
 	check(
-		"the next format uses the documented top-level policies array with tool.use",
+		"the legacy envelope uses experimental.policies with the permission action",
+		(buildPolicyPosture({ format: "2.0" }).config as any).experimental.policies.every((rule: any) => rule.action === "permission"),
+	);
+	check(
+		"the current envelope uses the top-level policies array with tool.use",
 		(buildPolicyPosture({ format: "next" }).config as any).policies.every((rule: any) => rule.action === "tool.use"),
+	);
+	// Each host reads one key and ignores the other, so the default must carry
+	// both. A single-key default is silently inert on the other host.
+	check(
+		"each host envelope keys its own action value",
+		(posture.config as any).experimental.policies.every((rule: any) => rule.action === "permission") &&
+			(posture.config as any).policies.every((rule: any) => rule.action === "tool.use") &&
+			(posture.config as any).experimental.policies.length === (posture.config as any).policies.length,
 	);
 	check(
 		"every emitted resource carries its composite action prefix",
@@ -5537,6 +5549,30 @@ console.log("- Static policy posture -");
 		const hit = rules.filter((rule) => rule.action === "permission" && hostMatch(rule.resource, `${action}:${resource}`));
 		return hit.length > 0 && hit[hit.length - 1].effect === "deny";
 	};
+	// The 2.1.x evaluator: same composite string and matcher, `tool.use` action,
+	// top-level key. Both matchers read the default config, so a rule lost from
+	// either envelope fails here rather than shipping silently.
+	const deniesCurrent = (config: any, action: string, resource: string): boolean => {
+		const rules: any[] = config.policies;
+		const hit = rules.filter((rule) => rule.action === "tool.use" && hostMatch(rule.resource, `${action}:${resource}`));
+		return hit.length > 0 && hit[hit.length - 1].effect === "deny";
+	};
+	const verdicts: Array<[string, string]> = [
+		["shell", push(forceFlag, "origin", "main")],
+		["shell", push("origin", "master")],
+		["shell", push("origin", "HEAD:main")],
+		["shell", push("origin", "feat/x")],
+		["edit", `${process.env.HOME}/.config/opencode/opencode.jsonc`],
+		["read", `${process.env.HOME}/.ssh/id_ed25519`],
+		["read", "/srv/backup/id_rsa.bak"],
+		["external_directory", "/srv/other-repo/src/a.ts"],
+		["edit", `${root}/src/a.ts`],
+		["shell", `cd /tmp && ${push("origin", "main")}`],
+	];
+	check(
+		"both host envelopes reach the same verdict for every probed resource",
+		verdicts.every(([action, resource]) => denies(posture.config, action, resource) === deniesCurrent(posture.config, action, resource)),
+	);
 	check("host matcher: a trunk push with flags is denied", denies(posture.config, "shell", push(forceFlag, "origin", "main")));
 	check("host matcher: a bare trunk push is denied", denies(posture.config, "shell", push("origin", "master")));
 	check("host matcher: a HEAD refspec trunk push is denied", denies(posture.config, "shell", push("origin", "HEAD:main")));
@@ -5556,7 +5592,9 @@ console.log("- Static policy posture -");
 	const rendered = renderPolicyPosture();
 	check("the rendered posture is valid JSONC with a documented header", rendered.startsWith("// Workflow Guard static policy posture"));
 	check("the rendered posture parses back to the same rule count", (JSON.parse(stripJsonComments(rendered)) as any).experimental.policies.length === posture.rules.length);
+	check("the rendered posture carries both host envelopes", (JSON.parse(stripJsonComments(rendered)) as any).policies.length === posture.rules.length);
 	check("the rendered posture states precedence and residual risk", /Precedence/.test(rendered) && /Residual risk/.test(rendered));
+	check("the rendered header names both qualified hosts", /2\.0\.x and 2\.1\.x/.test(rendered));
 
 	// The CLI prints to stdout and never writes. A second identical run proves
 	// determinism; the absence of a write path is enforced by the CLI itself,
@@ -5566,10 +5604,16 @@ console.log("- Static policy posture -");
 	check("the policies subcommand prints a parseable posture to stdout", printed.status === 0 && JSON.parse(stripJsonComments(printed.stdout)).experimental.policies.length > 0);
 	const printedAgain = spawnSync(process.execPath, [binPath, "policies", "--print"], { encoding: "utf8" });
 	check("the policies subcommand is deterministic", printed.stdout === printedAgain.stdout);
+	check("the policies subcommand defaults to both envelopes", printed.status === 0 && Boolean(JSON.parse(stripJsonComments(printed.stdout)).policies));
 	check("the policies subcommand refuses to run without --print", spawnSync(process.execPath, [binPath, "policies"], { encoding: "utf8" }).status !== 0);
 	check("the policies subcommand rejects an unknown format", spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "3.0"], { encoding: "utf8" }).status !== 0);
 	const nextPrinted = spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "next"], { encoding: "utf8" });
 	check("the policies subcommand honors --format next", nextPrinted.status === 0 && JSON.parse(stripJsonComments(nextPrinted.stdout)).policies.length > 0);
+	check(
+		"pinning one host omits the other envelope",
+		!JSON.parse(stripJsonComments(nextPrinted.stdout)).experimental &&
+			!JSON.parse(stripJsonComments(spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "2.0"], { encoding: "utf8" }).stdout)).policies,
+	);
 }
 
 // Todo capability wiring: setup probes the host registry once, records it for

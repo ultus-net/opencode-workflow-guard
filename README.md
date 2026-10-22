@@ -76,7 +76,7 @@ The context modules — project memory, Socratic learning, and recovery checkpoi
 |---|---|
 | [**Policy Reference**](docs/policies.md) | Comprehensive specification of all 24 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
 | [**Installation & Configuration**](docs/installation.md) | Setup options, global vs. local install, worktree isolation, and project configuration |
-| [**Static Policy Posture**](docs/policy-posture.md) | Emitting host-level `experimental.policies` for invariants a repository cannot lift, precedence, and residual risk |
+| [**Static Policy Posture**](docs/policy-posture.md) | Emitting host-level policies for invariants a repository cannot lift: both host envelopes (`experimental.policies` on 2.0.x, top-level `policies` on 2.1.x), precedence, and residual risk |
 | [**Managed Deployment**](docs/managed-deployment.md) | Administrator-managed OpenCode policy, platform locations, and startup diagnostics |
 | [**Troubleshooting**](docs/troubleshooting.md) | Diagnosing policy blocks, common false positives, and emergency override procedures |
 | [**Testing Architecture**](docs/testing.md) | Test harness design, adversarial regression matrix, and CI verification |

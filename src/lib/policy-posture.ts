@@ -8,17 +8,23 @@
  *
  * Two host shapes exist and they are not interchangeable:
  *
- * - **OpenCode 2.0.x** reads `experimental.policies` as
- *   `{ action, resource, effect }` with `effect` limited to `allow`/`deny`, and
- *   matches `resource` against the composite string `<permission action>:<resource>`
- *   (`opencode.config.policy` in the 2.0.15 binary). A deny there surfaces as
+ * - **OpenCode 2.0.x** reads `experimental.policies` and requires
+ *   `action: "permission"`. Its evaluator matches the composite string
+ *   `<permission action>:<resource>` as a whole-string glob
+ *   (`opencode.config.policy` in the 2.0.15 binary). A deny surfaces as
  *   "Blocked by configuration policy".
- * - **Newer hosts** document a top-level `policies` array whose entries use
- *   `action: "tool.use"` with the same composite `resource` string.
+ * - **OpenCode 2.1.x** reads a top-level `policies` array and requires
+ *   `action: "tool.use"` instead. It ignores `experimental.policies`.
  *
- * The invariants are identical in both shapes; only the envelope differs. This
- * module emits the shape the caller asks for and defaults to the qualified
- * 2.0.x shape.
+ * Each host silently ignores the key it does not read, which makes a
+ * single-key posture look applied while enforcing nothing. The default
+ * therefore emits both keys. `--format 2.0` and `--format next` remain for
+ * pinning one host, and the reason to avoid them is the failure above.
+ *
+ * Schema acceptance is not runtime acceptance: `@opencode/schema` 2.0.10
+ * admits a top-level `policies` array that the 2.0.15 runtime never reads.
+ * The envelopes below were verified by live denial canaries on both hosts,
+ * not by decoding config.
  *
  * The plugin never writes another tool's configuration. The caller prints the
  * block and the operator decides where it lands, because a plugin that can
@@ -94,11 +100,11 @@ export const STATIC_INVARIANTS: readonly StaticInvariant[] = [
 		action: "execute",
 		resources: ["*"],
 		reason:
-			"Code Mode wraps tools behind a single `execute` surface, and its nested calls reach the tool layer on a path this guard does not evaluate. Denying `execute` removes that surface where the host asserts the action. On 2.0.x the host never asserts `execute`, so this rule is inert there and the plugin's read-only pruning plus `execute.before` remain the only coverage.",
+			"Code Mode wraps tools behind a single `execute` surface, and its nested calls reach the tool layer on a path this guard does not evaluate. Denying `execute` removes that surface where the host asserts the action. The qualified hosts (2.0.15 and 2.1.3) register no `execute` tool and never assert an `execute` permission action, so this rule is inert on both; the plugin's read-only pruning plus `execute.before` remain the coverage.",
 	},
 ];
 
-export type PolicyPostureFormat = "2.0" | "next";
+export type PolicyPostureFormat = "2.0" | "next" | "both";
 
 export interface StaticPolicyRule {
 	action: string;
@@ -135,36 +141,39 @@ function rulesFor(invariants: readonly StaticInvariant[]): StaticPolicyRule[] {
 /**
  * Envelope a rule list for the target host.
  *
- * `2.0` uses the `permission` action inside `experimental.policies`, because
- * that is what the 2.0.x config schema accepts and what its evaluator compares.
- * `next` uses the documented top-level `policies` array with `tool.use`.
+ * `2.0` uses `experimental.policies` with the `permission` action, which is
+ * what the 2.0.x evaluator compares. `next` uses the top-level `policies`
+ * array with `tool.use`, which is what 2.1.x reads. `both` emits each rule
+ * under its own host's key: neither host reads the other's key, so the
+ * duplicate cannot double-apply or conflict.
  */
 function envelope(
 	format: PolicyPostureFormat,
 	rules: readonly StaticPolicyRule[],
 ): Record<string, unknown> {
-	if (format === "2.0") {
-		return {
-			experimental: {
-				policies: rules.map((rule) => ({
-					action: "permission",
-					resource: `${rule.action}:${rule.resource}`,
-					effect: rule.effect,
-				})),
-			},
-		};
-	}
-	return {
+	const legacy = {
+		experimental: {
+			policies: rules.map((rule) => ({
+				action: "permission",
+				resource: `${rule.action}:${rule.resource}`,
+				effect: rule.effect,
+			})),
+		},
+	};
+	const current = {
 		policies: rules.map((rule) => ({
 			action: "tool.use",
 			resource: `${rule.action}:${rule.resource}`,
 			effect: rule.effect,
 		})),
 	};
+	if (format === "2.0") return legacy;
+	if (format === "next") return current;
+	return { ...legacy, ...current };
 }
 
 export function buildPolicyPosture(options?: { format?: PolicyPostureFormat }): PolicyPosture {
-	const format = options?.format ?? "2.0";
+	const format = options?.format ?? "both";
 	const rules = rulesFor(STATIC_INVARIANTS);
 	return {
 		format,
@@ -193,7 +202,13 @@ export function renderPolicyPosture(options?: { format?: PolicyPostureFormat }):
 	const header = commentLines([
 		"Workflow Guard static policy posture. Generated, never installed automatically.",
 		"",
-		`Target: OpenCode ${posture.format === "2.0" ? "2.0.x (experimental.policies, action \"permission\")" : "newer (top-level policies, action \"tool.use\")"}.`,
+		`Target: OpenCode ${
+			posture.format === "2.0"
+				? "2.0.x only (experimental.policies, action \"permission\")"
+				: posture.format === "next"
+					? "2.1.x only (top-level policies, action \"tool.use\")"
+					: "2.0.x and 2.1.x (both keys; each host reads its own and ignores the other)"
+		}.`,
 		"",
 		"Precedence, highest first: managed preferences and Console policies, then /etc/opencode,",
 		"then ~/.config/opencode, then project opencode.json(c). Later rules win within one",

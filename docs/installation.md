@@ -20,8 +20,15 @@ verified it.
 | Guard | OpenCode qualified | Hook seats exercised | Notes |
 |---|---|---|---|
 | 1.16.x | 2.0.15 | `permission.hook("evaluate")`, `tool.hook("execute.before"/"execute.after")`, `session.hook("context")`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client | Unit and package-loader verified. Live model-driven probes reached the provider and were classified `live unavailable` (`Model unavailable: openrouter/openrouter/auto`), so no guard verdict was produced. |
+| 1.16.x | 2.1.3 | `permission.hook("evaluate")`, `tool.hook(...)`, `session.hook(...)`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client, `todowrite` behind `experimental.todo` | Package-loader and headless-runtime verified (`npm run test:install`: 27 passed). Live host probe confirmed `ctx.tool.list()` exposes `todowrite` with `experimental.todo: true` and omits it when false. Live static-policy denial canary produced `Blocked by configuration policy`. |
 | 1.16.x | 1.18.32 (`@opencode-ai/plugin`) | V1 `PluginModule` loader, native todo endpoint | Compatibility export only; unit-tested, no live host probe. |
-| 1.16.x | 2.1.x (`todowrite` behind `experimental.todo`) | Todo capability probe and gate inversion | **NOT RUN.** Only synthetic registry/session data is covered. The 2.1.x acceptance in the implementation plan remains open. |
+
+The 2.1.3 pins require the 2.1.x package set. `@opencode/plugin` and
+`@opencode/ai` are pinned to `2.1.3`, which depends on `effect@4.0.1` and
+requires `@opentui/solid >=0.6.6`; the guard pins `0.6.6`. A 2.0.x pin set on a
+2.1.x host fails to load at all: the plugin imports an `effect` path the host no
+longer provides, and the host reports `failed to load plugin` while every
+policy stays inert.
 
 `guard_status` reports `pluginVersion`, `qualifiedHostVersion`, and the live
 `hostVersion`, so a mismatch is visible at runtime rather than surfacing as a

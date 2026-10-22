@@ -17,6 +17,7 @@ this surface, and it is also why the plugin refuses to install it for you.
 
 ```
 opencode-workflow-guard policies --print
+opencode-workflow-guard policies --print --format 2.0
 opencode-workflow-guard policies --print --format next
 ```
 
@@ -25,19 +26,31 @@ The command writes JSONC to stdout and nothing else. It refuses to run without
 rails has moved those rails back inside the plugin, so the operator places the
 block.
 
-`--format 2.0` (default) emits the shape OpenCode 2.0.x reads. `--format next`
-emits the documented newer shape. The invariants are identical. Only the
-envelope differs:
+The default is `both`, which emits each rule under the key its host reads:
 
-| Format | Envelope | Rule action |
-|---|---|---|
-| `2.0` | `experimental.policies` | `permission` |
-| `next` | top-level `policies` | `tool.use` |
+| Format | Envelope | Rule action | Host that reads it |
+|---|---|---|---|
+| `both` (default) | `experimental.policies` and top-level `policies` | `permission` and `tool.use` | 2.0.x and 2.1.x |
+| `2.0` | `experimental.policies` | `permission` | 2.0.x only |
+| `next` | top-level `policies` | `tool.use` | 2.1.x only |
 
-The default is `2.0` because 2.0.x silently drops unknown top-level keys, so a
-`next` block installed there looks applied and does nothing. Verified against
-`@opencode/schema` 2.0.10: the `2.0` block decodes with all rules intact, and
-the `next` block decodes to `policies: undefined`.
+The envelopes are not interchangeable, and neither host warns about the one it
+does not read. OpenCode 2.0.x evaluates `experimental.policies` with
+`action === "permission"` and ignores a top-level `policies` array entirely.
+OpenCode 2.1.x evaluates the top-level `policies` array with
+`action === "tool.use"` and ignores `experimental.policies`. A single-key block
+therefore looks applied on the other host and enforces nothing.
+
+Both hosts read only their own key, so carrying both cannot double-apply a rule
+or make them conflict. `--format 2.0` and `--format next` exist for a pinned
+host; `both` is the default because the silent no-op is the failure this
+surface exists to prevent.
+
+Schema acceptance is not runtime acceptance. `@opencode/schema` 2.0.10 admits a
+top-level `policies` array that the 2.0.15 runtime never reads, so a decode test
+grades the block as valid while the host enforces nothing. The envelope table
+above is verified by live denial canaries on both hosts, in the acceptance
+section below.
 
 ## What is emitted
 
@@ -63,11 +76,12 @@ deliberately if they conflict with normal work:
 - `external_directory: *` denies every path outside the active project. Cross
   repository reads then require an explicit later `allow` rule. That is the
   strict posture, and it is the one the write-confinement work assumes.
-- `execute: *` removes Code Mode. On 2.0.x the host never asserts an `execute`
-  permission action, so the rule is inert there and Code Mode stays available.
-  On hosts that do assert it, the rule removes a surface whose nested tool calls
+- `execute: *` removes Code Mode. The qualified hosts (2.0.15 and 2.1.3)
+  register no `execute` tool and never assert an `execute` permission action,
+  so the rule is inert on both and Code Mode stays available. On a host that
+  does assert the action, the rule removes a surface whose nested tool calls
   this guard does not evaluate. The plugin's read-only tool pruning and
-  `execute.before` remain the coverage on 2.0.x.
+  `execute.before` remain the coverage today.
 
 ## Precedence
 
@@ -114,27 +128,44 @@ Read this before treating the block as a sandbox.
 
 ## Acceptance status
 
-The acceptance canary in the implementation plan installs the block into a
-running host and confirms the denial message is `Blocked by configuration
-policy` rather than a hook message.
+**Status: RUN.** The canary installs the emitted block into an isolated project
+config and drives a real model turn that calls the denied tool. It is run once
+per host.
 
-**Status: NOT RUN.** Two reasons, both environmental:
+| Host | Emitted block | Probed rule | Result |
+|---|---|---|---|
+| 2.0.15 | `--format 2.0` | `shell:printf*` | `Blocked by configuration policy` |
+| 2.1.3 | `--format 2.0` | `shell:printf*` | **executed** (silent no-op) |
+| 2.0.15 | `--format next` | `shell:printf*` | **executed** (silent no-op) |
+| 2.1.3 | `--format next` | `shell:printf*` | `Blocked by configuration policy` |
+| 2.0.15 | default (`both`) | `read:*id_rsa*` | `Blocked by configuration policy` |
+| 2.1.3 | default (`both`) | `read:*id_rsa*` | `Blocked by configuration policy` |
 
-- The canary needs a model turn to drive a tool call, and this environment has
-  no configured provider.
-- Placing the block requires writing a live control-plane config path, which the
-  guard's own tamper policy refuses to let an agent do. That refusal is correct.
+The two silent no-ops are the defect this section exists to prevent, and they
+are why the default emits both envelopes. A single-key block is not merely
+unverified on the other host. It is actively misleading there, because the
+config loads and reports no error.
 
-What was verified instead, on the installed 2.0.15 host:
+Two limits on the canary, so nobody over-reads it:
 
-- `@opencode/schema` 2.0.10 accepts the emitted `2.0` block with all rules
-  intact, and drops the `next` block.
-- The 2.0.15 binary carries the `opencode.config.policy` plugin, which reads
-  `experimental.policies`, matches `<action>:<resource>` as a whole-string glob,
-  and sets the message to the literal `Blocked by configuration policy`.
-- The emitted resources match the intended commands under a replica of that
-  matcher, asserted in `test/test.mts`.
+- The `write` tool is gated by the `edit` permission action on 2.1.3 but not on
+  2.0.15, so a `write` canary would not have proved the `edit` rule on both.
+  The `read` rule was chosen for the cross-host proof because both hosts map it
+  identically.
+- The `execute` invariant stays inert on both qualified hosts, because neither
+  registers an `execute` tool. Its canary cannot pass until a host asserts the
+  action, and the rule is documented as inert rather than claimed as coverage.
+
+Placing the block in a live control-plane path stays out of scope for an agent:
+the tamper policy refuses that write, and that refusal is correct. The canary
+uses an isolated project config instead, which exercises the same evaluator.
+
+The emitted resources are also asserted against a replica of the host matcher in
+`test/test.mts`, and both envelopes are required to reach the same verdict for
+every probed resource.
 
 To run the canary yourself, install the block into `~/.config/opencode`, then
 attempt a denied action in a live session and confirm the message names
-configuration policy rather than the plugin.
+configuration policy rather than the plugin. Use the default (`both`) envelope
+unless you have pinned the host, and check the result on the host you actually
+run.
