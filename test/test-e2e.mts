@@ -45,11 +45,11 @@ const packageEntry = join(testDir, "node_modules", "opencode-workflow-guard", "s
 const installedPackageDir = join(testDir, "node_modules", "opencode-workflow-guard");
 const installedPackageJson = JSON.parse(readFileSync(join(testDir, "node_modules", "opencode-workflow-guard", "package.json"), "utf8"));
 check(
-	"npm package keeps direct dependencies on latest",
+	"npm package pins every direct dependency to an exact version",
 	Object.keys(installedPackageJson.dependencies ?? {}).length > 0 &&
-		Object.values(installedPackageJson.dependencies).every((spec) => spec === "latest") &&
+		Object.values(installedPackageJson.dependencies).every((spec) => /^\d+\.\d+\.\d+/.test(String(spec))) &&
 		Object.keys(installedPackageJson.devDependencies ?? {}).length > 0 &&
-		Object.values(installedPackageJson.devDependencies).every((spec) => spec === "latest"),
+		Object.values(installedPackageJson.devDependencies).every((spec) => /^\d+\.\d+\.\d+/.test(String(spec))),
 );
 check(
 	"npm tarball installs modular plugin entrypoint",

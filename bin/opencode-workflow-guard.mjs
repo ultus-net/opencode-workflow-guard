@@ -2,14 +2,21 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { parse, modify, applyEdits } from "jsonc-parser";
+import { join } from "node:path";
+import { preparePluginUpdate } from "../src/lib/config-writer.mjs";
 
 const PACKAGE_NAME = "opencode-workflow-guard";
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const SERVER_SPEC = `${PACKAGE_NAME}@${PACKAGE_VERSION}`;
 const TUI_SPEC = SERVER_SPEC;
 const LEGACY_TUI_SPEC = "opencode-workflow-guard/tui";
+
+const USAGE = `Usage:
+  opencode-workflow-guard setup [--major 1|2]
+  opencode-workflow-guard policies --print [--format 2.0|next]
+
+setup writes \`plugins\` for OpenCode 2 (the default) and \`plugin\` for OpenCode 1.
+An existing config's key wins unless --major is passed.`;
 
 function configHome() {
 	return process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -26,43 +33,6 @@ function restoreConfig(path, previous) {
 	if (previous === undefined) rmSync(path, { force: true });
 	else writeFileSync(path, previous);
 }
-
-function matchesPackageSpec(entry, spec) {
-	const value = Array.isArray(entry) ? entry[0] : entry;
-	return typeof value === "string" && (value === spec || value.startsWith(`${spec}@`));
-}
-function preparePluginUpdate(path, schema, spec, legacySpec) {
-	const source = existsSync(path) ? readFileSync(path, "utf8") : `{
-  "$schema": "${schema}"
-}\n`;
-	const errors = [];
-	const config = parse(source, errors, { allowTrailingComma: true, disallowComments: false });
-	if (errors.length > 0 || !config || typeof config !== "object" || Array.isArray(config)) {
-		throw new Error(`Cannot update invalid config: ${path}`);
-	}
-	if (config.plugin !== undefined && !Array.isArray(config.plugin)) {
-		throw new Error(`Cannot update ${path}: "plugin" must be an array`);
-	}
-	const plugins = config.plugin ?? [];
-	const hasSpec = plugins.some((entry) => matchesPackageSpec(entry, PACKAGE_NAME));
-	const updatedPlugins = legacySpec
-		? plugins.filter((entry) => !matchesPackageSpec(entry, legacySpec))
-		: plugins;
-	if (updatedPlugins.length !== plugins.length) {
-		if (!hasSpec) updatedPlugins.push(spec);
-		return applyEdits(source, modify(source, ["plugin"], updatedPlugins, {
-			formattingOptions: { insertSpaces: true, tabSize: 2 },
-		}));
-	}
-	if (hasSpec) return undefined;
-	return applyEdits(source, modify(source, ["plugin", plugins.length], spec, {
-		formattingOptions: { insertSpaces: true, tabSize: 2 },
-	}));
-}
-
-const USAGE = `Usage:
-  opencode-workflow-guard setup
-  opencode-workflow-guard policies --print [--format 2.0|next]`;
 
 /**
  * Static policy posture. Prints to stdout only.
@@ -98,16 +68,25 @@ if (process.argv[2] === "policies") {
 		console.error(USAGE);
 		process.exitCode = 1;
 	}
-} else if (process.argv[2] !== "setup" || process.argv.length > 3) {
+} else if (process.argv[2] !== "setup") {
 	console.error(USAGE);
 	process.exitCode = 1;
 } else {
 	try {
+		const args = process.argv.slice(3);
+		let explicitMajor;
+		for (let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			const raw = arg === "--major" ? args[++i] : arg.startsWith("--major=") ? arg.slice("--major=".length) : undefined;
+			if (raw === undefined) throw new Error(`Unknown argument '${arg}'.`);
+			if (raw !== "1" && raw !== "2") throw new Error(`Unknown --major '${raw}'. Use 1 or 2.`);
+			explicitMajor = Number(raw);
+		}
 		const base = join(configHome(), "opencode");
 		const serverPath = existingConfig(base, "opencode");
 		const tuiPath = existingConfig(base, "tui");
-		const serverUpdate = preparePluginUpdate(serverPath, "https://opencode.ai/config.json", SERVER_SPEC);
-		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC, LEGACY_TUI_SPEC);
+		const serverUpdate = preparePluginUpdate(serverPath, "https://opencode.ai/config.json", SERVER_SPEC, undefined, explicitMajor);
+		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC, LEGACY_TUI_SPEC, explicitMajor);
 		const serverBefore = existsSync(serverPath) ? readFileSync(serverPath, "utf8") : undefined;
 		const tuiBefore = existsSync(tuiPath) ? readFileSync(tuiPath, "utf8") : undefined;
 		mkdirSync(base, { recursive: true });

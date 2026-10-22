@@ -78,6 +78,7 @@ import {
 	branchHasDocumentationChange,
 	isDocumentationRequired,
 	loadedPluginVersion,
+	qualifiedHostVersion,
 	isReviewRequired,
 	getOperationProfile,
 	isRecoveryCheckpointsEnabled,
@@ -123,6 +124,7 @@ import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheck
 import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
 import { scanSessionTodos, toolPartName, detectTodoCapability, recordedTodoCapability, recordTodoCapability, reportTodoGateFailOpen, resetTodoCapabilityForTesting } from "../src/lib/v2-todo.ts";
 import { buildPolicyPosture, renderPolicyPosture } from "../src/lib/policy-posture.ts";
+import { pluginKeyFor, preparePluginUpdate } from "../src/lib/config-writer.mjs";
 import { effectiveTodosWithOwner, completionClaimMismatch } from "../src/policies/todo.ts";
 import { resetPluginInstancesForTesting } from "../src/lib/plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim, resetToolCallClaimsForTesting } from "../src/lib/call-claims.ts";
@@ -5562,6 +5564,59 @@ console.log("- V2 todo capability wiring -");
 	rmSync(capabilityRoot, { recursive: true, force: true });
 }
 
+// ── setup writes the key the target host actually reads ──
+// 2.0.10 drops a singular `plugin` key without an error, so a wrong key yields
+// a config that looks configured and loads nothing. These assertions pin the
+// key selection and the non-destructive update path.
+console.log("- setup config writer -");
+{
+	const writerRoot = mkdtempSync(join(tmpdir(), "wg-config-writer-"));
+	const target = join(writerRoot, "settings-under-test.json");
+	const spec = "opencode-workflow-guard@9.9.9";
+
+	check("writer: a fresh config targets the plural key", pluginKeyFor({}) === "plugins");
+	check("writer: an existing plugins key means 2.x", pluginKeyFor({ plugins: [] }) === "plugins");
+	check("writer: an existing plugin key means 1.x", pluginKeyFor({ plugin: [] }) === "plugin");
+	check("writer: an explicit major overrides the existing key", pluginKeyFor({ plugin: [] }, 2) === "plugins");
+
+	writeFileSync(target, '{\n  "$schema": "https://opencode.ai/config.json"\n}\n');
+	const fresh = preparePluginUpdate(target, "https://opencode.ai/config.json", spec);
+	check("writer: a fresh config gains a plugins array", fresh !== undefined && JSON.parse(stripJsonComments(fresh)).plugins[0] === spec);
+	check("writer: the fresh write does not add the singular key", !/\"plugin\"\s*:/.test(fresh ?? ""));
+
+	writeFileSync(target, '{\n  "plugins": ["other-plugin"]\n}\n');
+	const appended = preparePluginUpdate(target, "https://opencode.ai/config.json", spec);
+	check("writer: an existing plugins entry is preserved", JSON.stringify(JSON.parse(stripJsonComments(appended!)).plugins) === JSON.stringify(["other-plugin", spec]));
+
+	writeFileSync(target, `{\n  "plugins": ["${spec}"]\n}\n`);
+	check("writer: an already-configured package is not rewritten", preparePluginUpdate(target, "https://opencode.ai/config.json", spec) === undefined);
+
+	writeFileSync(target, '{\n  "plugin": ["other-plugin"]\n}\n');
+	const legacy = preparePluginUpdate(target, "https://opencode.ai/config.json", spec);
+	check("writer: a 1.x config keeps the singular key", legacy !== undefined && JSON.parse(stripJsonComments(legacy)).plugin[0] === "other-plugin" && JSON.parse(stripJsonComments(legacy)).plugins === undefined);
+	const forced = preparePluginUpdate(target, "https://opencode.ai/config.json", spec, undefined, 2);
+	check("writer: --major 2 writes the plural key even for a 1.x-shaped config", forced !== undefined && JSON.parse(stripJsonComments(forced)).plugins[0] === spec);
+
+	writeFileSync(target, `{\n  "plugin": ["${spec}"], "plugins": ["${spec}"]\n}\n`);
+	check("writer: a config already naming the package under either key is untouched", preparePluginUpdate(target, "https://opencode.ai/config.json", spec) === undefined);
+
+	writeFileSync(target, `{\n  "plugin": ["opencode-workflow-guard/tui", "${spec}"]\n}\n`);
+	const migrated = preparePluginUpdate(target, "https://opencode.ai/config.json", spec, "opencode-workflow-guard/tui");
+	check("writer: a legacy TUI spec is replaced, not duplicated", JSON.stringify(JSON.parse(stripJsonComments(migrated!)).plugin) === JSON.stringify([spec]));
+
+	writeFileSync(target, '{\n  "plugins": "not-an-array"\n}\n');
+	let threw = false;
+	try { preparePluginUpdate(target, "https://opencode.ai/config.json", spec); } catch { threw = true; }
+	check("writer: a non-array plugin key is refused instead of clobbered", threw);
+
+	writeFileSync(target, "not json at all {{{");
+	threw = false;
+	try { preparePluginUpdate(target, "https://opencode.ai/config.json", spec); } catch { threw = true; }
+	check("writer: an unparseable config is refused instead of clobbered", threw);
+
+	rmSync(writerRoot, { recursive: true, force: true });
+}
+
 // Loaded plugin version visibility: OpenCode resolves configured bare plugin
 // names through Node's parent-directory lookup from its configuration
 // location, so the loaded copy can silently differ from a globally
@@ -5628,6 +5683,12 @@ check("loadedPluginVersion reads the adjacent package manifest", loadedPluginVer
 check("loadedPluginVersion fails soft for an unreadable manifest", loadedPluginVersion(pathToFileURL(join(root, "wg-version-none", "src", "workflow-guard.ts")).href) === undefined);
 const versionStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: root }, { sessionID: "s-version", worktree: root, directory: root } as any)));
 check("guard_status exposes the loaded plugin version", versionStatus.pluginVersion === expectedVersion);
+const expectedHostQualification = String((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { dependencies: Record<string, string> }).dependencies["@opencode/plugin"]);
+check("qualifiedHostVersion reads the pinned host dependency", qualifiedHostVersion() === expectedHostQualification);
+check("the qualified host version is an exact pin, not a range", /^\d+\.\d+\.\d+$/.test(expectedHostQualification));
+check("qualifiedHostVersion fails soft for an unreadable manifest", qualifiedHostVersion(pathToFileURL(join(root, "wg-version-none", "src", "workflow-guard.ts")).href) === undefined);
+check("guard_status exposes the qualified host version", versionStatus.qualifiedHostVersion === expectedHostQualification);
+check("guard_status reports a null host version on the V1 path", versionStatus.hostVersion === null);
 const versionLogs: string[] = [];
 await WorkflowGuard({
 	directory: root,

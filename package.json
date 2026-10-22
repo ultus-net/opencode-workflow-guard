@@ -47,15 +47,15 @@
     "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "latest",
-    "@opencode/plugin": "latest",
-    "@opentui/solid": "latest",
-    "jsonc-parser": "latest",
-    "@opencode/ai": "latest"
+    "@opencode-ai/plugin": "1.18.32",
+    "@opencode/plugin": "2.0.10",
+    "@opentui/solid": "0.5.11",
+    "jsonc-parser": "3.3.1",
+    "@opencode/ai": "2.0.10"
   },
   "devDependencies": {
-    "@changesets/cli": "latest",
-    "@types/node": "latest",
-    "typescript": "latest"
+    "@changesets/cli": "3.0.3",
+    "@types/node": "26.6.2",
+    "typescript": "7.0.2"
   }
 }

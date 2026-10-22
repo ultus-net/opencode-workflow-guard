@@ -6,8 +6,26 @@
 
 ## Requirements
 
-- **OpenCode >= 1.18** (V1: requires the `GET /session/:id/todo` endpoint and the V1 `PluginModule` loader) or **OpenCode 2.x** (V2: loads through the `@opencode/plugin` API; the current todo list is reconstructed from the session message history because V2 has no todo endpoint).
+- **OpenCode >= 1.18** (V1: requires the `GET /session/:id/todo` endpoint and the V1 `PluginModule` loader) or **OpenCode 2.x** (V2: loads through the `@opencode/plugin` API; the current todo list is reconstructed from session message history, or read from the native `todowrite` on 2.1.x when `experimental.todo` is enabled).
 - **Node.js >= 22.18** or **Bun** (for running test scripts directly).
+
+### Version Qualification
+
+The guard declares exact host dependency versions, so an unreviewed host API can
+never float in. A host release is qualified only when it appears in this table
+with the seats that were actually exercised against it. An unlisted version is
+unqualified by definition, which does not mean it is broken; it means nobody has
+verified it.
+
+| Guard | OpenCode qualified | Hook seats exercised | Notes |
+|---|---|---|---|
+| 1.16.x | 2.0.15 | `permission.hook("evaluate")`, `tool.hook("execute.before"/"execute.after")`, `session.hook("context")`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client | Unit and package-loader verified. Live model-driven probes: NOT RUN (no provider in the verification environment). |
+| 1.16.x | 1.18.32 (`@opencode-ai/plugin`) | V1 `PluginModule` loader, native todo endpoint | Compatibility export only; unit-tested, no live host probe. |
+| 1.16.x | 2.1.x (`todowrite` behind `experimental.todo`) | Todo capability probe and gate inversion | **NOT RUN.** Only synthetic registry/session data is covered. The 2.1.x acceptance in the implementation plan remains open. |
+
+`guard_status` reports `pluginVersion`, `qualifiedHostVersion`, and the live
+`hostVersion`, so a mismatch is visible at runtime rather than surfacing as a
+silently inert hook.
 
 ---
 
@@ -27,7 +45,7 @@ OpenCode 2 documents `opencode plugin add <package>` as the command to install a
 
 Use the same two commands to upgrade after a Workflow Guard release. Keep the explicit version in OpenCode's configuration rather than relying on a bare package name or `@latest`: OpenCode caches npm plugins, and an already-populated `@latest` cache key may continue resolving to the version that originally populated it. An explicit new version creates a new package-cache key without manually deleting OpenCode's cache.
 
-If you only want the server guard without the TUI companion, add the package to your project's `opencode.json` (or global `~/.config/opencode/opencode.json`). OpenCode 2 uses the plural `plugins` key; OpenCode 1.x uses the singular `plugin` key (V2 normalizes the singular form in memory, but the native shape is `plugins`):
+If you only want the server guard without the TUI companion, add the package to your project's `opencode.json` (or global `~/.config/opencode/opencode.json`). OpenCode 2 reads only the plural `plugins` key; OpenCode 1.x uses the singular `plugin` key. A singular key in an OpenCode 2 config is dropped by the config schema without an error, so the guard will appear configured and never load:
 
 ```json
 {
@@ -39,6 +57,24 @@ If you only want the server guard without the TUI companion, add the package to 
 ```
 
 OpenCode automatically installs configured npm plugins and their dependencies at startup. The npm package contains both server and TUI entrypoints, but OpenCode activates them from separate configuration files. See [OpenCode's npm plugin documentation](https://opencode.ai/docs/plugins/#from-npm) and [plugin installation behavior](https://opencode.ai/docs/plugins/#how-plugins-are-installed).
+
+### 2. Self-Configuring `setup` Command
+
+The package ships a `setup` command that writes the plugin entry into the global
+configuration for you:
+
+```bash
+opencode-workflow-guard setup            # OpenCode 2: writes `plugins`
+opencode-workflow-guard setup --major 1  # OpenCode 1: writes `plugin`
+```
+
+The command detects the target from the existing config: a `plugins` key means
+OpenCode 2, a `plugin` key means OpenCode 1, and a fresh config defaults to
+OpenCode 2. `--major` overrides the detection. The two keys are not
+interchangeable: OpenCode 2's config schema drops a singular `plugin` key
+without an error, so writing the wrong one produces a config that looks
+configured and loads nothing. The writer refuses to clobber an unparseable
+config or a non-array plugin key.
 
 ### Configure The Guard In One Location Only
 
@@ -52,7 +88,7 @@ A configured bare package name is resolved through Node's parent-directory looku
 
 ---
 
-### 2. Manual Local-File Installation (Server Plugin)
+### 3. Manual Local-File Installation (Server Plugin)
 
 The npm package entrypoint uses OpenCode's V1 plugin module shape (`{ id, server }`). For a source checkout, keep the modular server source outside the auto-loaded `plugins/` directory and add a small adapter with the same module shape:
 
@@ -67,7 +103,7 @@ OpenCode automatically discovers the adapter from the project-level `.opencode/p
 
 ---
 
-### 3. TUI Visual Indicator (Prompt Box Badge)
+### 4. TUI Visual Indicator (Prompt Box Badge)
 
 To enable the static `Workflow Guard 🛡️` prompt-bar badge, with block details reported separately through warning toasts:
 

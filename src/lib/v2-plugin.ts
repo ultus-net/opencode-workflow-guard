@@ -213,7 +213,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	const toolOutcomes = new ToolOutcomeTracker();
 
 	// ── Custom tools + builtin description enrichment ──
-	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree: createHostWorktreePort(ctx), todoCapability: () => recordedTodoCapability() });
+	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree: createHostWorktreePort(ctx), todoCapability: () => recordedTodoCapability(), hostVersion: () => ctx.app?.version });
 	await ctx.tool.transform((editor) => {
 		for (const [name, definition] of Object.entries(customTools)) {
 			editor.add({

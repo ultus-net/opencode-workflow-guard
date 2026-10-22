@@ -200,7 +200,7 @@ export function managedConfigDiagnostic(platform = process.platform, env: NodeJS
 		: "managed config location is unknown on this platform; plugin provenance is not verified by the OpenCode V1 API";
 }
 
-export { loadedPluginVersion } from "./lib/version.ts";
+export { loadedPluginVersion, qualifiedHostVersion } from "./lib/version.ts";
 
 // ── Verification engine ──────────────────────────────────────────────────────
 import {
