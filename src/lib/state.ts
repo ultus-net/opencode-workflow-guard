@@ -1,7 +1,7 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
+import { audit, getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { findGitRoot, getCachedProjectConfig, isSameGitRepo, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { normalizeLiveControlPlaneRoots } from "./live-control-plane.ts";
@@ -89,33 +89,90 @@ export function getSessionBoundWorkspace(sessionID?: string): string | undefined
 }
 
 /**
- * Register a session's workspace from a tool call's own context. Candidates in
- * priority order: tool-argument paths (workdir/filePath — the call's own
- * target), then a host-provided per-call worktree/directory. A session that is
- * already registered is never re-anchored from the plugin-instance fallback:
- * under concurrent loops that fallback can belong to a different session's
- * workspace, which is exactly how workspaces cross-contaminate. Only a
- * session with no registration at all is bootstrapped from the fallback, and
- * such a bootstrap stays unbound (never used to bind review evidence).
+ * Register a session's workspace from a tool call's own context.
+ *
+ * Two distinct operations, deliberately split:
+ *
+ * - **First bind.** A session with no bound workspace adopts the git root of
+ *   its own call arguments (`workdir`/`filePath`), else the host-provided
+ *   per-call worktree, else a path-derived bootstrap from the plugin-instance
+ *   fallback. A bootstrap from the fallback stays unbound: concurrent loops
+ *   share this process, so a value derived from the last-active plugin
+ *   instance must never bind review evidence.
+ * - **Widen.** Once bound, only an explicit host-declared per-call worktree
+ *   may move the boundary. Worktree isolation and relay flows set it, so it is
+ *   a boundary statement from the host. A bare path candidate outside the
+ *   boundary is a read or write against foreign state, which the boundary
+ *   policy refuses; adopting it would let one allowed external read move the
+ *   whole write boundary.
+ *
+ * Every widen and every refused widen is journaled, because the boundary is
+ * what unattended operation rests on.
  */
 export function registerSessionWorkspaceFromToolCall(
 	sessionID: string | undefined,
-	call: { workdir?: string; filePath?: string; hostWorktree?: string; toolWorktree: string },
+	call: { workdir?: string; filePath?: string; hostWorktree?: string; toolWorktree: string; mutating?: boolean },
 ): void {
 	if (!sessionID) return;
-	const rawCandidate = call.workdir ?? call.filePath ?? call.hostWorktree;
-	if (rawCandidate) {
-		const candidatePath = isAbsolute(rawCandidate) ? rawCandidate : resolve(call.toolWorktree, rawCandidate);
-		const gitRoot = findGitRoot(candidatePath);
-		if (gitRoot) {
-			sessionWorkspaces.set(sessionID, gitRoot);
-			sessionWorkspaceBound.add(sessionID);
-		}
+	const bound = getSessionBoundWorkspace(sessionID);
+
+	// A host-declared per-call worktree is an explicit boundary statement.
+	const hostRoot = call.hostWorktree ? findGitRoot(call.hostWorktree) : undefined;
+	if (hostRoot && hostRoot !== bound) {
+		setSessionWorkspace(sessionID, hostRoot);
+		auditWorkspaceRebind(sessionID, bound, hostRoot, "host-worktree");
 		return;
 	}
-	if (sessionWorkspaces.has(sessionID)) return;
-	const gitRoot = findGitRoot(call.toolWorktree);
-	sessionWorkspaces.set(sessionID, gitRoot ?? projectRootKey(call.toolWorktree));
+
+	const rawCandidate = call.workdir ?? call.filePath;
+	if (!rawCandidate) {
+		if (sessionWorkspaces.has(sessionID)) return;
+		const gitRoot = findGitRoot(call.toolWorktree);
+		sessionWorkspaces.set(sessionID, gitRoot ?? projectRootKey(call.toolWorktree));
+		return;
+	}
+
+	const candidatePath = isAbsolute(rawCandidate) ? rawCandidate : resolve(call.toolWorktree, rawCandidate);
+	const gitRoot = findGitRoot(candidatePath);
+	if (!gitRoot) return;
+	if (gitRoot === bound) return;
+
+	if (!bound) {
+		sessionWorkspaces.set(sessionID, gitRoot);
+		sessionWorkspaceBound.add(sessionID);
+		return;
+	}
+	auditWorkspaceRebindRefused(sessionID, bound, gitRoot, call.mutating ? "mutation" : "read");
+}
+
+/** Durable record of a granted boundary widening. */
+function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: string, source: string): void {
+	audit({
+		ts: new Date().toISOString(),
+		sessionID,
+		tool: "workspace.binding",
+		decision: "allow",
+		phase: "event",
+		reason: "workspace_rebind_host_worktree",
+		input: { from, to, source },
+	});
+}
+
+/**
+ * Durable record of a refused widening. The refusal itself is the boundary
+ * policy's decision; this entry exists so an operator can tell whether a
+ * foreign path arrived through a read or a mutation.
+ */
+function auditWorkspaceRebindRefused(sessionID: string, from: string, to: string, source: "read" | "mutation"): void {
+	audit({
+		ts: new Date().toISOString(),
+		sessionID,
+		tool: "workspace.binding",
+		decision: "block",
+		phase: "event",
+		reason: "workspace_rebind_refused",
+		input: { from, to, source },
+	});
 }
 
 /**

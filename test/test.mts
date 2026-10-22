@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync, realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -3381,6 +3381,42 @@ check("a session binds to its workspace from its own call context", getSessionBo
 // The other loop's plugin instance must not re-anchor it from its own root.
 await isoHookOf(isoPluginB)?.({ sessionID: "s-iso-shared", tool: "bash", callID: "c-iso-2" }, { args: { command: "ls -la" } });
 check("an instance-derived fallback never re-anchors a bound session", getSessionBoundWorkspace("s-iso-shared") === isoRepoA);
+// A path-derived candidate must not widen an existing binding either. A
+// foreign read is allowed (external_directory defaults to allow), and the old
+// code then adopted that repository as the session's home: one allowed read
+// moved the entire write boundary.
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-widen", tool: "read", callID: "c-widen-1" }, { args: { filePath: join(isoRepoA, "seed.txt") } });
+check("a session binds from its first call context (widen fixture)", getSessionBoundWorkspace("s-iso-widen") === isoRepoA);
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-widen", tool: "read", callID: "c-widen-2" }, { args: { filePath: join(isoRepoB, "seed.txt") } });
+check("an allowed read in another repository does not widen the write boundary", getSessionBoundWorkspace("s-iso-widen") === isoRepoA);
+const widenRefusalAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_refused" && entry.sessionID === "s-iso-widen");
+check(
+	"a refused widening is journaled with both roots and the call label",
+	widenRefusalAudit?.decision === "block" &&
+		(widenRefusalAudit.input as any)?.from === isoRepoA &&
+		(widenRefusalAudit.input as any)?.to === isoRepoB &&
+		(widenRefusalAudit.input as any)?.source === "read",
+);
+todo("s-iso-widen", item("boundary probe", "in_progress"));
+const crossWrite = await guardToolDecision("write", { filePath: join(isoRepoB, "escape.txt"), content: "x" }, { sessionID: "s-iso-widen" });
+check("a foreign write is refused after a foreign read", crossWrite.status === "blocked" && crossWrite.policy === "boundary");
+if (crossWrite.status !== "blocked") console.log("   decision:", JSON.stringify(crossWrite));
+// An explicit host-declared worktree is still a legitimate widening statement:
+// worktree isolation and relay flows set it, and a subagent must be able to
+// bind to the linked worktree it was given.
+const isoWidenWorktree = join(root, "wg-iso-widen-wt");
+const widenWorktreeAdd = spawnSync("git", ["-C", isoRepoA, "worktree", "add", "-q", "-b", "feat/iso-wt", isoWidenWorktree]);
+check("a linked worktree fixture is created for the widening check", widenWorktreeAdd.status === 0);
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-relay", tool: "read", callID: "c-relay-1", worktree: isoWidenWorktree }, { args: { filePath: join(isoWidenWorktree, "seed.txt") } });
+check("a host-declared worktree binds an unbound session", getSessionBoundWorkspace("s-iso-relay") === realpathSync(isoWidenWorktree));
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-hostwiden", tool: "read", callID: "c-hostwiden-1" }, { args: { filePath: join(isoRepoB, "seed.txt") } });
+check("a second session binds through its own call context", getSessionBoundWorkspace("s-iso-hostwiden") === isoRepoB);
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-hostwiden", tool: "read", callID: "c-hostwiden-2", worktree: isoWidenWorktree }, { args: {} });
+check("a host-declared worktree may widen a bound session", getSessionBoundWorkspace("s-iso-hostwiden") === realpathSync(isoWidenWorktree));
+const hostRebindAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_host_worktree" && entry.sessionID === "s-iso-hostwiden");
+check("a granted host-worktree widening is journaled", hostRebindAudit?.decision === "allow" && (hostRebindAudit.input as any)?.to === realpathSync(isoWidenWorktree));
+spawnSync("git", ["-C", isoRepoA, "worktree", "remove", "--force", isoWidenWorktree]);
+rmSync(isoWidenWorktree, { recursive: true, force: true });
 const isoStatus = JSON.parse(String(await isoPluginB.tool?.guard_status?.execute({}, { sessionID: "s-iso-shared" } as any)));
 check("guard_status resolves the session's own workspace under plugin-instance drift", isoStatus.workspaceRoot === isoRepoA && isoStatus.branch === "feat/iso-a");
 const isoStatusExplicit = JSON.parse(String(await isoPluginB.tool?.guard_status?.execute({ directory: isoRepoB }, { sessionID: "s-iso-shared" } as any)));

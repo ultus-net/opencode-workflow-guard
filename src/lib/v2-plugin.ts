@@ -266,7 +266,12 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			const record = asRecord(args);
 			const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 			const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-			registerSessionWorkspaceFromToolCall(event.sessionID, { workdir, filePath, toolWorktree });
+			registerSessionWorkspaceFromToolCall(event.sessionID, {
+				workdir,
+				filePath,
+				toolWorktree,
+				mutating: EDIT_TOOL_NAMES.has(event.tool) || SHELL_TOOL_NAMES.has(event.tool),
+			});
 			if (event.tool === "read") {
 				const target = editTargets(args, toolWorktree)[0];
 				if (target) {

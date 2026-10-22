@@ -492,7 +492,13 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					const record = asRecord(args);
 					const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 					const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-					registerSessionWorkspaceFromToolCall(input.sessionID, { workdir, filePath, hostWorktree, toolWorktree });
+					registerSessionWorkspaceFromToolCall(input.sessionID, {
+						workdir,
+						filePath,
+						hostWorktree,
+						toolWorktree,
+						mutating: EDIT_TOOL_NAMES.has(input.tool) || SHELL_TOOL_NAMES.has(input.tool),
+					});
 				}
 				if (input.tool === "read") {
 					const target = editTargets(args, toolWorktree)[0];
