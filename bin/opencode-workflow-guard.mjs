@@ -2,14 +2,22 @@
 
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
-import { parse, modify, applyEdits } from "jsonc-parser";
+import { join } from "node:path";
+import { preparePluginUpdate, PACKAGE_NAME } from "../src/lib/config-writer.mjs";
 
-const PACKAGE_NAME = "opencode-workflow-guard";
 const PACKAGE_VERSION = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")).version;
 const SERVER_SPEC = `${PACKAGE_NAME}@${PACKAGE_VERSION}`;
 const TUI_SPEC = SERVER_SPEC;
 const LEGACY_TUI_SPEC = "opencode-workflow-guard/tui";
+
+const USAGE = `Usage:
+  opencode-workflow-guard setup [--major 1|2]
+  opencode-workflow-guard policies --print [--format both|2.0|next]
+
+setup writes \`plugins\` for OpenCode 2 (the default) and \`plugin\` for OpenCode 1.
+An existing config's key wins unless --major is passed.
+\`policies\` defaults to both, which the 2.0.x and 2.1.x hosts each read under
+their own key. Pass --format to pin one host.`;
 
 function configHome() {
 	return process.env.XDG_CONFIG_HOME || join(homedir(), ".config");
@@ -27,49 +35,62 @@ function restoreConfig(path, previous) {
 	else writeFileSync(path, previous);
 }
 
-function matchesPackageSpec(entry, spec) {
-	const value = Array.isArray(entry) ? entry[0] : entry;
-	return typeof value === "string" && (value === spec || value.startsWith(`${spec}@`));
-}
-function preparePluginUpdate(path, schema, spec, legacySpec) {
-	const source = existsSync(path) ? readFileSync(path, "utf8") : `{
-  "$schema": "${schema}"
-}\n`;
-	const errors = [];
-	const config = parse(source, errors, { allowTrailingComma: true, disallowComments: false });
-	if (errors.length > 0 || !config || typeof config !== "object" || Array.isArray(config)) {
-		throw new Error(`Cannot update invalid config: ${path}`);
+/**
+ * Static policy posture. Prints to stdout only.
+ *
+ * A plugin that writes another tool's configuration has moved the static rails
+ * back inside the thing they are meant to outlive. So: emit, never install.
+ */
+async function runPolicies() {
+	const args = process.argv.slice(3);
+	const formats = ["both", "2.0", "next"];
+	let print = false;
+	let format = "both";
+	for (let i = 0; i < args.length; i++) {
+		const arg = args[i];
+		if (arg === "--print") print = true;
+		else if (arg === "--format") {
+			format = args[++i];
+			if (!formats.includes(format)) throw new Error(`Unknown --format '${format}'. Use both, 2.0 or next.`);
+		} else if (arg.startsWith("--format=")) {
+			format = arg.slice("--format=".length);
+			if (!formats.includes(format)) throw new Error(`Unknown --format '${format}'. Use both, 2.0 or next.`);
+		} else throw new Error(`Unknown argument '${arg}'.`);
 	}
-	if (config.plugin !== undefined && !Array.isArray(config.plugin)) {
-		throw new Error(`Cannot update ${path}: "plugin" must be an array`);
-	}
-	const plugins = config.plugin ?? [];
-	const hasSpec = plugins.some((entry) => matchesPackageSpec(entry, PACKAGE_NAME));
-	const updatedPlugins = legacySpec
-		? plugins.filter((entry) => !matchesPackageSpec(entry, legacySpec))
-		: plugins;
-	if (updatedPlugins.length !== plugins.length) {
-		if (!hasSpec) updatedPlugins.push(spec);
-		return applyEdits(source, modify(source, ["plugin"], updatedPlugins, {
-			formattingOptions: { insertSpaces: true, tabSize: 2 },
-		}));
-	}
-	if (hasSpec) return undefined;
-	return applyEdits(source, modify(source, ["plugin", plugins.length], spec, {
-		formattingOptions: { insertSpaces: true, tabSize: 2 },
-	}));
+	if (!print) throw new Error("Refusing to write config. Pass --print and place the block yourself.");
+	const { renderPolicyPosture } = await import(new URL("../src/lib/policy-posture.ts", import.meta.url).href);
+	process.stdout.write(renderPolicyPosture({ format }));
 }
 
-if (process.argv[2] !== "setup" || process.argv.length > 3) {
-	console.error("Usage: opencode-workflow-guard setup");
+if (process.argv[2] === "policies") {
+	try {
+		await runPolicies();
+	} catch (error) {
+		console.error(error instanceof Error ? error.message : String(error));
+		console.error(USAGE);
+		process.exitCode = 1;
+	}
+} else if (process.argv[2] !== "setup") {
+	console.error(USAGE);
 	process.exitCode = 1;
 } else {
 	try {
+		const args = process.argv.slice(3);
+		let explicitMajor;
+		for (let i = 0; i < args.length; i++) {
+			const arg = args[i];
+			const raw = arg === "--major" ? args[++i] : arg.startsWith("--major=") ? arg.slice("--major=".length) : undefined;
+			if (raw === undefined) throw new Error(`Unknown argument '${arg}'.`);
+			if (raw !== "1" && raw !== "2") throw new Error(`Unknown --major '${raw}'. Use 1 or 2.`);
+			explicitMajor = Number(raw);
+		}
 		const base = join(configHome(), "opencode");
 		const serverPath = existingConfig(base, "opencode");
 		const tuiPath = existingConfig(base, "tui");
-		const serverUpdate = preparePluginUpdate(serverPath, "https://opencode.ai/config.json", SERVER_SPEC);
-		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC, LEGACY_TUI_SPEC);
+		const serverUpdate = preparePluginUpdate(serverPath, "https://opencode.ai/config.json", SERVER_SPEC, undefined, explicitMajor);
+		// `tui.json` keeps the singular `plugin` key on both majors: OpenCode 2
+		// reads that key and migrates it into `cli.json.plugins`.
+		const tuiUpdate = preparePluginUpdate(tuiPath, "https://opencode.ai/tui.json", TUI_SPEC, LEGACY_TUI_SPEC, explicitMajor, "plugin");
 		const serverBefore = existsSync(serverPath) ? readFileSync(serverPath, "utf8") : undefined;
 		const tuiBefore = existsSync(tuiPath) ? readFileSync(tuiPath, "utf8") : undefined;
 		mkdirSync(base, { recursive: true });

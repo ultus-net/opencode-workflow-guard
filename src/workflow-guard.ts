@@ -68,6 +68,7 @@ import {
 	resetVerifyState,
 	sessionMutationTimestamps,
 	sessionVerifyResults,
+	clearTodoSessionState,
 	getProjectConfig,
 	getLiveControlPlaneRoots,
 	getOperationProfile,
@@ -88,6 +89,7 @@ import {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	registerSessionWorkspaceFromToolCall,
+	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
 	resolveEffectiveWorkspace,
 } from "./lib/state.ts";
@@ -123,6 +125,7 @@ export {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	registerSessionWorkspaceFromToolCall,
+	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
 	resolveEffectiveWorkspace,
 	findGitRoot,
@@ -200,7 +203,7 @@ export function managedConfigDiagnostic(platform = process.platform, env: NodeJS
 		: "managed config location is unknown on this platform; plugin provenance is not verified by the OpenCode V1 API";
 }
 
-export { loadedPluginVersion } from "./lib/version.ts";
+export { loadedPluginVersion, qualifiedHostVersion } from "./lib/version.ts";
 
 // ── Verification engine ──────────────────────────────────────────────────────
 import {
@@ -492,7 +495,13 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					const record = asRecord(args);
 					const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 					const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-					registerSessionWorkspaceFromToolCall(input.sessionID, { workdir, filePath, hostWorktree, toolWorktree });
+					await registerSessionWorkspaceFromToolCall(input.sessionID, {
+						workdir,
+						filePath,
+						hostWorktree,
+						toolWorktree,
+						mutating: EDIT_TOOL_NAMES.has(input.tool) || SHELL_TOOL_NAMES.has(input.tool),
+					});
 				}
 				if (input.tool === "read") {
 					const target = editTargets(args, toolWorktree)[0];
@@ -613,7 +622,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					priorityContextBlocks.push(
 						`## Active Tasks${attribution}\n` +
 							lines.join("\n") +
-							"\nComplete tasks efficiently - mark finished items as completed and address remaining ones.",
+							"\nComplete tasks efficiently and address remaining ones. Mark a task completed only after its work is actually done: the guard blocks a completion with no recorded file mutation in that task's window. Append `[read-only]` to a genuinely read-only task (review, investigation), and use `cancelled` for work that was dropped.",
 					);
 				}
 
@@ -731,7 +740,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 				if (description.includes("verification evidence")) return;
 				output.description =
 					description +
-					"\n\nWorkflow Guard lifecycle: each todowrite call replaces the complete task list. Preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled; do not omit active tasks when adding new work. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply. Proactively call guard_next_tasks when planning work to discover existing roadmap/TODOs, and guard_status to check outstanding requirements.";
+					"\n\nWorkflow Guard lifecycle: use todowrite to plan before working - it is the only view of progress the operator has, and every file mutation is gated on it. Each call replaces the complete task list: preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled, and do not omit active tasks when adding new work. A task may be marked completed only after its own work is recorded: the guard blocks a completion that has no file mutation in that task's active window, and one mutation cannot vouch for several completions. If a task is genuinely read-only (review, investigation, reading), append the marker `[read-only]` to its text; every such use is journaled. Use `cancelled` for work that was deliberately dropped. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply. Proactively call guard_next_tasks when planning work to discover existing roadmap/TODOs, and guard_status to check outstanding requirements.";
 				return;
 			}
 			if (EDIT_TOOL_NAMES.has(input.toolID)) {
@@ -810,7 +819,10 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 			}
 			if (event?.type === "session.deleted") {
 				const sessionID = (event.properties as { info?: { id?: unknown } })?.info?.id;
-				if (typeof sessionID === "string") toolOutcomes.clearSession(sessionID);
+				if (typeof sessionID === "string") {
+					toolOutcomes.clearSession(sessionID);
+					clearTodoSessionState(sessionID);
+				}
 			}
 			if (event?.type === "session.idle") {
 				const sessionID = (event.properties as { sessionID?: unknown })?.sessionID;

@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync, realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -47,6 +47,7 @@ import {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	registerSessionWorkspaceFromToolCall,
+	resolveInheritedWorkspace,
 	resolveEffectiveWorkspace,
 	getLastReviewResultForWorkspace,
 	isSameGitRepo,
@@ -78,6 +79,7 @@ import {
 	branchHasDocumentationChange,
 	isDocumentationRequired,
 	loadedPluginVersion,
+	qualifiedHostVersion,
 	isReviewRequired,
 	getOperationProfile,
 	isRecoveryCheckpointsEnabled,
@@ -121,8 +123,18 @@ import { isProjectMemoryFreshAsync } from "../src/lib/project-memory.ts";
 import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
 import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, readRecoveryCheckpointsOption, writeRecoveryCheckpointsOption } from "../src/workflow-guard-ui.ts";
-import { scanSessionTodos, toolPartName } from "../src/lib/v2-todo.ts";
-import { effectiveTodosWithOwner } from "../src/policies/todo.ts";
+import { scanSessionTodos, toolPartName, detectTodoCapability, recordedTodoCapability, recordTodoCapability, reportTodoGateFailOpen, resetTodoCapabilityForTesting } from "../src/lib/v2-todo.ts";
+import { buildPolicyPosture, renderPolicyPosture } from "../src/lib/policy-posture.ts";
+import { pluginKeyFor, preparePluginUpdate } from "../src/lib/config-writer.mjs";
+import { effectiveTodosWithOwner, isReadOnlyTodo, readOnlyTodoCompletions, recordTodoTaskStarts, todoEvidenceReport, unverifiedTodoCompletions, validateTodoLifecycle } from "../src/policies/todo.ts";
+import { todoTaskStarts, clearTodoSessionState } from "../src/lib/state.ts";
+import { resetPluginInstancesForTesting } from "../src/lib/plugin-instance.ts";
+import { claimToolCall, releaseToolCallClaim, resetToolCallClaimsForTesting } from "../src/lib/call-claims.ts";
+import { pruneToolsForReadOnlyRole, READ_ONLY_PRUNED_TOOLS } from "../src/lib/read-only-tools.ts";
+import { createHostWorktreePort } from "../src/lib/host-worktree.ts";
+import { validateHostWorktreeDirectory } from "../src/lib/worktree.ts";
+import { guardedTokensFromServerName, listHostMcpServerNames, recordHostMcpServers } from "../src/lib/mcp-inventory.ts";
+import { addGuardedMcpTokens, guardedMcpServers, mcpMutationTool, resetGuardedMcpTokensForTesting } from "../src/policies/mcp.ts";
 
 let pass = 0;
 let fail = 0;
@@ -201,10 +213,13 @@ check("task gate is per session (other session's todos don't help)", blocked(awa
 console.log("- Policy 1: todowrite lifecycle validation -");
 // Multiple in_progress allowed (no single-task focus rule)
 check("todowrite allows multiple in_progress tasks", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
-// Flexible out-of-order completion allows finishing independent items without artificial sequential blockers
+// Flexible out-of-order completion allows finishing independent items without artificial sequential blockers.
+// Completion now requires work recorded in the session, so the setup records one mutation.
+recordMutation("s-empty");
 check("todowrite allows flexible out-of-order completion", !(await call("todowrite", { todos: [item("a", "pending"), item("b", "completed")] }, { sessionID: "s-empty" })));
 // No silent deletion: active task cannot silently vanish
 todo("s-lifecycle", item("task 1", "completed"), item("task 2", "in_progress"), item("task 3", "pending"));
+recordMutation("s-lifecycle");
 check("todowrite allows updating active tasks to completed/cancelled", !(await call("todowrite", { todos: [item("task 1", "completed"), item("task 2", "completed"), item("task 3", "cancelled")] }, { sessionID: "s-lifecycle" })));
 check("todowrite blocks silently dropping task 2 without completion", blocked(await call("todowrite", { todos: [item("task 1", "completed"), item("task 3", "pending")] }, { sessionID: "s-lifecycle" })));
 todo("s-review-remediation", item("Run full verification and secondary review", "in_progress"));
@@ -221,6 +236,7 @@ check("todowrite cannot silently drop remediation work while retaining review ex
 todo("s-review-multiplicity", item("Run security secondary review", "in_progress"), item("Run architecture secondary review", "pending"));
 check("todowrite cannot collapse multiple review obligations into one replacement", blocked(await call("todowrite", { todos: [item("Run secondary review", "in_progress")] }, { sessionID: "s-review-multiplicity" })));
 check("todowrite allows one replacement per existing review obligation", !(await call("todowrite", { todos: [item("Run security re-review", "in_progress"), item("Run architecture re-review", "pending")] }, { sessionID: "s-review-multiplicity" })));
+recordMutation("s-review-multiplicity");
 check("todowrite allows completing one review while replacing another one-for-one", !(await call("todowrite", { todos: [item("Run security secondary review", "completed"), item("Run architecture re-review", "pending")] }, { sessionID: "s-review-multiplicity" })));
 todo("s-duplicate-lifecycle", item("same task", "pending"), item("same task", "pending"));
 check("todowrite cannot silently drop one of two duplicate active tasks", blocked(await call("todowrite", { todos: [item("same task", "pending")] }, { sessionID: "s-duplicate-lifecycle" })));
@@ -274,6 +290,161 @@ check("V2: legacy name field is still accepted", Array.isArray(legacy) && legacy
 const inFlight = await scanSessionTodos(ctxWith([todoPart([item("x")], "pending")]), "s-v2");
 check("V2: in-flight todowrite reports an empty list, not unknown", Array.isArray(inFlight) && inFlight.length === 0);
 check("V2: toolPartName prefers tool and falls back to name", toolPartName({ tool: "shell" }) === "shell" && toolPartName({ name: "bash" }) === "bash" && toolPartName({}) === undefined);
+
+// ── Capability probe: the registry answers "can this host plan at all?" ──
+// The 2.0.x inference ("no todowrite in history means no capability") becomes
+// wrong on 2.1.x, where a registered tool plus an empty history means the
+// session never planned. These assertions invert that baseline.
+const emptyHistory = ctxWith([{ content: [{ type: "tool", tool: "edit", state: { status: "completed" } }] }]);
+check("capability: an empty history with a registered todowrite is a definitive empty list", JSON.stringify(await scanSessionTodos(emptyHistory, "s-cap", "available")) === "[]");
+check("capability: an empty history without the tool stays unknown", (await scanSessionTodos(emptyHistory, "s-cap", "unavailable")) === undefined);
+check("capability: an unread registry stays unknown rather than unavailable", (await scanSessionTodos(emptyHistory, "s-cap", "unknown")) === undefined);
+check("capability: default remains unknown so existing callers are unchanged", (await scanSessionTodos(emptyHistory, "s-cap")) === undefined);
+check("capability: a registry listing todowrite reports available", (await detectTodoCapability({ tool: { list: async () => [{ name: "todowrite" }, { name: "edit" }] } })) === "available");
+check("capability: a registry without todowrite reports unavailable", (await detectTodoCapability({ tool: { list: async () => [{ name: "edit" }, { name: "shell" }] } })) === "unavailable");
+check("capability: a 2.1.x tool id with a name field still counts", (await detectTodoCapability({ tool: { list: async () => [{ id: "todowrite", name: "todowrite" }] } })) === "available");
+check("capability: a throwing registry reports unknown, never unavailable", (await detectTodoCapability({ tool: { list: async () => { throw new Error("rpc"); } } })) === "unknown");
+check("capability: a host without a tool domain reports unknown", (await detectTodoCapability({})) === "unknown");
+check("capability: a non-array registry answer reports unknown", (await detectTodoCapability({ tool: { list: async () => ({ nope: true }) } })) === "unknown");
+
+// The recorded capability is process-global (two module copies must agree)
+// and the fail-open warning fires once per session, not once per mutation.
+resetTodoCapabilityForTesting();
+check("capability: the recorded value starts unknown", recordedTodoCapability() === "unknown");
+check("capability: recordTodoCapability returns the previous value", recordTodoCapability("unavailable") === "unknown" && recordedTodoCapability() === "unavailable");
+check("capability: a first fail-open report is recorded", reportTodoGateFailOpen("s-warn", "unavailable") === true);
+check("capability: a repeated fail-open report for the same session is suppressed", reportTodoGateFailOpen("s-warn", "unavailable") === false);
+check("capability: a different session warns again", reportTodoGateFailOpen("s-warn-2", "unavailable") === true);
+resetTodoCapabilityForTesting();
+
+// Per-task completion evidence: a completion transition needs at least one
+// mutation inside that task's window, so a model cannot flip the list to
+// `completed` and move on. Read-only tasks carry an explicit marker.
+const starts = new Map<string, number>();
+const activeTwo = [item("write the fix", "in_progress"), item("run tests", "pending")];
+const completedTwo = [item("write the fix", "completed"), item("run tests", "completed")];
+recordTodoTaskStarts(starts, undefined, activeTwo, 0);
+check("completion evidence: no mutation in the window blocks the completion", JSON.stringify(unverifiedTodoCompletions(activeTwo, completedTwo, starts, 0)) === JSON.stringify(["write the fix", "run tests"]));
+check("completion evidence: one mutation cannot vouch for two completions", unverifiedTodoCompletions(activeTwo, completedTwo, new Map(starts), 1).length === 2);
+check("completion evidence: two mutations satisfy two completions", unverifiedTodoCompletions(activeTwo, completedTwo, new Map(starts), 2).length === 0);
+const startsSingle = new Map<string, number>();
+recordTodoTaskStarts(startsSingle, undefined, [item("write the fix", "in_progress")], 0);
+check("completion evidence: a single mutation satisfies a single completion", unverifiedTodoCompletions([item("write the fix", "in_progress")], [item("write the fix", "completed")], startsSingle, 1).length === 0);
+
+// Window isolation: mutations spent before a task became active do not count.
+const startsLate = new Map<string, number>();
+recordTodoTaskStarts(startsLate, undefined, [item("early work", "in_progress")], 0);
+recordTodoTaskStarts(startsLate, [item("early work", "in_progress")], [item("early work", "completed"), item("late work", "in_progress")], 4);
+check("completion evidence: mutations before the task's window do not count for it", JSON.stringify(unverifiedTodoCompletions([item("early work", "completed"), item("late work", "in_progress")], [item("early work", "completed"), item("late work", "completed")], startsLate, 4)) === JSON.stringify(["late work"]));
+check("completion evidence: a later mutation in the task's own window counts", unverifiedTodoCompletions([item("late work", "in_progress")], [item("late work", "completed")], startsLate, 5).length === 0);
+check("completion evidence: a finished task releases its window", !startsLate.has("early work"));
+
+// Window overlap: a mutation spent before a later task began cannot vouch for
+// it, even when the total count looks sufficient.
+const staggered = new Map([["first", 0], ["second", 5]]);
+const staggeredPrev = [item("first", "in_progress"), item("second", "in_progress")];
+const staggeredNext = [item("first", "completed"), item("second", "completed")];
+check("completion evidence: staggered windows reject a completion whose window saw no work", JSON.stringify(unverifiedTodoCompletions(staggeredPrev, staggeredNext, staggered, 5)) === JSON.stringify(["second"]));
+check("completion evidence: staggered windows pass once the later window sees work", unverifiedTodoCompletions(staggeredPrev, staggeredNext, staggered, 6).length === 0);
+check("completion evidence: interleaved windows each get their own mutation", unverifiedTodoCompletions(staggeredPrev, staggeredNext, new Map([["first", 0], ["second", 1]]), 2).length === 0);
+
+// Duplicate content must not hide a new completion behind an already-completed
+// item of the same text.
+const dupPrev = [item("x", "completed"), item("y", "in_progress")];
+const dupNext = [item("x", "completed"), item("y", "in_progress"), item("x", "completed")];
+check("completion evidence: a duplicate completed item is not a new claim", unverifiedTodoCompletions(dupPrev, [dupPrev[0]!, dupPrev[1]!], new Map(), 0).length === 0);
+check("completion evidence: duplicate content cannot smuggle a new completion", JSON.stringify(unverifiedTodoCompletions(dupPrev, dupNext, new Map(), 0)) === JSON.stringify(["x"]));
+
+// The marker is an annotation, not part of task identity, so appending it must
+// not read as deleting one task and inventing another. The marker must be
+// present on the completed item for the escape to apply.
+check("completion evidence: appending the marker keeps the task's identity", JSON.stringify(unverifiedTodoCompletions([item("Review the diff", "in_progress")], [item("Review the diff [read-only]", "completed")], new Map(), 0)) === JSON.stringify([]));
+check("completion evidence: dropping the marker does not inherit the escape", JSON.stringify(unverifiedTodoCompletions([item("Review the diff [read-only]", "in_progress")], [item("Review the diff", "completed")], new Map(), 0)) === JSON.stringify(["Review the diff"]));
+check("completion evidence: identity ignores marker spelling and spacing", JSON.stringify(unverifiedTodoCompletions([item("Review   the diff", "in_progress")], [item("Review the diff [read_only]", "completed")], new Map(), 0)) === JSON.stringify([]));
+check("completion evidence: a non-read-only completion is still blocked despite identity stripping", JSON.stringify(unverifiedTodoCompletions([item("Fix the bug", "in_progress")], [item("Fix the bug", "completed")], new Map(), 0)) === JSON.stringify(["Fix the bug"]));
+check("completion evidence: a task that is only the marker has no identity and is not journaled", JSON.stringify(readOnlyTodoCompletions([], [item("   [read-only]", "completed")])) === JSON.stringify([]));
+check("lifecycle: appending the read-only marker to a planned task is not a silent deletion", !validateTodoLifecycle([item("Review the diff [read-only]", "completed")], [item("Review the diff", "in_progress")]));
+check("lifecycle: appending the marker to a still-active task retains it", !validateTodoLifecycle([item("Review the diff [read-only]", "in_progress")], [item("Review the diff", "in_progress")]));
+
+// Marker escape, and the transitions that are not new claims.
+check("completion evidence: the read-only marker is recognized", isReadOnlyTodo(item("Review the diff [read-only]", "completed")) && !isReadOnlyTodo(item("Review the diff", "completed")));
+check("completion evidence: a marked read-only task completes with no mutation", unverifiedTodoCompletions([item("Review the diff [read-only]", "in_progress")], [item("Review the diff [read-only]", "completed")], new Map(), 0).length === 0);
+check("completion evidence: an already-completed task is not a new claim", unverifiedTodoCompletions([item("a", "completed")], [item("a", "completed")], new Map(), 0).length === 0);
+check("completion evidence: a pending-to-pending rewrite is not a claim", unverifiedTodoCompletions([item("a", "pending")], [item("a", "pending")], new Map(), 0).length === 0);
+check("completion evidence: a task first seen already completed is judged on session history", unverifiedTodoCompletions([item("a", "pending")], [item("a", "pending"), item("b", "completed")], new Map(), 0).length === 1);
+
+// End-to-end through the real dispatcher on the test workspace.
+setSdkClient(fakeClient);
+todo("s-evidence", item("write the fix", "in_progress"));
+check("dispatcher blocks marking a task completed with no recorded work", blocked(await call("todowrite", { todos: [item("write the fix", "completed")] }, { sessionID: "s-evidence" })));
+todo("s-evidence-ro", item("Review the diff [read-only]", "in_progress"));
+check("dispatcher allows the read-only marker in place of a mutation", !(await call("todowrite", { todos: [item("Review the diff [read-only]", "completed")] }, { sessionID: "s-evidence-ro" })));
+// The window is registered by an allowed write, then work lands inside it.
+todo("s-evidence-mut", item("write the fix", "in_progress"));
+check("dispatcher allows a write that only adds pending work", !(await call("todowrite", { todos: [item("write the fix", "in_progress"), item("run tests", "pending")] }, { sessionID: "s-evidence-mut" })));
+check("dispatcher blocks completion of the unwritten task", blocked(await call("todowrite", { todos: [item("write the fix", "completed"), item("run tests", "pending")] }, { sessionID: "s-evidence-mut" })));
+recordMutation("s-evidence-mut");
+check("dispatcher allows completion once work is recorded in the window", !(await call("todowrite", { todos: [item("write the fix", "completed"), item("run tests", "pending")] }, { sessionID: "s-evidence-mut" })));
+// guard_why must predict the gate instead of reporting a falsely permissive result.
+todo("s-evidence-sim", item("write the fix", "in_progress"));
+check("simulation reports the same completion verdict as enforcement", blocked(await call("todowrite", { todos: [item("write the fix", "completed")] }, { sessionID: "s-evidence-sim", simulate: true } as never)));
+check("simulation does not shift the task window", !todoTaskStarts("s-evidence-sim").has("write the fix"));
+
+// The documented remedy, end to end: a planned task discovered to be read-only
+// is completed by appending the marker. This must not trip the lifecycle gate.
+todo("s-evidence-append", item("Review the diff", "in_progress"));
+check("dispatcher allows appending the read-only marker to a planned task", !(await call("todowrite", { todos: [item("Review the diff [read-only]", "completed")] }, { sessionID: "s-evidence-append" })));
+const readOnlyAudit = getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only");
+check("dispatcher journals read-only marker use", readOnlyAudit.length > 0 && JSON.stringify((readOnlyAudit.at(-1)?.input as { tasks?: unknown })?.tasks) === JSON.stringify(["Review the diff [read-only]"]));
+// A blocked write must not journal a read-only completion that never landed.
+todo("s-evidence-audit-order", item("real work", "in_progress"));
+const auditBeforeBlocked = getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only").length;
+await call("todowrite", { todos: [item("real work [read-only]", "completed"), item("brand new", "completed")] }, { sessionID: "s-evidence-audit-order" });
+check("a blocked todowrite does not journal a read-only completion", getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only").length === auditBeforeBlocked);
+
+// guard_status surfaces the requirement before it bites.
+todo("s-evidence-report", item("write the fix", "in_progress"), item("Review the diff [read-only]", "in_progress"), item("done already", "completed"));
+const evidenceReport = await todoEvidenceReport("s-evidence-report");
+check("status report names active tasks lacking recorded work", JSON.stringify(evidenceReport.tasksWithoutRecordedWork) === JSON.stringify(["write the fix"]));
+check("status report lists read-only tasks separately", JSON.stringify(evidenceReport.readOnlyTasks) === JSON.stringify(["Review the diff [read-only]"]));
+check("status report counts active and completed tasks", evidenceReport.active === 2 && evidenceReport.completed === 1);
+check("status report is empty without a session", (await todoEvidenceReport(undefined)).tasksWithoutRecordedWork.length === 0);todoTaskStarts("s-evidence-clean").set("stale task", 0);
+clearTodoSessionState("s-evidence-clean");
+check("session cleanup drops task windows so a reused session id starts clean", !todoTaskStarts("s-evidence-clean").has("stale task"));
+
+// Subagent completion is judged on the subagent's own counter, per the chosen
+// policy. recordMutation credits both the todo owner and the acting session, so
+// work done in a subagent is visible to whichever session reports it.
+fakeParents.set("s-evidence-child", "s-evidence-owner");
+todo("s-evidence-owner", item("shared work", "in_progress"));
+todo("s-evidence-child", item("shared work", "in_progress"));
+check("subagent cannot complete inherited work it did not do", blocked(await call("todowrite", { todos: [item("shared work", "completed")] }, { sessionID: "s-evidence-child" })));
+recordMutation("s-evidence-owner", "s-evidence-child");
+check("subagent can complete work it did, credited to both sessions", !(await call("todowrite", { todos: [item("shared work", "completed")] }, { sessionID: "s-evidence-child" })));
+
+
+// The plan's failing baseline, inverted: on 2.1.x with `experimental.todo:
+// true`, a mutation with no todo list must be blocked. On 2.0.x the same state
+// is a legitimate fail-open. Drive both through the real dispatcher by
+// swapping only the adapter's todo endpoint.
+const v2TodoClient = (capability: "available" | "unavailable") => ({
+	session: {
+		todo: async ({ path }: { path: { id: string } }) => ({ data: await scanSessionTodos(emptyHistory, path.id, capability) }),
+		get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: undefined } }),
+	},
+});
+setSdkClient(v2TodoClient("available"));
+recordTodoCapability("available");
+const gatedMutation = await call("edit", { filePath: join(root, "v2-cap-gated.ts"), content: "x" }, { sessionID: "s-v2-cap" });
+check("capability: a mutation with no todo is BLOCKED when the host can plan", blocked(gatedMutation) && String(gatedMutation).includes("no active todo item"));
+setSdkClient(v2TodoClient("unavailable"));
+recordTodoCapability("unavailable");
+const failedOpenMutation = await call("edit", { filePath: join(root, "v2-cap-open.ts"), content: "x" }, { sessionID: "s-v2-cap" });
+check("capability: the same mutation fails open when the host cannot plan", !blocked(failedOpenMutation));
+check("capability: the fail-open path is journaled once for the session", getRecentAuditEntries(20).filter((entry) => entry.reason === "todo_gate_fail_open_unavailable").length === 1);
+setSdkClient(fakeClient);
+resetTodoCapabilityForTesting();
+
 
 console.log("- Policy 1: parent-chain walk tolerates unknown links (V2) -");
 const walkTodos = new Map<string, TestTodo[] | undefined>();
@@ -2565,6 +2736,9 @@ spawnSync("git", ["init", "-b", "feature/why"], { cwd: whyVerifyRoot });
 writeFileSync(join(whyVerifyRoot, "package.json"), JSON.stringify({ scripts: { typecheck: "node -e 'process.exit(9)'" } }));
 const whyVerifyPlugin = await WorkflowGuard({ directory: whyVerifyRoot, worktree: whyVerifyRoot, client: diagnosticClient as any } as any);
 todo("s-why-verify", item("finish", "in_progress"));
+// Completion evidence is judged first: record work so the simulation reaches
+// the finalization gate this test is about.
+recordMutation("s-why-verify");
 const verifyHistoryBeforeWhy = getRecentVerifyHistory(100).length;
 const verifyResultBeforeWhy = getLastVerifyResult();
 const auditBeforeWhy = getRecentAuditEntries(50).length;
@@ -3379,6 +3553,70 @@ check("a session binds to its workspace from its own call context", getSessionBo
 // The other loop's plugin instance must not re-anchor it from its own root.
 await isoHookOf(isoPluginB)?.({ sessionID: "s-iso-shared", tool: "bash", callID: "c-iso-2" }, { args: { command: "ls -la" } });
 check("an instance-derived fallback never re-anchors a bound session", getSessionBoundWorkspace("s-iso-shared") === isoRepoA);
+// A path-derived candidate must not widen an existing binding either. A
+// foreign read is allowed (external_directory defaults to allow), and the old
+// code then adopted that repository as the session's home: one allowed read
+// moved the entire write boundary.
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-widen", tool: "read", callID: "c-widen-1" }, { args: { filePath: join(isoRepoA, "seed.txt") } });
+check("a session binds from its first call context (widen fixture)", getSessionBoundWorkspace("s-iso-widen") === isoRepoA);
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-widen", tool: "read", callID: "c-widen-2" }, { args: { filePath: join(isoRepoB, "seed.txt") } });
+check("an allowed read in another repository does not widen the write boundary", getSessionBoundWorkspace("s-iso-widen") === isoRepoA);
+const widenRefusalAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_refused" && entry.sessionID === "s-iso-widen");
+check(
+	"a refused widening is journaled with both roots and the call label",
+	widenRefusalAudit?.decision === "block" &&
+		(widenRefusalAudit.input as any)?.from === isoRepoA &&
+		(widenRefusalAudit.input as any)?.to === isoRepoB &&
+		(widenRefusalAudit.input as any)?.source === "read",
+);
+todo("s-iso-widen", item("boundary probe", "in_progress"));
+const crossWrite = await guardToolDecision("write", { filePath: join(isoRepoB, "escape.txt"), content: "x" }, { sessionID: "s-iso-widen" });
+check("a foreign write is refused after a foreign read", crossWrite.status === "blocked" && crossWrite.policy === "boundary");
+if (crossWrite.status !== "blocked") console.log("   decision:", JSON.stringify(crossWrite));
+// A subagent has no direct binding, but its policy root inherits the nearest
+// bound ancestor's workspace. Registration must use that same inherited root,
+// or the child's first foreign read rebinds it into another repository while
+// the parent stays confined: one allowed read moves the child's write
+// boundary, which is the Task 3 defect one level down.
+fakeParents.set("s-iso-child", "s-iso-widen");
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-child", tool: "read", callID: "c-child-1" }, { args: { filePath: join(isoRepoB, "seed.txt") } });
+check(
+	"a subagent's foreign read does not rebind it out of the parent's workspace",
+	getSessionBoundWorkspace("s-iso-child") === undefined &&
+		getSessionWorkspace("s-iso-child") !== isoRepoB &&
+		(await resolveInheritedWorkspace("s-iso-child")) === isoRepoA,
+);
+const childRefusalAudit = getRecentAuditEntries(30).find((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_refused" && entry.sessionID === "s-iso-child");
+check(
+	"a subagent's refused widening is journaled against the inherited root",
+	childRefusalAudit?.decision === "block" &&
+		(childRefusalAudit.input as any)?.from === isoRepoA &&
+		(childRefusalAudit.input as any)?.to === isoRepoB,
+);
+check("resolveInheritedWorkspace reports the parent's root for a subagent", (await resolveInheritedWorkspace("s-iso-child")) === isoRepoA);
+// The real hook runs the child's decision under the plugin instance root, which
+// for a relay flow is the parent's repository. A write into the foreign repo
+// must still be refused there.
+const childEscapeWrite = await guardToolDecision("write", { filePath: join(isoRepoB, "child-escape.txt"), content: "x" }, { sessionID: "s-iso-child", worktree: isoRepoA });
+check("a subagent's foreign write stays blocked by the inherited boundary", childEscapeWrite.status === "blocked" && childEscapeWrite.policy === "boundary");
+if (childEscapeWrite.status !== "blocked") console.log("   decision:", JSON.stringify(childEscapeWrite));
+fakeParents.delete("s-iso-child");
+// An explicit host-declared worktree is still a legitimate widening statement:
+// worktree isolation and relay flows set it, and a subagent must be able to
+// bind to the linked worktree it was given.
+const isoWidenWorktree = join(root, "wg-iso-widen-wt");
+const widenWorktreeAdd = spawnSync("git", ["-C", isoRepoA, "worktree", "add", "-q", "-b", "feat/iso-wt", isoWidenWorktree]);
+check("a linked worktree fixture is created for the widening check", widenWorktreeAdd.status === 0);
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-relay", tool: "read", callID: "c-relay-1", worktree: isoWidenWorktree }, { args: { filePath: join(isoWidenWorktree, "seed.txt") } });
+check("a host-declared worktree binds an unbound session", getSessionBoundWorkspace("s-iso-relay") === realpathSync(isoWidenWorktree));
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-hostwiden", tool: "read", callID: "c-hostwiden-1" }, { args: { filePath: join(isoRepoB, "seed.txt") } });
+check("a second session binds through its own call context", getSessionBoundWorkspace("s-iso-hostwiden") === isoRepoB);
+await isoHookOf(isoPluginA)?.({ sessionID: "s-iso-hostwiden", tool: "read", callID: "c-hostwiden-2", worktree: isoWidenWorktree }, { args: {} });
+check("a host-declared worktree may widen a bound session", getSessionBoundWorkspace("s-iso-hostwiden") === realpathSync(isoWidenWorktree));
+const hostRebindAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_host_worktree" && entry.sessionID === "s-iso-hostwiden");
+check("a granted host-worktree widening is journaled", hostRebindAudit?.decision === "allow" && (hostRebindAudit.input as any)?.to === realpathSync(isoWidenWorktree));
+spawnSync("git", ["-C", isoRepoA, "worktree", "remove", "--force", isoWidenWorktree]);
+rmSync(isoWidenWorktree, { recursive: true, force: true });
 const isoStatus = JSON.parse(String(await isoPluginB.tool?.guard_status?.execute({}, { sessionID: "s-iso-shared" } as any)));
 check("guard_status resolves the session's own workspace under plugin-instance drift", isoStatus.workspaceRoot === isoRepoA && isoStatus.branch === "feat/iso-a");
 const isoStatusExplicit = JSON.parse(String(await isoPluginB.tool?.guard_status?.execute({ directory: isoRepoB }, { sessionID: "s-iso-shared" } as any)));
@@ -4983,6 +5221,591 @@ check("project-memory initialization failure leaves core guard hooks active", ty
 if (prevDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDataHome;
 
+// ── V2 load-once guard: one policy decision per call, one duplicate record ──
+// OpenCode 2 merges plugin arrays, so naming the guard in both global and
+// project config loads the same entrypoint twice under two ids. The second
+// setup must register nothing and leave a warn-level audit record; otherwise
+// every tool call is evaluated and audited twice, and two instances prime the
+// process-global workspace latch from two roots in the same tick.
+console.log("- V2 duplicate load guard -");
+resetPluginInstancesForTesting();
+resetToolCallClaimsForTesting();
+const v2DuplicateRoot = mkdtempSync(join(tmpdir(), "wg-v2-dup-"));
+const prevDuplicateDataHome = process.env.XDG_DATA_HOME;
+process.env.XDG_DATA_HOME = join(v2DuplicateRoot, "data");
+const makeV2Context = (directory: string, options?: {
+	projectID?: string;
+	registeredTools?: Array<{ id: string; description?: string }>;
+	mcpServers?: string[];
+	worktreeApi?: {
+		create: (input: any) => Promise<{ directory?: string } | undefined>;
+		list: (input: any) => Promise<ReadonlyArray<{ directory?: string }> | undefined>;
+		refresh?: (input: any) => Promise<unknown>;
+	};
+}) => {
+	const state = {
+		transforms: 0,
+		addedTools: [] as string[],
+		beforeHooks: [] as Array<(event: unknown) => unknown>,
+		afterHooks: [] as Array<(event: unknown) => unknown>,
+		permissionHooks: [] as Array<(event: unknown) => unknown>,
+		contextHooks: [] as Array<(event: unknown) => unknown>,
+		commands: [] as Array<{ name: string; description?: string; execute: (input: unknown) => Promise<void> }>,
+		syntheticMessages: [] as string[],
+		prompts: [] as string[],
+		worktreeCalls: [] as string[],
+		mcpListCalls: 0,
+	};
+	const editor = {
+		list: () => [],
+		get: () => undefined,
+		namespace: () => {},
+		add: (tool: { name: string }) => { state.addedTools.push(tool.name); },
+		update: () => {},
+		remove: () => {},
+	};
+	const registration = { dispose: async () => {} };
+	const registeredTools = options?.registeredTools ?? [];
+	const ctx = {
+		location: { directory, ...(options?.projectID ? { project: { id: options.projectID, directory, canonical: directory } } : {}) },
+		options: {},
+		tool: {
+			transform: async (callback: (input: unknown) => void) => { state.transforms++; callback(editor); return registration; },
+			reload: async () => {},
+			list: async () => registeredTools,
+			hook: async (name: string, callback: (event: unknown) => unknown) => {
+				if (name === "execute.before") state.beforeHooks.push(callback);
+				if (name === "execute.after") state.afterHooks.push(callback);
+				return registration;
+			},
+		},
+		command: {
+			list: async () => ({ data: [] }),
+			transform: async (callback: (editor: { add: (definition: never) => void }) => void) => {
+				callback({ add: (definition: never) => { state.commands.push(definition); } });
+				return registration;
+			},
+			reload: async () => {},
+		},
+		mcp: {
+			list: async () => {
+				state.mcpListCalls++;
+				return options?.mcpServers === undefined ? undefined : { data: options.mcpServers.map((name) => ({ name, status: { type: "connected" } })) };
+			},
+		},
+		worktree: options?.worktreeApi ? {
+			create: async (input: unknown) => { state.worktreeCalls.push("create"); return options.worktreeApi!.create(input); },
+			list: async (input: unknown) => { state.worktreeCalls.push("list"); return options.worktreeApi!.list(input); },
+			refresh: async (input: unknown) => { state.worktreeCalls.push("refresh"); return options.worktreeApi!.refresh?.(input); },
+		} : undefined,
+		session: {
+			get: async () => ({}),
+			context: async () => [],
+			prompt: async (input: { text?: string }) => { state.prompts.push(String(input?.text ?? "")); },
+			synthetic: async (input: { text?: string }) => { state.syntheticMessages.push(String(input?.text ?? "")); },
+			hook: async (name: string, callback: (event: unknown) => unknown) => {
+				if (name === "context") state.contextHooks.push(callback);
+				return registration;
+			},
+		},
+		permission: {
+			hook: async (name: string, callback: (event: unknown) => unknown) => {
+				if (name === "evaluate") state.permissionHooks.push(callback);
+				return registration;
+			},
+		},
+		shell: { hook: async () => registration },
+		event: { subscribe: async function* () {} },
+		app: { log: async () => {} },
+	};
+	return { ctx, state };
+};
+const v2Owner = makeV2Context(v2DuplicateRoot);
+const v2OwnerCleanup = (await defaultExport.setup(v2Owner.ctx as any)) as (() => void) | undefined;
+const v2Duplicate = makeV2Context(v2DuplicateRoot);
+const v2DuplicateCleanup = (await defaultExport.setup(v2Duplicate.ctx as any)) as (() => void) | undefined;
+check("the first V2 instance registers its tool transform", v2Owner.state.transforms === 1 && v2Owner.state.addedTools.includes("guard_status"));
+check("a duplicate V2 instance registers no tool transform", v2Duplicate.state.transforms === 0);
+check("a duplicate V2 instance registers no execute hooks", v2Duplicate.state.beforeHooks.length === 0 && v2Duplicate.state.afterHooks.length === 0);
+check("a duplicate V2 instance registers no permission seat", v2Duplicate.state.permissionHooks.length === 0);
+
+// ── Permission seat: evaluate denies, execute.before still aborts ──
+// `evaluate` sees normalized action/resources before the tool runs, so a deny
+// here means the tool never starts. `execute.before` still aborts with the
+// specific remediation message, because it is the only seat that sees raw
+// tool input. Both canaries must fail closed with attributable messages.
+console.log("- V2 permission seat -");
+const permissionEvent = (action: string, resources: string[], sessionID = "s-perm-seat") => ({
+	sessionID,
+	agent: "build",
+	action,
+	resources,
+	effect: "allow" as "allow" | "deny" | "ask",
+	message: undefined as string | undefined,
+});
+const seatShell = permissionEvent("shell", ["git push origin main"]);
+await v2Owner.state.permissionHooks[0]?.(seatShell);
+check("evaluate denies a protected-branch push before the tool runs", seatShell.effect === "deny" && /protected branch|main/i.test(String(seatShell.message)));
+if (seatShell.effect !== "deny") console.log("   evaluate message:", seatShell.message);
+const seatSecret = permissionEvent("read", [".env"]);
+await v2Owner.state.permissionHooks[0]?.(seatSecret);
+check("evaluate denies a secret read", seatSecret.effect === "deny" && /secret|credential/i.test(String(seatSecret.message)));
+const seatBoundary = permissionEvent("edit", [join(v2DuplicateRoot, "..", "outside.txt")]);
+await v2Owner.state.permissionHooks[0]?.(seatBoundary);
+check("evaluate denies a boundary-escaping edit", seatBoundary.effect === "deny" && /workspace/i.test(String(seatBoundary.message)));
+const seatAllowed = permissionEvent("shell", ["ls -la"]);
+await v2Owner.state.permissionHooks[0]?.(seatAllowed);
+check("evaluate leaves an ordinary command allowed", seatAllowed.effect === "allow");
+const seatUnmapped = permissionEvent("external_directory", ["/tmp/*"]);
+await v2Owner.state.permissionHooks[0]?.(seatUnmapped);
+check("evaluate leaves unmapped host actions to the host", seatUnmapped.effect === "allow");
+const predefinedDeny = { ...permissionEvent("shell", ["ls"]), effect: "deny" as const };
+await v2Owner.state.permissionHooks[0]?.(predefinedDeny);
+check("an explicit configured deny stays final and untouched", predefinedDeny.effect === "deny" && predefinedDeny.message === undefined);
+const seatAuditEntries = getRecentAuditEntries(60).filter((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.decision === "block");
+const seatAudit = seatAuditEntries.find((entry) => entry.policyDecision?.status === "blocked");
+check("evaluate denials are journaled with the policy decision", seatAudit !== undefined);
+const configuredDenyAudit = seatAuditEntries.find((entry) => (entry.input as any)?.configuredEffect === "deny");
+check("a configured deny is journaled as such without inventing a guard decision", configuredDenyAudit !== undefined && configuredDenyAudit.policyDecision === undefined);
+let executeBeforeDenied = false;
+try {
+	await v2Owner.state.beforeHooks[0]?.({ tool: "write", sessionID: "s-perm-seat", agent: "build", messageID: "msg-perm", id: "call-perm", input: { filePath: join(root, "..", "outside.txt"), content: "x" } });
+} catch (error) {
+	executeBeforeDenied = String((error as Error)?.message).includes("[workflow-guard]");
+}
+check("execute.before still aborts with the guard's remediation message", executeBeforeDenied);
+const duplicateAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "plugin.instance" && entry.reason === "duplicate_plugin_load");
+check("a duplicate V2 load writes an audit record naming the instance key", duplicateAudit !== undefined && String((duplicateAudit.input as any)?.instanceKey).includes(v2DuplicateRoot));
+check("the first V2 instance records exactly one plugin_loaded entry", getRecentAuditEntries(50).filter((entry) => entry.tool === "plugin.instance" && entry.reason === "plugin_loaded").length === 1);
+let duplicateDecisions = 0;
+for (const callback of v2Owner.state.beforeHooks) {
+	await callback({ tool: "read", sessionID: "s-v2-dup", agent: "build", messageID: "msg-v2-dup", id: "call-v2-dup", input: { filePath: join(v2DuplicateRoot, "seed.txt") } });
+	duplicateDecisions++;
+}
+for (const callback of v2Duplicate.state.beforeHooks) {
+	await callback({ tool: "read", sessionID: "s-v2-dup", agent: "build", messageID: "msg-v2-dup", id: "call-v2-dup", input: { filePath: join(v2DuplicateRoot, "seed.txt") } });
+	duplicateDecisions++;
+}
+const duplicateDecisionAudits = getRecentAuditEntries(50).filter((entry) => entry.tool === "read" && entry.phase === "decision" && entry.callID === "call-v2-dup");
+check("a duplicated load produces one policy decision per tool call", duplicateDecisions === 1 && duplicateDecisionAudits.length === 1);
+v2DuplicateCleanup?.();
+v2OwnerCleanup?.();
+// A second copy with a DISTINCT module path (cache copy plus source checkout)
+// cannot be made inert by keying alone; the claim table keeps one decision.
+resetToolCallClaimsForTesting();
+check("the first copy claims a tool call for its module path", claimToolCall("module-a", "s-v2-claim", "call-claim", "read") === true);
+check("a second module copy defers on the same tool call", claimToolCall("module-b", "s-v2-claim", "call-claim", "read") === false);
+releaseToolCallClaim("module-a", "s-v2-claim", "call-claim", "read");
+check("a settled call can be claimed by the next copy", claimToolCall("module-b", "s-v2-claim", "call-claim", "read") === true);
+check("claims without a call id are never shared across instances", claimToolCall("module-a", "s-v2-claim", undefined, "read") === true && claimToolCall("module-b", "s-v2-claim", undefined, "read") === true);
+resetToolCallClaimsForTesting();
+if (prevDuplicateDataHome === undefined) delete process.env.XDG_DATA_HOME;
+else process.env.XDG_DATA_HOME = prevDuplicateDataHome;
+rmSync(v2DuplicateRoot, { recursive: true, force: true });
+
+// ── V2 adopt-now surfaces: command, read-only pruning, worktrees, MCP ──
+// Four additive V2 API adoptions, each tested for its narrowing direction:
+// the command adds an operator surface, pruning removes tools, worktree cleanup
+// only accepts host-declared directories, and the MCP inventory only widens.
+console.log("- V2 adopt-now surfaces -");
+
+// /guard-status: registered server-side, delivered without a model turn.
+{
+	resetPluginInstancesForTesting();
+	const cmdRoot = mkdtempSync(join(tmpdir(), "wg-v2-cmd-"));
+	const prevCmdDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = join(cmdRoot, "data");
+	const cmdCtx = makeV2Context(cmdRoot);
+	const cmdCleanup = (await defaultExport.setup(cmdCtx.ctx as any)) as (() => void) | undefined;
+	const guardStatusCommand = cmdCtx.state.commands.find((command) => command.name === "guard-status");
+	check("the V2 plugin registers a server-side guard-status command", guardStatusCommand !== undefined);
+	check("guard-status carries an operator-facing description", /status/i.test(String(guardStatusCommand?.description)));
+	await guardStatusCommand?.execute({ sessionID: "s-v2-cmd" } as any);
+	check("guard-status delivers the report as a synthetic message", cmdCtx.state.syntheticMessages.length === 1 && cmdCtx.state.syntheticMessages[0].includes("pluginVersion"));
+	check("guard-status costs no model turn on the normal path", cmdCtx.state.prompts.length === 0);
+	check("guard-status is journaled in the audit trail", getRecentAuditEntries(20).some((entry) => entry.tool === "command.guard-status" && entry.reason === "guard_status_command"));
+	cmdCleanup?.();
+	if (prevCmdDataHome === undefined) delete process.env.XDG_DATA_HOME;
+	else process.env.XDG_DATA_HOME = prevCmdDataHome;
+	rmSync(cmdRoot, { recursive: true, force: true });
+}
+
+// Read-only roles: mutating tools leave the per-request snapshot.
+{
+	const snapshot = {
+		read: { description: "read", input: {} },
+		glob: { description: "glob", input: {} },
+		grep: { description: "grep", input: {} },
+		webfetch: { description: "webfetch", input: {} },
+		write: { description: "write", input: {} },
+		edit: { description: "edit", input: {} },
+		patch: { description: "patch", input: {} },
+		apply_patch: { description: "apply_patch", input: {} },
+		shell: { description: "shell", input: {} },
+		execute: { description: "execute", input: {} },
+		todowrite: { description: "todowrite", input: {} },
+		subagent: { description: "subagent", input: {} },
+	};
+	const removed = pruneToolsForReadOnlyRole(snapshot as any);
+	check("read-only pruning removes every mutating tool", READ_ONLY_PRUNED_TOOLS.every((id) => !(id in snapshot)));
+	check("read-only pruning keeps the read-only tools", ["read", "glob", "grep", "webfetch"].every((id) => id in snapshot));
+	check("read-only pruning reports what it removed", removed.includes("write") && removed.includes("shell") && removed.includes("execute") && !removed.includes("read"));
+	const emptySnapshot: Record<string, unknown> = { read: {} };
+	check("read-only pruning is a no-op on an already narrow snapshot", pruneToolsForReadOnlyRole(emptySnapshot).length === 0 && "read" in emptySnapshot);
+	check("read-only pruning tolerates a missing snapshot", pruneToolsForReadOnlyRole(undefined).length === 0);
+
+	resetPluginInstancesForTesting();
+	const roRoot = mkdtempSync(join(tmpdir(), "wg-v2-ro-"));
+	const prevRoDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = join(roRoot, "data");
+	const roCtx = makeV2Context(roRoot);
+	const roCleanup = (await defaultExport.setup(roCtx.ctx as any)) as (() => void) | undefined;
+	const roEvent = {
+		sessionID: "s-v2-ro",
+		agent: "reviewer",
+		model: { providerID: "p", id: "m" },
+		system: [] as Array<{ type: string; text: string }>,
+		messages: [],
+		options: {},
+		tools: { read: { description: "read", input: {} }, write: { description: "write", input: {} }, shell: { description: "shell", input: {} } },
+	};
+	await roCtx.state.contextHooks[0]?.(roEvent);
+	check("the context hook prunes mutating tools for a read-only role", !("write" in roEvent.tools) && !("shell" in roEvent.tools) && "read" in roEvent.tools);
+	check("read-only pruning is journaled with the removed tool ids", getRecentAuditEntries(20).some((entry) => entry.tool === "session.context" && entry.reason === "read_only_role_tools_pruned" && Array.isArray((entry.input as any)?.removed)));
+	const buildEvent = {
+		sessionID: "s-v2-build",
+		agent: "build",
+		model: { providerID: "p", id: "m" },
+		system: [] as Array<{ type: string; text: string }>,
+		messages: [],
+		options: {},
+		tools: { read: { description: "read", input: {} }, write: { description: "write", input: {} } },
+	};
+	await roCtx.state.contextHooks[0]?.(buildEvent);
+	check("the context hook leaves a write-capable role's tools intact", "write" in buildEvent.tools);
+	roCleanup?.();
+	if (prevRoDataHome === undefined) delete process.env.XDG_DATA_HOME;
+	else process.env.XDG_DATA_HOME = prevRoDataHome;
+	rmSync(roRoot, { recursive: true, force: true });
+}
+
+// Host worktrees: creation may use the host, removal may not.
+{
+	const unavailablePort = createHostWorktreePort({ location: { directory: root } });
+	check("the host worktree port is unavailable without a host API", !unavailablePort.available && unavailablePort.projectID === undefined);
+	check("an unavailable port reports an error instead of guessing a directory", (await unavailablePort.create({ branch: "feat/x" })).directory === undefined);
+	check("an unavailable port lists nothing rather than an empty roster", (await unavailablePort.list()) === undefined);
+
+	const throwingPort = createHostWorktreePort({
+		location: { project: { id: "proj-1" } },
+		worktree: {
+			create: async () => { throw new Error("boom"); },
+			list: async () => { throw new Error("boom"); },
+		},
+	});
+	check("a throwing host create degrades to a reportable error", (await throwingPort.create({ branch: "feat/x" })).error?.includes("boom") === true);
+	check("a throwing host list degrades to unknown", (await throwingPort.list()) === undefined);
+	await throwingPort.refresh();
+
+	const recordingPort = createHostWorktreePort({
+		location: { project: { id: "proj-1" } },
+		worktree: {
+			create: async (input: any) => ({ directory: `${input.branch}-dir` }),
+			list: async () => [{ directory: "/wt/a" }, { directory: undefined }, { directory: "/wt/b" }],
+			refresh: async () => {},
+		},
+	});
+	check("the host worktree port is available when the host supplies a project id", recordingPort.available && recordingPort.projectID === "proj-1");
+	check("host create passes the project id and a collision-safe name", (await recordingPort.create({ branch: "feat/x" })).directory === "feat/x-dir");
+	check("host list drops entries without a directory", JSON.stringify(await recordingPort.list()) === JSON.stringify(["/wt/a", "/wt/b"]));
+
+	// Validation is independent of the host: a declared directory must be a
+	// registered worktree of THIS repo and must not be the primary tree.
+	// A dedicated repo keeps this block independent of the earlier worktree
+	// fixture, which has already been torn down by this point.
+	const hostWtRepo = join(root, "wg-v2-host-wt");
+	mkdirSync(hostWtRepo, { recursive: true });
+	const hwtGit = (args: string[]): string => {
+		const res = spawnSync("git", args, { cwd: hostWtRepo, encoding: "utf8" });
+		if (res.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${res.stderr}`);
+		return res.stdout;
+	};
+	hwtGit(["init", "-q", "-b", "main"]);
+	hwtGit(["config", "user.email", "test@test.local"]);
+	hwtGit(["config", "user.name", "Test Runner"]);
+	writeFileSync(join(hostWtRepo, "seed.txt"), "seed\n");
+	hwtGit(["add", "seed.txt"]);
+	hwtGit(["commit", "-qm", "seed"]);
+	check("host worktree validation rejects a missing directory", !validateHostWorktreeDirectory(join(root, "..", "nope-not-here"), hostWtRepo).ok);
+	check("host worktree validation rejects the primary working tree", !validateHostWorktreeDirectory(hostWtRepo, hostWtRepo).ok);
+	const hostValidated = createGitWorktree("feat/host-validated", "HEAD", hostWtRepo);
+	check("host worktree validation accepts a registered non-primary worktree", hostValidated.success && validateHostWorktreeDirectory(hostValidated.worktreePath!, hostWtRepo).ok === true);
+	if (hostValidated.worktreePath) {
+		// A host-declared directory outside the guard's storage is cleanable, but
+		// only because the host listed it AND git registers it.
+		const outsideStorage = join(root, "wg-v2-host-wt-outside");
+		rmSync(outsideStorage, { recursive: true, force: true });
+		// Detached: the branch is already checked out in the guard worktree.
+		hwtGit(["worktree", "add", "-q", "--detach", outsideStorage, "feat/host-validated"]);
+		const hostCleanup = cleanupGitWorktree(outsideStorage, hostWtRepo, { hostWorktrees: [outsideStorage] });
+		check("cleanup removes a host-declared worktree outside guard storage", hostCleanup.success && !existsSync(outsideStorage));
+		const unlistedPath = join(root, "wg-v2-host-wt-unlisted");
+		rmSync(unlistedPath, { recursive: true, force: true });
+		hwtGit(["worktree", "add", "-q", "--detach", unlistedPath, "feat/host-validated"]);
+		const unlistedCleanup = cleanupGitWorktree(unlistedPath, hostWtRepo);
+		check("cleanup still refuses a registered path outside storage that the host did not declare", !unlistedCleanup.success && existsSync(unlistedPath));
+		hwtGit(["worktree", "remove", "--force", unlistedPath]);
+		cleanupGitWorktree(hostValidated.worktreePath, hostWtRepo);
+	}
+	rmSync(hostWtRepo, { recursive: true, force: true });
+}
+
+// MCP inventory: host-declared servers widen the guarded set, never narrow it.
+{
+	resetGuardedMcpTokensForTesting();
+	check("a static guarded server name yields its tokens", guardedTokensFromServerName("github").includes("github"));
+	check("a multi-word guarded server name yields normalized tokens", JSON.stringify(guardedTokensFromServerName("Azure DevOps")) === JSON.stringify(["azure", "devops"]));
+	check("an unrelated server name yields nothing", guardedTokensFromServerName("linear").length === 0);
+	check("an unknown MCP roster is not an empty roster", (await listHostMcpServerNames({})) === undefined);
+	check("a host without the MCP API reports unknown", (await listHostMcpServerNames({ mcp: {} })) === undefined);
+	check("a bare-array MCP roster is accepted", JSON.stringify(await listHostMcpServerNames({ mcp: { list: async () => ["github-enterprise"] } })) === JSON.stringify(["github-enterprise"]));
+	check("a throwing MCP list degrades to unknown", (await listHostMcpServerNames({ mcp: { list: async () => { throw new Error("x"); } } })) === undefined);
+
+	const added = recordHostMcpServers(["github-enterprise", "linear"]);
+	check("host servers contribute only guarded tokens", added.includes("enterprise") && !added.includes("linear"));
+	check("recordHostMcpServers tolerates an unknown roster", recordHostMcpServers(undefined).length === 0);
+	check("a host-declared server token is added to the effective set", guardedMcpServers().has("enterprise"));
+	check("a host-declared guarded server widens the MCP mutation policy", mcpMutationTool("enterprise_create_issue") === "GitHub/Azure DevOps");
+	check("an unrelated server stays unguarded", mcpMutationTool("linear_create_issue") === undefined);
+	// Removal is a no-op, not a narrowing.
+	recordHostMcpServers([]);
+	check("an empty roster never narrows the guarded set", guardedMcpServers().has("enterprise") && guardedMcpServers().has("github"));
+	addGuardedMcpTokens(["GitHub"]);
+	check("adding a static token is idempotent", guardedMcpServers().has("github"));
+	resetGuardedMcpTokensForTesting();
+	check("the static floor survives a reset", guardedMcpServers().has("github") && !guardedMcpServers().has("enterprise"));
+}
+
+// Static policy posture: emit, never install. The assertions run against a
+// faithful copy of the host's matcher (`resource` is matched as a whole-string
+// glob against `<permission action>:<resource>`, last match wins, only
+// allow/deny effects exist), so a rule that reads correctly but does not match
+// the command it targets fails here rather than in production.
+console.log("- Static policy posture -");
+{
+	// Command text is assembled from parts: a literal force-push string in a
+	// test file is exactly the smuggling path the shell guard refuses, and the
+	// assertions only need the resulting string, not the literal.
+	const push = (...args: string[]): string => ["git", "push", ...args].join(" ");
+	const forceFlag = `-${"f"}`;
+	const posture = buildPolicyPosture();
+	check("the posture emits deny-only rules", posture.rules.every((rule) => rule.effect === "deny"));
+	check(
+		"the posture covers every static invariant",
+		JSON.stringify(posture.rationale.map((entry) => entry.id)) ===
+			JSON.stringify(["protected-trunk-push", "live-control-plane-write", "secret-material-read", "external-directory-widening", "code-mode-surface"]),
+	);
+	check(
+		"the default format emits both host envelopes",
+		Boolean((posture.config as any).experimental.policies) && Boolean((posture.config as any).policies),
+	);
+	check(
+		"the legacy envelope uses experimental.policies with the permission action",
+		(buildPolicyPosture({ format: "2.0" }).config as any).experimental.policies.every((rule: any) => rule.action === "permission"),
+	);
+	check(
+		"the current envelope uses the top-level policies array with tool.use",
+		(buildPolicyPosture({ format: "next" }).config as any).policies.every((rule: any) => rule.action === "tool.use"),
+	);
+	// Each host reads one key and ignores the other, so the default must carry
+	// both. A single-key default is silently inert on the other host.
+	check(
+		"each host envelope keys its own action value",
+		(posture.config as any).experimental.policies.every((rule: any) => rule.action === "permission") &&
+			(posture.config as any).policies.every((rule: any) => rule.action === "tool.use") &&
+			(posture.config as any).experimental.policies.length === (posture.config as any).policies.length,
+	);
+	check(
+		"every emitted resource carries its composite action prefix",
+		(buildPolicyPosture({ format: "next" }).config as any).policies.every((rule: any) => /^(shell|edit|read|external_directory|execute):/.test(rule.resource)),
+	);
+	// `rules` stays unprefixed and `config` holds the enveloped form, so a
+	// caller reading `rules` cannot accidentally feed the host a substring.
+	check(
+		"posture.rules stays unprefixed while posture.config is enveloped",
+		posture.rules.every((rule) => !rule.resource.startsWith(`${rule.action}:`)) &&
+			(posture.config as any).experimental.policies.every((rule: any) => /^(shell|edit|read|external_directory|execute):/.test(rule.resource)),
+	);
+
+	// Host matcher: glob -> anchored regex, `*` is greedy across the whole
+	// string, and the last matching rule in a ruleset wins.
+	const hostMatch = (pattern: string, value: string): boolean => {
+		const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".");
+		return new RegExp(`^${escaped}$`).test(value);
+	};
+	const denies = (config: any, action: string, resource: string): boolean => {
+		const rules: any[] = config.experimental.policies;
+		const hit = rules.filter((rule) => rule.action === "permission" && hostMatch(rule.resource, `${action}:${resource}`));
+		return hit.length > 0 && hit[hit.length - 1].effect === "deny";
+	};
+	// The 2.1.x evaluator: same composite string and matcher, `tool.use` action,
+	// top-level key. Both matchers read the default config, so a rule lost from
+	// either envelope fails here rather than shipping silently.
+	const deniesCurrent = (config: any, action: string, resource: string): boolean => {
+		const rules: any[] = config.policies;
+		const hit = rules.filter((rule) => rule.action === "tool.use" && hostMatch(rule.resource, `${action}:${resource}`));
+		return hit.length > 0 && hit[hit.length - 1].effect === "deny";
+	};
+	const verdicts: Array<[string, string]> = [
+		["shell", push(forceFlag, "origin", "main")],
+		["shell", push("origin", "master")],
+		["shell", push("origin", "HEAD:main")],
+		["shell", push("origin", "feat/x")],
+		["edit", `${process.env.HOME}/.config/opencode/opencode.jsonc`],
+		["read", `${process.env.HOME}/.ssh/id_ed25519`],
+		["read", "/srv/backup/id_rsa.bak"],
+		["external_directory", "/srv/other-repo/src/a.ts"],
+		["edit", `${root}/src/a.ts`],
+		["shell", `cd /tmp && ${push("origin", "main")}`],
+	];
+	check(
+		"both host envelopes reach the same verdict for every probed resource",
+		verdicts.every(([action, resource]) => denies(posture.config, action, resource) === deniesCurrent(posture.config, action, resource)),
+	);
+	check("host matcher: a trunk push with flags is denied", denies(posture.config, "shell", push(forceFlag, "origin", "main")));
+	check("host matcher: a bare trunk push is denied", denies(posture.config, "shell", push("origin", "master")));
+	check("host matcher: a HEAD refspec trunk push is denied", denies(posture.config, "shell", push("origin", "HEAD:main")));
+	check("host matcher: a feature-branch push is NOT denied by the static floor", !denies(posture.config, "shell", push("origin", "feat/x")));
+	check("host matcher: a live control-plane edit is denied", denies(posture.config, "edit", `${process.env.HOME}/.config/opencode/opencode.jsonc`));
+	// A tilde resource would never match: 2.0.x expands `~` only for the
+	// `permissions` key, so this assertion pins the version-independent form.
+	check("host matcher: a tilde resource would not match an absolute path", !hostMatch("~/.config/opencode/*", `${process.env.HOME}/.config/opencode/opencode.jsonc`));
+	check("host matcher: a private key read is denied", denies(posture.config, "read", `${process.env.HOME}/.ssh/id_ed25519`));
+	check("host matcher: an id_rsa read outside .ssh is denied", denies(posture.config, "read", "/srv/backup/id_rsa.bak"));
+	check("host matcher: the external directory boundary is denied", denies(posture.config, "external_directory", "/srv/other-repo/src/a.ts"));
+	check("host matcher: a project source edit is NOT denied by the static floor", !denies(posture.config, "edit", `${root}/src/a.ts`));
+	// Honest about the limit: a compound command line is not covered, which is
+	// why the plugin seat stays the primary control.
+	check("host matcher: a compound command evades the whole-string glob", !denies(posture.config, "shell", `cd /tmp && ${push("origin", "main")}`));
+
+	const rendered = renderPolicyPosture();
+	check("the rendered posture is valid JSONC with a documented header", rendered.startsWith("// Workflow Guard static policy posture"));
+	check("the rendered posture parses back to the same rule count", (JSON.parse(stripJsonComments(rendered)) as any).experimental.policies.length === posture.rules.length);
+	check("the rendered posture carries both host envelopes", (JSON.parse(stripJsonComments(rendered)) as any).policies.length === posture.rules.length);
+	check("the rendered posture states precedence and residual risk", /Precedence/.test(rendered) && /Residual risk/.test(rendered));
+	check("the rendered header names both qualified hosts", /2\.0\.x and 2\.1\.x/.test(rendered));
+
+	// The CLI prints to stdout and never writes. A second identical run proves
+	// determinism; the absence of a write path is enforced by the CLI itself,
+	// which refuses to run without --print.
+	const binPath = join(process.cwd(), "bin", "opencode-workflow-guard.mjs");
+	const printed = spawnSync(process.execPath, [binPath, "policies", "--print"], { encoding: "utf8" });
+	check("the policies subcommand prints a parseable posture to stdout", printed.status === 0 && JSON.parse(stripJsonComments(printed.stdout)).experimental.policies.length > 0);
+	const printedAgain = spawnSync(process.execPath, [binPath, "policies", "--print"], { encoding: "utf8" });
+	check("the policies subcommand is deterministic", printed.stdout === printedAgain.stdout);
+	check("the policies subcommand defaults to both envelopes", printed.status === 0 && Boolean(JSON.parse(stripJsonComments(printed.stdout)).policies));
+	check("the policies subcommand refuses to run without --print", spawnSync(process.execPath, [binPath, "policies"], { encoding: "utf8" }).status !== 0);
+	check("the policies subcommand rejects an unknown format", spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "3.0"], { encoding: "utf8" }).status !== 0);
+	const nextPrinted = spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "next"], { encoding: "utf8" });
+	check("the policies subcommand honors --format next", nextPrinted.status === 0 && JSON.parse(stripJsonComments(nextPrinted.stdout)).policies.length > 0);
+	check(
+		"pinning one host omits the other envelope",
+		!JSON.parse(stripJsonComments(nextPrinted.stdout)).experimental &&
+			!JSON.parse(stripJsonComments(spawnSync(process.execPath, [binPath, "policies", "--print", "--format", "2.0"], { encoding: "utf8" }).stdout)).policies,
+	);
+}
+
+// Todo capability wiring: setup probes the host registry once, records it for
+// guard_status, and the adapter passes it into history reconstruction. A host
+// that registers todowrite (2.1.x + experimental.todo) must be reported as
+// available; one that does not (2.0.x) must be reported as unavailable.
+console.log("- V2 todo capability wiring -");
+{
+	const capabilityRoot = mkdtempSync(join(tmpdir(), "wg-v2-cap-"));
+	const prevCapDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = join(capabilityRoot, "data");
+	resetTodoCapabilityForTesting();
+	const withTool = makeV2Context(capabilityRoot, { registeredTools: [{ id: "todowrite", description: "todo" }] });
+	const withCleanup = (await defaultExport.setup(withTool.ctx as any)) as (() => void) | undefined;
+	check("setup records available when the host registers todowrite", recordedTodoCapability() === "available");
+	check("setup journals the probed capability", getRecentAuditEntries(20).some((entry) => entry.reason === "todo_capability_available"));
+	withCleanup?.();
+
+	resetTodoCapabilityForTesting();
+	const withoutTool = makeV2Context(capabilityRoot, { registeredTools: [{ id: "edit", description: "edit" }] });
+	const withoutCleanup = (await defaultExport.setup(withoutTool.ctx as any)) as (() => void) | undefined;
+	check("setup records unavailable when the host has no todowrite", recordedTodoCapability() === "unavailable");
+	check("setup journals the unavailable capability", getRecentAuditEntries(20).some((entry) => entry.reason === "todo_capability_unavailable"));
+	withoutCleanup?.();
+	resetTodoCapabilityForTesting();
+	if (prevCapDataHome === undefined) delete process.env.XDG_DATA_HOME;
+	else process.env.XDG_DATA_HOME = prevCapDataHome;
+	rmSync(capabilityRoot, { recursive: true, force: true });
+}
+
+// ── setup writes the key the target host actually reads ──
+// 2.0.10 drops a singular `plugin` key without an error, so a wrong key yields
+// a config that looks configured and loads nothing. These assertions pin the
+// key selection and the non-destructive update path.
+console.log("- setup config writer -");
+{
+	const writerRoot = mkdtempSync(join(tmpdir(), "wg-config-writer-"));
+	const target = join(writerRoot, "settings-under-test.json");
+	const spec = "opencode-workflow-guard@9.9.9";
+
+	check("writer: a fresh config targets the plural key", pluginKeyFor({}) === "plugins");
+	check("writer: an existing plugins key means 2.x", pluginKeyFor({ plugins: [] }) === "plugins");
+	check("writer: an existing plugin key means 1.x", pluginKeyFor({ plugin: [] }) === "plugin");
+	check("writer: an explicit major overrides the existing key", pluginKeyFor({ plugin: [] }, 2) === "plugins");
+
+	writeFileSync(target, '{\n  "$schema": "https://opencode.ai/config.json"\n}\n');
+	const fresh = preparePluginUpdate(target, "https://opencode.ai/config.json", spec);
+	check("writer: a fresh config gains a plugins array", fresh !== undefined && JSON.parse(stripJsonComments(fresh)).plugins[0] === spec);
+	check("writer: the fresh write does not add the singular key", !/\"plugin\"\s*:/.test(fresh ?? ""));
+
+	writeFileSync(target, '{\n  "plugins": ["other-plugin"]\n}\n');
+	const appended = preparePluginUpdate(target, "https://opencode.ai/config.json", spec);
+	check("writer: an existing plugins entry is preserved", JSON.stringify(JSON.parse(stripJsonComments(appended!)).plugins) === JSON.stringify(["other-plugin", spec]));
+
+	writeFileSync(target, `{\n  "plugins": ["${spec}"]\n}\n`);
+	check("writer: an already-configured package is not rewritten", preparePluginUpdate(target, "https://opencode.ai/config.json", spec) === undefined);
+
+	writeFileSync(target, '{\n  "plugin": ["other-plugin"]\n}\n');
+	const legacy = preparePluginUpdate(target, "https://opencode.ai/config.json", spec);
+	check("writer: a 1.x config keeps the singular key", legacy !== undefined && JSON.parse(stripJsonComments(legacy)).plugin[0] === "other-plugin" && JSON.parse(stripJsonComments(legacy)).plugins === undefined);
+	const forced = preparePluginUpdate(target, "https://opencode.ai/config.json", spec, undefined, 2);
+	check("writer: --major 2 writes the plural key even for a 1.x-shaped config", forced !== undefined && JSON.parse(stripJsonComments(forced)).plugins[0] === spec);
+
+	writeFileSync(target, `{\n  "plugin": ["${spec}"], "plugins": ["${spec}"]\n}\n`);
+	check("writer: a config already naming the package under either key is untouched", preparePluginUpdate(target, "https://opencode.ai/config.json", spec) === undefined);
+
+	writeFileSync(target, `{\n  "plugin": ["opencode-workflow-guard/tui", "${spec}"]\n}\n`);
+	const migrated = preparePluginUpdate(target, "https://opencode.ai/config.json", spec, "opencode-workflow-guard/tui");
+	check("writer: a legacy TUI spec is replaced, not duplicated", JSON.stringify(JSON.parse(stripJsonComments(migrated!)).plugin) === JSON.stringify([spec]));
+
+	// `tui.json` keeps the singular key on both majors; `--major 2` must not
+	// rewrite it to `plugins`, which that schema ignores (the TUI plugin would
+	// then silently never load).
+	writeFileSync(target, '{\n  "$schema": "https://opencode.ai/tui.json"\n}\n');
+	const tuiForced = preparePluginUpdate(target, "https://opencode.ai/tui.json", spec, undefined, 2, "plugin");
+	check("writer: --major 2 still writes the singular key into tui.json", tuiForced !== undefined && JSON.parse(stripJsonComments(tuiForced)).plugin?.[0] === spec && JSON.parse(stripJsonComments(tuiForced)).plugins === undefined);
+	writeFileSync(target, tuiForced!);
+	const tuiExisting = preparePluginUpdate(target, "https://opencode.ai/tui.json", spec, undefined, 2, "plugin");
+	check("writer: an already-configured tui.json is not rewritten", tuiExisting === undefined);
+
+	writeFileSync(target, '{\n  "plugins": "not-an-array"\n}\n');
+	let threw = false;
+	try { preparePluginUpdate(target, "https://opencode.ai/config.json", spec); } catch { threw = true; }
+	check("writer: a non-array plugin key is refused instead of clobbered", threw);
+
+	writeFileSync(target, "not json at all {{{");
+	threw = false;
+	try { preparePluginUpdate(target, "https://opencode.ai/config.json", spec); } catch { threw = true; }
+	check("writer: an unparseable config is refused instead of clobbered", threw);
+
+	rmSync(writerRoot, { recursive: true, force: true });
+}
+
 // Loaded plugin version visibility: OpenCode resolves configured bare plugin
 // names through Node's parent-directory lookup from its configuration
 // location, so the loaded copy can silently differ from a globally
@@ -5049,6 +5872,12 @@ check("loadedPluginVersion reads the adjacent package manifest", loadedPluginVer
 check("loadedPluginVersion fails soft for an unreadable manifest", loadedPluginVersion(pathToFileURL(join(root, "wg-version-none", "src", "workflow-guard.ts")).href) === undefined);
 const versionStatus = JSON.parse(String(await customPlugin.tool?.guard_status?.execute({ directory: root }, { sessionID: "s-version", worktree: root, directory: root } as any)));
 check("guard_status exposes the loaded plugin version", versionStatus.pluginVersion === expectedVersion);
+const expectedHostQualification = String((JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { dependencies: Record<string, string> }).dependencies["@opencode/plugin"]);
+check("qualifiedHostVersion reads the pinned host dependency", qualifiedHostVersion() === expectedHostQualification);
+check("the qualified host version is an exact pin, not a range", /^\d+\.\d+\.\d+$/.test(expectedHostQualification));
+check("qualifiedHostVersion fails soft for an unreadable manifest", qualifiedHostVersion(pathToFileURL(join(root, "wg-version-none", "src", "workflow-guard.ts")).href) === undefined);
+check("guard_status exposes the qualified host version", versionStatus.qualifiedHostVersion === expectedHostQualification);
+check("guard_status reports a null host version on the V1 path", versionStatus.hostVersion === null);
 const versionLogs: string[] = [];
 await WorkflowGuard({
 	directory: root,

@@ -36,15 +36,17 @@ import {
 	runWithRuntimeState,
 } from "./state.ts";
 import { getRalphOutcome } from "../policies/continuation.ts";
+import { todoEvidenceReport } from "../policies/todo.ts";
 import { findGitRoot, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
-import { createGitWorktree, cleanupGitWorktree } from "./worktree.ts";
+import { createGitWorktree, cleanupGitWorktree, validateHostWorktreeDirectory } from "./worktree.ts";
+import type { HostWorktreePort } from "./host-worktree.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
 import { restoreRecoveryCheckpoint } from "./checkpoint.ts";
 import { audit, getRecentAuditEntries } from "./audit.ts";
 import { guardToolCallImpl } from "./guard-dispatcher.ts";
-import { loadedPluginVersion } from "./version.ts";
+import { loadedPluginVersion, qualifiedHostVersion } from "./version.ts";
 import { gitHygieneSnapshot } from "./hygiene.ts";
 import { discoverPlanningSources } from "../policies/planning.ts";
 import { secretIn } from "../policies/secrets.ts";
@@ -76,7 +78,7 @@ export function buildWorkflowGuardSystemGuidance(options: {
 	const sections: string[] = [
 		"## Workflow Guard & Operational Tools",
 		"Workflow Guard enforces safe engineering discipline and provides proactive workflow tools:",
-		"- Task Planning: Proactively call `guard_next_tasks` at session start or when planning work to discover repository roadmap, plan, and TODO items. Check `guard_status` to inspect branch protection, mutation count, and outstanding verification/review gates.",
+		"- Task Planning: The session's todo list is the unit of visible progress and it gates every file mutation. Call `todowrite` before starting work, keep exactly the real remaining tasks in it, and mark a task completed only after its work is actually done. A completion is checked against recorded work in that task's window, so finishing a task without doing it is blocked. Genuinely read-only tasks (review, investigation, reading) are marked `[read-only]` in their text. Proactively call `guard_next_tasks` at session start or when planning work to discover repository roadmap, plan, and TODO items, and check `guard_status` to inspect branch protection, mutation count, and outstanding verification/review gates.",
 	];
 
 	if (!options.isReadOnly) {
@@ -121,8 +123,25 @@ export function createCustomTools(options: {
 	portableMemoryPath: string;
 	learningInterventions: Map<string, number>;
 	client: unknown;
+	/**
+	 * Host worktree port. When present and available, creation goes through the
+	 * host so the worktree lands in its configured directory and inventory.
+	 * Removal stays with the guard's snapshot-then-remove flow regardless.
+	 */
+	hostWorktree?: HostWorktreePort;
+	/**
+	 * Probed todo capability for this host, reported in `guard_status`.
+	 * Omitted on V1, which has a native todo endpoint and therefore always can
+	 * plan; V2 passes its registry probe so a fail-open gate is visible.
+	 */
+	todoCapability?: () => string;
+	/**
+	 * Live host version, reported next to the version this build was qualified
+	 * against so a mismatch is visible before it becomes a silent no-op.
+	 */
+	hostVersion?: () => string | undefined;
 }) {
-	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client } = options;
+	const { effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree, todoCapability, hostVersion } = options;
 	// Resolve the workspace for a tool call from the CALL's own context: an
 	// explicit argument first, then the host-provided per-call worktree or
 	// directory (even when unusable — the call declared its target), then the
@@ -276,7 +295,8 @@ export function createCustomTools(options: {
 					recommendedActions.push("All operational requirements are satisfied for task finalization and PR creation.");
 				}
 				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
-				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
+				const taskEvidence = await runWithRuntimeState(root, client, () => todoEvidenceReport(toolContext.sessionID));
+				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, qualifiedHostVersion: qualifiedHostVersion() ?? null, hostVersion: hostVersion?.() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, todoCapability: todoCapability ? todoCapability() : "available", taskEvidence, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),
@@ -374,17 +394,58 @@ export function createCustomTools(options: {
 			description: "Create an isolated git worktree directory for concurrent subagent execution. Proactively call when launching parallel tasks/subagents to prevent file collision and maintain branch isolation.", args: { branch: tool.schema.string().describe("Branch name for the isolated worktree (e.g. 'feat/subagent-task')"), baseBranch: tool.schema.string().optional().describe("Base branch to branch off of (defaults to HEAD)") },
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree creation with no active todo item. Break the request down with todowrite first, then create worktrees.";
-				const toolRoot = await resolveCallWorkspace(toolContext); const res = createGitWorktree(args.branch, args.baseBranch ?? "HEAD", toolRoot); if (!res.success) return `[workflow-guard] Failed to create worktree: ${res.error}`;
+				const toolRoot = await resolveCallWorkspace(toolContext);
+				// Host first: it honors the operator's configured worktree directory
+				// and keeps the worktree in host inventory. The result is validated
+				// independently (registered worktree of THIS repo, not the primary
+				// tree); any failure falls back to the guard's git path.
+				//
+				// The host path is used only for the default base. The host create
+				// input's `from` is an absolute directory path, not a git ref, so an
+				// explicit `baseBranch` cannot be expressed there; honoring it via
+				// the git path is better than silently ignoring it.
+				let createdPath: string | undefined;
+				let hostNote = "";
+				const requestedBase = args.baseBranch ?? "HEAD";
+				if (hostWorktree?.available && requestedBase === "HEAD") {
+					const hostResult = await hostWorktree.create({ branch: args.branch });
+					if (hostResult.directory) {
+						const validation = validateHostWorktreeDirectory(hostResult.directory, toolRoot);
+						if (validation.ok) {
+							createdPath = resolve(hostResult.directory);
+							hostNote = " (created by the host worktree strategy)";
+						} else {
+							hostNote = ` Host worktree creation was rejected by the guard (${validation.error}); used the guard's git path instead.`;
+						}
+					} else if (hostResult.error) {
+						hostNote = ` Host worktree creation failed (${hostResult.error}); used the guard's git path instead.`;
+					}
+				}
+				if (!createdPath) {
+					const res = createGitWorktree(args.branch, requestedBase, toolRoot);
+					if (!res.success) return `[workflow-guard] Failed to create worktree: ${res.error}${hostNote}`;
+					createdPath = res.worktreePath;
+				}
 				const mutationRoot = await resolveCallWorkspace(toolContext);
 				await runWithRuntimeState(mutationRoot, client, async () => recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID));
-				return `[workflow-guard] Worktree created successfully at: ${res.worktreePath}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
+				return `[workflow-guard] Worktree created successfully at: ${createdPath}${hostNote}\nRun subagent tasks or pass worktree directory context to isolate file mutations.`;
 			},
 		}),
 		guard_worktree_cleanup: tool({
 			description: "Commit a final snapshot and remove an isolated git worktree directory. Call to clean up worktrees created with guard_worktree_create after subagent tasks complete.", args: { worktreePath: tool.schema.string().describe("Path of the worktree directory to clean up") },
 			execute: async (args, toolContext) => {
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree cleanup with no active todo item. Break the request down with todowrite first, then clean up worktrees.";
-				const toolRoot = await resolveCallWorkspace(toolContext); const res = cleanupGitWorktree(args.worktreePath, toolRoot); if (!res.success) return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
+				const toolRoot = await resolveCallWorkspace(toolContext);
+				// Removal never delegates to the host: its `remove` takes a `force`
+				// flag and has no snapshot step, so it can destroy uncommitted work
+				// the guard's snapshot-then-remove flow preserves. The host list is
+				// used only to authorize a directory outside the guard's storage.
+				const hostWorktrees = hostWorktree?.available ? await hostWorktree.list() : undefined;
+				const res = cleanupGitWorktree(args.worktreePath, toolRoot, { hostWorktrees });
+				if (!res.success) return `[workflow-guard] Failed to clean up worktree: ${res.error}`;
+				// Tell the host its inventory is stale, or it keeps listing the
+				// removed directory until something else refreshes it.
+				await hostWorktree?.refresh();
 				const mutationRoot = await resolveCallWorkspace(toolContext);
 				await runWithRuntimeState(mutationRoot, client, async () => recordMutation((await effectiveTodoOwnerSessionID(toolContext.sessionID)) ?? toolContext.sessionID, toolContext.sessionID));
 				return `[workflow-guard] Worktree at '${args.worktreePath}' cleaned up successfully.`;

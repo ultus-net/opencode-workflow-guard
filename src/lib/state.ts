@@ -1,7 +1,7 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
+import { audit, getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { findGitRoot, getCachedProjectConfig, isSameGitRepo, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { normalizeLiveControlPlaneRoots } from "./live-control-plane.ts";
@@ -56,6 +56,23 @@ const workspaceMutationCounts = new Map<string, number>();
 export const sessionMutationTimestamps = new Map<string, number>();
 export const sessionMutationCounts = new Map<string, number>();
 export const sessionWorkspaces = new Map<string, string>();
+// Per-session, per-task mutation count recorded when an active task entered
+// its current active window. Completion is judged per task: one mutation
+// cannot vouch for several completions.
+export const sessionTodoTaskStarts = new Map<string, Map<string, number>>();
+
+export function todoTaskStarts(sessionID: string): Map<string, number> {
+	let starts = sessionTodoTaskStarts.get(sessionID);
+	if (!starts) {
+		starts = new Map();
+		sessionTodoTaskStarts.set(sessionID, starts);
+	}
+	return starts;
+}
+
+export function clearTodoSessionState(sessionID: string): void {
+	sessionTodoTaskStarts.delete(sessionID);
+}
 // Sessions whose workspace was registered from their OWN context (tool-call
 // arguments or a host-provided per-call worktree). A session registered only
 // from the plugin-instance default is deliberately left unmarked: concurrent
@@ -89,33 +106,155 @@ export function getSessionBoundWorkspace(sessionID?: string): string | undefined
 }
 
 /**
- * Register a session's workspace from a tool call's own context. Candidates in
- * priority order: tool-argument paths (workdir/filePath — the call's own
- * target), then a host-provided per-call worktree/directory. A session that is
- * already registered is never re-anchored from the plugin-instance fallback:
- * under concurrent loops that fallback can belong to a different session's
- * workspace, which is exactly how workspaces cross-contaminate. Only a
- * session with no registration at all is bootstrapped from the fallback, and
- * such a bootstrap stays unbound (never used to bind review evidence).
+ * The nearest bound workspace up the parent chain, for a session with no
+ * direct binding of its own.
+ *
+ * A subagent's policy root already inherits its parent's workspace, so its
+ * registration must use the same answer. Without this, a child of a bound
+ * session looked unbound to the registration path and its first foreign read
+ * rebound it into another repository: the parent stayed confined and the child
+ * escaped.
+ *
+ * Walks at most `MAX_PARENT_DEPTH` links and stops on a cycle.
+ *
+ * Cost: one `session.get` per parent link, issued only when the session has no
+ * direct binding. A directly bound session returns from the in-memory map with
+ * no RPC, so the common case pays nothing. The walk is depth-capped and
+ * cycle-checked, so a malformed parent graph cannot spin.
  */
-export function registerSessionWorkspaceFromToolCall(
-	sessionID: string | undefined,
-	call: { workdir?: string; filePath?: string; hostWorktree?: string; toolWorktree: string },
-): void {
-	if (!sessionID) return;
-	const rawCandidate = call.workdir ?? call.filePath ?? call.hostWorktree;
-	if (rawCandidate) {
-		const candidatePath = isAbsolute(rawCandidate) ? rawCandidate : resolve(call.toolWorktree, rawCandidate);
-		const gitRoot = findGitRoot(candidatePath);
-		if (gitRoot) {
-			sessionWorkspaces.set(sessionID, gitRoot);
-			sessionWorkspaceBound.add(sessionID);
+const MAX_PARENT_DEPTH = 16;
+
+/**
+ * Walk up the parent chain from `sessionID` and return the nearest directly
+ * bound ancestor's workspace.
+ *
+ * Shared by `resolveInheritedWorkspace` (full walk, used by workspace
+ * registration so a subagent cannot rebind out of its parent's boundary) and
+ * `resolveSessionBoundWorkspace` (one level, used by review-verdict binding).
+ * The depth parameter is the only difference; keeping one implementation makes
+ * the one-lookup-per-link cost visible in a single place.
+ */
+async function resolveAncestorBoundWorkspace(sessionID: string, maxDepth: number): Promise<string | undefined> {
+	if (maxDepth <= 0) return undefined;
+	const client = getSdkClient();
+	const session = client?.session;
+	const get = session?.get;
+	if (typeof get !== "function") return undefined;
+	const seen = new Set<string>([sessionID]);
+	let current = sessionID;
+	for (let depth = 0; depth < maxDepth; depth++) {
+		let parentID: unknown;
+		try {
+			const result = await get.call(session, { path: { id: current } });
+			parentID = (result as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
+		} catch {
+			return undefined;
 		}
+		if (typeof parentID !== "string" || !parentID || seen.has(parentID)) return undefined;
+		const inherited = getSessionBoundWorkspace(parentID);
+		if (inherited) return inherited;
+		seen.add(parentID);
+		current = parentID;
+	}
+	return undefined;
+}
+
+export async function resolveInheritedWorkspace(sessionID?: string): Promise<string | undefined> {
+	if (!sessionID) return undefined;
+	const direct = getSessionBoundWorkspace(sessionID);
+	if (direct) return direct;
+	return resolveAncestorBoundWorkspace(sessionID, MAX_PARENT_DEPTH);
+}
+
+/**
+ * Register a session's workspace from a tool call's own context.
+ *
+ * Two distinct operations, deliberately split:
+ *
+ * - **First bind.** A session with no bound workspace adopts the git root of
+ *   its own call arguments (`workdir`/`filePath`), else the host-provided
+ *   per-call worktree, else a path-derived bootstrap from the plugin-instance
+ *   fallback. A bootstrap from the fallback stays unbound: concurrent loops
+ *   share this process, so a value derived from the last-active plugin
+ *   instance must never bind review evidence.
+ * - **Widen.** Once bound, only an explicit host-declared per-call worktree
+ *   may move the boundary. Worktree isolation and relay flows set it, so it is
+ *   a boundary statement from the host. A bare path candidate outside the
+ *   boundary is a read or write against foreign state, which the boundary
+ *   policy refuses; adopting it would let one allowed external read move the
+ *   whole write boundary.
+ *
+ * "Bound" includes an inherited binding: a subagent with no direct binding of
+ * its own already resolves to its nearest bound ancestor's workspace for
+ * policy decisions, so a path-derived candidate must not bind it elsewhere.
+ *
+ * Every widen and every refused widen is journaled, because the boundary is
+ * what unattended operation rests on.
+ */
+export async function registerSessionWorkspaceFromToolCall(
+	sessionID: string | undefined,
+	call: { workdir?: string; filePath?: string; hostWorktree?: string; toolWorktree: string; mutating?: boolean },
+): Promise<void> {
+	if (!sessionID) return;
+	const bound = await resolveInheritedWorkspace(sessionID);
+
+	// A host-declared per-call worktree is an explicit boundary statement.
+	const hostRoot = call.hostWorktree ? findGitRoot(call.hostWorktree) : undefined;
+	if (hostRoot && hostRoot !== bound) {
+		setSessionWorkspace(sessionID, hostRoot);
+		auditWorkspaceRebind(sessionID, bound, hostRoot, "host-worktree");
 		return;
 	}
-	if (sessionWorkspaces.has(sessionID)) return;
-	const gitRoot = findGitRoot(call.toolWorktree);
-	sessionWorkspaces.set(sessionID, gitRoot ?? projectRootKey(call.toolWorktree));
+
+	const rawCandidate = call.workdir ?? call.filePath;
+	if (!rawCandidate) {
+		if (sessionWorkspaces.has(sessionID)) return;
+		const gitRoot = findGitRoot(call.toolWorktree);
+		sessionWorkspaces.set(sessionID, gitRoot ?? projectRootKey(call.toolWorktree));
+		return;
+	}
+
+	const candidatePath = isAbsolute(rawCandidate) ? rawCandidate : resolve(call.toolWorktree, rawCandidate);
+	const gitRoot = findGitRoot(candidatePath);
+	if (!gitRoot) return;
+	if (gitRoot === bound) return;
+
+	if (!bound) {
+		sessionWorkspaces.set(sessionID, gitRoot);
+		sessionWorkspaceBound.add(sessionID);
+		return;
+	}
+	auditWorkspaceRebindRefused(sessionID, bound, gitRoot, call.mutating ? "mutation" : "read");
+}
+
+/** Durable record of a granted boundary widening. */
+function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: string, source: string): void {
+	audit({
+		ts: new Date().toISOString(),
+		sessionID,
+		tool: "workspace.binding",
+		decision: "allow",
+		phase: "event",
+		reason: "workspace_rebind_host_worktree",
+		input: { from, to, source },
+	});
+}
+
+/**
+ * Durable record of a refused widening. The refusal itself is the boundary
+ * policy's decision; this entry exists so an operator can tell whether a
+ * foreign path arrived through a read or a mutation.
+ */
+function auditWorkspaceRebindRefused(sessionID: string, from: string, to: string, source: "read" | "mutation"): void {
+	audit({
+		ts: new Date().toISOString(),
+		sessionID,
+		tool: "workspace.binding",
+		decision: "block",
+		phase: "event",
+		reason: "workspace_rebind_refused",
+		input: { from, to, source },
+	});
 }
 
 /**
@@ -129,19 +268,10 @@ export async function resolveSessionBoundWorkspace(sessionID?: string): Promise<
 	if (!sessionID) return undefined;
 	const direct = getSessionBoundWorkspace(sessionID);
 	if (direct) return direct;
-	try {
-		const client = getSdkClient();
-		const session = client?.session;
-		const get = session?.get;
-		if (typeof get === "function") {
-			const result = await get.call(session, { path: { id: sessionID } });
-			const parent = (result as { data?: { parentID?: unknown } } | undefined)?.data?.parentID;
-			if (typeof parent === "string" && parent && sessionWorkspaceBound.has(parent)) {
-				return sessionWorkspaces.get(parent);
-			}
-		}
-	} catch {}
-	return undefined;
+	// One level only: review-verdict binding asks for the immediate parent, and
+	// walking further would let a grandparent's workspace answer for a child
+	// that was deliberately left unbound.
+	return resolveAncestorBoundWorkspace(sessionID, 1);
 }
 
 export let lastVerify: VerifyResult | undefined;
@@ -242,6 +372,7 @@ export function resetVerifyState(): void {
 	workspaceMutationTimestamps.clear();
 	workspaceMutationCounts.clear();
 	sessionVerifyResults.clear();
+	sessionTodoTaskStarts.clear();
 }
 
 export function recordReviewResult(

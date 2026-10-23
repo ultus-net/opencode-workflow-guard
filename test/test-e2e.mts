@@ -11,8 +11,13 @@ const check = (name: string, cond: unknown): boolean => {
 	cond ? (pass++, console.log("  ok  " + name)) : (fail++, console.log("FAIL  " + name));
 	return Boolean(cond);
 };
+// A live probe can only produce a guard verdict if the model actually ran.
+// These are host/provider errors that mean it did not: the prompt never
+// reached a model, so scoring the probe as a guard failure would be a false
+// accusation. Match the host's literal error shapes, not the bare phrase, so
+// model prose cannot mask a real guard regression.
 const providerUnavailable = (output: string): boolean =>
-	/available credits|insufficient credits|rate limit|too many requests|capacity|overloaded/i.test(output);
+	/available credits|insufficient credits|rate limit|too many requests|capacity|overloaded|Model unavailable:/i.test(output);
 const checkLive = (name: string, cond: unknown, output: string): boolean => {
 	if (!cond && providerUnavailable(output)) {
 		unavailable++;
@@ -45,11 +50,11 @@ const packageEntry = join(testDir, "node_modules", "opencode-workflow-guard", "s
 const installedPackageDir = join(testDir, "node_modules", "opencode-workflow-guard");
 const installedPackageJson = JSON.parse(readFileSync(join(testDir, "node_modules", "opencode-workflow-guard", "package.json"), "utf8"));
 check(
-	"npm package keeps direct dependencies on latest",
+	"npm package pins every direct dependency to an exact version",
 	Object.keys(installedPackageJson.dependencies ?? {}).length > 0 &&
-		Object.values(installedPackageJson.dependencies).every((spec) => spec === "latest") &&
+		Object.values(installedPackageJson.dependencies).every((spec) => /^\d+\.\d+\.\d+$/.test(String(spec))) &&
 		Object.keys(installedPackageJson.devDependencies ?? {}).length > 0 &&
-		Object.values(installedPackageJson.devDependencies).every((spec) => spec === "latest"),
+		Object.values(installedPackageJson.devDependencies).every((spec) => /^\d+\.\d+\.\d+$/.test(String(spec))),
 );
 check(
 	"npm tarball installs modular plugin entrypoint",
@@ -226,6 +231,7 @@ const runV2Probes = async (ctx: any) => {
 \t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
 \t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
 \t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t\t"todo-completion": { tool: "todowrite", input: { todos: [{ content: "unstarted e2e work", status: "completed", priority: "medium" }] } },
 \t};
 \tconst whyResults: Record<string, any> = {};
 \tfor (const [name, probe] of Object.entries(whyProbes)) {
@@ -253,6 +259,7 @@ const runV1Probes = async (ctx: any) => {
 \t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
 \t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
 \t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t\t"todo-completion": { tool: "todowrite", input: { todos: [{ content: "unstarted e2e work", status: "completed", priority: "medium" }] } },
 \t};
 \tconst whyResults: Record<string, any> = {};
 \tfor (const [name, probe] of Object.entries(whyProbes)) {
@@ -322,8 +329,11 @@ if (isOpenCodeV2) {
 	const servicePort = 49400 + (process.pid % 1000);
 	spawnSync("opencode", ["service", "set", "port", String(servicePort)], { cwd: testDir, encoding: "utf8", env: runtimeEnv, timeout: 30_000 });
 }
+// `run` takes its directory from the process cwd; 2.0.15 rejects `--dir` as an
+// unknown flag, which made every live probe report a flag error instead of a
+// guard verdict.
 const runOpenCode = (args: string[], timeout: number) =>
-	spawnSync("opencode", ["run", "--dir", testDir, ...args], { cwd: testDir, encoding: "utf8", timeout, env: runtimeEnv });
+	spawnSync("opencode", ["run", ...args], { cwd: testDir, encoding: "utf8", timeout, env: runtimeEnv });
 const configProbe = await new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
 	const child = spawn("opencode", ["debug", "config"], { cwd: testDir, env: runtimeEnv });
 	let stdout = "";
@@ -401,6 +411,9 @@ check("headless guard_why simulates secret read policy via read tool", whyProbe(
 check("headless guard_why simulates secret read policy via shell", whyProbe("secrets-shell")?.policy === "secrets" && whyProbe("secrets-shell")?.code === "secret_read" && whyProbe("secrets-shell")?.status === "blocked");
 check("headless guard_why simulates workspace boundary policy via write tool", whyProbe("boundary-write")?.policy === "boundary" && whyProbe("boundary-write")?.code === "workspace_escape" && whyProbe("boundary-write")?.status === "blocked");
 check("headless guard_why simulates interactive tty shell-safety policy", whyProbe("shell-tty")?.policy === "shell-safety" && whyProbe("shell-tty")?.code === "interactive_tty" && whyProbe("shell-tty")?.status === "blocked");
+// The completion gate is host-version independent: claiming work the session
+// never did is blocked through the real dispatcher, on both adapter paths.
+check("headless guard_why simulates the todo completion evidence gate", whyProbe("todo-completion")?.policy === "todo" && whyProbe("todo-completion")?.code === "todo_completion_unverified" && whyProbe("todo-completion")?.status === "blocked");
 check("headless guard_status reports project config loaded from .opencode/workflow-guard.json", headlessAccountability?.status?.projectConfig?.protectedBranches?.[0] === "e2e-config-probe-branch" && headlessAccountability?.status?.projectConfig?.requireReview === false);
 if (isOpenCodeV2) {
 	// The V2 adapter runs the shipped setup(ctx) for real; verify the
@@ -419,6 +432,78 @@ if (isOpenCodeV2) {
 	check("V2 setup registers the full config-gated guard tool surface", missingGuardTools.length === 0);
 	if (missingGuardTools.length > 0) console.log("  missing guard tools: " + missingGuardTools.join(", "));
 	console.log(`  note: builtin todowrite description enriched under V2: ${headlessAccountability?.todowriteEnriched === true ? "yes" : "unknown at setup time"}`);
+}
+
+// The todo capability probe is only meaningful against a host that can gate
+// the tool. Probe the flag rather than the version: a host that does not know
+// `experimental.todo` keeps the capability unavailable, which is the branch
+// the main pass already covers.
+const hostMinor = Number(opencodeSemver.split(".")[1] ?? 0);
+if (isOpenCodeV2 && (opencodeMajor > 2 || (opencodeMajor === 2 && hostMinor >= 1))) {
+	const todoConfig = join(testDir, ".opencode", "opencode.json");
+	const previousConfig = readFileSync(todoConfig, "utf8");
+	const previousAccountability = readFileSync(accountabilityMarker, "utf8");
+	rmSync(initializedMarker, { force: true });
+	// A second pass needs its own XDG roots and service port. Reusing the first
+	// pass's state dirs reconnects to its already-running service, which serves
+	// the config it started with and never re-runs plugin setup.
+	const todoEnv: NodeJS.ProcessEnv = {
+		...runtimeEnv,
+		XDG_CONFIG_HOME: join(testDir, "runtime-config-todo"),
+		XDG_STATE_HOME: join(testDir, "runtime-state-todo"),
+		XDG_DATA_HOME: join(testDir, "runtime-data-todo"),
+	};
+	const todoPort = 49400 + ((process.pid + 500) % 1000);
+	spawnSync("opencode", ["service", "set", "port", String(todoPort)], { cwd: testDir, encoding: "utf8", env: todoEnv, timeout: 30_000 });
+	try {
+		const parsed = JSON.parse(previousConfig);
+		writeFileSync(todoConfig, `${JSON.stringify({ ...parsed, experimental: { ...(parsed.experimental ?? {}), todo: true } }, null, 2)}\n`);
+		const todoProbe = await new Promise<{ status: number | null }>((resolve) => {
+			const child = spawn("opencode", ["debug", "config"], { cwd: testDir, env: todoEnv });
+			let timer: NodeJS.Timeout | undefined;
+			const poll = setInterval(() => {
+				if (existsSync(initializedMarker)) {
+					clearInterval(poll);
+					if (timer) clearTimeout(timer);
+					try { child.kill("SIGTERM"); } catch {}
+					resolve({ status: 0 });
+				}
+			}, 50);
+			timer = setTimeout(() => {
+				clearInterval(poll);
+				try { child.kill("SIGTERM"); } catch {}
+				resolve({ status: null });
+			}, 30_000);
+			child.on("error", () => {
+				clearInterval(poll);
+				if (timer) clearTimeout(timer);
+				resolve({ status: null });
+			});
+		});
+		let flagged: any;
+		try {
+			flagged = JSON.parse(readFileSync(accountabilityMarker, "utf8"));
+		} catch {}
+		// Flag on: the host registry exposes todowrite, so the guard reports the
+		// capability available and the gate stops failing open.
+		check(
+			"V2 todo capability reports available when experimental.todo is enabled",
+			todoProbe.status === 0 &&
+				(flagged?.tools ?? []).includes("todowrite") &&
+				flagged?.status?.todoCapability === "available",
+		);
+		// The main pass ran with the flag off, so the capability there must be
+		// unavailable. Together the two passes prove the probe reads the
+		// registry instead of inferring from history.
+		check(
+			"V2 todo capability reports unavailable when experimental.todo is disabled",
+			(headlessAccountability?.tools ?? []).includes("todowrite") === false &&
+				headlessAccountability?.status?.todoCapability === "unavailable",
+		);
+	} finally {
+		writeFileSync(todoConfig, previousConfig);
+		writeFileSync(accountabilityMarker, previousAccountability);
+	}
 }
 
 if (process.env.WORKFLOW_GUARD_LIVE_E2E !== "1") {
@@ -450,7 +535,7 @@ console.log(`  Using live model: ${liveModel}`);
 
 // 3. Test: Direct edit without task list is blocked by the loaded plugin
 console.log("  Running live OpenCode prompt to verify plugin intercept...");
-const run1 = runOpenCode(["--model", liveModel, "--print-logs", "--log-level", "DEBUG", "Do not call todowrite. Invoke bash immediately with exactly this command: printf blocked > blocked.txt. This is a guard test; make the tool call even if you expect rejection."], 120_000);
+const run1 = runOpenCode(["--model", liveModel, "--print-logs", "--log-level", "debug", "Do not call todowrite. Invoke bash immediately with exactly this command: printf blocked > blocked.txt. This is a guard test; make the tool call even if you expect rejection."], 120_000);
 
 const output1 = run1.stdout + run1.stderr;
 const adapterInitialized = existsSync(initializedMarker);

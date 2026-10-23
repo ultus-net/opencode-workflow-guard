@@ -6,9 +6,11 @@
  * - `ctx.tool.transform` for custom tools and tool-description enrichment
  * - `ctx.tool.hook("execute.before"/"execute.after")` for deterministic enforcement
  * - `ctx.session.hook("context"/"compaction"/"prompt")` for system guidance,
- *   compaction context, and recovery checkpoints
- * - `ctx.permission.hook("evaluate")` for permission journaling
+ *   read-only tool pruning, compaction context, and recovery checkpoints
+ * - `ctx.command.transform` for the server-side `/guard-status` command
+ * - `ctx.permission.hook("evaluate")` for the pre-execution deny seat
  * - `ctx.shell.hook("create.before")` for env scrubbing
+ * - `ctx.mcp.list()` plus `mcp.tools.changed` for the guarded-server inventory
  * - `ctx.event.subscribe()` for tool outcomes, session lifecycle, and claims-vs-evidence
  *
  * The V1 SDK client surface (`TodoSdkClient`) is satisfied by an adapter so
@@ -20,7 +22,7 @@ import { Message } from "@opencode/ai";
 import { z } from "zod";
 import { join, resolve } from "node:path";
 import type { TodoSdkClient } from "./types.ts";
-import { scanSessionTodos, toolPartName } from "./v2-todo.ts";
+import { detectTodoCapability, recordTodoCapability, recordedTodoCapability, scanSessionTodos, toolPartName } from "./v2-todo.ts";
 import { findGitRoot, reloadProjectConfig } from "./project-config.ts";
 import {
 	setWorkspaceRoot,
@@ -31,6 +33,7 @@ import {
 	getSessionMutationCount,
 	sessionVerifyResults,
 	sessionReviews,
+	clearTodoSessionState,
 	isRecoveryCheckpointsEnabled,
 	isLearningEnabled,
 	isProjectMemoryEnabled,
@@ -65,6 +68,13 @@ import { loadedPluginVersion } from "./version.ts";
 import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, recordUserMessage } from "../policies/continuation.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, nextRecoveryRun } from "./checkpoint.ts";
 import { buildCompactionContext, guardToolCall } from "../workflow-guard.ts";
+import { registerPluginInstance, releasePluginInstance } from "./plugin-instance.ts";
+import { claimToolCall, releaseToolCallClaim } from "./call-claims.ts";
+import { evaluatePermissionSeat } from "./permission-seat.ts";
+import { pruneToolsForReadOnlyRole } from "./read-only-tools.ts";
+import { registerGuardStatusCommand } from "./guard-command.ts";
+import { createHostWorktreePort } from "./host-worktree.ts";
+import { listHostMcpServerNames, recordHostMcpServers } from "./mcp-inventory.ts";
 
 type V2Context = Plugin.Context;
 
@@ -88,7 +98,7 @@ function createV2SdkClient(ctx: V2Context): TodoSdkClient {
 			},
 		},
 		session: {
-			todo: async ({ path }) => ({ data: await scanSessionTodos(ctx, path.id) }),
+			todo: async ({ path }) => ({ data: await scanSessionTodos(ctx, path.id, recordedTodoCapability()) }),
 			get: async ({ path }) => {
 				const session = await ctx.session.get({ sessionID: path.id });
 				return { data: { parentID: (session as { parentID?: string }).parentID, title: (session as { title?: string }).title } };
@@ -110,7 +120,7 @@ function createV2SdkClient(ctx: V2Context): TodoSdkClient {
 // ── Builtin tool description enrichment ───────────────────────────────────────
 
 const TODOWRITE_SUFFIX =
-	"\n\nWorkflow Guard lifecycle: each todowrite call replaces the complete task list. Preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled; do not omit active tasks when adding new work. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply. Proactively call guard_next_tasks when planning work to discover existing roadmap/TODOs, and guard_status to check outstanding requirements.";
+	"\n\nWorkflow Guard lifecycle: use todowrite to plan before working - it is the only view of progress the operator has, and every file mutation is gated on it. Each call replaces the complete task list: preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled, and do not omit active tasks when adding new work. A task may be marked completed only after its own work is recorded: the guard blocks a completion that has no file mutation in that task's active window, and one mutation cannot vouch for several completions. If a task is genuinely read-only (review, investigation, reading), append the marker `[read-only]` to its text; every such use is journaled. Use `cancelled` for work that was deliberately dropped. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply. Proactively call guard_next_tasks when planning work to discover existing roadmap/TODOs, and guard_status to check outstanding requirements.";
 
 const EDIT_SUFFIX =
 	"\n\nWorkflow Guard requirement: Modifications require an active task in todowrite (status pending or in_progress), a feature branch (edits on main/master are blocked), and a prior read of existing files in the current session.";
@@ -122,12 +132,14 @@ const SUBAGENT_SUFFIX =
 // host's tool registry; `ToolEditor.update` ignores missing IDs, so extra
 // candidates are harmless no-ops.
 //
-// V2.0.10 builtin surface (docs + binary): read, glob, grep, edit, write,
-// patch, shell, webfetch, websearch, question, skill, subagent, execute.
-// - There is no builtin `todowrite` (the V1 name). Todowrite tool parts seen
-//   in V2 sessions come from ACP agents that supply their own tools; those
-//   are not in the server registry, so this enrichment cannot reach them.
-//   The candidate is kept for hosts that do register a todowrite tool.
+// Version boundary for the builtin surface:
+// - V2.0.x (docs + binary, up to and including 2.0.15): read, glob, grep,
+//   edit, write, patch, shell, webfetch, websearch, question, skill, subagent,
+//   execute. There is no builtin `todowrite`; todowrite parts in V2 sessions
+//   come from ACP agents that supply their own tools, which are not in the
+//   server registry, so this enrichment cannot reach them.
+// - V2.1.x adds a builtin `todowrite` behind the `experimental.todo` config
+//   key, so the candidate below reaches a real registry entry there.
 // - The V1 subagent tool `task` was renamed to `subagent`; both are kept as
 //   candidates for the same reason.
 const ENRICHMENT_TARGETS: Array<{ candidates: string[]; suffix: string; marker: string }> = [
@@ -141,7 +153,10 @@ const ENRICHMENT_TARGETS: Array<{ candidates: string[]; suffix: string; marker: 
 export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	const hostRoot = ctx.location?.directory || process.cwd();
 	const hostIsFilesystemRoot = resolve(hostRoot) === resolve(hostRoot, "..");
-	const projectDirectory = (ctx.location as { project?: { directory?: string; canonical?: string } })?.project?.directory;
+	// `location.project` is required by the host's `Location.Info` schema
+	// (`@opencode/schema/dist/location.d.ts`), so the optional read is only a
+	// runtime guard for harnesses and stubs that construct a partial context.
+	const projectDirectory = ctx.location.project?.directory;
 	let effectiveRoot = hostIsFilesystemRoot && projectDirectory && resolve(projectDirectory) !== resolve(projectDirectory, "..")
 		? projectDirectory
 		: hostRoot;
@@ -154,6 +169,20 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	}
 
 	const client = createV2SdkClient(ctx);
+	// Load-once guard: OpenCode 2 merges plugin arrays, so the same package
+	// named in global and project config loads this module twice. A duplicate
+	// stays inert (no hooks, no tools, no second workspace latch) and leaves a
+	// warn-level record; see lib/plugin-instance.ts.
+	const instance = registerPluginInstance({ workspaceRoot: effectiveRoot });
+	if (instance.duplicate) {
+		try {
+			console.warn(
+				`[workflow-guard] warn: duplicate plugin load for ${instance.workspaceRoot} (module ${instance.modulePath}); ` +
+					"this instance stays inert. Configure the guard in one location only.",
+			);
+		} catch {}
+		return () => releasePluginInstance(instance.key);
+	}
 	setWorkspaceRoot(effectiveRoot);
 	setSdkClient(client);
 	reloadProjectConfig(effectiveRoot);
@@ -185,7 +214,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	const toolOutcomes = new ToolOutcomeTracker();
 
 	// ── Custom tools + builtin description enrichment ──
-	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client });
+	const customTools = createCustomTools({ effectiveRoot, projectMemoryEnabled, learningEnabled, projectMemory, followupStore, portableMemoryPath, learningInterventions, client, hostWorktree: createHostWorktreePort(ctx), todoCapability: () => recordedTodoCapability(), hostVersion: () => ctx.app?.version });
 	await ctx.tool.transform((editor) => {
 		for (const [name, definition] of Object.entries(customTools)) {
 			editor.add({
@@ -222,8 +251,32 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		}
 	});
 
+	// ── /guard-status command ──
+	// Reachable from every V2 client without the optional TUI companion. The
+	// report is produced by the same guard_status implementation the tool uses,
+	// then delivered as a synthetic message so it costs no model turn.
+	await registerGuardStatusCommand(ctx, {
+		runStatus: async (sessionID) => {
+			const boundWorktree = getSessionBoundWorkspace(sessionID);
+			const result = await (customTools.guard_status as unknown as {
+				execute: (input: unknown, context: unknown) => Promise<unknown>;
+			}).execute({}, {
+				sessionID,
+				...(boundWorktree ? { worktree: boundWorktree } : {}),
+				directory: boundWorktree ?? effectiveRoot,
+			});
+			return typeof result === "string" ? result : JSON.stringify(result);
+		},
+		effectiveRoot,
+		client,
+	});
+
 	// ── Deterministic enforcement ──
 	await ctx.tool.hook("execute.before", (event) => {
+		// One policy decision per tool call even if a second instance with a
+		// different module path (global cache copy plus a source checkout)
+		// registered too. The owner evaluates; the other defers.
+		if (!claimToolCall(instance.key, event.sessionID, event.id, event.tool)) return;
 		const toolWorktree = getSessionBoundWorkspace(event.sessionID) || effectiveRoot;
 		return runWithRuntimeState(toolWorktree, client, async () => {
 			const args = event.input;
@@ -234,6 +287,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				agent: event.agent,
 			});
 			if (reason !== undefined) {
+				releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
 				await showBlockToast(reason);
 				const failureCount = event.sessionID ? toolOutcomes.getFailureCount(event.sessionID) : 0;
 				const circuitBreakerSuffix = failureCount >= 2
@@ -245,7 +299,12 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			const record = asRecord(args);
 			const workdir = typeof record?.workdir === "string" ? record.workdir : undefined;
 			const filePath = typeof record?.filePath === "string" ? record.filePath : (typeof record?.path === "string" ? record.path : undefined);
-			registerSessionWorkspaceFromToolCall(event.sessionID, { workdir, filePath, toolWorktree });
+			await registerSessionWorkspaceFromToolCall(event.sessionID, {
+				workdir,
+				filePath,
+				toolWorktree,
+				mutating: EDIT_TOOL_NAMES.has(event.tool) || SHELL_TOOL_NAMES.has(event.tool),
+			});
 			if (event.tool === "read") {
 				const target = editTargets(args, toolWorktree)[0];
 				if (target) {
@@ -286,6 +345,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	});
 
 	await ctx.tool.hook("execute.after", async (event) => {
+		releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
 		const startedAt = toolLifecycle.finish(event.sessionID, event.id);
 		const outcome = toolOutcomes.recordFallbackCompleted(event.sessionID, event.id, event.tool, startedAt === undefined ? undefined : Date.now() - startedAt);
 		if (outcome) {
@@ -339,6 +399,25 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	// ── Session request hooks ──
 	await ctx.session.hook("context", (event) => {
 		try {
+			// A read-only role must not be able to *choose* a mutating tool. The
+			// execute.before seat still denies it, but pruning the per-request
+			// tool snapshot removes the call before the model plans it. Pruning
+			// is a narrowing only: tools supplied outside the host snapshot
+			// (ACP agents, nested Code Mode calls) still meet the backstop.
+			if (event.agent && isReadOnlyRole(event.agent)) {
+				const removed = pruneToolsForReadOnlyRole(event.tools as Record<string, unknown> | undefined);
+				if (removed.length > 0) {
+					audit({
+						ts: new Date().toISOString(),
+						sessionID: event.sessionID,
+						tool: "session.context",
+						decision: "block",
+						phase: "decision",
+						reason: "read_only_role_tools_pruned",
+						input: { agent: event.agent, removed },
+					});
+				}
+			}
 			const existing = Array.isArray(event.system)
 				? event.system.map((part) => (typeof part === "string" ? part : (part as { text?: string }).text ?? "")).join("\n")
 				: "";
@@ -388,7 +467,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				priorityContextBlocks.push(
 					`## Active Tasks${attribution}\n` +
 						lines.join("\n") +
-						"\nComplete tasks efficiently - mark finished items as completed and address remaining ones.",
+						"\nComplete tasks efficiently and address remaining ones. Mark a task completed only after its work is actually done: the guard blocks a completion with no recorded file mutation in that task's window. Append `[read-only]` to a genuinely read-only task (review, investigation), and use `cancelled` for work that was dropped.",
 				);
 			}
 
@@ -451,22 +530,57 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		} catch {}
 	});
 
-	// ── Permission journaling ──
-	await ctx.permission.hook("evaluate", (event) => {
+	// ── Permission seat: deny before the tool starts ──
+	// `evaluate` sees normalized `action`/`resources` and runs before the tool,
+	// so it is the earliest hard stop for shell commands, file mutations, and
+	// guarded MCP calls. It cannot see raw tool input, so the raw-argument work
+	// (todo lifecycle, stale-write, post-edit snapshots) stays in
+	// `execute.before`. See lib/permission-seat.ts for the split and the limits.
+	//
+	// Flow limit, documented by the host: an explicit configured `deny` is
+	// resolved before this hook runs, so the hook never sees it. A guard audit
+	// therefore cannot explain a configured deny; only host config can. The
+	// hook runs for allow/ask, and a denial here is always a tightening.
+	await ctx.permission.hook("evaluate", async (event) => {
+		const configuredEffect = event.effect;
 		try {
+			const seat = await evaluatePermissionSeat(
+				{
+					sessionID: event.sessionID,
+					agent: event.agent,
+					action: event.action,
+					resources: event.resources,
+					effect: configuredEffect,
+				},
+				{ workspaceRoot: effectiveRoot, client },
+			);
+			if (seat.decision) {
+				event.effect = "deny";
+				event.message = seat.decision.message;
+			}
 			audit({
 				ts: new Date().toISOString(),
 				sessionID: event.sessionID,
 				tool: "permission.ask",
-				decision: event.effect === "deny" ? "block" : "allow",
+				decision: seat.effect === "deny" ? "block" : "allow",
+				phase: "decision",
+				reason: seat.decision?.code,
+				policyDecision: seat.decision,
 				input: {
 					action: event.action,
 					resources: event.resources,
 					agent: event.agent,
-					effect: event.effect,
+					configuredEffect,
+					mappedTool: seat.mappedTool,
 				},
 			});
-		} catch {}
+		} catch (error) {
+			// Fail closed: a seat that cannot evaluate must not become a pass.
+			try {
+				event.effect = "deny";
+				event.message = `[workflow-guard permission.evaluate] Blocked: the guard could not evaluate this permission request (${(error as Error)?.message ?? "unknown error"}).`;
+			} catch {}
+		}
 	});
 
 	// ── Shell env scrubbing ──
@@ -488,6 +602,47 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		} catch {}
 	});
 
+	// ── MCP inventory ──
+	// Seed the guarded token set from host-declared servers, then refresh it
+	// whenever the host reports that a server's tools changed. Widen-only:
+	// removal adds nothing, so a renamed or dropped server can never unguard a
+	// tool that still names a live system. The static defaults in
+	// policies/mcp.ts stay the floor.
+	const seedMcpInventory = async () => {
+		try {
+			const added = recordHostMcpServers(await listHostMcpServerNames(ctx));
+			if (added.length > 0) {
+				audit({
+					ts: new Date().toISOString(),
+					tool: "mcp.inventory",
+					decision: "allow",
+					phase: "event",
+					reason: "host_mcp_servers_widened",
+					input: { added },
+				});
+			}
+		} catch {}
+	};
+	await seedMcpInventory();
+
+	// ── Todo capability probe ──
+	// Ask the host's registry whether `todowrite` exists, instead of inferring
+	// it from history. On 2.0.x the answer is no, so the mutation gate fails
+	// open; on 2.1.x with `experimental.todo: true` the answer is yes, so a
+	// session that never planned is gated. Probe once: the registry is fixed
+	// for the life of the process.
+	try {
+		const capability = await detectTodoCapability(ctx);
+		recordTodoCapability(capability);
+		audit({
+			ts: new Date().toISOString(),
+			tool: "todo.capability",
+			decision: "allow",
+			phase: "event",
+			reason: `todo_capability_${capability}`,
+		});
+	} catch {}
+
 	// ── Event stream ──
 	const controller = new AbortController();
 	void (async () => {
@@ -500,6 +655,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 						client,
 						toolLifecycle,
 						toolOutcomes,
+						refreshMcpInventory: seedMcpInventory,
 					});
 				} catch {}
 			}
@@ -508,7 +664,10 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 		}
 	})();
 
-	return () => controller.abort();
+	return () => {
+		controller.abort();
+		releasePluginInstance(instance.key);
+	};
 };
 
 // ── Event handling ────────────────────────────────────────────────────────────
@@ -518,6 +677,8 @@ interface V2EventState {
 	client: unknown;
 	toolLifecycle: ToolInvocationLifecycle;
 	toolOutcomes: ToolOutcomeTracker;
+	/** Re-read the host MCP roster after `mcp.tools.changed`. */
+	refreshMcpInventory?: () => Promise<void>;
 }
 
 async function handleV2Event(
@@ -525,6 +686,14 @@ async function handleV2Event(
 	state: V2EventState,
 ): Promise<void> {
 	const { effectiveRoot, client, toolLifecycle, toolOutcomes } = state;
+
+	if (event.type === "mcp.tools.changed") {
+		// The host's server roster or one server's tool list changed. Re-read it
+		// so a newly connected live-system server is guarded before its tools
+		// are callable. Widen-only: this can add tokens, never remove them.
+		await state.refreshMcpInventory?.();
+		return;
+	}
 
 	if (event.type === "session.message.content.updated") {
 		const data = event.data as { sessionID?: unknown; content?: unknown } | undefined;
@@ -625,6 +794,7 @@ async function handleV2Event(
 			clearReadFingerprints(sessionID);
 			toolLifecycle.clearSession(sessionID);
 			toolOutcomes.clearSession(sessionID);
+			clearTodoSessionState(sessionID);
 			toolLifecycle.takeRecoveryRun(sessionID);
 			await runWithRuntimeState(effectiveRoot, client, () => clearContinuationState(sessionID));
 		}
@@ -646,8 +816,24 @@ async function handleV2Event(
 		});
 		return;
 	}
+	// `command.executed` exists in the V2 event stream (`data: { name, sessionID,
+	// arguments, messageID }`) and carries what the V1 audit wanted: the slash
+	// command name, its arguments, and the session. It is journaled here rather
+	// than dropped, so a command that mutates workspace state stays attributable.
+	if (event.type === "command.executed") {
+		const data = event.data as { sessionID?: unknown; name?: unknown; arguments?: unknown } | undefined;
+		audit({
+			ts: new Date().toISOString(),
+			sessionID: typeof data?.sessionID === "string" ? data.sessionID : undefined,
+			tool: "command.executed",
+			decision: "allow",
+			phase: "event",
+			reason: typeof data?.name === "string" ? data.name : undefined,
+			input: summarizeInput({ name: data?.name, arguments: data?.arguments }),
+		});
+		return;
+	}
 	// Note on V1 events without a V2 counterpart:
-	// - `command.executed`: no V2 event stream equivalent (audit-only in V1; dropped).
 	// - `permission.updated`: replaced by `permission.asked`/`permission.replied` above.
 	// - `session.created`: exists in the V2 union but needed no V1 behavior beyond
 	//   the audit above; session state resets happen on `session.deleted`.
