@@ -1816,6 +1816,7 @@ check("tokenised matching does not read obvious non-docs tools as research", !is
 check("guard inspection tools are not research", !isResearchTool("guard_review_followup_resolve") && !isResearchTool("guard_status") && !isResearchTool("guard_why"));
 check("generic readers and resolvers are not research", !isResearchTool("read_wiki_index") && !isResearchTool("resolve_conflict") && !isResearchTool("read_docs_page"));
 check("a bare docs-ish token is not enough on its own", !isResearchTool("docker") && !isResearchTool("doc") && !isResearchTool("wiki"));
+check("documented docs servers match through their namespace", isResearchTool("mcp__context7__get-library-docs") && isResearchTool("mcp__deepwiki__read_wiki") && isResearchTool("deepwiki_read_wiki"));
 check("operator-declared research patterns are honoured", isResearchTool("mcp__acme__lookup", ["acme"]) && !isResearchTool("mcp__acme__lookup"));
 check("does not treat unrelated tools as research", !isResearchTool("bash") && !isResearchTool("edit") && !isResearchTool("read"));
 
@@ -5673,6 +5674,33 @@ releaseToolCallClaim("module-a", "s-v2-claim", "call-claim", "read");
 check("a settled call can be claimed by the next copy", claimToolCall("module-b", "s-v2-claim", "call-claim", "read") === true);
 check("claims without a call id are never shared across instances", claimToolCall("module-a", "s-v2-claim", undefined, "read") === true && claimToolCall("module-b", "s-v2-claim", undefined, "read") === true);
 resetToolCallClaimsForTesting();
+// A floor block must release the claim it acquired before the throw, or the
+// next copy of this call can never run and the block leaks into a timeout.
+resetToolCallClaimsForTesting();
+const v2FloorSession = "s-v2-floor-claim";
+recordLiveDocsFailure(v2FloorSession);
+recordLiveDocsFailure(v2FloorSession);
+recordLiveDocsFailure(v2FloorSession);
+let v2FloorThrow = "";
+try {
+	await v2Owner.state.beforeHooks[0]?.({
+		tool: "write",
+		sessionID: v2FloorSession,
+		agent: "build",
+		messageID: "msg-v2-floor",
+		id: "call-v2-floor",
+		input: { filePath: join(v2DuplicateRoot, "floor.txt"), content: "x" },
+	});
+} catch (err) {
+	v2FloorThrow = (err as Error).message;
+}
+check("V2 floor block aborts the call", v2FloorThrow.includes("no live documentation lookup"));
+check(
+	"a V2 floor block releases its tool-call claim",
+	claimToolCall("module-after-floor", v2FloorSession, "call-v2-floor", "write") === true,
+);
+releaseToolCallClaim("module-after-floor", v2FloorSession, "call-v2-floor", "write");
+clearLiveDocsFloor(v2FloorSession);
 if (prevDuplicateDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDuplicateDataHome;
 rmSync(v2DuplicateRoot, { recursive: true, force: true });

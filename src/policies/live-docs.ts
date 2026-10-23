@@ -52,8 +52,12 @@ const RESEARCH_SERVER_TOKENS = new Set([
 	"firecrawl",
 ]);
 
-/** Tool-name segments that name a documentation lookup API directly. */
-const RESEARCH_API_TOKENS = new Set(["docs_search", "docssearch", "get-library-docs", "library_docs"]);
+/**
+ * Tool-name segments that name a documentation lookup API. Names are split on
+ * non-alphanumerics first, so a multi-segment name matches on its parts: the
+ * `get-library-docs` tool matches via the `context7` server token.
+ */
+const RESEARCH_API_TOKENS = new Set(["docssearch", "searchdocs"]);
 
 /**
  * A research tool is a recognised builtin/alias name, a documented MCP source
