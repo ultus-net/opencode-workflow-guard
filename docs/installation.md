@@ -20,7 +20,7 @@ verified it.
 | Guard | OpenCode qualified | Hook seats exercised | Notes |
 |---|---|---|---|
 | 1.16.x | 2.0.15 | `permission.hook("evaluate")`, `tool.hook("execute.before"/"execute.after")`, `session.hook("context")`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client | Unit and package-loader verified. Live model-driven probes reached the provider and were classified `live unavailable` (`Model unavailable: openrouter/openrouter/auto`), so no guard verdict was produced. |
-| 1.16.x | 2.1.3 | `permission.hook("evaluate")`, `tool.hook(...)`, `session.hook(...)`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client, `todowrite` behind `experimental.todo` | Package-loader and headless-runtime verified (`npm run test:install`: 27 passed). Live host probe confirmed `ctx.tool.list()` exposes `todowrite` with `experimental.todo: true` and omits it when false. Live static-policy denial canary produced `Blocked by configuration policy`. |
+| 1.16.x | 2.1.3 | `permission.hook("evaluate")`, `tool.hook(...)`, `session.hook(...)`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client, `todowrite` behind `experimental.todo` | Package-loader and headless-runtime verified (`npm run test:install`: 30 passed). Live host probe confirmed `ctx.tool.list()` exposes `todowrite` with `experimental.todo: true` and omits it when false. Live static-policy denial canary produced `Blocked by configuration policy`. |
 | 1.16.x | 1.18.32 (`@opencode-ai/plugin`) | V1 `PluginModule` loader, native todo endpoint | Compatibility export only; unit-tested, no live host probe. |
 
 The 2.1.3 pins require the 2.1.x package set. `@opencode/plugin` and
