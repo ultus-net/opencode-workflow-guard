@@ -20,18 +20,18 @@ Policy decisions and operational evidence are separate concepts.
 
 `PolicyDecision` is the result of evaluating whether an operation may proceed. It should provide a stable machine-readable status and code, an optional policy identifier, a human-readable message, and bounded structured details. Human block text, audit entries, `guard_why`, and controller-facing output should derive from this result rather than independently interpreting policy state.
 
-`EvidenceRecord` represents operational proof or observation such as verification, secondary review, tool outcome, policy evaluation, or lifecycle state. Evidence records should carry common project/session/worktree provenance where applicable. Existing purpose-built stores remain authoritative; this work should introduce a common representation rather than another database.
+`EvidenceRecord` represents operational proof or observation. Examples are verification, secondary review, tool outcome, policy evaluation, and lifecycle state. Evidence records should carry common project, session, and worktree provenance where applicable. Existing purpose-built stores remain authoritative. This work should introduce a common representation rather than another database.
 
 Evidence must be bound to the subject it actually establishes. Where applicable, that means identifying the workspace/worktree, commit or worktree fingerprint, session/call, actor or reviewer, policy/version, and observation time. A historical fact such as "verification passed" is not sufficient to establish that the current worktree is verified unless its subject still matches current state.
 
 Operational evidence should distinguish confidence classes rather than treating all machine-readable claims as equivalent:
 
 - Deterministic observation: repository state, changed files, tool execution/outcome, test exit status, or another directly observed fact.
-- Attestation: a reviewer, model, or human records a judgment such as approval. The fact that the attestation occurred is observable; the judgment is not converted into deterministic truth.
+- Attestation: a reviewer, model, or human records a judgment such as approval. The fact that the attestation occurred is observable. The judgment is not converted into deterministic truth.
 - Derived state: a reproducible conclusion such as "verification is fresh" computed from subject-bound observations and current state.
 - Agent assertion: natural-language claims such as "tests pass" or "review is complete". These may be useful diagnostics but are never sufficient evidence for a safety or finalization gate by themselves.
 
-Prefer outcome and state predicates over prescribed trajectories. Workflow Guard may require demonstrable end state or consequential checkpoints, but should not require one exact sequence of otherwise-valid agent actions when the desired state can be established directly.
+Prefer outcome and state predicates over prescribed trajectories. Workflow Guard may require demonstrable end state or consequential checkpoints. It should not require one exact sequence of otherwise-valid agent actions when the desired state can be established directly.
 
 Project memory and learning evidence remain separate from `EvidenceRecord`. Project memory represents durable repository knowledge. Learning evidence represents observations from real Socratic interactions. Neither should be forced into an allow/block or operational-proof model.
 
@@ -46,7 +46,7 @@ Project memory and learning evidence remain separate from `EvidenceRecord`. Proj
 7. Expand adversarial tests for stable decision codes, provenance invalidation, option/profile precedence, and machine-readable status. Add headless/server coverage proving core enforcement does not depend on the TUI or interactive approval.
 8. Update policy, installation, and managed-deployment documentation as behavior becomes user-visible.
 
-The accountability contracts now support an opt-in bounded autonomous-continuation add-on ("Ralph mode"). Its initial implementation only continues an agent while explicitly owned native todos remain unfinished; it does not interpret configured documents or invent completion criteria. It is disabled by default (including under the `autonomous` profile), user-interruptible, iteration-bounded, and preserves all core guardrails. It reports observable outcomes such as `completed`, `budget_exhausted`, or `user_stopped`; `blocked` is reserved for a demonstrable guard state rather than inferred from repeated idle events. Ralph remains an optional orchestration consumer rather than part of the accountability kernel.
+The accountability contracts now support an opt-in bounded autonomous-continuation add-on ("Ralph mode"). Its initial implementation only continues an agent while explicitly owned native todos remain unfinished. It does not interpret configured documents or invent completion criteria. It is disabled by default, including under the `autonomous` profile. It is user-interruptible, iteration-bounded, and preserves all core guardrails. It reports observable outcomes such as `completed`, `budget_exhausted`, and `user_stopped`. `blocked` is reserved for a demonstrable guard state rather than inferred from repeated idle events. Ralph remains an optional orchestration consumer rather than part of the accountability kernel.
 
 ## Configuration Boundary
 
@@ -54,13 +54,13 @@ Safety invariants stay core and are not weakened by operation profiles or option
 
 Capabilities that express user workflow preference, add continuity/context, or approach orchestration must be configurable. Examples include project memory, Socratic learning, recovery checkpoints, review/documentation requirements, bounded continuation behavior, and future autonomous-operation conveniences. Optional capabilities must fail independently where practical so disabling or failing an add-on does not disable core enforcement.
 
-Workflow Guard must not become responsible for planning work, choosing the next task, delegating tasks, autonomous retry loops, sequencing agents, or deciding when an external job should terminate. External SDK/server clients or dedicated add-ons own orchestration. The existing bounded `session.idle` continuation may enforce already-owned unfinished work but must not grow into an orchestration loop.
+Workflow Guard must not become responsible for planning work, choosing the next task, or delegating tasks. It also must not own autonomous retry loops, agent sequencing, or the decision that an external job should terminate. Those are orchestration duties. External SDK or server clients and dedicated add-ons own them. The bounded `session.idle` continuation may enforce already-owned unfinished work. It must never grow into an orchestration loop.
 
 The same boundary applies to review. Workflow Guard can prove that a review occurred against a particular subject, preserve the reviewer's disposition and findings, and enforce a configured review requirement. It must not infer that an approval proves correctness, choose reviewers, launch review loops, negotiate findings, or decide what work should happen next.
 
 ## External Research Rationale
 
-Recent OpenAI and Anthropic engineering/research material independently supports this architecture. These sources are design inputs rather than normative dependencies; Workflow Guard should continue to rely on supported OpenCode APIs and its own tested contracts.
+Recent OpenAI and Anthropic engineering and research material independently supports this architecture. These sources are design inputs rather than normative dependencies. Workflow Guard should continue to rely on supported OpenCode APIs and its own tested contracts.
 
 - OpenAI's February 2026 [Harness engineering: leveraging Codex in an agent-first world](https://openai.com/index/harness-engineering/) describes mechanically enforced architectural invariants around agent autonomy. The applicable inference for Workflow Guard is to enforce boundaries centrally while leaving implementation strategy and task execution to the agent.
 - OpenAI's March 2025 [Detecting misbehavior in frontier reasoning models](https://openai.com/index/chain-of-thought-monitoring/) reports coding agents exploiting evaluation loopholes, including weakening or altering verification. The applicable inference is to retain independent provenance about changed artifacts and verification subjects rather than trusting reported success or an undifferentiated test-pass signal.
@@ -71,11 +71,11 @@ Recent OpenAI and Anthropic engineering/research material independently supports
 - Anthropic's September 2025 [Effective context engineering for AI agents](https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents) recommends the smallest high-signal context and just-in-time retrieval. The applicable inference is that `guard_status` should expose compact current state and stable evidence references rather than inject an ever-growing accountability transcript.
 - Anthropic's December 2024 [Building effective agents](https://www.anthropic.com/engineering/building-effective-agents) separates deterministic workflows from model-directed agents, recommends simple composable mechanisms, and uses programmatic gates where checks are appropriate. The applicable inference is to keep Workflow Guard a guardrail/accountability layer, not an orchestrator-worker or evaluator-optimizer implementation.
 
-The combined design principle is: Workflow Guard should answer, "May this operation happen, given what can actually be demonstrated about the current state?" It should not answer, "What should the agent do next?"
+The combined design principle is this. Workflow Guard answers one question: "May this operation happen, given what can actually be demonstrated?" It does not answer, "What should the agent do next?"
 
 ## OpenCode API Boundary
 
-Use supported semantic OpenCode APIs wherever they provide enough information. `tool.execute.before` is the supported deterministic tool-blocking boundary. Current `session.idle` events and `experimental.text.complete` do not expose an explicit supported completion-veto result, so Workflow Guard must not emulate a hard completion gate through undocumented exception behavior.
+Use supported semantic OpenCode APIs wherever they provide enough information. `tool.execute.before` is the supported deterministic tool-blocking boundary. Current `session.idle` events and `experimental.text.complete` expose no explicit supported completion-veto result. Workflow Guard must therefore not emulate a hard completion gate through undocumented exception behavior.
 
 Machine-readable controller outcomes should therefore come from Workflow Guard's own structured contracts, tools, and audit trail until OpenCode exposes a stronger lifecycle decision hook.
 
@@ -84,7 +84,7 @@ Shell matching remains defense in depth rather than a sandbox. Prefer structured
 ## Compatibility And Non-Goals
 
 - Preserve existing human-readable block messages at the hook boundary while internal consumers migrate to structured decisions.
-- Preserve existing verification history, review state, project-memory databases, learning profiles, and review-follow-up storage; migrate representations before considering storage changes.
+- Preserve existing verification history, review state, project-memory databases, learning profiles, and review-follow-up storage. Migrate representations before considering storage changes.
 - Do not merge project memory, learner evidence, and operational evidence into a universal event store.
 - Do not claim managed deployment proves plugin provenance when OpenCode cannot provide that guarantee.
 - Do not add a hard completion gate until OpenCode exposes a supported block/continue lifecycle hook.

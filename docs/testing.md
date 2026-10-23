@@ -13,18 +13,18 @@ npm run typecheck   # or: npm run build
 ```
 
 ### 2. In-Memory Unit Tests
-Runs the comprehensive unit and adversarial tests covering all guard policies, lifecycle validation, subagent parent-chain resolution, privilege-isolated verification, and path/symlink boundary checks:
+Runs the unit and adversarial tests covering all guard policies, lifecycle validation, subagent parent-chain resolution, privilege-isolated verification, and path/symlink boundary checks:
 ```bash
 npm test            # runs test.mts with isolated XDG state/data (Node >= 22.18)
 ```
 
 ### 3. OpenCode Runtime & Install Tests
-Packs the npm tarball, installs it into an isolated project to verify the modular entrypoint resolves, then copies the server source into an isolated `.opencode/workflow-guard-source/` directory and exposes its `WorkflowGuard` plugin function through an explicitly registered `.opencode/plugins/` adapter. A provider-free config probe verifies OpenCode resolves that local plugin before the opt-in model-driven `opencode run` probes exercise its hooks:
+Packs the npm tarball into an isolated project to verify the modular entrypoint resolves. It then copies the server source into an isolated `.opencode/workflow-guard-source/` directory. That source's `WorkflowGuard` plugin function is exposed through an explicitly registered `.opencode/plugins/` adapter. A provider-free config probe verifies OpenCode resolves that local plugin before the opt-in model-driven `opencode run` probes exercise its hooks:
 ```bash
 npm run test:install # package install + provider-free OpenCode loader check
 WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # also run model-driven policy probes with OpenCode's most recently selected model
 ```
-Package and loader checks remain deterministic. Live probes explicitly select the first entry in OpenCode's persisted recent-model state (`${XDG_STATE_HOME:-~/.local/state}/opencode/model.json`) instead of silently inheriting the configured default model. Set `WORKFLOW_GUARD_LIVE_MODEL=provider/model` to override that selection; provider credentials still come from the normal OpenCode environment. If the selected model provider rejects a live prompt before guard behavior can run because credits, rate limits, capacity, overload, or an unresolvable model make the provider unavailable, that live case is reported as unavailable rather than as a guard failure. The classifier matches the host's literal `Model unavailable:` error line rather than the bare phrase, so model prose cannot mask a real guard regression. Other live-runtime failures still fail the suite.
+Package and loader checks remain deterministic. Live probes explicitly select the first entry in OpenCode's persisted recent-model state (`${XDG_STATE_HOME:-~/.local/state}/opencode/model.json`). They never silently inherit the configured default model. Set `WORKFLOW_GUARD_LIVE_MODEL=provider/model` to override that selection. Provider credentials still come from the normal OpenCode environment. A provider may reject a live prompt before guard behavior can run. That happens when credits, rate limits, capacity, overload, or an unresolvable model make the provider unavailable. Such a case is reported as unavailable rather than as a guard failure. The classifier matches the host's literal `Model unavailable:` error line rather than the bare phrase, so model prose cannot mask a real guard regression. Other live-runtime failures still fail the suite.
 
 ### 4. Full Verification Suite
 Runs typecheck, unit tests, and live runtime installation tests in sequence:
