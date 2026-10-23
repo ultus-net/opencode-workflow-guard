@@ -43,7 +43,7 @@ therefore looks applied on the other host and enforces nothing.
 
 Both hosts read only their own key, so carrying both cannot double-apply a rule
 or make them conflict. `--format 2.0` and `--format next` exist for a pinned
-host; `both` is the default because the silent no-op is the failure this
+host. `both` is the default, because the silent no-op is the failure this
 surface exists to prevent.
 
 Schema acceptance is not runtime acceptance. `@opencode/schema` 2.0.10 admits a

@@ -3,7 +3,7 @@
 ## Reporting a Vulnerability
 
 **Do not open a public GitHub issue** for security vulnerabilities or guard
-bypasses. The plugin enforces safety boundaries; public disclosure of a
+bypasses. The plugin enforces safety boundaries. Public disclosure of a
 bypass could put projects using it at risk.
 
 Report vulnerabilities privately to the repository maintainer by emailing

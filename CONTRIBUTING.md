@@ -1,7 +1,7 @@
 # Contributing to opencode-workflow-guard
 
 Thanks for your interest! This plugin enforces workflow discipline through
-**deterministic hooks**; every contribution should maintain that standard.
+**deterministic hooks**. Every contribution should maintain that standard.
 
 ## Quick Start
 
