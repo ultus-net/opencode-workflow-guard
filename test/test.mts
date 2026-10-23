@@ -1959,6 +1959,26 @@ try {
 check("a mutating lifecycle tool is not blocked once the floor is clear", !worktreeThrow.includes("websearch"));
 clearLiveDocsFloor(liveDocsSession3);
 
+// Positive direction: a lifecycle tool must be blocked while the floor is
+// active, or the guard's own tools are the way past its gate.
+const liveDocsSession4 = "s-live-docs-int4";
+for (const _ of [1, 2, 3]) recordLiveDocsFailure(liveDocsSession4);
+let worktreeBlocked = "";
+try {
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "guard_worktree_create", sessionID: liveDocsSession4, callID: "ld4-wt" } as any, { args: { branch: "feat/y" } } as any);
+} catch (err) {
+	worktreeBlocked = (err as Error).message;
+}
+check("a mutating lifecycle tool is blocked while the floor is active", worktreeBlocked.includes("Blocked:") && worktreeBlocked.includes("websearch"));
+let restoreBlocked = "";
+try {
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "guard_recovery_restore", sessionID: liveDocsSession4, callID: "ld4-restore" } as any, { args: {} } as any);
+} catch (err) {
+	restoreBlocked = (err as Error).message;
+}
+check("recovery restore is blocked while the floor is active", restoreBlocked.includes("Blocked:") && restoreBlocked.includes("websearch"));
+clearLiveDocsFloor(liveDocsSession4);
+
 await liveDocsPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: liveDocsSession2 } } } as any);
 check("session idle does not clear research debt", liveDocsFailureCount(liveDocsSession2) === 3);
 await liveDocsPlugin.event?.({ event: { type: "session.deleted", properties: { info: { id: liveDocsSession2 } } } } as any);
@@ -4635,6 +4655,22 @@ check(
 	"blocked tool call writes warning to app log",
 	appLogs.some((entry) => entry?.body?.level === "warn" && String(entry?.body?.message).includes("blocked write")),
 );
+
+// Policy 25 blocks must reach the durable app log at warn level too.
+appLogs.length = 0;
+const liveDocLogSession = "s-live-doc-log";
+for (const _ of [1, 2, 3]) recordLiveDocsFailure(liveDocLogSession);
+try {
+	await loggingPlugin["tool.execute.before"]?.(
+		{ tool: "bash", sessionID: liveDocLogSession, callID: "ld-log" } as any,
+		{ args: { command: "ls" } } as any,
+	);
+} catch {}
+check(
+	"research floor block writes warning to app log",
+	appLogs.some((entry) => entry?.body?.level === "warn" && String(entry?.body?.message).includes("no live documentation lookup")),
+);
+clearLiveDocsFloor(liveDocLogSession);
 
 // Concurrent plugin instances keep SDK client state isolated (AsyncLocalStorage).
 const activeClient = {
