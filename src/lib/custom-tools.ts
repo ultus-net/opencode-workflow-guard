@@ -36,6 +36,7 @@ import {
 	runWithRuntimeState,
 } from "./state.ts";
 import { getRalphOutcome } from "../policies/continuation.ts";
+import { todoEvidenceReport } from "../policies/todo.ts";
 import { findGitRoot, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { buildReviewRubric } from "./review.ts";
@@ -77,7 +78,7 @@ export function buildWorkflowGuardSystemGuidance(options: {
 	const sections: string[] = [
 		"## Workflow Guard & Operational Tools",
 		"Workflow Guard enforces safe engineering discipline and provides proactive workflow tools:",
-		"- Task Planning: Proactively call `guard_next_tasks` at session start or when planning work to discover repository roadmap, plan, and TODO items. Check `guard_status` to inspect branch protection, mutation count, and outstanding verification/review gates.",
+		"- Task Planning: The session's todo list is the unit of visible progress and it gates every file mutation. Call `todowrite` before starting work, keep exactly the real remaining tasks in it, and mark a task completed only after its work is actually done. A completion is checked against recorded work in that task's window, so finishing a task without doing it is blocked. Genuinely read-only tasks (review, investigation, reading) are marked `[read-only]` in their text. Proactively call `guard_next_tasks` at session start or when planning work to discover repository roadmap, plan, and TODO items, and check `guard_status` to inspect branch protection, mutation count, and outstanding verification/review gates.",
 	];
 
 	if (!options.isReadOnly) {
@@ -294,7 +295,8 @@ export function createCustomTools(options: {
 					recommendedActions.push("All operational requirements are satisfied for task finalization and PR creation.");
 				}
 				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
-				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, qualifiedHostVersion: qualifiedHostVersion() ?? null, hostVersion: hostVersion?.() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, todoCapability: todoCapability ? todoCapability() : "available", outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
+				const taskEvidence = await runWithRuntimeState(root, client, () => todoEvidenceReport(toolContext.sessionID));
+				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, qualifiedHostVersion: qualifiedHostVersion() ?? null, hostVersion: hostVersion?.() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, todoCapability: todoCapability ? todoCapability() : "available", taskEvidence, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),

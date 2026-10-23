@@ -56,11 +56,23 @@ const workspaceMutationCounts = new Map<string, number>();
 export const sessionMutationTimestamps = new Map<string, number>();
 export const sessionMutationCounts = new Map<string, number>();
 export const sessionWorkspaces = new Map<string, string>();
-// Mutation count at each session's previous `todowrite`, so the completion
-// laundering signal can tell whether anything changed between two writes.
-// Process-global like the mutation counts themselves: a subagent's write and
-// its parent's evidence share the same accounting.
-export const sessionTodoMutationBaseline = new Map<string, number>();
+// Per-session, per-task mutation count recorded when an active task entered
+// its current active window. Completion is judged per task: one mutation
+// cannot vouch for several completions.
+export const sessionTodoTaskStarts = new Map<string, Map<string, number>>();
+
+export function todoTaskStarts(sessionID: string): Map<string, number> {
+	let starts = sessionTodoTaskStarts.get(sessionID);
+	if (!starts) {
+		starts = new Map();
+		sessionTodoTaskStarts.set(sessionID, starts);
+	}
+	return starts;
+}
+
+export function clearTodoSessionState(sessionID: string): void {
+	sessionTodoTaskStarts.delete(sessionID);
+}
 // Sessions whose workspace was registered from their OWN context (tool-call
 // arguments or a host-provided per-call worktree). A session registered only
 // from the plugin-instance default is deliberately left unmarked: concurrent
@@ -360,6 +372,7 @@ export function resetVerifyState(): void {
 	workspaceMutationTimestamps.clear();
 	workspaceMutationCounts.clear();
 	sessionVerifyResults.clear();
+	sessionTodoTaskStarts.clear();
 }
 
 export function recordReviewResult(

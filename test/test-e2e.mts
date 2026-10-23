@@ -231,6 +231,7 @@ const runV2Probes = async (ctx: any) => {
 \t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
 \t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
 \t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t\t"todo-completion": { tool: "todowrite", input: { todos: [{ content: "unstarted e2e work", status: "completed", priority: "medium" }] } },
 \t};
 \tconst whyResults: Record<string, any> = {};
 \tfor (const [name, probe] of Object.entries(whyProbes)) {
@@ -258,6 +259,7 @@ const runV1Probes = async (ctx: any) => {
 \t\t"secrets-shell": { tool: "bash", input: { command: "cat .env" } },
 \t\t"boundary-write": { tool: "write", input: { filePath: "../outside_escaped.txt", content: "probe" } },
 \t\t"shell-tty": { tool: "bash", input: { command: "vim notes.txt" } },
+\t\t"todo-completion": { tool: "todowrite", input: { todos: [{ content: "unstarted e2e work", status: "completed", priority: "medium" }] } },
 \t};
 \tconst whyResults: Record<string, any> = {};
 \tfor (const [name, probe] of Object.entries(whyProbes)) {
@@ -409,6 +411,9 @@ check("headless guard_why simulates secret read policy via read tool", whyProbe(
 check("headless guard_why simulates secret read policy via shell", whyProbe("secrets-shell")?.policy === "secrets" && whyProbe("secrets-shell")?.code === "secret_read" && whyProbe("secrets-shell")?.status === "blocked");
 check("headless guard_why simulates workspace boundary policy via write tool", whyProbe("boundary-write")?.policy === "boundary" && whyProbe("boundary-write")?.code === "workspace_escape" && whyProbe("boundary-write")?.status === "blocked");
 check("headless guard_why simulates interactive tty shell-safety policy", whyProbe("shell-tty")?.policy === "shell-safety" && whyProbe("shell-tty")?.code === "interactive_tty" && whyProbe("shell-tty")?.status === "blocked");
+// The completion gate is host-version independent: claiming work the session
+// never did is blocked through the real dispatcher, on both adapter paths.
+check("headless guard_why simulates the todo completion evidence gate", whyProbe("todo-completion")?.policy === "todo" && whyProbe("todo-completion")?.code === "todo_completion_unverified" && whyProbe("todo-completion")?.status === "blocked");
 check("headless guard_status reports project config loaded from .opencode/workflow-guard.json", headlessAccountability?.status?.projectConfig?.protectedBranches?.[0] === "e2e-config-probe-branch" && headlessAccountability?.status?.projectConfig?.requireReview === false);
 if (isOpenCodeV2) {
 	// The V2 adapter runs the shipped setup(ctx) for real; verify the

@@ -126,7 +126,8 @@ import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, r
 import { scanSessionTodos, toolPartName, detectTodoCapability, recordedTodoCapability, recordTodoCapability, reportTodoGateFailOpen, resetTodoCapabilityForTesting } from "../src/lib/v2-todo.ts";
 import { buildPolicyPosture, renderPolicyPosture } from "../src/lib/policy-posture.ts";
 import { pluginKeyFor, preparePluginUpdate } from "../src/lib/config-writer.mjs";
-import { effectiveTodosWithOwner, completionClaimMismatch } from "../src/policies/todo.ts";
+import { effectiveTodosWithOwner, isReadOnlyTodo, readOnlyTodoCompletions, recordTodoTaskStarts, todoEvidenceReport, unverifiedTodoCompletions, validateTodoLifecycle } from "../src/policies/todo.ts";
+import { todoTaskStarts, clearTodoSessionState } from "../src/lib/state.ts";
 import { resetPluginInstancesForTesting } from "../src/lib/plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim, resetToolCallClaimsForTesting } from "../src/lib/call-claims.ts";
 import { pruneToolsForReadOnlyRole, READ_ONLY_PRUNED_TOOLS } from "../src/lib/read-only-tools.ts";
@@ -212,10 +213,13 @@ check("task gate is per session (other session's todos don't help)", blocked(awa
 console.log("- Policy 1: todowrite lifecycle validation -");
 // Multiple in_progress allowed (no single-task focus rule)
 check("todowrite allows multiple in_progress tasks", !(await call("todowrite", { todos: [item("a", "in_progress"), item("b", "in_progress")] }, { sessionID: "s-empty" })));
-// Flexible out-of-order completion allows finishing independent items without artificial sequential blockers
+// Flexible out-of-order completion allows finishing independent items without artificial sequential blockers.
+// Completion now requires work recorded in the session, so the setup records one mutation.
+recordMutation("s-empty");
 check("todowrite allows flexible out-of-order completion", !(await call("todowrite", { todos: [item("a", "pending"), item("b", "completed")] }, { sessionID: "s-empty" })));
 // No silent deletion: active task cannot silently vanish
 todo("s-lifecycle", item("task 1", "completed"), item("task 2", "in_progress"), item("task 3", "pending"));
+recordMutation("s-lifecycle");
 check("todowrite allows updating active tasks to completed/cancelled", !(await call("todowrite", { todos: [item("task 1", "completed"), item("task 2", "completed"), item("task 3", "cancelled")] }, { sessionID: "s-lifecycle" })));
 check("todowrite blocks silently dropping task 2 without completion", blocked(await call("todowrite", { todos: [item("task 1", "completed"), item("task 3", "pending")] }, { sessionID: "s-lifecycle" })));
 todo("s-review-remediation", item("Run full verification and secondary review", "in_progress"));
@@ -232,6 +236,7 @@ check("todowrite cannot silently drop remediation work while retaining review ex
 todo("s-review-multiplicity", item("Run security secondary review", "in_progress"), item("Run architecture secondary review", "pending"));
 check("todowrite cannot collapse multiple review obligations into one replacement", blocked(await call("todowrite", { todos: [item("Run secondary review", "in_progress")] }, { sessionID: "s-review-multiplicity" })));
 check("todowrite allows one replacement per existing review obligation", !(await call("todowrite", { todos: [item("Run security re-review", "in_progress"), item("Run architecture re-review", "pending")] }, { sessionID: "s-review-multiplicity" })));
+recordMutation("s-review-multiplicity");
 check("todowrite allows completing one review while replacing another one-for-one", !(await call("todowrite", { todos: [item("Run security secondary review", "completed"), item("Run architecture re-review", "pending")] }, { sessionID: "s-review-multiplicity" })));
 todo("s-duplicate-lifecycle", item("same task", "pending"), item("same task", "pending"));
 check("todowrite cannot silently drop one of two duplicate active tasks", blocked(await call("todowrite", { todos: [item("same task", "pending")] }, { sessionID: "s-duplicate-lifecycle" })));
@@ -312,20 +317,111 @@ check("capability: a repeated fail-open report for the same session is suppresse
 check("capability: a different session warns again", reportTodoGateFailOpen("s-warn-2", "unavailable") === true);
 resetTodoCapabilityForTesting();
 
-// Completion laundering: a completion transition with no mutation in the
-// interval is recorded as a mismatch, and is never a block.
-const launderingPrevious = [item("write the fix", "in_progress"), item("run tests", "pending")];
-const launderingClaim = [item("write the fix", "completed"), item("run tests", "completed")];
-check(
-	"laundering: completing tasks with no mutation since the last write is a mismatch",
-	JSON.stringify(completionClaimMismatch(launderingPrevious, launderingClaim, 0, 0)) === JSON.stringify(["write the fix", "run tests"]),
-);
-check("laundering: a mutation in the interval suppresses the signal", completionClaimMismatch(launderingPrevious, launderingClaim, 3, 3).length === 0);
-check("laundering: a first write with prior mutations is not a mismatch", completionClaimMismatch(undefined, launderingClaim, undefined, 4).length === 0);
-check("laundering: a first write with no mutations at all is a mismatch", completionClaimMismatch(undefined, launderingClaim, undefined, 0).length === 2);
-check("laundering: a completion that was already completed is not a transition", completionClaimMismatch([item("a", "completed")], [item("a", "completed")], 0, 0).length === 0);
-check("laundering: a pending-to-pending rewrite is not a transition", completionClaimMismatch([item("a", "pending")], [item("a", "pending")], 0, 0).length === 0);
-check("laundering: a new completed task is not a transition from previous state", completionClaimMismatch([item("a", "pending")], [item("a", "pending"), item("b", "completed")], 0, 0).length === 0);
+// Per-task completion evidence: a completion transition needs at least one
+// mutation inside that task's window, so a model cannot flip the list to
+// `completed` and move on. Read-only tasks carry an explicit marker.
+const starts = new Map<string, number>();
+const activeTwo = [item("write the fix", "in_progress"), item("run tests", "pending")];
+const completedTwo = [item("write the fix", "completed"), item("run tests", "completed")];
+recordTodoTaskStarts(starts, undefined, activeTwo, 0);
+check("completion evidence: no mutation in the window blocks the completion", JSON.stringify(unverifiedTodoCompletions(activeTwo, completedTwo, starts, 0)) === JSON.stringify(["write the fix", "run tests"]));
+check("completion evidence: one mutation cannot vouch for two completions", unverifiedTodoCompletions(activeTwo, completedTwo, new Map(starts), 1).length === 2);
+check("completion evidence: two mutations satisfy two completions", unverifiedTodoCompletions(activeTwo, completedTwo, new Map(starts), 2).length === 0);
+const startsSingle = new Map<string, number>();
+recordTodoTaskStarts(startsSingle, undefined, [item("write the fix", "in_progress")], 0);
+check("completion evidence: a single mutation satisfies a single completion", unverifiedTodoCompletions([item("write the fix", "in_progress")], [item("write the fix", "completed")], startsSingle, 1).length === 0);
+
+// Window isolation: mutations spent before a task became active do not count.
+const startsLate = new Map<string, number>();
+recordTodoTaskStarts(startsLate, undefined, [item("early work", "in_progress")], 0);
+recordTodoTaskStarts(startsLate, [item("early work", "in_progress")], [item("early work", "completed"), item("late work", "in_progress")], 4);
+check("completion evidence: mutations before the task's window do not count for it", JSON.stringify(unverifiedTodoCompletions([item("early work", "completed"), item("late work", "in_progress")], [item("early work", "completed"), item("late work", "completed")], startsLate, 4)) === JSON.stringify(["late work"]));
+check("completion evidence: a later mutation in the task's own window counts", unverifiedTodoCompletions([item("late work", "in_progress")], [item("late work", "completed")], startsLate, 5).length === 0);
+check("completion evidence: a finished task releases its window", !startsLate.has("early work"));
+
+// Window overlap: a mutation spent before a later task began cannot vouch for
+// it, even when the total count looks sufficient.
+const staggered = new Map([["first", 0], ["second", 5]]);
+const staggeredPrev = [item("first", "in_progress"), item("second", "in_progress")];
+const staggeredNext = [item("first", "completed"), item("second", "completed")];
+check("completion evidence: staggered windows reject a completion whose window saw no work", JSON.stringify(unverifiedTodoCompletions(staggeredPrev, staggeredNext, staggered, 5)) === JSON.stringify(["second"]));
+check("completion evidence: staggered windows pass once the later window sees work", unverifiedTodoCompletions(staggeredPrev, staggeredNext, staggered, 6).length === 0);
+check("completion evidence: interleaved windows each get their own mutation", unverifiedTodoCompletions(staggeredPrev, staggeredNext, new Map([["first", 0], ["second", 1]]), 2).length === 0);
+
+// Duplicate content must not hide a new completion behind an already-completed
+// item of the same text.
+const dupPrev = [item("x", "completed"), item("y", "in_progress")];
+const dupNext = [item("x", "completed"), item("y", "in_progress"), item("x", "completed")];
+check("completion evidence: a duplicate completed item is not a new claim", unverifiedTodoCompletions(dupPrev, [dupPrev[0]!, dupPrev[1]!], new Map(), 0).length === 0);
+check("completion evidence: duplicate content cannot smuggle a new completion", JSON.stringify(unverifiedTodoCompletions(dupPrev, dupNext, new Map(), 0)) === JSON.stringify(["x"]));
+
+// The marker is an annotation, not part of task identity, so appending it must
+// not read as deleting one task and inventing another. The marker must be
+// present on the completed item for the escape to apply.
+check("completion evidence: appending the marker keeps the task's identity", JSON.stringify(unverifiedTodoCompletions([item("Review the diff", "in_progress")], [item("Review the diff [read-only]", "completed")], new Map(), 0)) === JSON.stringify([]));
+check("completion evidence: dropping the marker does not inherit the escape", JSON.stringify(unverifiedTodoCompletions([item("Review the diff [read-only]", "in_progress")], [item("Review the diff", "completed")], new Map(), 0)) === JSON.stringify(["Review the diff"]));
+check("completion evidence: identity ignores marker spelling and spacing", JSON.stringify(unverifiedTodoCompletions([item("Review   the diff", "in_progress")], [item("Review the diff [read_only]", "completed")], new Map(), 0)) === JSON.stringify([]));
+check("completion evidence: a non-read-only completion is still blocked despite identity stripping", JSON.stringify(unverifiedTodoCompletions([item("Fix the bug", "in_progress")], [item("Fix the bug", "completed")], new Map(), 0)) === JSON.stringify(["Fix the bug"]));
+check("completion evidence: a task that is only the marker has no identity and is not journaled", JSON.stringify(readOnlyTodoCompletions([], [item("   [read-only]", "completed")])) === JSON.stringify([]));
+check("lifecycle: appending the read-only marker to a planned task is not a silent deletion", !validateTodoLifecycle([item("Review the diff [read-only]", "completed")], [item("Review the diff", "in_progress")]));
+check("lifecycle: appending the marker to a still-active task retains it", !validateTodoLifecycle([item("Review the diff [read-only]", "in_progress")], [item("Review the diff", "in_progress")]));
+
+// Marker escape, and the transitions that are not new claims.
+check("completion evidence: the read-only marker is recognized", isReadOnlyTodo(item("Review the diff [read-only]", "completed")) && !isReadOnlyTodo(item("Review the diff", "completed")));
+check("completion evidence: a marked read-only task completes with no mutation", unverifiedTodoCompletions([item("Review the diff [read-only]", "in_progress")], [item("Review the diff [read-only]", "completed")], new Map(), 0).length === 0);
+check("completion evidence: an already-completed task is not a new claim", unverifiedTodoCompletions([item("a", "completed")], [item("a", "completed")], new Map(), 0).length === 0);
+check("completion evidence: a pending-to-pending rewrite is not a claim", unverifiedTodoCompletions([item("a", "pending")], [item("a", "pending")], new Map(), 0).length === 0);
+check("completion evidence: a task first seen already completed is judged on session history", unverifiedTodoCompletions([item("a", "pending")], [item("a", "pending"), item("b", "completed")], new Map(), 0).length === 1);
+
+// End-to-end through the real dispatcher on the test workspace.
+setSdkClient(fakeClient);
+todo("s-evidence", item("write the fix", "in_progress"));
+check("dispatcher blocks marking a task completed with no recorded work", blocked(await call("todowrite", { todos: [item("write the fix", "completed")] }, { sessionID: "s-evidence" })));
+todo("s-evidence-ro", item("Review the diff [read-only]", "in_progress"));
+check("dispatcher allows the read-only marker in place of a mutation", !(await call("todowrite", { todos: [item("Review the diff [read-only]", "completed")] }, { sessionID: "s-evidence-ro" })));
+// The window is registered by an allowed write, then work lands inside it.
+todo("s-evidence-mut", item("write the fix", "in_progress"));
+check("dispatcher allows a write that only adds pending work", !(await call("todowrite", { todos: [item("write the fix", "in_progress"), item("run tests", "pending")] }, { sessionID: "s-evidence-mut" })));
+check("dispatcher blocks completion of the unwritten task", blocked(await call("todowrite", { todos: [item("write the fix", "completed"), item("run tests", "pending")] }, { sessionID: "s-evidence-mut" })));
+recordMutation("s-evidence-mut");
+check("dispatcher allows completion once work is recorded in the window", !(await call("todowrite", { todos: [item("write the fix", "completed"), item("run tests", "pending")] }, { sessionID: "s-evidence-mut" })));
+// guard_why must predict the gate instead of reporting a falsely permissive result.
+todo("s-evidence-sim", item("write the fix", "in_progress"));
+check("simulation reports the same completion verdict as enforcement", blocked(await call("todowrite", { todos: [item("write the fix", "completed")] }, { sessionID: "s-evidence-sim", simulate: true } as never)));
+check("simulation does not shift the task window", !todoTaskStarts("s-evidence-sim").has("write the fix"));
+
+// The documented remedy, end to end: a planned task discovered to be read-only
+// is completed by appending the marker. This must not trip the lifecycle gate.
+todo("s-evidence-append", item("Review the diff", "in_progress"));
+check("dispatcher allows appending the read-only marker to a planned task", !(await call("todowrite", { todos: [item("Review the diff [read-only]", "completed")] }, { sessionID: "s-evidence-append" })));
+const readOnlyAudit = getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only");
+check("dispatcher journals read-only marker use", readOnlyAudit.length > 0 && JSON.stringify((readOnlyAudit.at(-1)?.input as { tasks?: unknown })?.tasks) === JSON.stringify(["Review the diff [read-only]"]));
+// A blocked write must not journal a read-only completion that never landed.
+todo("s-evidence-audit-order", item("real work", "in_progress"));
+const auditBeforeBlocked = getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only").length;
+await call("todowrite", { todos: [item("real work [read-only]", "completed"), item("brand new", "completed")] }, { sessionID: "s-evidence-audit-order" });
+check("a blocked todowrite does not journal a read-only completion", getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only").length === auditBeforeBlocked);
+
+// guard_status surfaces the requirement before it bites.
+todo("s-evidence-report", item("write the fix", "in_progress"), item("Review the diff [read-only]", "in_progress"), item("done already", "completed"));
+const evidenceReport = await todoEvidenceReport("s-evidence-report");
+check("status report names active tasks lacking recorded work", JSON.stringify(evidenceReport.tasksWithoutRecordedWork) === JSON.stringify(["write the fix"]));
+check("status report lists read-only tasks separately", JSON.stringify(evidenceReport.readOnlyTasks) === JSON.stringify(["Review the diff [read-only]"]));
+check("status report counts active and completed tasks", evidenceReport.active === 2 && evidenceReport.completed === 1);
+check("status report is empty without a session", (await todoEvidenceReport(undefined)).tasksWithoutRecordedWork.length === 0);todoTaskStarts("s-evidence-clean").set("stale task", 0);
+clearTodoSessionState("s-evidence-clean");
+check("session cleanup drops task windows so a reused session id starts clean", !todoTaskStarts("s-evidence-clean").has("stale task"));
+
+// Subagent completion is judged on the subagent's own counter, per the chosen
+// policy. recordMutation credits both the todo owner and the acting session, so
+// work done in a subagent is visible to whichever session reports it.
+fakeParents.set("s-evidence-child", "s-evidence-owner");
+todo("s-evidence-owner", item("shared work", "in_progress"));
+todo("s-evidence-child", item("shared work", "in_progress"));
+check("subagent cannot complete inherited work it did not do", blocked(await call("todowrite", { todos: [item("shared work", "completed")] }, { sessionID: "s-evidence-child" })));
+recordMutation("s-evidence-owner", "s-evidence-child");
+check("subagent can complete work it did, credited to both sessions", !(await call("todowrite", { todos: [item("shared work", "completed")] }, { sessionID: "s-evidence-child" })));
+
 
 // The plan's failing baseline, inverted: on 2.1.x with `experimental.todo:
 // true`, a mutation with no todo list must be blocked. On 2.0.x the same state
@@ -2640,6 +2736,9 @@ spawnSync("git", ["init", "-b", "feature/why"], { cwd: whyVerifyRoot });
 writeFileSync(join(whyVerifyRoot, "package.json"), JSON.stringify({ scripts: { typecheck: "node -e 'process.exit(9)'" } }));
 const whyVerifyPlugin = await WorkflowGuard({ directory: whyVerifyRoot, worktree: whyVerifyRoot, client: diagnosticClient as any } as any);
 todo("s-why-verify", item("finish", "in_progress"));
+// Completion evidence is judged first: record work so the simulation reaches
+// the finalization gate this test is about.
+recordMutation("s-why-verify");
 const verifyHistoryBeforeWhy = getRecentVerifyHistory(100).length;
 const verifyResultBeforeWhy = getLastVerifyResult();
 const auditBeforeWhy = getRecentAuditEntries(50).length;

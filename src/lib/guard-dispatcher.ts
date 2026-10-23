@@ -17,8 +17,8 @@ import {
 	recordMutation,
 	recordVerifyResult,
 	sessionMutationTimestamps,
-	sessionTodoMutationBaseline,
 	sessionVerifyResults,
+	todoTaskStarts,
 } from "./state.ts";
 import {
 	dynamicShellSyntaxIn,
@@ -76,8 +76,11 @@ import {
 	effectiveTodos,
 	fetchSessionTodos,
 	hasActiveTodo,
-	completionClaimMismatch,
+	readOnlyTodoCompletions,
+	recordTodoTaskStarts,
 	subagentMutationBudgetReason,
+	todoCompletionBlockReason,
+	unverifiedTodoCompletions,
 	validateTodoLifecycle,
 } from "../policies/todo.ts";
 import { recordedTodoCapability, reportTodoGateFailOpen } from "./v2-todo.ts";
@@ -196,31 +199,21 @@ export async function guardToolCallImpl(
 				logPolicyBlock(`[workflow-guard] ${err}`);
 				return block("todo", "todo_lifecycle", err);
 			}
-			// Completion laundering signal. Recorded, never enforced: a task
-			// can legitimately complete without a mutation, and the
-			// verification gate is what decides finalization. Simulation is
-			// skipped so a permission-seat probe cannot shift the baseline.
-			if (context?.sessionID && !context.simulate) {
-				const baseline = sessionTodoMutationBaseline.get(context.sessionID);
+			// Per-task completion evidence. Every task may enter `completed`
+			// only after the session mutated inside that task's window. The
+			// check is pure, so simulation reports the same verdict without
+			// journaling or moving any window.
+			const readOnlyCompleted: string[] = [];
+			if (context?.sessionID) {
+				const starts = todoTaskStarts(context.sessionID);
 				const total = getSessionMutationCount(context.sessionID);
-				const mismatches = completionClaimMismatch(
-					existingTodos,
-					newTodos,
-					baseline === undefined ? undefined : Math.max(0, total - baseline),
-					total,
-				);
-				if (mismatches.length > 0) {
-					audit({
-						ts: new Date().toISOString(),
-						sessionID: context.sessionID,
-						tool: "todowrite",
-						decision: "allow",
-						phase: "event",
-						reason: "completion_claim_mismatch",
-						input: { tasks: mismatches, mutationCount: total },
-					});
+				const unverified = unverifiedTodoCompletions(existingTodos, newTodos, starts, total);
+				if (unverified.length > 0) {
+					const reason = todoCompletionBlockReason(unverified);
+					logPolicyBlock(`[workflow-guard] ${reason}`);
+					return block("todo", "todo_completion_unverified", reason);
 				}
-				sessionTodoMutationBaseline.set(context.sessionID, total);
+				if (!context.simulate) readOnlyCompleted.push(...readOnlyTodoCompletions(existingTodos, newTodos));
 			}
 			const allDone = newTodos.length > 0 && newTodos.every((t) => {
 				const s = String(t.status ?? "");
@@ -255,6 +248,22 @@ export async function guardToolCallImpl(
 							return block("verification", "verification_failed", reason);
 						}
 					}
+				}
+			}
+			// Only an accepted write becomes the task list, so task windows move
+			// and read-only marker use is journaled after every gate has passed.
+			if (context?.sessionID && !context.simulate) {
+				recordTodoTaskStarts(todoTaskStarts(context.sessionID), existingTodos, newTodos, getSessionMutationCount(context.sessionID));
+				if (readOnlyCompleted.length > 0) {
+					audit({
+						ts: new Date().toISOString(),
+						sessionID: context.sessionID,
+						tool: "todowrite",
+						decision: "allow",
+						phase: "event",
+						reason: "todo_completed_read_only",
+						input: { tasks: readOnlyCompleted, mutationCount: getSessionMutationCount(context.sessionID) },
+					});
 				}
 			}
 		}
