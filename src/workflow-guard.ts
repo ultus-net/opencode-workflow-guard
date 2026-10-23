@@ -866,7 +866,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					// attempt never accrues debt even when it fails: otherwise
 					// a flaky network would deepen the block the agent is
 					// already trying to escape, and the floor would deadlock.
-					if (isResearchTool(outcome.tool, getResearchToolPatterns(effectiveRoot))) {
+					if (isResearchTool(outcome.tool, getResearchToolPatterns(getSessionBoundWorkspace(outcome.sessionID) || effectiveRoot))) {
 						if (outcome.status !== "error") recordResearchLookup(outcome.sessionID);
 					} else if (outcome.status === "error") {
 						recordLiveDocsFailure(outcome.sessionID);

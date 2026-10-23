@@ -224,7 +224,7 @@ For stricter environments, set `requireSubagentReview: true` in `.opencode/workf
 
 Policy 25 is enabled by default. After a session accumulates failed tool calls with no live-documentation lookup since, the guard blocks the next mutating or shell call until the agent consults a current source. Only non-research failures count, so a failed `websearch` never deepens the block. Reads, greps, and research tools are never gated.
 
-The builtin research names cover `websearch`, `webfetch`, and common aliases. MCP documentation servers are matched on whole name tokens. If your docs server uses an unrecognised name, declare it:
+The builtin research names cover `websearch`, `webfetch`, and common aliases. MCP documentation servers are matched on whole server names, so a guard inspection tool or a generic file reader cannot clear the debt by name accident. If your docs server uses an unrecognised name, declare it:
 
 ```json
 {

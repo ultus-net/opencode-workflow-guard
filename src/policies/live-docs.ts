@@ -36,12 +36,12 @@ export const RESEARCH_TOOL_NAMES = new Set([
 ]);
 
 /**
- * Documentation sources expose lookup under their own tool names, and MCP tool
- * names arrive namespaced (`mcp__<server>__<tool>`, `<server>_<tool>`). Matching
- * whole tokens rather than substrings keeps `git_ref_*` or `read_wiki_index`
- * from being read as a docs source by accident.
+ * MCP tool names arrive namespaced (`mcp__<server>__<tool>`, `<server>_<tool>`),
+ * so a docs *server* is what makes a lookup live. Matching only documented
+ * server and API names keeps `read_wiki_index` and
+ * `guard_review_followup_resolve` from clearing debt as if they researched.
  */
-const RESEARCH_TOOL_TOKENS = new Set([
+const RESEARCH_SERVER_TOKENS = new Set([
 	"context7",
 	"deepwiki",
 	"tavily",
@@ -49,17 +49,15 @@ const RESEARCH_TOOL_TOKENS = new Set([
 	"exa",
 	"kagi",
 	"perplexity",
-	"docs",
-	"doc",
-	"docs_search",
-	"documentation",
-	"wiki",
-	"resolve",
+	"firecrawl",
 ]);
+
+/** Tool-name segments that name a documentation lookup API directly. */
+const RESEARCH_API_TOKENS = new Set(["docs_search", "docssearch", "get-library-docs", "library_docs"]);
 
 /**
  * A research tool is a recognised builtin/alias name, a documented MCP source
- * (matched by token), or an operator-declared name from `researchTools`.
+ * (matched by server name), or an operator-declared name from `researchTools`.
  */
 export function isResearchTool(toolName: string, extraPatterns: readonly string[] = []): boolean {
 	if (typeof toolName !== "string") return false;
@@ -67,7 +65,7 @@ export function isResearchTool(toolName: string, extraPatterns: readonly string[
 	if (RESEARCH_TOOL_NAMES.has(lower)) return true;
 	if (lower.includes("resolve-library")) return true;
 	const tokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
-	if (tokens.some((token) => RESEARCH_TOOL_TOKENS.has(token))) return true;
+	if (tokens.some((token) => RESEARCH_SERVER_TOKENS.has(token) || RESEARCH_API_TOKENS.has(token))) return true;
 	return extraPatterns.some((pattern) => pattern.length > 0 && lower.includes(pattern));
 }
 
@@ -114,7 +112,8 @@ export class LiveDocsResearchFloor {
 			`Blocked: ${count} tool failure(s) in this session and no live documentation lookup since. ` +
 			`Stop guessing from training data and consult current sources first with 'websearch' or 'webfetch' ` +
 			`(or an MCP documentation tool), then retry. If the failure is environmental rather than a knowledge gap, ` +
-			`inspect the underlying error before retrying instead.`
+			`inspect the underlying error before retrying instead. If this session has no research tool at all, ` +
+			`an operator can disable the floor with requireLiveDocs: false or WORKFLOW_GUARD_REQUIRE_LIVE_DOCS=0.`
 		);
 	}
 

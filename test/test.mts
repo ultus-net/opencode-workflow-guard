@@ -1811,6 +1811,11 @@ check("recognises builtin research tools", isResearchTool("websearch") && isRese
 check("recognises MCP documentation tools", isResearchTool("context7_resolve-library-id") && isResearchTool("mcp__context7__get-library-docs"));
 check("recognises tokenised docs servers beyond context7", isResearchTool("mcp__deepwiki__read_wiki") && isResearchTool("mcp__tavily__search") && isResearchTool("mcp__brave__web_search"));
 check("tokenised matching does not read obvious non-docs tools as research", !isResearchTool("mcp__git__ref_list") && !isResearchTool("git_status"));
+// The policy exists to force a real lookup. A guard inspection tool or a
+// generic file reader must not clear the debt by name accident.
+check("guard inspection tools are not research", !isResearchTool("guard_review_followup_resolve") && !isResearchTool("guard_status") && !isResearchTool("guard_why"));
+check("generic readers and resolvers are not research", !isResearchTool("read_wiki_index") && !isResearchTool("resolve_conflict") && !isResearchTool("read_docs_page"));
+check("a bare docs-ish token is not enough on its own", !isResearchTool("docker") && !isResearchTool("doc") && !isResearchTool("wiki"));
 check("operator-declared research patterns are honoured", isResearchTool("mcp__acme__lookup", ["acme"]) && !isResearchTool("mcp__acme__lookup"));
 check("does not treat unrelated tools as research", !isResearchTool("bash") && !isResearchTool("edit") && !isResearchTool("read"));
 
@@ -1820,6 +1825,10 @@ floorUnit.recordFailure("s-unit");
 check("research floor accrues failures below threshold", floorUnit.gatingReason("s-unit", "edit", 3) === undefined);
 floorUnit.recordFailure("s-unit");
 check("research floor blocks a mutation at threshold with no lookup", typeof floorUnit.gatingReason("s-unit", "edit", 3) === "string");
+check(
+	"floor block names the operator escape when no research tool exists",
+	(floorUnit.gatingReason("s-unit", "edit", 3) ?? "").includes("requireLiveDocs: false"),
+);
 check("research floor never blocks a research tool", floorUnit.gatingReason("s-unit", "websearch", 3) === undefined);
 floorUnit.recordResearch("s-unit");
 check("successful lookup clears the floor", floorUnit.gatingReason("s-unit", "bash", 3) === undefined);

@@ -308,7 +308,9 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				if (isLiveDocsRequired(toolWorktree)) {
 					const researchReason = liveDocsGatingReason(event.sessionID, event.tool, threshold, getResearchToolPatterns(toolWorktree));
 					if (researchReason !== undefined) {
+						releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
 						await showBlockToast(researchReason);
+						console.log(`[workflow-guard] warn: ${researchReason}`);
 						audit({
 							ts: new Date().toISOString(),
 							sessionID: event.sessionID,
@@ -752,7 +754,7 @@ async function handleV2Event(
 				// successful live-source lookups clear it. A failed research
 				// attempt never accrues debt, so a flaky lookup cannot deepen
 				// the block it was meant to escape.
-				if (isResearchTool(outcome.tool, getResearchToolPatterns(effectiveRoot))) {
+				if (isResearchTool(outcome.tool, getResearchToolPatterns(getSessionBoundWorkspace(outcome.sessionID) || effectiveRoot))) {
 					if (outcome.status !== "error") recordResearchLookup(outcome.sessionID);
 				} else if (outcome.status === "error") {
 					recordLiveDocsFailure(outcome.sessionID);
