@@ -38,6 +38,9 @@ import {
 	isLearningEnabled,
 	isProjectMemoryEnabled,
 	getProjectConfig,
+	isLiveDocsRequired,
+	getLiveDocFailureThreshold,
+	getResearchToolPatterns,
 } from "./state.ts";
 import {
 	openProjectMemory,
@@ -51,12 +54,14 @@ import {
 } from "./project-memory.ts";
 import { secretIn } from "../policies/secrets.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./custom-tools.ts";
-import { isReadOnlyRole, SHELL_TOOL_NAMES } from "./guard-dispatcher.ts";
+import { isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./guard-dispatcher.ts";
 import { ToolInvocationLifecycle } from "./tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./tool-outcomes.ts";
 import { EDIT_TOOL_NAMES, fetchParentSession, fetchParentSessionID, effectiveTodos } from "../policies/todo.ts";
 import { currentGitBranch, isProtectedBranchName } from "../policies/git.ts";
 import { checkCompletionClaims } from "../policies/completion.ts";
+import { checkSweepingClaims } from "../policies/sweeping-claims.ts";
+import { clearLiveDocsFloor, isResearchTool, liveDocsGatingReason, recordLiveDocsFailure, recordResearchLookup } from "../policies/live-docs.ts";
 import { releaseFileClaims } from "../policies/file-claims.ts";
 import { beginReadObservation, recordMutationObservation, recordSuccessfulRead, clearReadFingerprints } from "../policies/stale-write.ts";
 import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "../policies/post-edit-validation.ts";
@@ -294,6 +299,30 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 					? "\n\n[Workflow Guard Circuit Breaker: Repeated failures detected in this session. Stop attempting alternative workarounds or shell laundering. Address the required step above directly, or inspect policy details with guard_status or guard_why.]"
 					: "";
 				throw new Error(`[workflow-guard] ${reason}${circuitBreakerSuffix}`);
+			}
+			// Policy 25: repeated failures with no live lookup since block the
+			// guess-and-retry surfaces until the session grounds itself in
+			// current documentation (V1 parity). Research tools are never gated.
+			if (event.sessionID && isMutatingSurfaceTool(event.tool)) {
+				const threshold = getLiveDocFailureThreshold(toolWorktree);
+				if (isLiveDocsRequired(toolWorktree)) {
+					const researchReason = liveDocsGatingReason(event.sessionID, event.tool, threshold, getResearchToolPatterns(toolWorktree));
+					if (researchReason !== undefined) {
+						releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
+						await showBlockToast(researchReason);
+						console.log(`[workflow-guard] warn: ${researchReason}`);
+						audit({
+							ts: new Date().toISOString(),
+							sessionID: event.sessionID,
+							callID: event.id,
+							tool: event.tool,
+							decision: "block",
+							phase: "decision",
+							reason: "live_docs_research_floor",
+						});
+						throw new Error(`[workflow-guard] ${researchReason}`);
+					}
+				}
 			}
 			toolLifecycle.start(event.sessionID, event.id);
 			const record = asRecord(args);
@@ -721,6 +750,15 @@ async function handleV2Event(
 			};
 			const outcome = toolOutcomes.record(mapped);
 			if (outcome) {
+				// Policy 25 research floor (V1 parity): failures accrue debt;
+				// successful live-source lookups clear it. A failed research
+				// attempt never accrues debt, so a flaky lookup cannot deepen
+				// the block it was meant to escape.
+				if (isResearchTool(outcome.tool, getResearchToolPatterns(getSessionBoundWorkspace(outcome.sessionID) || effectiveRoot))) {
+					if (outcome.status !== "error") recordResearchLookup(outcome.sessionID);
+				} else if (outcome.status === "error") {
+					recordLiveDocsFailure(outcome.sessionID);
+				}
 				audit({
 					ts: new Date().toISOString(),
 					sessionID: outcome.sessionID,
@@ -765,6 +803,20 @@ async function handleV2Event(
 					input: { claim: check.claim, evidenceState: check.evidenceState },
 				});
 			}
+			// Policy 26: journal sweeping repository claims unsupported by read
+			// coverage. Observability only - never mutates the response text.
+			const sweeping = checkSweepingClaims(text, { sessionID });
+			if (sweeping.sweeping && sweeping.reason) {
+				console.log(`[workflow-guard] sweeping claim mismatch: ${sweeping.reason}`);
+				audit({
+					ts: new Date().toISOString(),
+					sessionID,
+					tool: "experimental.text.complete",
+					decision: "allow",
+					reason: `Sweeping claim '${sweeping.claim}' with ${sweeping.readFileCount} file(s) read`,
+					input: { claim: sweeping.claim, readFileCount: sweeping.readFileCount },
+				});
+			}
 		} catch {}
 		return;
 	}
@@ -793,6 +845,7 @@ async function handleV2Event(
 			releaseFileClaims(sessionID);
 			clearReadFingerprints(sessionID);
 			toolLifecycle.clearSession(sessionID);
+			clearLiveDocsFloor(sessionID);
 			toolOutcomes.clearSession(sessionID);
 			clearTodoSessionState(sessionID);
 			toolLifecycle.takeRecoveryRun(sessionID);

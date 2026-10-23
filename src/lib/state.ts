@@ -543,6 +543,51 @@ export function isDocumentationRequired(root: string): boolean {
 	return cfg.requireDocumentation === true;
 }
 
+/**
+ * Policy 25 (live-documentation research floor): enabled by default. The env
+ * override mirrors `isReviewRequired`; project config can opt out. The floor
+ * engages after `getLiveDocFailureThreshold` failed tool calls with no live
+ * lookup since the last failure.
+ */
+export function isLiveDocsRequired(root: string): boolean {
+	const env = process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS?.toLowerCase();
+	if (env === "0" || env === "false" || env === "off") return false;
+	if (env === "1" || env === "true" || env === "on") return true;
+	const cfg = getProjectConfig(root);
+	return cfg.requireLiveDocs !== false;
+}
+
+export function getLiveDocFailureThreshold(root: string): number {
+	const env = process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
+	if (env !== undefined && env.trim() !== "") {
+		// Number() rejects trailing junk that parseInt would silently accept.
+		const parsed = Number(env.trim());
+		if (Number.isInteger(parsed) && parsed >= 1) return parsed;
+	}
+	const cfg = getProjectConfig(root);
+	if (typeof cfg.liveDocFailureThreshold === "number" && Number.isInteger(cfg.liveDocFailureThreshold) && cfg.liveDocFailureThreshold >= 1) {
+		return cfg.liveDocFailureThreshold;
+	}
+	return 3;
+}
+
+/**
+ * Extra tool-name fragments that count as a live-documentation lookup, so an
+ * operator whose docs server is not in the builtin token set can still satisfy
+ * the floor: `researchTools` in project config or
+ * `WORKFLOW_GUARD_RESEARCH_TOOLS` (comma-separated).
+ */
+export function getResearchToolPatterns(root: string = getWorkspaceRoot()): string[] {
+	const env = process.env.WORKFLOW_GUARD_RESEARCH_TOOLS;
+	if (env !== undefined && env.trim() !== "") {
+		return env.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+	}
+	const configured = getProjectConfig(root).researchTools;
+	return Array.isArray(configured)
+		? configured.filter((value): value is string => typeof value === "string").map((value) => value.trim().toLowerCase()).filter(Boolean)
+		: [];
+}
+
 export function getOperationProfile(root: string): "interactive" | "autonomous" {
 	return getProjectConfig(root).profile === "autonomous" ? "autonomous" : "interactive";
 }

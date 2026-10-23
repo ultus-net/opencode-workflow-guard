@@ -85,3 +85,13 @@ export function staleWriteReason(path: string, sessionID: string): string | unde
 export function clearReadFingerprints(sessionID: string): void {
 	reads.delete(sessionID);
 }
+
+/**
+ * Number of distinct files the session has read or authored (a successful
+ * mutation seeds an observation too). Policy 26 uses this as reading-coverage
+ * evidence: a sweeping repository claim backed by one or two touched files is
+ * a skim, not a review.
+ */
+export function sessionReadFileCount(sessionID: string): number {
+	return reads.get(sessionID)?.size ?? 0;
+}

@@ -87,6 +87,20 @@ import { recordedTodoCapability, reportTodoGateFailOpen } from "./v2-todo.ts";
 
 export const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
+/**
+ * Tools that can change repository or workspace state, and so sit behind the
+ * Policy 25 research floor. Widening past the edit/shell sets matters because
+ * the guard's own lifecycle tools mutate the repository without a shell.
+ */
+export function isMutatingSurfaceTool(toolName: string): boolean {
+	return (
+		EDIT_TOOL_NAMES.has(toolName) ||
+		SHELL_TOOL_NAMES.has(toolName) ||
+		toolName.startsWith("guard_worktree_") ||
+		toolName === "guard_recovery_restore"
+	);
+}
+
 // dynamic_shell_syntax is fail-closed by design; naming the construct and a
 // remedy keeps agents from retrying near-identical commands. Keyed by the
 // construct strings returned by dynamicShellSyntaxIn; unknown constructs fall
