@@ -33,7 +33,7 @@ import { sessionReadFileCount } from "./stale-write.ts";
  * modules, components, sources) are matched.
  */
 const SWEEPING_CLAIM_RE =
-	/\b(?:the\s+)?(?:entire|whole|all|every)\s+(?:codebase|repository|repo|project|application|packages?|modules?|components?|sources?)\b|\b(?:throughout|across)\s+the\s+(?:codebase|repository|repo|project|code|app|application)\b|\bno\s+other\s+(?:place|occurrence|usage|reference|references|callers?|usages?)\b|\bnothing\s+else\s+(?:uses?|references?|calls?|depends\s+on)\b|\bnot\s+used\s+anywhere\s+else\b/i;
+	/\b(?:the\s+)?(?:entire|whole|all|every)\s+(?:codebase|repository|repo|project|application|packages?|modules?|components?|sources?)\b|\b(?:throughout|across)\s+the\s+(?:codebase|repository|repo|project|code|app|application)\b|\bno\s+other\s+(?:place|occurrence|usage|reference|references|callers?|usages?)\b|\bnothing\s+(?:else\s+)?(?:uses?|references?|calls?|depends\s+on)\b|\bnot\s+used\s+anywhere\s+else\b/i;
 
 /** Distinct files that must be touched before a sweeping claim is "backed". */
 export const MIN_SWEEPING_READ_COVERAGE = 2;

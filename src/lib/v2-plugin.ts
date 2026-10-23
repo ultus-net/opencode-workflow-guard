@@ -40,6 +40,7 @@ import {
 	getProjectConfig,
 	isLiveDocsRequired,
 	getLiveDocFailureThreshold,
+	getResearchToolPatterns,
 } from "./state.ts";
 import {
 	openProjectMemory,
@@ -53,7 +54,7 @@ import {
 } from "./project-memory.ts";
 import { secretIn } from "../policies/secrets.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./custom-tools.ts";
-import { isReadOnlyRole, SHELL_TOOL_NAMES } from "./guard-dispatcher.ts";
+import { isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./guard-dispatcher.ts";
 import { ToolInvocationLifecycle } from "./tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./tool-outcomes.ts";
 import { EDIT_TOOL_NAMES, fetchParentSession, fetchParentSessionID, effectiveTodos } from "../policies/todo.ts";
@@ -302,10 +303,10 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			// Policy 25: repeated failures with no live lookup since block the
 			// guess-and-retry surfaces until the session grounds itself in
 			// current documentation (V1 parity). Research tools are never gated.
-			if (event.sessionID && (EDIT_TOOL_NAMES.has(event.tool) || SHELL_TOOL_NAMES.has(event.tool))) {
+			if (event.sessionID && isMutatingSurfaceTool(event.tool)) {
 				const threshold = getLiveDocFailureThreshold(toolWorktree);
 				if (isLiveDocsRequired(toolWorktree)) {
-					const researchReason = liveDocsGatingReason(event.sessionID, event.tool, threshold);
+					const researchReason = liveDocsGatingReason(event.sessionID, event.tool, threshold, getResearchToolPatterns(toolWorktree));
 					if (researchReason !== undefined) {
 						await showBlockToast(researchReason);
 						audit({
@@ -748,11 +749,13 @@ async function handleV2Event(
 			const outcome = toolOutcomes.record(mapped);
 			if (outcome) {
 				// Policy 25 research floor (V1 parity): failures accrue debt;
-				// successful live-source lookups clear it.
-				if (outcome.status === "error") {
+				// successful live-source lookups clear it. A failed research
+				// attempt never accrues debt, so a flaky lookup cannot deepen
+				// the block it was meant to escape.
+				if (isResearchTool(outcome.tool, getResearchToolPatterns(effectiveRoot))) {
+					if (outcome.status !== "error") recordResearchLookup(outcome.sessionID);
+				} else if (outcome.status === "error") {
 					recordLiveDocsFailure(outcome.sessionID);
-				} else if (isResearchTool(outcome.tool)) {
-					recordResearchLookup(outcome.sessionID);
 				}
 				audit({
 					ts: new Date().toISOString(),

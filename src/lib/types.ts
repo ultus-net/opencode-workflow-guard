@@ -61,6 +61,11 @@ export interface ProjectConfig {
 	/** Failure count at which the research floor engages (default 3). */
 	liveDocFailureThreshold?: number;
 	/**
+	 * Extra tool-name fragments counted as a live-documentation lookup, for an
+	 * operator whose docs server is not in the builtin research token set.
+	 */
+	researchTools?: string[];
+	/**
 	 * Absolute paths of the LIVE control plane (runtime `~/.config/opencode`,
 	 * the guard's own install). When set, config-path protection classifies by
 	 * runtime consumption instead of filename segments: only targets under a

@@ -80,6 +80,7 @@ import {
 	isDocumentationRequired,
 	isLiveDocsRequired,
 	getLiveDocFailureThreshold,
+	getResearchToolPatterns,
 	loadedPluginVersion,
 	qualifiedHostVersion,
 	isReviewRequired,
@@ -1808,6 +1809,9 @@ check("invalid tool timing is omitted", new ToolOutcomeTracker().record({ type: 
 console.log("- live-docs research floor -");
 check("recognises builtin research tools", isResearchTool("websearch") && isResearchTool("webfetch"));
 check("recognises MCP documentation tools", isResearchTool("context7_resolve-library-id") && isResearchTool("mcp__context7__get-library-docs"));
+check("recognises tokenised docs servers beyond context7", isResearchTool("mcp__deepwiki__read_wiki") && isResearchTool("mcp__tavily__search") && isResearchTool("mcp__brave__web_search"));
+check("tokenised matching does not read obvious non-docs tools as research", !isResearchTool("mcp__git__ref_list") && !isResearchTool("git_status"));
+check("operator-declared research patterns are honoured", isResearchTool("mcp__acme__lookup", ["acme"]) && !isResearchTool("mcp__acme__lookup"));
 check("does not treat unrelated tools as research", !isResearchTool("bash") && !isResearchTool("edit") && !isResearchTool("read"));
 
 const floorUnit = new LiveDocsResearchFloor();
@@ -1820,6 +1824,16 @@ check("research floor never blocks a research tool", floorUnit.gatingReason("s-u
 floorUnit.recordResearch("s-unit");
 check("successful lookup clears the floor", floorUnit.gatingReason("s-unit", "bash", 3) === undefined);
 check("floor disabled when threshold is non-positive", floorUnit.gatingReason("s-unit", "edit", 0) === undefined);
+
+// A failed (or cancelled) research attempt must not deepen the debt it was
+// meant to clear; otherwise a flaky lookup deadlocks the session.
+const floorDeadlock = new LiveDocsResearchFloor();
+for (const _ of [1, 2, 3]) floorDeadlock.recordFailure("s-deadlock");
+check("floor blocks before a research attempt", typeof floorDeadlock.gatingReason("s-deadlock", "bash", 3) === "string");
+check("a research tool stays ungated while the floor is active", floorDeadlock.gatingReason("s-deadlock", "mcp__deepwiki__read_wiki", 3) === undefined);
+check("an operator-declared research tool stays ungated too", floorDeadlock.gatingReason("s-deadlock", "mcp__acme__lookup", 3, ["acme"]) === undefined);
+floorDeadlock.recordResearch("s-deadlock");
+check("clearing the floor lets the mutation through", floorDeadlock.gatingReason("s-deadlock", "bash", 3) === undefined);
 
 // Module-level helpers share state; a fresh session isolates the check.
 recordLiveDocsFailure("s-live-helpers");
@@ -1842,6 +1856,18 @@ check("env override can disable the research floor", isLiveDocsRequired(root) ==
 delete process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS;
 process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD = "5";
 check("env override can raise the research threshold", getLiveDocFailureThreshold(root) === 5);
+process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD = "5abc";
+check("trailing junk in the threshold is rejected, not silently parsed", getLiveDocFailureThreshold(root) === 3);
+process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD = "0";
+check("a zero threshold falls back to the default instead of disabling the floor", getLiveDocFailureThreshold(root) === 3);
+process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD = " 4 ";
+check("a padded threshold value is still honoured", getLiveDocFailureThreshold(root) === 4);
+delete process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
+const prevResearchTools = process.env.WORKFLOW_GUARD_RESEARCH_TOOLS;
+process.env.WORKFLOW_GUARD_RESEARCH_TOOLS = "acme,corp-docs";
+check("operator research tool patterns come from the environment", getResearchToolPatterns(root).join(",") === "acme,corp-docs");
+delete process.env.WORKFLOW_GUARD_RESEARCH_TOOLS;
+if (prevResearchTools === undefined) delete process.env.WORKFLOW_GUARD_RESEARCH_TOOLS; else process.env.WORKFLOW_GUARD_RESEARCH_TOOLS = prevResearchTools;
 delete process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
 if (prevRequireLive === undefined) delete process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS; else process.env.WORKFLOW_GUARD_REQUIRE_LIVE_DOCS = prevRequireLive;
 if (prevThreshold === undefined) delete process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD; else process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD = prevThreshold;
@@ -1906,6 +1932,33 @@ try {
 // The floor reason names websearch; the no-active-todo/edit gate would not, so
 // this asserts Policy 25 (not an unrelated gate) actually fired.
 check("mutation still blocks after an unrelated success", unrelatedBlock.includes("Blocked:") && unrelatedBlock.includes("websearch"));
+
+// A failed research attempt must not deepen the debt, and must clear on success.
+const liveDocsSession3 = "s-live-docs-int3";
+const livePart3 = (callID: string, status: "error" | "completed", tool = "bash") => ({
+	type: "tool",
+	sessionID: liveDocsSession3,
+	callID,
+	tool,
+	state: { status, error: status === "error" ? `boom-${callID}` : undefined, time: { start: 1, end: 2 } },
+} as const);
+for (const id of ["ld3-e1", "ld3-e2", "ld3-e3"]) {
+	await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties: { part: livePart3(id, "error") } } } as any);
+}
+check("floor is active before the research attempt", liveDocsFailureCount(liveDocsSession3) === 3);
+await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties: { part: livePart3("ld3-research-fail", "error", "websearch") } } } as any);
+check("a failed research attempt does not accrue research debt", liveDocsFailureCount(liveDocsSession3) === 3);
+await liveDocsPlugin.event?.({ event: { type: "message.part.updated", properties: { part: livePart3("ld3-research-ok", "completed", "websearch") } } } as any);
+check("a successful research attempt clears the debt", liveDocsFailureCount(liveDocsSession3) === 0);
+let worktreeThrow = "";
+try {
+	await liveDocsPlugin["tool.execute.before"]?.({ tool: "guard_worktree_create", sessionID: liveDocsSession3, callID: "ld3-wt" } as any, { args: { branch: "feat/x" } } as any);
+} catch (err) {
+	worktreeThrow = (err as Error).message;
+}
+check("a mutating lifecycle tool is not blocked once the floor is clear", !worktreeThrow.includes("websearch"));
+clearLiveDocsFloor(liveDocsSession3);
+
 await liveDocsPlugin.event?.({ event: { type: "session.idle", properties: { sessionID: liveDocsSession2 } } } as any);
 check("session idle does not clear research debt", liveDocsFailureCount(liveDocsSession2) === 3);
 await liveDocsPlugin.event?.({ event: { type: "session.deleted", properties: { info: { id: liveDocsSession2 } } } } as any);
@@ -4950,6 +5003,7 @@ console.log("- sweeping-claims grounding (observability) -");
 check("benign text does not trigger a sweeping claim", !checkSweepingClaims("I refactored the module.").sweeping);
 check("whole-codebase phrasing is detected", checkSweepingClaims("The entire codebase uses this pattern.").sweeping);
 check("no-other-callers phrasing is detected", checkSweepingClaims("No other callers reference this function.").sweeping);
+check("bare nothing-depends phrasing is detected without 'else'", checkSweepingClaims("Nothing depends on it.").sweeping && checkSweepingClaims("Nothing else depends on it.").sweeping);
 check(
 	"a sweeping claim with thin read coverage is flagged",
 	typeof checkSweepingClaims("Nothing else uses this helper.", { sessionID: "s-sweep-thin" }).reason === "string",
@@ -4982,7 +5036,17 @@ check(
 	appLogs.some((entry) => entry?.body?.level === "info" && String(entry?.body?.message).includes("sweeping claim mismatch")) &&
 		!appLogs.some((entry) => entry?.body?.level === "warn"),
 );
+// Negative hook case: a non-sweeping message must not journal a sweeping entry,
+// so the positive assertion above cannot pass on Policy 24's row alone.
+const sweepCleanBefore = getRecentAuditEntries(50).filter((e) => String(e.reason).includes("Sweeping claim")).length;
+await loggingPlugin["experimental.text.complete"]?.(
+	{ sessionID: "s-sweep-clean", messageID: "m4", partID: "p4" } as any,
+	{ text: "I refactored the helper and added a test." } as any,
+);
+const sweepCleanAfter = getRecentAuditEntries(50).filter((e) => String(e.reason).includes("Sweeping claim")).length;
+check("a non-sweeping message journals no sweeping-claim entry", sweepCleanAfter === sweepCleanBefore);
 clearReadFingerprints("s-sweep-hook");
+clearReadFingerprints("s-sweep-clean");
 
 // tool.definition enriches todowrite's description with the gate note
 const defPlugin = await WorkflowGuard({ directory: root, worktree: root, client: fakeClient as any } as any);

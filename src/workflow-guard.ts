@@ -22,7 +22,7 @@ import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, re
 import { beginReadObservation, clearReadFingerprints, recordMutationObservation, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
 import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
-import { guardToolCallImpl, isReadOnlyRole, SHELL_TOOL_NAMES } from "./lib/guard-dispatcher.ts";
+import { guardToolCallImpl, isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./lib/guard-dispatcher.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./lib/custom-tools.ts";
 import type { PolicyDecision, TodoSdkClient } from "./lib/types.ts";
 export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
@@ -78,6 +78,7 @@ import {
 	isDocumentationRequired,
 	isLiveDocsRequired,
 	getLiveDocFailureThreshold,
+	getResearchToolPatterns,
 	getSubagentMutationBudget,
 	isLearningEnabled,
 	isProjectMemoryEnabled,
@@ -118,6 +119,7 @@ export {
 	isDocumentationRequired,
 	isLiveDocsRequired,
 	getLiveDocFailureThreshold,
+	getResearchToolPatterns,
 	getSubagentMutationBudget,
 	isLearningEnabled,
 	getLearningInterventionBudget,
@@ -359,6 +361,14 @@ function logObservation(client: unknown, message: string): void {
 	} catch {}
 }
 
+function logWarn(client: unknown, message: string): void {
+	try {
+		void (client as TodoSdkClient | undefined)?.app?.log?.({
+			body: { service: "workflow-guard", level: "warn", message },
+		});
+	} catch {}
+}
+
 /**
  * Public guard entry point. Audits every decision (block or allow) to a
  * durable JSONL file before returning.
@@ -513,15 +523,13 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 				// the session grounds itself in current documentation. Research
 				// tools are never gated; an allowed research call records the
 				// lookup after it succeeds.
-				if (
-					input.sessionID &&
-					(EDIT_TOOL_NAMES.has(input.tool) || SHELL_TOOL_NAMES.has(input.tool))
-				) {
+				if (input.sessionID && isMutatingSurfaceTool(input.tool)) {
 					const threshold = getLiveDocFailureThreshold(toolWorktree);
 					if (isLiveDocsRequired(toolWorktree)) {
-						const researchReason = liveDocsGatingReason(input.sessionID, input.tool, threshold);
+						const researchReason = liveDocsGatingReason(input.sessionID, input.tool, threshold, getResearchToolPatterns(toolWorktree));
 						if (researchReason !== undefined) {
 							await emitBlockFeedback(researchReason);
+							logWarn(ctx.client, `[workflow-guard] ${researchReason}`);
 							audit({
 								ts: new Date().toISOString(),
 								sessionID: input.sessionID,
@@ -854,11 +862,14 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 				if (outcome) {
 					// Policy 25 research floor: a failed call accrues debt; a
 					// successful live-source lookup clears it. Unrelated
-					// successes intentionally do not clear it.
-					if (outcome.status === "error") {
+					// successes intentionally do not clear it. A research
+					// attempt never accrues debt even when it fails: otherwise
+					// a flaky network would deepen the block the agent is
+					// already trying to escape, and the floor would deadlock.
+					if (isResearchTool(outcome.tool, getResearchToolPatterns(effectiveRoot))) {
+						if (outcome.status !== "error") recordResearchLookup(outcome.sessionID);
+					} else if (outcome.status === "error") {
 						recordLiveDocsFailure(outcome.sessionID);
-					} else if (isResearchTool(outcome.tool)) {
-						recordResearchLookup(outcome.sessionID);
 					}
 					audit({
 						ts: new Date().toISOString(),

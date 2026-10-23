@@ -36,15 +36,39 @@ export const RESEARCH_TOOL_NAMES = new Set([
 ]);
 
 /**
- * A research tool is any recognised builtin/alias name, plus MCP documentation
- * servers such as Context7 that expose documentation lookup under their own
- * tool names (`context7`, `resolve-library-id`, `docs_search`).
+ * Documentation sources expose lookup under their own tool names, and MCP tool
+ * names arrive namespaced (`mcp__<server>__<tool>`, `<server>_<tool>`). Matching
+ * whole tokens rather than substrings keeps `git_ref_*` or `read_wiki_index`
+ * from being read as a docs source by accident.
  */
-export function isResearchTool(toolName: string): boolean {
+const RESEARCH_TOOL_TOKENS = new Set([
+	"context7",
+	"deepwiki",
+	"tavily",
+	"brave",
+	"exa",
+	"kagi",
+	"perplexity",
+	"docs",
+	"doc",
+	"docs_search",
+	"documentation",
+	"wiki",
+	"resolve",
+]);
+
+/**
+ * A research tool is a recognised builtin/alias name, a documented MCP source
+ * (matched by token), or an operator-declared name from `researchTools`.
+ */
+export function isResearchTool(toolName: string, extraPatterns: readonly string[] = []): boolean {
 	if (typeof toolName !== "string") return false;
 	const lower = toolName.toLowerCase();
 	if (RESEARCH_TOOL_NAMES.has(lower)) return true;
-	return lower.includes("context7") || lower.includes("docs_search") || lower.includes("resolve-library");
+	if (lower.includes("resolve-library")) return true;
+	const tokens = lower.split(/[^a-z0-9]+/).filter(Boolean);
+	if (tokens.some((token) => RESEARCH_TOOL_TOKENS.has(token))) return true;
+	return extraPatterns.some((pattern) => pattern.length > 0 && lower.includes(pattern));
 }
 
 const MAX_TRACKED_SESSIONS = 4096;
@@ -80,10 +104,10 @@ export class LiveDocsResearchFloor {
 	 * live source, or `undefined` when the call may proceed. Research tools are
 	 * never gated, and calls below the failure threshold proceed.
 	 */
-	gatingReason(sessionID: string, toolName: string, threshold: number): string | undefined {
+	gatingReason(sessionID: string, toolName: string, threshold: number, extraPatterns: readonly string[] = []): string | undefined {
 		if (!sessionID) return undefined;
 		if (!Number.isInteger(threshold) || threshold < 1) return undefined;
-		if (isResearchTool(toolName)) return undefined;
+		if (isResearchTool(toolName, extraPatterns)) return undefined;
 		const count = this.bucket(sessionID);
 		if (count < threshold) return undefined;
 		return (
@@ -120,8 +144,8 @@ export function liveDocsFailureCount(sessionID: string): number {
  * Policy decision helper for the enforcement hooks: a block reason when a
  * mutation/shell call must first research, otherwise `undefined`.
  */
-export function liveDocsGatingReason(sessionID: string, toolName: string, threshold: number): string | undefined {
-	return floor.gatingReason(sessionID, toolName, threshold);
+export function liveDocsGatingReason(sessionID: string, toolName: string, threshold: number, extraPatterns: readonly string[] = []): string | undefined {
+	return floor.gatingReason(sessionID, toolName, threshold, extraPatterns);
 }
 
 /** Drop a session's floor state (session deletion). */

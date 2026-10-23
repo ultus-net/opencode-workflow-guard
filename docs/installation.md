@@ -220,6 +220,26 @@ For stricter environments, set `requireSubagentReview: true` in `.opencode/workf
 
 ---
 
+## Live-Documentation Research Floor
+
+Policy 25 is enabled by default. After a session accumulates failed tool calls with no live-documentation lookup since, the guard blocks the next mutating or shell call until the agent consults a current source. Only non-research failures count, so a failed `websearch` never deepens the block. Reads, greps, and research tools are never gated.
+
+The builtin research names cover `websearch`, `webfetch`, and common aliases. MCP documentation servers are matched on whole name tokens. If your docs server uses an unrecognised name, declare it:
+
+```json
+{
+  "requireLiveDocs": true,
+  "liveDocFailureThreshold": 3,
+  "researchTools": ["acme-docs", "internal-wiki"]
+}
+```
+
+Or set `WORKFLOW_GUARD_REQUIRE_LIVE_DOCS=0` to disable the floor, `WORKFLOW_GUARD_LIVE_DOC_THRESHOLD` to retune the trigger, and `WORKFLOW_GUARD_RESEARCH_TOOLS` (comma-separated) to add research names. An unparseable, zero, or negative threshold falls back to the default of 3.
+
+The acting agent must be permitted to call at least one research tool. An agent whose toolset denies `websearch`/`webfetch` and exposes no MCP docs server cannot satisfy the floor, so grant one or disable the policy.
+
+---
+
 ## Recommended Companion Configuration
 
 For defense in depth, pair `opencode-workflow-guard` with OpenCode's native permission rules (see [OpenCode Permissions](https://opencode.ai/docs/permissions/)). OpenCode 2 uses one ordered `permissions` array (`bash` actions are named `shell` in V2):

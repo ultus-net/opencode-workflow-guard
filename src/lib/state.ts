@@ -559,8 +559,9 @@ export function isLiveDocsRequired(root: string): boolean {
 
 export function getLiveDocFailureThreshold(root: string): number {
 	const env = process.env.WORKFLOW_GUARD_LIVE_DOC_THRESHOLD;
-	if (env !== undefined) {
-		const parsed = Number.parseInt(env, 10);
+	if (env !== undefined && env.trim() !== "") {
+		// Number() rejects trailing junk that parseInt would silently accept.
+		const parsed = Number(env.trim());
 		if (Number.isInteger(parsed) && parsed >= 1) return parsed;
 	}
 	const cfg = getProjectConfig(root);
@@ -568,6 +569,23 @@ export function getLiveDocFailureThreshold(root: string): number {
 		return cfg.liveDocFailureThreshold;
 	}
 	return 3;
+}
+
+/**
+ * Extra tool-name fragments that count as a live-documentation lookup, so an
+ * operator whose docs server is not in the builtin token set can still satisfy
+ * the floor: `researchTools` in project config or
+ * `WORKFLOW_GUARD_RESEARCH_TOOLS` (comma-separated).
+ */
+export function getResearchToolPatterns(root: string = getWorkspaceRoot()): string[] {
+	const env = process.env.WORKFLOW_GUARD_RESEARCH_TOOLS;
+	if (env !== undefined && env.trim() !== "") {
+		return env.split(",").map((value) => value.trim().toLowerCase()).filter(Boolean);
+	}
+	const configured = getProjectConfig(root).researchTools;
+	return Array.isArray(configured)
+		? configured.filter((value): value is string => typeof value === "string").map((value) => value.trim().toLowerCase()).filter(Boolean)
+		: [];
 }
 
 export function getOperationProfile(root: string): "interactive" | "autonomous" {
