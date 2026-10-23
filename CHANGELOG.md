@@ -1,5 +1,134 @@
 # Changelog
 
+## 1.16.0
+
+### Minor Changes
+
+- e5fd6a1: Enforce per-task completion evidence for `todowrite`.
+
+    A task may now enter `completed` only when the session recorded at least one file mutation inside that task's active window. Previously, a list-wide `todowrite` could flip every item to `completed` with no work behind it; the guard only journalled a `completion_claim_mismatch` audit record and allowed it. That signal is now an enforced policy.
+
+    - **Per-task windows, not a session baseline.** Each active task records the session mutation count when it entered its current window. One mutation cannot vouch for several completions, so N completions need N mutations counted from the earliest of them, and work done before a task became active never counts toward it. A finished or dropped task releases its window, so reusing a task's text starts clean. Task identity is the task text with the read-only marker stripped, and occurrences are counted rather than matched by last write, so duplicate text cannot hide a new completion.
+    - **`[read-only]` escape for review and investigation.** Tasks that legitimately change no file carry `[read-only]` in their text (also `[read_only]` / `[read only]`) and complete freely. Because the marker is an annotation rather than part of identity, it can be appended to an already-planned task instead of forcing a re-plan. Every use is journaled as `todo_completed_read_only`, so relabeling real work as read-only is visible in the audit trail instead of passing silently. Deliberately dropped work uses `cancelled`.
+    - **Planned late.** A task first observed already `completed` has no window, so it is scored against the session's mutation history, bounded by the one-mutation-per-completion rule.
+    - **Block message names the remedy.** A rejected write names the offending tasks and states the three legitimate paths: do the work, mark it `[read-only]`, or mark it `cancelled`.
+    - **Simulation predicts the gate.** `guard_why` now reports the same verdict the enforcement path would, and does not move any task window.
+    - **Steering, not just enforcement.** The `todowrite` tool description, the system-prompt guidance, and the compaction injection now state the lifecycle contract: plan before working, keep the list truthful, complete a task only after its work is done, and use the marker for genuinely read-only tasks.
+    - **`guard_status` reports `taskEvidence`** (`active`, `completed`, `tasksWithoutRecordedWork`, `readOnlyTasks`), so the requirement is visible before it blocks anything.
+
+    Todo state is per session and cleared on `session.deleted`. The completion check never replaces the finalization gates: fresh verification evidence and the review gate remain the authority on whether the work is done.
+
+- 2818ad0: Adopt five OpenCode 2 plugin APIs that were previously unused, and correct documentation that had drifted from the host.
+
+    `ctx.command.transform` now registers a server-side `/guard-status` command, so guard state is readable from every V2 client without the separately installed TUI companion. The report is delivered as a synthetic message, which costs no model turn.
+
+    Read-only subagent roles now lose the mutating tools from their per-request tool snapshot in `session.hook("context")` (`write`, `edit`, `patch`, `apply_patch`, `shell`, `bash`, `execute`, `todowrite`, `subagent`/`task`, and the worktree lifecycle tools). Previously they received guidance text and were denied late in `execute.before`; now the model cannot plan the call at all. The `execute.before` seat is unchanged and remains the backstop for tools supplied outside the host snapshot. Every pruning is journaled as `session.context` / `read_only_role_tools_pruned`.
+
+    `guard_worktree_create` uses the host worktree API when the host exposes a project id, so the worktree lands in the operator's configured `worktree.directory` and appears in host inventory. The host's answer is validated independently (existing directory, a registered worktree of this repository, never the primary tree) and any failure falls back to the existing git path. `guard_worktree_cleanup` still owns removal, because the host's `remove` has a `force` flag and no snapshot step, so delegating it could destroy uncommitted work the guard preserves. Cleanup accepts a directory outside the guard's storage only when the host declares it, and it asks the host to refresh its inventory afterwards.
+
+    The MCP policy now widens its guarded server tokens from `ctx.mcp.list()`, refreshed on `mcp.tools.changed`. A renamed or enterprise instance of a guarded product is matched without a code change. Widening is one-way: removing a server adds nothing and the static token list stays the floor, because tool names are model-supplied text and the MCP policy is a live-system rail.
+
+    `command.executed` is now journaled. The previous comment claimed V2 had no such event; the installed 2.0.10 schema has it, and the 2.0.15 host emits it.
+
+    Docs corrected in the same pass: `docs/policies.md` now lists the V2 hook names alongside the V1 ones (V1 plugin implementations do not run on OpenCode 2), qualifies the `todowrite` version boundary (absent through 2.0.15, reintroduced in 2.1.x behind `experimental.todo`), and names `session.hook("compaction")` as the V2 compaction seat. Stale comments in `src/lib/v2-todo.ts` and `src/lib/v2-plugin.ts` now state the version boundary instead of asserting that no `todowrite` exists.
+
+- 7842250: The V2 `permission.hook("evaluate")` seat now enforces instead of only journaling. It maps the host's normalized permission `action`/`resources` back onto the policy core and sets `effect = "deny"` with an attributable message, so a denied shell command or file mutation never starts. Shell resources feed the shell, git, destructive, and workspace policies, `read` resources feed the secret policy, `edit`/`write`/`patch`/`apply_patch` resources feed the boundary, tamper, secret, protected-branch, and todo policies, and guarded MCP servers feed the MCP policy. The seat only tightens: an explicit configured `deny` stays final, unmapped host actions remain with host policy, and a seat failure fails closed. `execute.before` is kept as the last-resort seat because it is the only one that sees raw tool input.
+- f320ecf: OpenCode 2 policy posture: close a write-confinement escape, add the permission
+  seat, ship installable static policies, restore the task/todo distinction, and
+  pin the host dependency.
+
+    **Security fix.** A session could widen its write boundary into another
+    repository through a single allowed read, because a path-derived workspace
+    candidate was adopted even for an already-bound session. That is the one change
+    in this release with a security impact; see the dedicated write-confinement
+    changeset for the mechanism and its regression checks.
+
+    The rest:
+
+    - **Permission seat.** `ctx.permission.hook("evaluate")` now denies before a
+      tool starts, tightening only: a configured `deny` is already final, so the
+      hook never re-permits one.
+    - **Static policy posture.** `opencode-workflow-guard policies --print` emits a
+      host-level policy block for invariants a repository cannot lift. It prints and
+      refuses to install, because a plugin that writes the config holding its own
+      static rails has moved them back inside the plugin.
+    - **Todo capability.** The `todowrite` capability is probed from the tool
+      registry instead of inferred from history, so OpenCode 2.1.x gates a session
+      that never planned while 2.0.x still fails open, now with a once-per-session
+      warning and a `todoCapability` field in `guard_status`.
+    - **Pinned host dependency.** Direct dependencies no longer float on `latest`,
+      and `guard_status` reports the qualified host version next to the loaded one.
+    - **`setup` writes the right key.** OpenCode 2 reads `plugins`, not the singular
+      `plugin`; the old writer produced a config that looked configured and loaded
+      nothing on 2.x. The TUI file is the exception: `tui.json` keeps singular
+      `plugin` on both majors, because 2.x reads that key and migrates it into
+      `cli.json.plugins`.
+    - **Subagents inherit the parent's write boundary.** A subagent has no direct
+      binding of its own, so a path-derived candidate used to look like a first bind
+      even when its parent was confined: one allowed foreign read moved the child
+      into another repository. Registration now resolves the nearest bound ancestor
+      first, so the child stays inside the parent's boundary and the refusal is
+      journaled.
+    - **Adopted current plugin APIs.** Server-side `/guard-status` command, read-only
+      tool pruning from the per-request snapshot, native worktree creation with
+      host-declared cleanup, and a widen-only MCP inventory.
+
+    ## Verification status
+
+    Probe-gated, not date-gated. Verified on the installed host:
+
+    | Gate                                             | Result                                                                                                                                                                                                         |
+    | ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+    | `npm run typecheck`                              | clean on the final tree                                                                                                                                                                                        |
+    | `npm test`                                       | 1261 passed, 0 failed                                                                                                                                                                                          |
+    | `npm run test:install`                           | 27 passed, 0 failed, on OpenCode v2.0.15                                                                                                                                                                       |
+    | `WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install` | 29 passed, 0 failed, 3 live unavailable. All three model-driven probes reached the provider, got `Model unavailable: openrouter/openrouter/auto`, and were classified unavailable rather than passed or failed |
+    | Static-policy denial canary                      | **NOT RUN**: needs a live session and an operator-installed config; the guard's tamper rail correctly blocks an agent from writing a live control-plane path                                                   |
+    | OpenCode 2.1.x todo acceptance                   | **NOT RUN**: the installed host is 2.0.15 and has no `todowrite` to probe. Covered by synthetic registry and session data only                                                                                 |
+
+    Do not read the unrun rows as passes. They are recorded gaps, and each names the
+    condition that would close it.
+
+- 4540e9c: Add `opencode-workflow-guard policies --print`, which emits a static host-level policy block for invariants a repository cannot lift: protected-trunk pushes, live control-plane edits, secret reads, external-directory widening, and the Code Mode surface. The command prints JSONC to stdout and refuses to install it, because a plugin that writes the config holding its own static rails has moved them back inside the plugin.
+
+    **The default emits both host envelopes.** OpenCode 2.0.x evaluates `experimental.policies` with `action: "permission"`, and OpenCode 2.1.x evaluates a top-level `policies` array with `action: "tool.use"`. Each host ignores the key it does not read and reports no error, so a single-key block loads cleanly on the other host and enforces nothing. Live denial canaries confirmed both silent no-ops: the `2.0` block executed a denied command on 2.1.3, and the `next` block executed it on 2.0.15. `--print` therefore defaults to `both`, and `--format 2.0` / `--format next` remain for pinning one host.
+
+    The same canaries confirm the default block denies on both hosts with `Blocked by configuration policy`. The `execute` invariant is documented as inert on both qualified hosts, because neither registers an `execute` tool.
+
+    See [docs/policy-posture.md](docs/policy-posture.md) for precedence, the two rules that are judgement calls, the acceptance matrix, and the residual risk: whole-string shell globs do not cover compound command lines, and a config that can be written can be edited.
+
+- 19b846b: Probe the host's `todowrite` capability instead of inferring it from session history. OpenCode 2.1.x reintroduces `todowrite` behind `experimental.todo: true`, and on that host a session with no todo list has never planned, which must gate mutations. On 2.0.x the tool does not exist, so the gate still fails open; that path now logs once per session, journals an audit record, and reports `todoCapability` in `guard_status` instead of staying silent.
+
+    Also add a completion-laundering audit signal. Marking a task `completed` with no mutation since the previous `todowrite` writes a `completion_claim_mismatch` record. The signal alone never blocked. A later policy enforces per-task completion evidence; see the `todowrite` per-task completion evidence changeset for the enforced form and the `[read-only]` escape.
+
+    Live acceptance on OpenCode 2.1.3: `ctx.tool.list()` at setup exposes
+    `todowrite` when `experimental.todo: true` is set and omits it when the flag is
+    false, so the probe reports `available` and `unavailable` against the real host
+    registry rather than synthetic data. The capability probe, the gate inversion,
+    and the fail-open path are also covered by unit tests.
+
+### Patch Changes
+
+- ca914cb: Clear the dependency audit so a release can ship clean.
+
+    `npm audit` reported 10 vulnerabilities (4 high, 6 critical). Three are leaf packages with direct fixes, applied by `npm audit fix`: `launch-editor` 2.14.2, `shell-quote` 1.12.0, and `brace-expansion` 2.1.7.
+
+    The remaining five are nested inside the OpenCode host dependency tree, where the parent packages hard-pin the vulnerable ranges. Two `overrides` entries clear them:
+
+    - `solid-js` 1.9.17: `@opentui/solid@0.6.6` peer-pins exactly `1.9.12`, which requires `seroval ~1.5.0` and carries memory-exhaustion and thenable-assimilation advisories. `1.9.17` requires `seroval ~1.6.8`, which is patched. The TUI imports `solid-js` directly, so this is the version the guard actually runs.
+    - `toml` 5.0.1: `effect@4.0.0-beta.83` (via `@opencode-ai/plugin`) requires `^4.1.1`; `toml <=5.0.0` carries three quadratic-complexity denial-of-service advisories. `5.0.1` keeps the single `parse` export the caller uses, and the guard never parses TOML itself.
+
+    `npm audit` now reports zero vulnerabilities. Note that `npm overrides` apply only to the root project, so this protects this repository's install and CI, not a consumer's transitive tree; a consumer resolves the parent-declared ranges unless it declares the same overrides. Both entries are documented in `docs/installation.md` and should be dropped once the parent packages widen their ranges.
+
+- 0467945: Settings tamper now flags `patch` and `perl -i` / `perl -pi` in-place editors when their target is protected OpenCode config (`opencode.json`, `.config/opencode/**`, `.opencode/**`). Previously `V_LIST` in `src/policies/tamper.ts` omitted these verbs, so they could rewrite guarded settings without tripping the tamper policy. Regression tests cover the blocked targets and the allowed normal-file cases.
+- 1a76df9: Pin every direct dependency to the exact version this build is qualified against instead of `latest`. A floating host API lets a new major load and silently no-op, which is the failure mode the migration guide names. `guard_status` now also reports `qualifiedHostVersion` next to the live `hostVersion`, so a mismatch is visible before it becomes an inert hook.
+
+    Qualify OpenCode 2.1.3 and move the host pins with it: `@opencode/plugin` and `@opencode/ai` to `2.1.3`, and `@opentui/solid` to `0.6.6` (the 2.1.3 peer floor). A 2.0.x pin set on a 2.1.x host does not degrade gracefully: the plugin imports an `effect` path the host no longer provides, so the host reports `failed to load plugin` and every policy is inert. This was reproduced, then fixed by moving the pins.
+
+    Fix `opencode-workflow-guard setup`, which wrote the singular `plugin` key unconditionally. OpenCode 2 reads only `plugins`, and its config schema drops the singular key without an error, so setup on a 2.x install produced a config that looked configured and loaded nothing. Setup now detects the target from the existing config, defaults to OpenCode 2, and accepts `--major 1|2` to state it explicitly.
+
+- bdea302: Security fix: a session could widen its write boundary into another repository through a single allowed read. `registerSessionWorkspaceFromToolCall` adopted the git root of any `workdir`/`filePath` argument, even when the session already had a bound workspace, so reading a file in a foreign repository moved the boundary there and later writes into that repository were allowed. A path-derived candidate now binds only an unbound session. Widening a bound session requires an explicit host-declared per-call worktree (worktree isolation and relay flows), and every granted or refused widening is journaled as `workspace.binding`. Regression checks cover the foreign-read, foreign-write, and legitimate host-worktree cases.
+
 ## 1.15.5
 
 ### Patch Changes

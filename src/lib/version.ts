@@ -19,3 +19,25 @@ export function loadedPluginVersion(moduleUrl: string = import.meta.url): string
 		return undefined;
 	}
 }
+
+/**
+ * The OpenCode release this build is qualified against, read from the pinned
+ * `@opencode/plugin` dependency in the same manifest.
+ *
+ * Pinning the host API stops an unreviewed major from floating in, but a
+ * published guard can still be installed into a host that is newer or older
+ * than the one it was verified on. Reporting the qualified pair next to the
+ * loaded host version makes that mismatch visible before it becomes a silent
+ * no-op, which is the failure mode the migration guide names.
+ */
+export function qualifiedHostVersion(moduleUrl: string = import.meta.url): string | undefined {
+	try {
+		const manifest = JSON.parse(readFileSync(fileURLToPath(new URL("../../package.json", moduleUrl)), "utf8")) as {
+			dependencies?: Record<string, unknown>;
+		};
+		const pinned = manifest.dependencies?.["@opencode/plugin"];
+		return typeof pinned === "string" && /^\d+\.\d+\.\d+/.test(pinned) ? pinned : undefined;
+	} catch {
+		return undefined;
+	}
+}

@@ -8,6 +8,7 @@ import {
 	getLiveControlPlaneRoots,
 	getSdkClient,
 	getSessionBoundWorkspace,
+	getSessionMutationCount,
 	getWorkspaceRoot,
 	isDocumentationRequired,
 	isReviewRequired,
@@ -17,6 +18,7 @@ import {
 	recordVerifyResult,
 	sessionMutationTimestamps,
 	sessionVerifyResults,
+	todoTaskStarts,
 } from "./state.ts";
 import {
 	dynamicShellSyntaxIn,
@@ -74,9 +76,14 @@ import {
 	effectiveTodos,
 	fetchSessionTodos,
 	hasActiveTodo,
+	readOnlyTodoCompletions,
+	recordTodoTaskStarts,
 	subagentMutationBudgetReason,
+	todoCompletionBlockReason,
+	unverifiedTodoCompletions,
 	validateTodoLifecycle,
 } from "../policies/todo.ts";
+import { recordedTodoCapability, reportTodoGateFailOpen } from "./v2-todo.ts";
 
 export const SHELL_TOOL_NAMES = new Set(["bash", "run_commands", "execute_command", "shell"]);
 
@@ -192,6 +199,22 @@ export async function guardToolCallImpl(
 				logPolicyBlock(`[workflow-guard] ${err}`);
 				return block("todo", "todo_lifecycle", err);
 			}
+			// Per-task completion evidence. Every task may enter `completed`
+			// only after the session mutated inside that task's window. The
+			// check is pure, so simulation reports the same verdict without
+			// journaling or moving any window.
+			const readOnlyCompleted: string[] = [];
+			if (context?.sessionID) {
+				const starts = todoTaskStarts(context.sessionID);
+				const total = getSessionMutationCount(context.sessionID);
+				const unverified = unverifiedTodoCompletions(existingTodos, newTodos, starts, total);
+				if (unverified.length > 0) {
+					const reason = todoCompletionBlockReason(unverified);
+					logPolicyBlock(`[workflow-guard] ${reason}`);
+					return block("todo", "todo_completion_unverified", reason);
+				}
+				if (!context.simulate) readOnlyCompleted.push(...readOnlyTodoCompletions(existingTodos, newTodos));
+			}
 			const allDone = newTodos.length > 0 && newTodos.every((t) => {
 				const s = String(t.status ?? "");
 				return s === "completed" || s === "cancelled";
@@ -225,6 +248,22 @@ export async function guardToolCallImpl(
 							return block("verification", "verification_failed", reason);
 						}
 					}
+				}
+			}
+			// Only an accepted write becomes the task list, so task windows move
+			// and read-only marker use is journaled after every gate has passed.
+			if (context?.sessionID && !context.simulate) {
+				recordTodoTaskStarts(todoTaskStarts(context.sessionID), existingTodos, newTodos, getSessionMutationCount(context.sessionID));
+				if (readOnlyCompleted.length > 0) {
+					audit({
+						ts: new Date().toISOString(),
+						sessionID: context.sessionID,
+						tool: "todowrite",
+						decision: "allow",
+						phase: "event",
+						reason: "todo_completed_read_only",
+						input: { tasks: readOnlyCompleted, mutationCount: getSessionMutationCount(context.sessionID) },
+					});
 				}
 			}
 		}
@@ -308,6 +347,23 @@ export async function guardToolCallImpl(
 		if (todos !== undefined && !hasActiveTodo(todos)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: no active todo item (session ${context?.sessionID ?? "?"})`);
 			return block("todo", "no_active_todo", "Blocked: no active todo item. First break the request down with the todowrite tool (create items with status 'pending' or 'in_progress'), then work them through, marking each completed via todowrite as you finish it. When every item is completed, create a fresh todo list before starting new work.");
+		}
+		if (todos === undefined) {
+			// Fail-open, but never silent: once per session, record that the
+			// gate did not enforce and why. A rails policy that quietly stops
+			// enforcing is indistinguishable from one that was removed.
+			const capability = recordedTodoCapability();
+			if (reportTodoGateFailOpen(context?.sessionID, capability)) {
+				audit({
+					ts: new Date().toISOString(),
+					sessionID: context?.sessionID,
+					tool: "todo.gate",
+					decision: "allow",
+					phase: "event",
+					reason: `todo_gate_fail_open_${capability}`,
+					input: { [toolName]: true },
+				});
+			}
 		}
 		if (context?.sessionID) {
 			const reason = await subagentMutationBudgetReason(context.sessionID, currentRoot);

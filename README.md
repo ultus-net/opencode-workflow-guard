@@ -46,7 +46,7 @@ WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # Also run policy probes with Ope
 The plugin enforces **26 deterministic policy rules** across four main pillars:
 
 * **Branch & History Protection:** Enforces feature-branch workflows (blocks edits/commits on `main`/`master`), hard-blocks direct or forced pushes to protected branches, enforces mergeability pre-flight checks, enforces secondary review approval (bound to the reviewed worktree content) before PR creation by default, and requires PR changelogs / changesets.
-* **Task & Verification Discipline:** Gates file mutations on active `todowrite` tasks with subagent inheritance, blocks concurrent direct edits to the same canonical file across sessions, requires same-session fresh reads before `edit`/`write` can replace existing files, blocks silent task deletion, enforces fresh test verification evidence before task completion, journals completion claims vs. verification mismatches, journals sweeping repository claims unsupported by read coverage, and forces a live-documentation lookup after repeated failures instead of guessing from training data.
+* **Task & Verification Discipline:** Gates file mutations on active `todowrite` tasks with subagent inheritance, requires each task's own recorded work before it can be marked completed (with an audited `[read-only]` marker for review and investigation tasks), blocks concurrent direct edits to the same canonical file across sessions, requires same-session fresh reads before `edit`/`write` can replace existing files, blocks silent task deletion, enforces fresh test verification evidence before task completion, journals completion claims vs. verification mismatches, journals sweeping repository claims unsupported by read coverage, and forces a live-documentation lookup after repeated failures instead of guessing from training data.
 * **Secrets & Workspace Confinement:** Confines edit tools and recognized shell/git mutations within the workspace root (including symlink and `../` escape checks), scrubs sensitive environment variables in agent subshells, and redacts `.env` reads with safe schema masks. Arbitrary executables are not OS-sandboxed; use containers or filesystem isolation when hard confinement is required.
 * **Destructive CLI & Environment Safety:** Intercepts destructive cloud/database/infrastructure commands, stops script laundering and interpreter evasion, blocks TTY hangs (`vim`, `nano`, `sudo`), and guards against dangerous package manager flags.
 
@@ -74,8 +74,9 @@ The context modules — project memory, Socratic learning, and recovery checkpoi
 
 | Guide | Description |
 |---|---|
-| [**Policy Reference**](docs/policies.md) | Comprehensive specification of all 24 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
+| [**Policy Reference**](docs/policies.md) | Comprehensive specification of all 26 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
 | [**Installation & Configuration**](docs/installation.md) | Setup options, global vs. local install, worktree isolation, and project configuration |
+| [**Static Policy Posture**](docs/policy-posture.md) | Emitting host-level policies for invariants a repository cannot lift: both host envelopes (`experimental.policies` on 2.0.x, top-level `policies` on 2.1.x), precedence, and residual risk |
 | [**Managed Deployment**](docs/managed-deployment.md) | Administrator-managed OpenCode policy, platform locations, and startup diagnostics |
 | [**Troubleshooting**](docs/troubleshooting.md) | Diagnosing policy blocks, common false positives, and emergency override procedures |
 | [**Testing Architecture**](docs/testing.md) | Test harness design, adversarial regression matrix, and CI verification |
