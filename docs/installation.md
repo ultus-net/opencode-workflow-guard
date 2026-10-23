@@ -34,6 +34,24 @@ policy stays inert.
 `hostVersion`, so a mismatch is visible at runtime rather than surfacing as a
 silently inert hook.
 
+### Dependency Audit Overrides
+
+Two transitive dependencies are pinned above the range their parent declares, to
+clear advisories that would otherwise ship:
+
+| Package | Parent constraint | Override | Why |
+|---|---|---|---|
+| `solid-js` | `@opentui/solid@0.6.6` peer-pins exactly `1.9.12` | `1.9.17` | `1.9.12` requires `seroval ~1.5.0`, which carries memory-exhaustion and thenable-assimilation advisories. `1.9.17` requires `seroval ~1.6.8`, which is patched. The TUI imports `solid-js` directly, so the bump is also the version the guard actually runs. |
+| `toml` | `effect@4.0.0-beta.83` (via `@opencode-ai/plugin`) requires `^4.1.1` | `5.0.1` | `toml <=5.0.0` carries three quadratic-complexity denial-of-service advisories. `5.0.1` keeps the same single `parse` export the caller uses. The guard itself never parses TOML; this is host plumbing. |
+
+Both are `overrides` entries in `package.json`, and `npm audit` reports zero
+vulnerabilities for this repository. `npm overrides` apply only to the root
+project, so they protect this repository's install and its CI, not a consumer's
+transitive tree. A consumer that installs the published package resolves the
+parent-declared ranges unless it declares the same overrides itself. Revisit both
+when `@opentui/solid` or `@opencode-ai/plugin` widen their ranges, and drop the
+override rather than carrying it forward.
+
 ---
 
 ## Installation Methods

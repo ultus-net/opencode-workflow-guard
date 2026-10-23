@@ -60,5 +60,9 @@
     "@changesets/cli": "3.0.3",
     "@types/node": "26.6.2",
     "typescript": "7.0.2"
+  },
+  "overrides": {
+    "solid-js": "1.9.17",
+    "toml": "5.0.1"
   }
 }
