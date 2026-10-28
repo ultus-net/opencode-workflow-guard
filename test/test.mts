@@ -2336,6 +2336,44 @@ check(
 	blocked(failFinalRes),
 );
 
+// A timeout is not a failing test. Both block finalization, but the reason
+// must name the timeout and its remedy. Reporting a timeout as "verification
+// is failing" sends the agent looking for a failing assertion that does not
+// exist, and the real fix is a longer timeout rather than a code change.
+console.log("- Policy 10: verification timeout attribution -");
+const verifyTimeoutRepo = mkdtempSync(join(tmpdir(), "wg-verify-timeout-finalize-"));
+mkdirSync(join(verifyTimeoutRepo, ".opencode"), { recursive: true });
+writeFileSync(
+	join(verifyTimeoutRepo, ".opencode", "workflow-guard.json"),
+	JSON.stringify({ verifyCommand: "node -e \"setTimeout(() => {}, 5000)\"", verifyTimeoutMs: 50 }),
+);
+reloadProjectConfig(verifyTimeoutRepo);
+setWorkspaceRoot(verifyTimeoutRepo);
+resetVerifyState();
+todo("s-verify-timeout", item("timeout work", "in_progress"));
+await call(
+	"edit",
+	{ filePath: join(verifyTimeoutRepo, "code.ts"), content: "timeout" },
+	{ sessionID: "s-verify-timeout" },
+);
+const timeoutFinalRes = await call(
+	"todowrite",
+	{ todos: [item("timeout work", "completed")] },
+	{ sessionID: "s-verify-timeout" },
+);
+check("verification timeout blocks finalization", blocked(timeoutFinalRes));
+check(
+	"verification timeout is not reported as a failing test",
+	!String(timeoutFinalRes).includes("verification is failing"),
+);
+check(
+	"verification timeout names the elapsed limit and the remedy",
+	String(timeoutFinalRes).includes("timed out") && String(timeoutFinalRes).includes("verifyTimeoutMs"),
+);
+setWorkspaceRoot(verifyRepo);
+reloadProjectConfig(verifyRepo);
+rmSync(verifyTimeoutRepo, { recursive: true, force: true });
+
 // A subagent mutation governed by the parent's todos must invalidate the
 // parent's cached verification result.
 writeFileSync(

@@ -47,7 +47,7 @@ npm run test:all
 | **Policy 5: MCP Mutations** | Verifies GitHub/Azure mutating MCP tools are blocked while read-only tools pass. |
 | **Policy 6: Settings Tamper** | Verifies protection of `opencode.json`, `~/.config/opencode/*`, and `opencode auth`. |
 | **Policy 8: Workspace Boundary** | Verifies path traversal (`../`), symlinks, and absolute path escape protection in `edit`, `write`, `apply_patch`, and shell mutations. |
-| **Policy 10: Evidence Verification** | Verifies isolated verification execution, timeout handling, scrubbed environment, and finalization gating on fresh passing tests. |
+| **Policy 10: Evidence Verification** | Verifies isolated verification execution, timeout handling, scrubbed environment, and finalization gating on fresh passing tests. A timeout blocks finalization under its own code, and its reason names the limit and the remedy instead of claiming a failing test. |
 | **Adversarial Invariants** | Verifies defense against compound shell mutations, symlink escapes, chained git normalization, verify script abuse, and external repo mutations. |
 | **Audit & Permission Events** | Verifies the typed `permission.ask` hook, permission replies, and command journaling in the audit trail. |
 | **Completion Claims & Tool Honesty** | Verifies the claims-vs-evidence detector (missing/failing/stale/fresh states), `experimental.text.complete` journaling, and `tool.definition` enrichment idempotence. |

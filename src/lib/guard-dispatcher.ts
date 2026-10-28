@@ -256,10 +256,16 @@ export async function guardToolCallImpl(
 						const result = await runVerify(command, currentRoot, resolveVerifyTimeoutMs(currentRoot));
 						recordVerifyResult(command, result, sessionID, currentRoot);
 						if (!result.passed) {
-							const tail = snipVerifyOutput(result.output, result.passed).slice(-500);
-							const reason = `Blocked todowrite: all tasks marked done but verification is failing (${command}). Fix the failure before finishing; output tail: ${tail}`;
+							// A timeout is not a failing test. Both block
+							// finalization, but naming a failure sends the
+							// agent chasing an assertion that never ran, and
+							// the remedy is a longer limit rather than a code
+							// change.
+							const reason = result.timedOut
+								? `Blocked todowrite: verification did not finish within ${Math.round((result.timeoutMs ?? 0) / 1000)}s, so the result is unknown rather than failing (${command}). Raise the limit with verifyTimeoutMs in .opencode/workflow-guard.json or WORKFLOW_GUARD_VERIFY_TIMEOUT_MS, then complete the tasks again; output tail: ${snipVerifyOutput(result.output, result.passed).slice(-500)}`
+								: `Blocked todowrite: all tasks marked done but verification is failing (${command}). Fix the failure before finishing; output tail: ${snipVerifyOutput(result.output, result.passed).slice(-500)}`;
 							logPolicyBlock(`[workflow-guard] ${reason}`);
-							return block("verification", "verification_failed", reason);
+							return block("verification", result.timedOut ? "verification_timed_out" : "verification_failed", reason);
 						}
 					}
 				}
