@@ -18,7 +18,7 @@
  */
 
 import { Plugin } from "@opencode/plugin";
-import { Message } from "@opencode/ai";
+import { Message } from "@opencode/ai/effect";
 import { z } from "zod";
 import { join, resolve } from "node:path";
 import type { TodoSdkClient } from "./types.ts";
@@ -145,6 +145,9 @@ const SUBAGENT_SUFFIX =
 //   server registry, so this enrichment cannot reach them.
 // - V2.1.x adds a builtin `todowrite` behind the `experimental.todo` config
 //   key, so the candidate below reaches a real registry entry there.
+// - V2.2.x exposes `todowrite` through that same `experimental.todo` opt-in.
+//   The guard probes the registry rather than inferring capability from the
+//   version, so 2.1.x and 2.2.x need no version check here.
 // - The V1 subagent tool `task` was renamed to `subagent`; both are kept as
 //   candidates for the same reason.
 const ENRICHMENT_TARGETS: Array<{ candidates: string[]; suffix: string; marker: string }> = [
@@ -583,17 +586,22 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				},
 				{ workspaceRoot: effectiveRoot, client },
 			);
-			if (seat.decision) {
+			if (seat.effect === "deny" && seat.decision) {
 				event.effect = "deny";
 				event.message = seat.decision.message;
 			}
+			// An abstention leaves the configured effect and message untouched,
+			// and still journals. `execute.before` runs the real check, which
+			// includes the remote PR probe that simulation skips. It records
+			// `abstain` rather than `allow`, so the deferral stays visible.
+			const abstained = seat.effect === "abstain";
 			audit({
 				ts: new Date().toISOString(),
 				sessionID: event.sessionID,
 				tool: "permission.ask",
-				decision: seat.effect === "deny" ? "block" : "allow",
+				decision: seat.effect === "deny" ? "block" : abstained ? "abstain" : "allow",
 				phase: "decision",
-				reason: seat.decision?.code,
+				reason: abstained ? "deferred_to_execute_before" : seat.decision?.code,
 				policyDecision: seat.decision,
 				input: {
 					action: event.action,
@@ -601,6 +609,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 					agent: event.agent,
 					configuredEffect,
 					mappedTool: seat.mappedTool,
+					...(abstained ? { deferred: "execute.before" } : {}),
 				},
 			});
 		} catch (error) {

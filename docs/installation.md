@@ -6,8 +6,14 @@
 
 ## Requirements
 
-- **OpenCode >= 1.18** (V1: requires the `GET /session/:id/todo` endpoint and the V1 `PluginModule` loader) or **OpenCode 2.x**. V2 loads through the `@opencode/plugin` API. The current todo list is reconstructed from session message history, or read from the native `todowrite` on 2.1.x when `experimental.todo` is enabled.
+- **OpenCode >= 1.18** (V1: requires the `GET /session/:id/todo` endpoint and the V1 `PluginModule` loader) or **OpenCode 2.x**. V2 loads through the `@opencode/plugin` API. The current todo list is reconstructed from session message history, or read from the native `todowrite` behind `experimental.todo`. The guard probes the host tool registry for that capability instead of assuming it per version.
 - **Node.js >= 22.18** or **Bun** (for running test scripts directly).
+  `@opentui/core` declares `node >=26.4.0` in its own `engines`, and that has
+  been true since at least `0.6.6`. It arrives as a transitive dependency of
+  `@opentui/solid`, so npm reports an engine warning rather than refusing the
+  install, and the server plugin never imports it. Only the optional TUI
+  companion loads `@opentui/solid`. The pin set is exercised on Node 22.18+ in
+  CI, which is the practical floor for the plugin itself.
 
 ### Version Qualification
 
@@ -22,13 +28,24 @@ verified it.
 | 1.16.x | 2.0.15 | `permission.hook("evaluate")`, `tool.hook("execute.before"/"execute.after")`, `session.hook("context")`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client | Unit and package-loader verified. Live model-driven probes reached the provider and were classified `live unavailable` (`Model unavailable: openrouter/openrouter/auto`), so no guard verdict was produced. |
 | 1.16.x | 2.1.3 | `permission.hook("evaluate")`, `tool.hook(...)`, `session.hook(...)`, `experimental.text.complete`, command registration, `mcp.list`, `worktree` client, `todowrite` behind `experimental.todo` | Package-loader and headless-runtime verified (`npm run test:install`: 30 passed). Live host probe confirmed `ctx.tool.list()` exposes `todowrite` with `experimental.todo: true` and omits it when false. Live static-policy denial canary produced `Blocked by configuration policy`. |
 | 1.16.x | 1.18.32 (`@opencode-ai/plugin`) | V1 `PluginModule` loader, native todo endpoint | Compatibility export only; unit-tested, no live host probe. |
+| 1.18.x | 2.2.0 | `permission.hook("evaluate")`, `tool.hook("execute.before"/"execute.after")`, `session.hook("context"/"compaction"/"prompt")`, `command.transform`, `shell.hook("create.before")`, `event.subscribe()` (completion-claim observation via `session.text.ended`), command registration, `mcp.list`, `worktree` client, `todowrite` behind `experimental.todo` | Package-loader and headless-runtime verified on the 2.2.0 pin set (`npm run test:install`: 32 passed). Registration of the hook seats and custom tools is asserted, not re-derived: the 2.2.0-specific probes are the permission seat (a real finding denies, an undecidable push abstains) and the todo capability (both branches asserted on this host). V2 exposes completion claims through `event.subscribe()` rather than the V1 `experimental.text.complete` hook; the audit trail keeps the V1 tool name for continuity. Live model-driven probes were skipped, so no guard verdict from a model turn is claimed here. |
 
-The 2.1.3 pins require the 2.1.x package set. `@opencode/plugin` and
-`@opencode/ai` are pinned to `2.1.3`, which depends on `effect@4.0.1` and
-requires `@opentui/solid >=0.6.6`. The guard pins `0.6.6`. A 2.0.x pin set on a
-2.1.x host fails to load at all. The plugin imports an `effect` path the host no
-longer provides, and the host reports `failed to load plugin` while every
-policy stays inert.
+The 2.2.0 pins require the 2.2.x package set. `@opencode/plugin` and
+`@opencode/ai` are pinned to `2.2.0`, and `@opentui/solid` moves to `0.7.0`
+because `@opencode/plugin@2.2.0` declares that as an exact peer requirement.
+`@opentui/core` is not pinned directly: `@opentui/solid@0.7.0` already declares
+it as an exact dependency, so resolution supplies the matching version. That
+release also moves `Message` out of the `@opencode/ai` root: on 2.2.0 the root
+no longer re-exports the schema surface, so a root named import of `Message`
+throws at load, and the schema lives behind `@opencode/ai/effect`. The guard
+imports from `/effect`, which is the path `@opencode/plugin@2.2.0` uses itself.
+`@opencode/ai@2.1.3` resolves `./effect` only through its `"./*"` wildcard, and
+that release ships no `dist/effect.js` for the wildcard to reach, so the two pin
+sets are not interchangeable: one release's import path does not exist in the
+other.
+
+`@opencode-ai/plugin` stays at `1.19.3`. That is the V1 pin, emitted alongside
+the V2 entrypoint, and the 2.2.0 release does not change it.
 
 `guard_status` reports `pluginVersion`, `qualifiedHostVersion`, and the live
 `hostVersion`, so a mismatch is visible at runtime rather than surfacing as a
@@ -36,21 +53,29 @@ silently inert hook.
 
 ### Dependency Audit Overrides
 
-Two transitive dependencies are pinned above the range their parent declares, to
-clear advisories that would otherwise ship:
+Three transitive dependencies are pinned above the range their parent declares,
+to clear advisories that would otherwise ship:
 
 | Package | Parent constraint | Override | Why |
 |---|---|---|---|
-| `solid-js` | `@opentui/solid@0.6.6` peer-pins exactly `1.9.12` | `1.9.17` | `1.9.12` requires `seroval ~1.5.0`, which carries memory-exhaustion and thenable-assimilation advisories. `1.9.17` requires `seroval ~1.6.8`, which is patched. The TUI imports `solid-js` directly, so the bump is also the version the guard actually runs. |
+| `solid-js` | `@opentui/solid@0.7.0` peer-pins exactly `1.9.12` | `1.9.17` | `1.9.12` requires `seroval ~1.5.0`, which carries memory-exhaustion and thenable-assimilation advisories. `1.9.17` requires `seroval ~1.6.8`, which is patched. The TUI imports `solid-js` directly, so the bump is also the version the guard actually runs. |
 | `toml` | `effect@4.0.0-beta.83` (via `@opencode-ai/plugin`) requires `^4.1.1` | `5.0.1` | `toml <=5.0.0` carries three quadratic-complexity denial-of-service advisories. `5.0.1` keeps the same single `parse` export the caller uses. The guard itself never parses TOML; this is host plumbing. |
+| `zod` | `@opencode-ai/plugin@1.19.3` pins `4.1.8` exactly | `4.6.6` | `GHSA-mrhx-c7xc-m3w5` (published 2026-10-01) covers `zod <4.6.6` with a memory-exhaustion advisory. `4.6.6` is the patched release in the same major line. `zod` reaches the tree only through the V1 host pin, but the guard's own V2 entrypoint imports it, so one deduped patched copy serves both. An override is required where a direct dependency would not do: the V1 pin is exact, so declaring `zod` at the root alone leaves a nested `4.1.8` and the advisory standing. |
 
-Both are `overrides` entries in `package.json`, and `npm audit` reports zero
+All three are `overrides` entries in `package.json`, and `npm audit` reports zero
 vulnerabilities for this repository. `npm overrides` apply only to the root
 project, so they protect this repository's install and its CI, not a consumer's
 transitive tree. A consumer that installs the published package resolves the
-parent-declared ranges unless it declares the same overrides itself. Revisit both
-when `@opentui/solid` or `@opencode-ai/plugin` widen their ranges, and drop the
-override rather than carrying it forward.
+parent-declared ranges unless it declares the same overrides itself. Revisit
+them when `@opentui/solid` or `@opencode-ai/plugin` widen their ranges, and drop
+the override rather than carrying it forward.
+
+Changing an override requires a clean reinstall. `npm install` over an existing
+`node_modules` can leave a lockfile that still resolves the old version, and the
+resulting failure reads like an incompatibility. With the `zod` override, an
+incremental install produced 14 `test:install` failures and a `tsc` error about
+a missing `zod`, while removing `node_modules` and `package-lock.json` and
+reinstalling passed every check.
 
 ---
 

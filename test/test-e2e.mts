@@ -225,6 +225,16 @@ const runV2Probes = async (ctx: any) => {
 \tconst guardWhy = byId("guard_why");
 \tconst pick = (r: any) => (typeof r?.content === "string" ? r.content : JSON.stringify(r));
 \tconst statusRes = guardStatus ? await guardStatus.execute({}, headlessToolContext) : undefined;
+\t// Permission-seat canary. The seat runs inside the real host plugin setup,
+\t// with the workspace taken from the host's own location.directory, so a
+\t// typed-only seat cannot pass. No client is passed: this probe makes no
+\t// remote call, and the push case is the one that must abstain precisely
+\t// because simulation skips the remote PR probe.
+\tconst { evaluatePermissionSeat } = await import("../workflow-guard-source/lib/permission-seat.ts");
+\tconst workspaceRoot = ctx?.location?.directory ?? process.cwd();
+\tconst seatEvent = (action: string, resources: string[]) => ({ sessionID: "headless-e2e-seat", agent: "build", action, resources, effect: "allow" as const });
+\tconst seatDeny = await evaluatePermissionSeat(seatEvent("read", [".env"]), { workspaceRoot, client: undefined });
+\tconst seatPush = await evaluatePermissionSeat(seatEvent("shell", ["git push origin feat/install-verification"]), { workspaceRoot, client: undefined });
 \tconst whyProbes: Record<string, { tool: string; input: Record<string, unknown> }> = {
 \t\tgit: { tool: "bash", input: { command: "git push origin main" } },
 \t\t"secrets-read": { tool: "read", input: { filePath: ".env" } },
@@ -244,6 +254,7 @@ const runV2Probes = async (ctx: any) => {
 \t\tstatus: JSON.parse(pick(statusRes)),
 \t\twhy: whyResults.git,
 \t\twhyProbes: whyResults,
+\t\tseat: { deny: seatDeny, push: seatPush },
 \t}) + "\\n");
 \twriteFileSync(${JSON.stringify(initializedMarker)}, "initialized\\n");
 };
@@ -432,6 +443,21 @@ if (isOpenCodeV2) {
 	check("V2 setup registers the full config-gated guard tool surface", missingGuardTools.length === 0);
 	if (missingGuardTools.length > 0) console.log("  missing guard tools: " + missingGuardTools.join(", "));
 	console.log(`  note: builtin todowrite description enriched under V2: ${headlessAccountability?.todowriteEnriched === true ? "yes" : "unknown at setup time"}`);
+	// Provenance: `workspaceRoot` is the host's own `location.directory`, read
+	// inside the real setup call. The seat runs with no client, so nothing here
+	// depends on hand-built remote state.
+	check(
+		"V2 permission seat denies a real finding against the live host context",
+		headlessAccountability?.seat?.deny?.effect === "deny" &&
+			headlessAccountability?.seat?.deny?.decision?.status === "blocked" &&
+			headlessAccountability?.seat?.deny?.decision?.policy === "secrets" &&
+			headlessAccountability?.seat?.deny?.decision?.code === "secret_read",
+	);
+	check(
+		"V2 permission seat abstains on an undecidable push instead of denying it",
+		headlessAccountability?.seat?.push?.effect === "abstain" &&
+			headlessAccountability?.seat?.push?.decision?.code === "remote_state_unchecked",
+	);
 }
 
 // The todo capability probe is only meaningful against a host that can gate
