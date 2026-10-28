@@ -2341,11 +2341,23 @@ check(
 // is failing" sends the agent looking for a failing assertion that does not
 // exist, and the real fix is a longer timeout rather than a code change.
 console.log("- Policy 10: verification timeout attribution -");
+// The verify env overrides beat project config, so a developer with either one
+// exported (the docs recommend doing exactly that for this repo's suite) would
+// otherwise make these checks measure their shell instead of the guard.
+const prevTimeoutVerifyEnv = process.env.WORKFLOW_GUARD_VERIFY;
+const prevTimeoutLimitEnv = process.env.WORKFLOW_GUARD_VERIFY_TIMEOUT_MS;
+delete process.env.WORKFLOW_GUARD_VERIFY;
+delete process.env.WORKFLOW_GUARD_VERIFY_TIMEOUT_MS;
 const verifyTimeoutRepo = mkdtempSync(join(tmpdir(), "wg-verify-timeout-finalize-"));
 mkdirSync(join(verifyTimeoutRepo, ".opencode"), { recursive: true });
+// The command prints far more than snipVerifyOutput's line budget, so the
+// tail exercises the snipper rather than a short literal output.
 writeFileSync(
 	join(verifyTimeoutRepo, ".opencode", "workflow-guard.json"),
-	JSON.stringify({ verifyCommand: "node -e \"setTimeout(() => {}, 5000)\"", verifyTimeoutMs: 50 }),
+	JSON.stringify({
+		verifyCommand: "node -e \"for (let i = 0; i < 60; i++) console.log('noise ' + i); setTimeout(() => {}, 5000)\"",
+		verifyTimeoutMs: 50,
+	}),
 );
 reloadProjectConfig(verifyTimeoutRepo);
 setWorkspaceRoot(verifyTimeoutRepo);
@@ -2367,11 +2379,21 @@ check(
 	!String(timeoutFinalRes).includes("verification is failing"),
 );
 check(
-	"verification timeout names the elapsed limit and the remedy",
-	String(timeoutFinalRes).includes("timed out") && String(timeoutFinalRes).includes("verifyTimeoutMs"),
+	"a timed-out tail carries no failure header that restates the misattribution",
+	!String(timeoutFinalRes).includes("Verification Failed"),
+);
+check(
+	"verification timeout names the elapsed limit at the precision it was set",
+	String(timeoutFinalRes).includes("timed out") && String(timeoutFinalRes).includes("50ms"),
+);
+check(
+	"verification timeout names a remedy the agent can actually apply",
+	String(timeoutFinalRes).includes("verifyTimeoutMs") && String(timeoutFinalRes).includes("WORKFLOW_GUARD_VERIFY_TIMEOUT_MS"),
 );
 setWorkspaceRoot(verifyRepo);
 reloadProjectConfig(verifyRepo);
+if (prevTimeoutVerifyEnv !== undefined) process.env.WORKFLOW_GUARD_VERIFY = prevTimeoutVerifyEnv;
+if (prevTimeoutLimitEnv !== undefined) process.env.WORKFLOW_GUARD_VERIFY_TIMEOUT_MS = prevTimeoutLimitEnv;
 rmSync(verifyTimeoutRepo, { recursive: true, force: true });
 
 // A subagent mutation governed by the parent's todos must invalidate the

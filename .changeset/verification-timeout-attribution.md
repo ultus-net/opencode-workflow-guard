@@ -22,6 +22,13 @@ Both still block finalization. A timeout is not evidence of passing work, so
 allowing it through would be a silent weakening of the verification gate. Only
 the attribution changed.
 
-Regression coverage asserts three things: a timeout blocks finalization, the
-block reason does not claim a failure, and it names both the limit and the
-remedy. All three fail against the previous message.
+Regression coverage asserts five things: a timeout blocks finalization, the
+block reason does not claim a failure, the snipped tail carries no "Verification
+Failed" header, the limit is named at the precision it was set, and the reason
+names a remedy. Four of those fail against the previous message; the block
+itself already held, and must keep holding.
+
+The remedy is the one lever the agent cannot pull. `.opencode/workflow-guard.json`
+is tamper-protected, so the reason names both the project setting and the
+environment variable, and the operator applies it. That is deliberate: the guard
+reports what it knows, and does not pretend the agent can widen its own gate.

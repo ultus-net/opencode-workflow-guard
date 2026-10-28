@@ -153,6 +153,17 @@ function logBlock(message: string, simulate = false): void {
 	} catch {}
 }
 
+/**
+ * Render a verification timeout limit for the block reason.
+ *
+ * Sub-second limits are exercised by tests, and a bare `Math.round(ms/1000)`
+ * reports those as "0s", which reads as no limit at all.
+ */
+function formatTimeoutLimit(timeoutMs: number | undefined): string {
+	if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) return "the verification timeout";
+	return timeoutMs < 1000 ? `${timeoutMs}ms` : `${Math.round(timeoutMs / 1000)}s`;
+}
+
 export async function guardToolCallImpl(
 	toolName: string,
 	input: unknown,
@@ -260,10 +271,14 @@ export async function guardToolCallImpl(
 							// finalization, but naming a failure sends the
 							// agent chasing an assertion that never ran, and
 							// the remedy is a longer limit rather than a code
-							// change.
+							// change. The tail is snipped as passing output on
+							// that path, because snipVerifyOutput labels a
+							// failing run with a "Verification Failed" header
+							// that would restate the misattribution.
+							const tail = snipVerifyOutput(result.output, result.timedOut === true).slice(-500);
 							const reason = result.timedOut
-								? `Blocked todowrite: verification did not finish within ${Math.round((result.timeoutMs ?? 0) / 1000)}s, so the result is unknown rather than failing (${command}). Raise the limit with verifyTimeoutMs in .opencode/workflow-guard.json or WORKFLOW_GUARD_VERIFY_TIMEOUT_MS, then complete the tasks again; output tail: ${snipVerifyOutput(result.output, result.passed).slice(-500)}`
-								: `Blocked todowrite: all tasks marked done but verification is failing (${command}). Fix the failure before finishing; output tail: ${snipVerifyOutput(result.output, result.passed).slice(-500)}`;
+								? `Blocked todowrite: verification did not finish within ${formatTimeoutLimit(result.timeoutMs)} so the result is unknown rather than failing (${command}). Raise the limit in the project .opencode/workflow-guard.json (verifyTimeoutMs) or with WORKFLOW_GUARD_VERIFY_TIMEOUT_MS, then complete the tasks again; output tail: ${tail}`
+								: `Blocked todowrite: all tasks marked done but verification is failing (${command}). Fix the failure before finishing; output tail: ${tail}`;
 							logPolicyBlock(`[workflow-guard] ${reason}`);
 							return block("verification", result.timedOut ? "verification_timed_out" : "verification_failed", reason);
 						}
