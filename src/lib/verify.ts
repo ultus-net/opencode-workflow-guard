@@ -231,11 +231,26 @@ export function resolveVerifyTimeoutMs(root: string): number {
 	return typeof configured === "number" && Number.isFinite(configured) && configured > 0 ? configured : 30_000;
 }
 
+export interface VerifyRun {
+	passed: boolean;
+	output: string;
+	durationMs: number;
+	/**
+	 * Set when the command was killed at the timeout rather than exiting on its
+	 * own. A timeout is not a failing assertion: it says nothing about whether
+	 * the change is correct, and the remedy is a longer limit, not a code fix.
+	 * Callers that report a reason must attribute it, or the agent chases a
+	 * failure that does not exist.
+	 */
+	timedOut?: boolean;
+	timeoutMs?: number;
+}
+
 export async function runVerify(
 	command: string,
 	root: string,
 	timeoutMs = 30_000,
-): Promise<{ passed: boolean; output: string; durationMs: number }> {
+): Promise<VerifyRun> {
 	const start = Date.now();
 	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
 
@@ -294,6 +309,8 @@ export async function runVerify(
 					passed: false,
 					output: output + `\n(Verification timed out after ${Math.round(timeoutMs / 1000)}s)`,
 					durationMs: Date.now() - start,
+					timedOut: true,
+					timeoutMs,
 				});
 			});
 		}, timeoutMs);
