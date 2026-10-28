@@ -143,7 +143,12 @@ export interface AuditEntry {
 	sessionID?: string;
 	callID?: string;
 	tool: string;
-	decision: "allow" | "block";
+	/**
+	 * `abstain` records a decision the guard deferred instead of resolving:
+	 * the simulated permission seat cannot judge remote PR state, so
+	 * `execute.before` decides for real. It is not an allow.
+	 */
+	decision: "allow" | "block" | "abstain";
 	policyDecision?: PolicyDecision;
 	phase?: "decision" | "outcome" | "event";
 	durationMs?: number;

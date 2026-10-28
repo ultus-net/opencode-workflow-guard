@@ -16,6 +16,12 @@
  * when the configured effect is allow/ask). A hook denial is therefore always a
  * response to something the host would otherwise permit.
  *
+ * An `abstain` is the one case where the seat does not tighten. The simulated
+ * core reports `needs_approval` when it cannot decide without the remote
+ * GitHub/Azure PR probe, which simulation skips on purpose. The host's
+ * configured effect then stays untouched and `execute.before` runs the real
+ * check, probe included.
+ *
  * Every decision here is a simulation of the policy core: `simulate: true`
  * skips mutation accounting, file claims, verification runs, and durable audit
  * writes, because the same call is evaluated for real in `execute.before`.
@@ -41,15 +47,38 @@ export interface PermissionSeatDeps {
 }
 
 export interface PermissionSeatResult {
-	/** The effect the seat leaves in place. */
-	effect: "allow" | "deny";
-	/** Set only when the seat denied. */
+	/**
+	 * The effect the seat leaves in place. `abstain` is an explicit third
+	 * state: the simulated policy core could not decide, so the host's
+	 * configured effect stays untouched and `execute.before` enforces.
+	 */
+	effect: "allow" | "deny" | "abstain";
+	/** Set when the seat denied, and kept on an abstention for the audit row. */
 	decision?: PolicyDecision;
 	/** The guard tool the action was mapped onto, for attribution. */
 	mappedTool?: string;
 }
 
 const EDIT_ACTIONS = new Set(["edit", "write", "patch", "apply_patch"]);
+
+/**
+ * Map one simulated policy decision onto the seat's effect.
+ *
+ * Only `needs_approval` abstains. That status means the simulated core could
+ * not decide, because `simulate: true` deliberately skips the remote GitHub or
+ * Azure PR probe. Collapsing it into `deny` would miscategorise an abstention
+ * as a finding and block every non-protected `git push`. Deferring it leaves
+ * the host's configured effect untouched, and `execute.before` runs the real
+ * check with the probe. Every other non-allowed status stays a denial.
+ */
+function seatVerdict(decision: PolicyDecision, mappedTool: string): PermissionSeatResult | undefined {
+	if (decision.status === "allowed") return undefined;
+	return {
+		effect: decision.status === "needs_approval" ? "abstain" : "deny",
+		decision: { ...decision, message: `[workflow-guard permission.evaluate] ${decision.message}` },
+		mappedTool,
+	};
+}
 
 function mappedToolFor(action: string): { tool: string; input: (resource: string) => unknown } | undefined {
 	if (action === "shell" || action === "bash") {
@@ -90,13 +119,8 @@ export async function evaluatePermissionSeat(
 	if (mapping) {
 		for (const resource of resources) {
 			const decision = await decide(mapping.tool, mapping.input(resource));
-			if (decision.status !== "allowed") {
-				return {
-					effect: "deny",
-					decision: { ...decision, message: `[workflow-guard permission.evaluate] ${decision.message}` },
-					mappedTool: mapping.tool,
-				};
-			}
+			const verdict = seatVerdict(decision, mapping.tool);
+			if (verdict) return verdict;
 		}
 		return { effect: "allow", mappedTool: mapping.tool };
 	}
@@ -106,14 +130,7 @@ export async function evaluatePermissionSeat(
 	for (const resource of resources) {
 		if (!mcpMutationTool(event.action) && !mcpMutationTool(resource)) continue;
 		const decision = await decide(event.action, {});
-		if (decision.status !== "allowed") {
-			return {
-				effect: "deny",
-				decision: { ...decision, message: `[workflow-guard permission.evaluate] ${decision.message}` },
-				mappedTool: event.action,
-			};
-		}
-		return { effect: "allow", mappedTool: event.action };
+		return seatVerdict(decision, event.action) ?? { effect: "allow", mappedTool: event.action };
 	}
 	return { effect: "allow" };
 }

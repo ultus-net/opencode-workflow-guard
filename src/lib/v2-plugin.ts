@@ -583,17 +583,22 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				},
 				{ workspaceRoot: effectiveRoot, client },
 			);
-			if (seat.decision) {
+			if (seat.effect === "deny" && seat.decision) {
 				event.effect = "deny";
 				event.message = seat.decision.message;
 			}
+			// An abstention leaves the configured effect and message untouched,
+			// and still journals. `execute.before` runs the real check, which
+			// includes the remote PR probe that simulation skips. It records
+			// `abstain` rather than `allow`, so the deferral stays visible.
+			const abstained = seat.effect === "abstain";
 			audit({
 				ts: new Date().toISOString(),
 				sessionID: event.sessionID,
 				tool: "permission.ask",
-				decision: seat.effect === "deny" ? "block" : "allow",
+				decision: seat.effect === "deny" ? "block" : abstained ? "abstain" : "allow",
 				phase: "decision",
-				reason: seat.decision?.code,
+				reason: abstained ? "deferred_to_execute_before" : seat.decision?.code,
 				policyDecision: seat.decision,
 				input: {
 					action: event.action,
@@ -601,6 +606,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 					agent: event.agent,
 					configuredEffect,
 					mappedTool: seat.mappedTool,
+					...(abstained ? { deferred: "execute.before" } : {}),
 				},
 			});
 		} catch (error) {

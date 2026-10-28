@@ -122,6 +122,7 @@ import {
 import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
 import { audit } from "../src/lib/audit.ts";
+import { evaluatePermissionSeat } from "../src/lib/permission-seat.ts";
 import { isProjectMemoryFreshAsync } from "../src/lib/project-memory.ts";
 import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
@@ -5704,6 +5705,98 @@ clearLiveDocsFloor(v2FloorSession);
 if (prevDuplicateDataHome === undefined) delete process.env.XDG_DATA_HOME;
 else process.env.XDG_DATA_HOME = prevDuplicateDataHome;
 rmSync(v2DuplicateRoot, { recursive: true, force: true });
+
+// ── Permission seat: an undecidable simulation abstains, a finding denies ──
+// The seat always runs the policy core with `simulate: true`, which skips the
+// remote GitHub/Azure PR probe on purpose. `needs_approval` means exactly
+// that: the core could not decide. Collapsing it into a denial blocked every
+// non-protected `git push`, so the seat must abstain and leave the configured
+// effect untouched while `execute.before` runs the real check. A genuine local
+// finding still denies, and an abstention never upgrades a configured `ask`.
+console.log("- V2 permission seat: abstention -");
+const makeSeatRepo = (branch: string): string => {
+	const repo = mkdtempSync(join(tmpdir(), "wg-seat-"));
+	spawnSync("git", ["init", "-b", branch], { cwd: repo });
+	writeFileSync(join(repo, "tracked.txt"), "tracked\n");
+	spawnSync("git", ["add", "tracked.txt"], { cwd: repo });
+	spawnSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "initial"], { cwd: repo });
+	return repo;
+};
+const seatFeatureRepo = makeSeatRepo("feature/push-seat");
+const seatMainRepo = makeSeatRepo("main");
+const seatEvent = (resources: string[], effect: "allow" | "ask" | "deny" = "allow") => ({
+	sessionID: "s-seat-abstain",
+	agent: "build",
+	action: "shell",
+	resources,
+	effect,
+});
+try {
+	const pushSeat = await evaluatePermissionSeat(
+		seatEvent(["git push origin feature/push-seat"]),
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat abstains on a non-protected push whose remote PR state is unverified",
+		pushSeat.effect !== "deny" && pushSeat.effect === "abstain",
+	);
+	check(
+		"seat keeps the undecidable decision for audit attribution",
+		pushSeat.decision?.status === "needs_approval" && pushSeat.decision?.code === "remote_state_unchecked",
+	);
+	const protectedPushSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["git push origin feature/push-seat"]), sessionID: "s-seat-block" },
+		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat still denies a real finding (push from a protected branch)",
+		protectedPushSeat.effect === "deny" && protectedPushSeat.decision?.status === "blocked" && /protected branch/i.test(String(protectedPushSeat.decision?.message)),
+	);
+	const askedSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["git push origin feature/push-seat"], "ask"), sessionID: "s-seat-ask" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check("an abstaining seat never upgrades a configured ask to allow", askedSeat.effect === "abstain");
+} finally {
+	rmSync(seatFeatureRepo, { recursive: true, force: true });
+	rmSync(seatMainRepo, { recursive: true, force: true });
+}
+
+// The end-to-end seat: the same undecidable push through the registered hook
+// must leave the configured effect and message untouched, and journal the
+// deferral so the skipped remote probe stays legible.
+{
+	resetPluginInstancesForTesting();
+	const seatHookRepo = makeSeatRepo("feature/push-seat-hook");
+	const prevSeatDataHome = process.env.XDG_DATA_HOME;
+	process.env.XDG_DATA_HOME = join(seatHookRepo, "data");
+	const seatCtx = makeV2Context(seatHookRepo);
+	const seatCleanup = (await defaultExport.setup(seatCtx.ctx as any)) as (() => void) | undefined;
+	const seatAskEvent = { ...permissionEvent("shell", ["git push origin feature/push-seat-hook"], "s-seat-hook-ask"), effect: "ask" as "allow" | "deny" | "ask" };
+	await seatCtx.state.permissionHooks[0]?.(seatAskEvent);
+	check(
+		"evaluate leaves a configured ask in place when the simulation abstains",
+		seatAskEvent.effect === "ask" && seatAskEvent.message === undefined,
+	);
+	const seatPushEvent = permissionEvent("shell", ["git push origin feature/push-seat-hook"], "s-seat-hook");
+	await seatCtx.state.permissionHooks[0]?.(seatPushEvent);
+	check(
+		"evaluate does not deny a non-protected push it cannot decide",
+		seatPushEvent.effect === "allow" && seatPushEvent.message === undefined,
+	);
+	const abstainAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.reason === "deferred_to_execute_before");
+	check(
+		"an abstention is journaled as deferred to execute.before, not as a plain allow",
+		abstainAudit !== undefined &&
+			abstainAudit.policyDecision?.status === "needs_approval" &&
+			abstainAudit.policyDecision?.code === "remote_state_unchecked" &&
+			(abstainAudit.input as any)?.deferred === "execute.before",
+	);
+	seatCleanup?.();
+	if (prevSeatDataHome === undefined) delete process.env.XDG_DATA_HOME;
+	else process.env.XDG_DATA_HOME = prevSeatDataHome;
+	rmSync(seatHookRepo, { recursive: true, force: true });
+}
 
 // ── V2 adopt-now surfaces: command, read-only pruning, worktrees, MCP ──
 // Four additive V2 API adoptions, each tested for its narrowing direction:
