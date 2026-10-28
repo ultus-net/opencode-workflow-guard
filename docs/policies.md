@@ -135,7 +135,7 @@ This is a policy and enforcement layer, not an agent harness. Policies may const
 - `client.app.log()` complements the on-disk trail with in-app logs.
 
 ### 15. Compaction State & Policy Context Preservation
-- Integrates with OpenCode's compaction hook to inject bounded active policy state before context summarization. The hook is `experimental.session.compacting` on OpenCode 1.x and `session.hook("compaction")` on OpenCode 2.x, which is stable in the installed 2.1.3 typings:
+- Integrates with OpenCode's compaction hook to inject bounded active policy state before context summarization. The hook is `experimental.session.compacting` on OpenCode 1.x and `session.hook("compaction")` on OpenCode 2.x, which is stable in the installed 2.2.0 typings:
   - Caps injected continuity context at 8,000 characters. Operational guard state is preserved first. The remaining budget holds active tasks, review follow-ups, and fresh local project memory.
   - Active `todowrite` tasks with status badges and subagent hierarchy attribution.
   - Active Git branch name and protected branch status.

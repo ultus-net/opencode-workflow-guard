@@ -18,7 +18,7 @@
  */
 
 import { Plugin } from "@opencode/plugin";
-import { Message } from "@opencode/ai";
+import { Message } from "@opencode/ai/effect";
 import { z } from "zod";
 import { join, resolve } from "node:path";
 import type { TodoSdkClient } from "./types.ts";
@@ -145,6 +145,9 @@ const SUBAGENT_SUFFIX =
 //   server registry, so this enrichment cannot reach them.
 // - V2.1.x adds a builtin `todowrite` behind the `experimental.todo` config
 //   key, so the candidate below reaches a real registry entry there.
+// - V2.2.x exposes `todowrite` through that same `experimental.todo` opt-in.
+//   The guard probes the registry rather than inferring capability from the
+//   version, so 2.1.x and 2.2.x need no version check here.
 // - The V1 subagent tool `task` was renamed to `subagent`; both are kept as
 //   candidates for the same reason.
 const ENRICHMENT_TARGETS: Array<{ candidates: string[]; suffix: string; marker: string }> = [
