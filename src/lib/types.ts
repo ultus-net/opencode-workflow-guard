@@ -184,6 +184,13 @@ export interface AuditEntry {
 export interface GitInvocation {
 	repoDir: string;
 	rest: string;
+	/**
+	 * True when the command text itself names the repository (`-C`,
+	 * `--git-dir`, `--work-tree`, `GIT_DIR=`). False means `repoDir` is only
+	 * the invocation's assumed base directory, which is the shell's working
+	 * directory and not a fact the command string carries.
+	 */
+	explicitRepoDir?: boolean;
 }
 
 export interface ShellMutation {

@@ -235,9 +235,39 @@ function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: s
 		tool: "workspace.binding",
 		decision: "allow",
 		phase: "event",
-		reason: "workspace_rebind_host_worktree",
+		reason: source === "session-move" ? "workspace_rebind_session_move" : "workspace_rebind_host_worktree",
 		input: { from, to, source },
 	});
+}
+
+/**
+ * Rebind a session to the workspace the HOST says it now occupies.
+ *
+ * `session_move` (and the equivalent host move command) relocates a session
+ * between checkouts. Without this the binding stayed on the old checkout, so
+ * every later boundary, branch, and PR decision judged the tree the session had
+ * left: the move looked like it had no effect. A host move is an explicit
+ * boundary statement from the host, in the same class as a per-call worktree,
+ * so it may widen a already-bound session. It is journaled for that reason.
+ *
+ * An update that does not actually move the session (the host re-emits
+ * `session.updated` for unrelated reasons) is a no-op, so repeated events cost
+ * nothing after the first resolution.
+ */
+export function rebindSessionWorkspaceFromHost(sessionID: string | undefined, directory: string | undefined): void {
+	if (!sessionID || !directory) return;
+	const gitRoot = findGitRoot(directory);
+	if (!gitRoot) return;
+	const previous = sessionWorkspaces.get(sessionID);
+	if (previous === gitRoot) {
+		// A bootstrap entry that was never bound still needs binding: the host
+		// just named the session's real directory.
+		if (sessionWorkspaceBound.has(sessionID)) return;
+		sessionWorkspaceBound.add(sessionID);
+		return;
+	}
+	setSessionWorkspace(sessionID, gitRoot);
+	auditWorkspaceRebind(sessionID, previous, gitRoot, "session-move");
 }
 
 /**

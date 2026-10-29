@@ -29,6 +29,9 @@
 
 import { guardToolCallImpl } from "./guard-dispatcher.ts";
 import { getSessionBoundWorkspace, runWithRuntimeState } from "./state.ts";
+import { GIT_BRANCH_CREATE_RE, GIT_WRITE_RE, PUSH_TO_MAIN_RE, parseGitInvocation } from "../policies/git.ts";
+import { hasPrCreateInvocation } from "../policies/changelog.ts";
+import { splitShellSegments } from "./shell.ts";
 import { mcpMutationTool } from "../policies/mcp.ts";
 import type { PolicyDecision } from "./types.ts";
 
@@ -60,6 +63,44 @@ export interface PermissionSeatResult {
 }
 
 const EDIT_ACTIONS = new Set(["edit", "write", "patch", "apply_patch"]);
+
+/**
+ * Commands whose verdict depends on WHICH checkout they run in.
+ *
+ * A bare `git push`, `git commit`, or branch creation is judged against the
+ * repository the shell's working directory resolves to, and PR preflight is
+ * judged against the branch the PR publishes. This seat sees normalized
+ * `action`/`resources` only, never the tool's `workdir`, so for those commands
+ * the repository is an assumption rather than a fact: the session-bound
+ * checkout may be the primary tree while the command targets a linked
+ * worktree. Deciding on the assumption denied legitimate pushes and PRs, so
+ * the seat defers them to `execute.before`, which sees the raw arguments.
+ *
+ * Two cases stay decisive:
+ *
+ * - An explicit `-C`/`--git-dir`/`--work-tree`/`GIT_DIR` names the repository
+ *   in the command text, so it is a fact the seat can judge.
+ * - A push whose destination is an explicitly named protected branch is a
+ *   finding in every checkout, so no `workdir` can change the verdict.
+ */
+function repositoryDependent(command: string): boolean {
+	for (const segment of splitShellSegments(command)) {
+		// PR creation names no repository at all: the checkout is cwd-derived,
+		// and a `--head`/`--source-branch` may live in another worktree.
+		if (hasPrCreateInvocation(segment)) return true;
+		const parsed = parseGitInvocation(segment);
+		if (!parsed) continue;
+		const rest = `git ${parsed.rest}`;
+		if (parsed.explicitRepoDir) continue;
+		if (PUSH_TO_MAIN_RE.test(rest)) continue;
+		const repositorySensitive =
+			/\bgit\s+push\b/.test(rest) ||
+			GIT_WRITE_RE.test(rest) ||
+			GIT_BRANCH_CREATE_RE.test(rest);
+		if (repositorySensitive) return true;
+	}
+	return false;
+}
 
 /**
  * Map one simulated policy decision onto the seat's effect.
@@ -117,12 +158,32 @@ export async function evaluatePermissionSeat(
 
 	const mapping = mappedToolFor(event.action);
 	if (mapping) {
+		let deferred: PermissionSeatResult | undefined;
 		for (const resource of resources) {
+			// Where the command runs is part of the decision for some commands,
+			// and this seat cannot see the tool's `workdir`. Defer those:
+			// `execute.before` sees the raw arguments, resolves them against the
+			// call's workspace, and enforces. Evaluation of the remaining
+			// resources still runs first, so a genuine finding in a compound
+			// command is never hidden behind the deferral.
+			if (mapping.tool === "bash" && repositoryDependent(resource)) {
+				deferred = {
+					effect: "abstain",
+					mappedTool: mapping.tool,
+					decision: {
+						status: "needs_approval",
+						policy: "git",
+						code: "repository_unidentified",
+						message: "[workflow-guard permission.evaluate] Deferred: this command's verdict depends on the directory it runs in, which the permission seat cannot see. `execute.before` resolves the shell's workdir and enforces there.",
+					},
+				};
+				continue;
+			}
 			const decision = await decide(mapping.tool, mapping.input(resource));
 			const verdict = seatVerdict(decision, mapping.tool);
 			if (verdict) return verdict;
 		}
-		return { effect: "allow", mappedTool: mapping.tool };
+		return deferred ?? { effect: "allow", mappedTool: mapping.tool };
 	}
 
 	// `<server>_<tool>` MCP actions: only the guarded live-system servers are

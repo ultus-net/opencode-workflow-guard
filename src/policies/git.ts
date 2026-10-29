@@ -63,8 +63,21 @@ const GIT_GLOBAL_BOOLEAN_OPTIONS = new Set([
 const GIT_ENV_DIR_RE =
 	/(?:^|\s)(?:env\s+(?:-\S+\s+)*)?(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=(?:"([^"]*)"|'([^']*)'|(\S+))/;
 
-export function parseGitInvocation(command: string): GitInvocation | undefined {
-	const root = getWorkspaceRoot();
+/**
+ * Parse one git invocation.
+ *
+ * `baseDir` is the directory the command actually runs in: a shell call's
+ * `workdir`, resolved against the call's workspace by the caller. It defaults
+ * to the ambient workspace root for callers that only classify command text.
+ * Without it, `git push` inside a linked worktree was resolved against the
+ * session-bound checkout, so every branch-state check judged the wrong tree.
+ *
+ * `explicitRepoDir` records whether the command text named the repository
+ * itself. A caller that cannot see `workdir` uses that flag to tell a fact
+ * from an assumption.
+ */
+export function parseGitInvocation(command: string, baseDir?: string): GitInvocation | undefined {
+	const root = baseDir ?? getWorkspaceRoot();
 	const tokens = unwrapShellWords(command);
 	if (tokens[0] !== "git") return undefined;
 	let i = 1;
@@ -110,7 +123,7 @@ export function parseGitInvocation(command: string): GitInvocation | undefined {
 		break;
 	}
 	if (!sawDirOption) repoDir = root;
-	return { repoDir, rest: tokens.slice(i).join(" ") };
+	return { repoDir, rest: tokens.slice(i).join(" "), explicitRepoDir: sawDirOption };
 }
 
 export function normalizeGitCommands(command: string): string {
@@ -304,14 +317,76 @@ export function isBranchAlreadyMergedOrClosed(
 	return { merged: false };
 }
 
-export function checkMergeConflicts(root: string): {
+/**
+ * The source branch a PR-creation command names, if any.
+ *
+ * `gh` names it with `--head`/`-H`, and Azure DevOps with `--source-branch`.
+ * Fork forms carry an `owner:` prefix; a ref cannot contain `:`, so the last
+ * segment is the local branch name the caller looks up. Callers fall back to
+ * the invoking checkout when the branch is not checked out anywhere locally.
+ */
+export function prSourceBranch(command: string): string | undefined {
+	const words = unwrapShellWords(command);
+	let source: string | undefined;
+	for (let i = 0; i < words.length; i++) {
+		const word = words[i]!;
+		let raw: string | undefined;
+		if (word === "--head" || word === "-H" || word === "--source-branch") {
+			raw = words[i + 1];
+		} else if (/^--(?:head|source-branch)=/.test(word)) {
+			raw = word.slice(word.indexOf("=") + 1);
+		} else if (/^-H\S/.test(word)) {
+			raw = word.slice(2);
+		}
+		if (raw === undefined) continue;
+		const branch = raw.includes(":") ? raw.slice(raw.lastIndexOf(":") + 1) : raw;
+		if (branch) source = branch;
+	}
+	return source;
+}
+
+/**
+ * Which checkout of this repository has `branch` checked out, if any.
+ *
+ * A PR is evaluated against the tree the branch actually lives in, not against
+ * whatever the caller's checkout happens to hold. Linked worktrees are the
+ * normal case: a session may sit in the primary checkout while the reviewed
+ * branch is checked out in an isolated worktree.
+ */
+export function findWorktreeForBranch(root: string, branch: string): string | undefined {
+	const target = branch.replace(/^refs\/heads\//, "").trim();
+	if (!target) return undefined;
+	const res = spawnSync("git", ["worktree", "list", "--porcelain"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	if (res.status !== 0) return undefined;
+	let current: string | undefined;
+	for (const line of res.stdout.split("\n")) {
+		if (line.startsWith("worktree ")) {
+			current = line.slice("worktree ".length).trim();
+			continue;
+		}
+		if (line.startsWith("branch ") && current) {
+			if (line.slice("branch ".length).trim().replace(/^refs\/heads\//, "") === target) return current;
+		}
+	}
+	return undefined;
+}
+
+export function checkMergeConflicts(root: string, ref?: string): {
 	hasConflicts: boolean;
 	baseBranch?: string;
 	reason?: string;
 } {
+	// A branch that is not checked out anywhere still has to be judged; the
+	// caller passes its ref, and HEAD stands in only when no ref was named.
+	const subject = typeof ref === "string" && ref.trim() ? ref.trim() : "HEAD";
+	const subjectLabel = subject === "HEAD" ? "" : `Branch '${subject}'`;
 	const candidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
 	for (const base of candidates) {
-		const mergeBaseRes = spawnSync("git", ["merge-base", "HEAD", base], {
+		const mergeBaseRes = spawnSync("git", ["merge-base", subject, base], {
 			cwd: root,
 			encoding: "utf8",
 			timeout: 5_000,
@@ -319,7 +394,7 @@ export function checkMergeConflicts(root: string): {
 		if (mergeBaseRes.status !== 0 || !mergeBaseRes.stdout.trim()) continue;
 		const mergeBase = mergeBaseRes.stdout.trim();
 
-		const treeRes = spawnSync("git", ["merge-tree", mergeBase, "HEAD", base], {
+		const treeRes = spawnSync("git", ["merge-tree", mergeBase, subject, base], {
 			cwd: root,
 			encoding: "utf8",
 			timeout: 10_000,
@@ -328,7 +403,7 @@ export function checkMergeConflicts(root: string): {
 			return {
 				hasConflicts: true,
 				baseBranch: base,
-				reason: `Branch has merge conflicts with base branch '${base}'. Rebase or merge '${base}' to resolve all conflicts before opening a PR or handing off.`,
+				reason: `${subjectLabel || "Branch"} has merge conflicts with base branch '${base}'. Rebase or merge '${base}' to resolve all conflicts before opening a PR or handing off.`,
 			};
 		}
 	}

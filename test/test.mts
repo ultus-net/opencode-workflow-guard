@@ -5797,20 +5797,59 @@ try {
 		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
 	);
 	check(
-		"seat abstains on a non-protected push whose remote PR state is unverified",
-		pushSeat.effect !== "deny" && pushSeat.effect === "abstain",
+		"seat defers a cwd-dependent push instead of judging the session checkout",
+		pushSeat.effect === "abstain" && pushSeat.decision?.code === "repository_unidentified",
+	);
+	// An explicit `-C` names the repository in the command text, so the seat is
+	// back on facts and runs the core. That is the path that reports the
+	// deliberately skipped remote PR probe.
+	const explicitPushSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatFeatureRepo} push origin feature/push-seat`]), sessionID: "s-seat-explicit" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
 	);
 	check(
-		"seat keeps the undecidable decision for audit attribution",
-		pushSeat.decision?.status === "needs_approval" && pushSeat.decision?.code === "remote_state_unchecked",
+		"seat still runs the core when the command names its repository",
+		explicitPushSeat.effect === "abstain" && explicitPushSeat.decision?.code === "remote_state_unchecked",
 	);
-	const protectedPushSeat = await evaluatePermissionSeat(
+	// The bug this fixes: the session sat in the primary checkout while the
+	// command targeted a linked worktree, and the seat denied on the primary
+	// checkout's protected branch. A cwd-dependent push must never be judged
+	// against a checkout the command does not name.
+	const protectedCheckoutSeat = await evaluatePermissionSeat(
 		{ ...seatEvent(["git push origin feature/push-seat"]), sessionID: "s-seat-block" },
 		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
 	);
 	check(
-		"seat still denies a real finding (push from a protected branch)",
-		protectedPushSeat.effect === "deny" && protectedPushSeat.decision?.status === "blocked" && /protected branch/i.test(String(protectedPushSeat.decision?.message)),
+		"seat no longer denies a cwd-dependent push from a protected session checkout",
+		protectedCheckoutSeat.effect === "abstain" && protectedCheckoutSeat.decision?.code === "repository_unidentified",
+	);
+	// A push whose DESTINATION is protected is a finding in every checkout, so
+	// the workdir cannot change the verdict and the seat keeps its denial.
+	const protectedDestSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["git push origin main"]), sessionID: "s-seat-dest" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat denies a push to a protected destination regardless of the working directory",
+		protectedDestSeat.effect === "deny",
+	);
+	const explicitProtectedSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatMainRepo} push origin feature/push-seat`]), sessionID: "s-seat-explicit-protected" },
+		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat denies a push from an explicitly named protected checkout",
+		explicitProtectedSeat.effect === "deny" && explicitProtectedSeat.decision?.status === "blocked" && /protected branch/i.test(String(explicitProtectedSeat.decision?.message)),
+	);
+	// Naming a repository outside the session's workspace stays a boundary
+	// finding, and the seat keeps denying it for that reason.
+	const foreignRepoSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatMainRepo} commit -m x`]), sessionID: "s-seat-foreign" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat denies an explicitly named repository outside the workspace",
+		foreignRepoSeat.effect === "deny" && foreignRepoSeat.decision?.policy === "boundary",
 	);
 	const askedSeat = await evaluatePermissionSeat(
 		{ ...seatEvent(["git push origin feature/push-seat"], "ask"), sessionID: "s-seat-ask" },
@@ -5822,9 +5861,9 @@ try {
 	rmSync(seatMainRepo, { recursive: true, force: true });
 }
 
-// The end-to-end seat: the same undecidable push through the registered hook
-// must leave the configured effect and message untouched, and journal the
-// deferral so the skipped remote probe stays legible.
+// The end-to-end seat: a deferred command through the registered hook must
+// leave the configured effect and message untouched, and journal the deferral
+// so a skipped decision stays legible.
 {
 	resetPluginInstancesForTesting();
 	const seatHookRepo = makeSeatRepo("feature/push-seat-hook");
@@ -5835,22 +5874,32 @@ try {
 	const seatAskEvent = { ...permissionEvent("shell", ["git push origin feature/push-seat-hook"], "s-seat-hook-ask"), effect: "ask" as "allow" | "deny" | "ask" };
 	await seatCtx.state.permissionHooks[0]?.(seatAskEvent);
 	check(
-		"evaluate leaves a configured ask in place when the simulation abstains",
+		"evaluate leaves a configured ask in place when the seat defers",
 		seatAskEvent.effect === "ask" && seatAskEvent.message === undefined,
 	);
 	const seatPushEvent = permissionEvent("shell", ["git push origin feature/push-seat-hook"], "s-seat-hook");
 	await seatCtx.state.permissionHooks[0]?.(seatPushEvent);
 	check(
-		"evaluate does not deny a non-protected push it cannot decide",
+		"evaluate does not deny a cwd-dependent push it cannot locate",
 		seatPushEvent.effect === "allow" && seatPushEvent.message === undefined,
 	);
-	const abstainAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.reason === "deferred_to_execute_before");
+	const deferAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.reason === "deferred_to_execute_before");
 	check(
-		"an abstention is journaled as deferred to execute.before, not as a plain allow",
-		abstainAudit !== undefined &&
-			abstainAudit.policyDecision?.status === "needs_approval" &&
-			abstainAudit.policyDecision?.code === "remote_state_unchecked" &&
-			(abstainAudit.input as any)?.deferred === "execute.before",
+		"a cwd-dependent deferral is journaled with its own code, not as a plain allow",
+		deferAudit !== undefined &&
+			deferAudit.policyDecision?.status === "needs_approval" &&
+			deferAudit.policyDecision?.code === "repository_unidentified" &&
+			(deferAudit.input as any)?.deferred === "execute.before",
+	);
+	// The remote-probe deferral still exists for commands that name their
+	// repository, because the seat's simulation skips that probe on purpose.
+	const explicitSeatEvent = permissionEvent("shell", [`git -C ${seatHookRepo} push origin feature/push-seat-hook`], "s-seat-hook-explicit");
+	await seatCtx.state.permissionHooks[0]?.(explicitSeatEvent);
+	const remoteProbeAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.sessionID === "s-seat-hook-explicit");
+	check(
+		"a repository-naming command keeps the remote-probe deferral",
+		explicitSeatEvent.effect === "allow" &&
+			remoteProbeAudit?.policyDecision?.code === "remote_state_unchecked",
 	);
 	seatCleanup?.();
 	if (prevSeatDataHome === undefined) delete process.env.XDG_DATA_HOME;

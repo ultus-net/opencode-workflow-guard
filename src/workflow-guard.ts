@@ -91,6 +91,7 @@ import {
 	setSessionWorkspace,
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
+	rebindSessionWorkspaceFromHost,
 	registerSessionWorkspaceFromToolCall,
 	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
@@ -130,6 +131,7 @@ export {
 	setSessionWorkspace,
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
+	rebindSessionWorkspaceFromHost,
 	registerSessionWorkspaceFromToolCall,
 	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
@@ -914,6 +916,16 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					}
 					const settleTitle = getProjectConfig(effectiveRoot).titleSettleWorkaround !== false;
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID, settleTitle));
+				}
+			}
+			if (event?.type === "session.updated") {
+				// `session_move` relocates a session between checkouts, and the
+				// host re-emits `session.updated` for the moved session. Its
+				// `directory` is the authoritative post-move location; without
+				// this rebind the session kept judging the tree it left.
+				const info = (event.properties as { info?: { id?: unknown; directory?: unknown } })?.info;
+				if (typeof info?.id === "string" && typeof info.directory === "string") {
+					rebindSessionWorkspaceFromHost(info.id, info.directory);
 				}
 			}
 			if (event?.type === "message.updated") {

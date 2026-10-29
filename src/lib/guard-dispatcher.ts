@@ -55,11 +55,13 @@ import {
 	checkBranchBaseIsUpToDate,
 	checkMergeConflicts,
 	currentGitBranch,
+	findWorktreeForBranch,
 	hasUnsafeGitAlias,
 	isBranchAlreadyMergedOrClosed,
 	normalizeGitCommands,
 	onProtectedBranch,
 	parseGitInvocation,
+	prSourceBranch,
 	pushedProtectedBranchIn,
 	tagRefspecIn,
 } from "../policies/git.ts";
@@ -470,11 +472,17 @@ export async function guardToolCallImpl(
 		}
 		const normalizedCommand = normalizeGitCommands(command);
 		if (hasUnsafeGitAlias(command)) return block("git", "unsafe_git_alias", "Blocked: per-invocation Git aliases cannot be used because they can hide guarded Git operations.");
-		const gitInvocations = splitShellSegments(command).map((segment) => parseGitInvocation(segment.trim())).filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
+		const gitInvocations = splitShellSegments(command).map((segment) => parseGitInvocation(segment.trim(), shellRoot)).filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
 		const effectiveRoot = gitInvocations[0]?.repoDir ?? currentRoot;
 		for (const invocation of gitInvocations) {
 			const normalizedInvocation = `git ${invocation.rest}`;
-			if (isPathOutsideWorkspace(invocation.repoDir, currentRoot) && (GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))) {
+			// A linked worktree of the SAME repository is not foreign state: the
+			// shell's workdir legitimately lives there when a session works in an
+			// isolated checkout, and judging those commands is the point of the
+			// workdir-aware parse above. A genuinely different repository stays
+			// confined, exactly as before.
+			const foreignRepo = isPathOutsideWorkspace(invocation.repoDir, currentRoot) && !isSameGitRepo(invocation.repoDir, currentRoot);
+			if (foreignRepo && (GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))) {
 				logPolicyBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
 				return block(
 					"boundary",
@@ -604,15 +612,28 @@ export async function guardToolCallImpl(
 			}
 		}
 		if (hasPrCreateInvocation(raw)) {
-			const prRoot = shellRoot;
+			// The PR is about a BRANCH, not about whatever the shell's checkout
+			// happens to have checked out. Resolve the branch the command names
+			// (`gh --head`, `az --source-branch`) and then the checkout that
+			// holds it: a linked worktree is the normal case, because the
+			// orchestrator session may sit in the primary checkout while the
+			// reviewed branch lives in an isolated worktree. Every preflight
+			// check then judges that tree instead of the caller's.
+			const prSegment = splitShellSegments(raw).find((segment) => hasPrCreateInvocation(segment));
+			const sourceBranch = prSegment ? prSourceBranch(unwrapShellCommand(prSegment)) : undefined;
+			let prRoot = shellRoot;
+			let branch = currentGitBranch(shellRoot);
+			if (sourceBranch) {
+				prRoot = findWorktreeForBranch(shellRoot, sourceBranch) ?? findWorktreeForBranch(currentRoot, sourceBranch) ?? shellRoot;
+				branch = sourceBranch;
+			}
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
 			const descFlag = isAz ? "--description" : "--body";
 			const preflightFailures: string[] = [];
 			if (prBodyHasLiteralLineBreakEscapes(raw)) preflightFailures.push(`PR description contains literal \\n/\\r escapes that will render as text; use real newlines, ANSI-C quoting ($'...\\n...'), or a body/description file instead.`);
-			const conflictCheck = checkMergeConflicts(prRoot);
+			const conflictCheck = checkMergeConflicts(prRoot, branch);
 			if (conflictCheck.hasConflicts) preflightFailures.push(conflictCheck.reason ?? "Branch has merge conflicts with its base branch.");
-			const branch = currentGitBranch(prRoot);
 			if (branch) {
 				if (context?.simulate) remotePrStateUnchecked = true;
 				const mergedStatus = isBranchAlreadyMergedOrClosed(prRoot, branch, !context?.simulate);
