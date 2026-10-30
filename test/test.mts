@@ -221,6 +221,9 @@ const call = (
 ) => guardToolCall(toolName, input, context);
 const shell = (cmd: string) => call("bash", { command: cmd });
 const blocked = (r: unknown): boolean => typeof r === "string";
+// An allow is anything that is not a block string. Asserting that explicitly
+// keeps "not a string" from silently accepting an unrelated error object.
+const allowed = (r: unknown): boolean => !blocked(r);
 
 console.log("- Policy 1: native todo gate -");
 todo("s-empty");
@@ -2931,7 +2934,7 @@ process.env.WORKFLOW_GUARD_REQUIRE_REVIEW = "0";
 check("dogfood gate is off by default", isDogfoodRequired(dogfoodRepo) === false);
 check(
 	"PR creation allowed without dogfood evidence when the gate is off",
-	!(await shell("gh pr create --title t --body 'Changelog: update'")),
+	allowed(await shell("gh pr create --title t --body 'Changelog: update'")),
 );
 
 writeFileSync(join(dogfoodRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: false, requireDogfood: true }));
@@ -2981,7 +2984,7 @@ check("a PASS verdict caches durable evidence", passedDogfood.verdict === "pass"
 check("a PASS verdict satisfies the gate for its own worktree", evaluateDogfoodGate(dogfoodRepo).missingHosts.length === 0 && evaluateDogfoodGate(dogfoodRepo).matched?.scenarioId === "permission-rule-reorder");
 check(
 	"PR creation allowed once a passing run is recorded at the current tree",
-	!(await shell("gh pr create --title t --body 'Changelog: update'")),
+	allowed(await shell("gh pr create --title t --body 'Changelog: update'")),
 );
 
 // The evidence binds to tracked content: a tracked edit invalidates it.
@@ -3058,6 +3061,42 @@ check(
 	loadDogfoodCache().some((record) => record.host.label === "bluefin") && !loadDogfoodCache().some((record) => record.verdict === "hold"),
 );
 
+// Retention is per host. A global cap would let repeated passes on one host
+// evict another host's only pass and silently reopen the gate for a host that
+// never changed.
+resetDogfoodState();
+for (let run = 0; run < 6; run += 1) {
+	recordDogfoodResult({
+		verdict: "pass",
+		scenarioId: "permission-rule-reorder",
+		scenarioSha256: "c".repeat(64),
+		taxonomySha256: "d".repeat(64),
+		checks: [{ id: "exit-code", status: "pass" }],
+		runCount: 1,
+		host: { label: "bluefin" },
+		workspace: dogfoodRepo,
+	}, "s-dogfood");
+}
+recordDogfoodResult({
+	verdict: "pass",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "c".repeat(64),
+	taxonomySha256: "d".repeat(64),
+	checks: [{ id: "exit-code", status: "pass" }],
+	runCount: 1,
+	host: { label: "windows-ci" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+check(
+	"repeated passes on one host cannot evict another host's pass",
+	getDogfoodRecordsForWorkspace(dogfoodRepo).some((record) => record.host.label === "windows-ci"),
+);
+check(
+	"per-host retention keeps only the newest few runs for the busiest host",
+	getDogfoodRecordsForWorkspace(dogfoodRepo).filter((record) => record.host.label === "bluefin").length <= 3,
+);
+resetDogfoodState();
+
 // Compaction must carry the dogfood state, so a context summary cannot lose the
 // only reminder that a pre-deployment run is still outstanding.
 const dogfoodRepoPlugin = await (defaultExport?.server ?? WorkflowGuard)({
@@ -3076,7 +3115,12 @@ if (typeof dogfoodCompactFn === "function") {
 }
 check(
 	"compaction reports the missing dogfood hosts by name",
-	dogfoodCompactOutput.context.some((context) => context.includes("Dogfood Evidence: MISSING for windows-ci")),
+	dogfoodCompactOutput.context.some(
+		(context) =>
+			context.includes("Dogfood Evidence: MISSING") &&
+			context.includes("bluefin") &&
+			context.includes("windows-ci"),
+	),
 );
 
 // The system guidance advertises the gate only for a repository that enabled
@@ -3139,9 +3183,20 @@ check(
 const anonymousHost = await dogfoodPlugin.tool?.record_dogfood?.execute(
 	{ scenarioId: "s", scenarioSha256: "a".repeat(64), taxonomySha256: "b".repeat(64), verdict: "pass", checks: JSON.stringify([{ id: "exit-code", status: "pass" }]), hostLabel: "   ", directory: dogfoodRepo },
 	{ sessionID: "s-dogfood", worktree: dogfoodRepo, directory: dogfoodRepo } as any,
-);check(
+);
+check(
 	"an empty host label is refused because the deploy matrix could never match it",
 	typeof anonymousHost === "string" && anonymousHost.includes("scenarioId and hostLabel must both be non-empty"),
+);
+// An empty check list would slip past the per-row checks because `[].some(...)`
+// is false, so a pass would assert nothing.
+const noChecks = await dogfoodPlugin.tool?.record_dogfood?.execute(
+	{ scenarioId: "s", scenarioSha256: "a".repeat(64), taxonomySha256: "b".repeat(64), verdict: "pass", checks: "[]", hostLabel: "bluefin", directory: dogfoodRepo },
+	{ sessionID: "s-dogfood", worktree: dogfoodRepo, directory: dogfoodRepo } as any,
+);
+check(
+	"a pass with no check rows is refused instead of asserting nothing",
+	typeof noChecks === "string" && noChecks.includes("at least one check row is required") && evaluateDogfoodGate(dogfoodRepo).missingHosts.length > 0,
 );
 
 // A real recorded verdict through the tool satisfies the gate and journals it.

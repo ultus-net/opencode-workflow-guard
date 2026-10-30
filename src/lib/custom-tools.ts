@@ -452,6 +452,13 @@ export function createCustomTools(options: {
 					auditVerdict("rejected", "invalid_dogfood_check_row");
 					return "[workflow-guard] Dogfood record rejected: every check row needs a string 'id' and a 'status' of pass, hold, or skip.";
 				}
+				// A record with no checks is a claim, not an observation. Without
+				// this, an empty array would slip past the per-row checks below
+				// because `[].some(...)` is false, and a pass would mean nothing.
+				if (checks.length === 0) {
+					auditVerdict("rejected", "dogfood_without_checks");
+					return "[workflow-guard] Dogfood record rejected: at least one check row is required. A verdict with no observed checks carries no information about the run.";
+				}
 				// A pass is only credible when every check actually ran. A skipped
 				// check is a HOLD by the design's own rule, so accepting it here
 				// would let the gate pass by omission.

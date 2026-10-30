@@ -456,7 +456,24 @@ export function resetReviewState(): void {
 }
 
 let dogfoodRecords: DogfoodResult[] = [];
-const MAX_DOGFOOD_RECORDS = 20;
+/**
+ * Per-host retention, not a global cap. A global cap would let 20 passes on one
+ * host evict another host's only pass, silently reopening the gate for a host
+ * that never changed.
+ */
+const MAX_DOGFOOD_RECORDS_PER_HOST = 3;
+
+function retainNewestPerHost(records: DogfoodResult[]): DogfoodResult[] {
+	const byHost = new Map<string, DogfoodResult[]>();
+	for (const record of records) {
+		byHost.set(record.host.label, [...(byHost.get(record.host.label) ?? []), record]);
+	}
+	return [...byHost.values()].flatMap((hostRecords) =>
+		hostRecords
+			.sort((left, right) => right.timestamp - left.timestamp)
+			.slice(0, MAX_DOGFOOD_RECORDS_PER_HOST),
+	);
+}
 
 /**
  * Records a dogfood run for a workspace.
@@ -482,7 +499,7 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
 		worktreeFingerprint: getTrackedWorktreeFingerprint(root),
 		sessionID: targetSessionID,
 	};
-	dogfoodRecords = [stored, ...dogfoodRecords].slice(0, MAX_DOGFOOD_RECORDS);
+	dogfoodRecords = retainNewestPerHost([stored, ...dogfoodRecords]);
 	if (stored.verdict === "pass") persistDogfoodCache(dogfoodRecords.filter((record) => record.verdict === "pass"));
 	return stored;
 }
@@ -491,8 +508,9 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
  * Candidate dogfood records for one worktree.
  *
  * Memory and disk are merged, so a pass recorded in a previous process is
- * still a candidate next to one recorded now. Duplicates are harmless because
- * the gate keeps only the newest record per host.
+ * still a candidate next to one recorded now. A record written to both must
+ * stay one record, because the per-host retention cap counts them: a
+ * double-counted record would let itself evict a sibling host's only pass.
  *
  * Exact-worktree candidates win over same-repository ones, so a sibling
  * worktree's run cannot displace this worktree's evidence. Same-repository
@@ -502,9 +520,15 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
  */
 export function getDogfoodRecordsForWorkspace(root: string): DogfoodResult[] {
 	const workspace = projectRootKey(root);
-	const all = [...dogfoodRecords, ...loadDogfoodCache()].filter(
-		(result): result is DogfoodResult & { workspace: string } => result?.workspace != null,
-	);
+	const seen = new Set<string>();
+	const all: Array<DogfoodResult & { workspace: string }> = [];
+	for (const result of [...dogfoodRecords, ...loadDogfoodCache()]) {
+		if (result?.workspace == null) continue;
+		const identity = `${result.host.label}\u0000${result.scenarioId}\u0000${result.timestamp}\u0000${result.commitHash ?? ""}`;
+		if (seen.has(identity)) continue;
+		seen.add(identity);
+		all.push(result as DogfoodResult & { workspace: string });
+	}
 	const exact = all.filter((result) => projectRootKey(result.workspace) === workspace);
 	if (exact.length > 0) return exact;
 	return all.filter((result) => isSameGitRepo(result.workspace, root));
