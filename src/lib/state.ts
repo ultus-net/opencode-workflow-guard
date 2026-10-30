@@ -457,9 +457,9 @@ export function resetReviewState(): void {
 
 let dogfoodRecords: DogfoodResult[] = [];
 /**
- * Retention per workspace and host, not a global cap. A global cap would let 20
- * passes in one workspace or on one host evict another workspace's or host's
- * only pass, silently reopening the gate for a target that never changed.
+ * Retention per workspace and host. This bounds in-memory and merged history so
+ * one busy key cannot grow without limit. Only the newest record per key is ever
+ * durable, so this cap never decides what survives a restart.
  */
 const MAX_DOGFOOD_RECORDS_PER_WORKSPACE_HOST = 3;
 
@@ -507,7 +507,12 @@ function durableDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
 	for (const record of records) {
 		const key = dogfoodRetentionKey(record);
 		const seen = newest.get(key);
-		if (!seen || record.timestamp > seen.timestamp) newest.set(key, record);
+		// A same-millisecond tie must resolve the same way the gate resolves it,
+		// to the HOLD. Otherwise a pass could be persisted alongside a HOLD that
+		// supersedes it, and a restart would serve the pass.
+		if (!seen || record.timestamp > seen.timestamp || (record.timestamp === seen.timestamp && record.verdict === "hold")) {
+			newest.set(key, record);
+		}
 	}
 	return [...newest.values()].filter((record) => record.verdict === "pass");
 }
@@ -575,8 +580,10 @@ function dedupeDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
 	for (const record of records) {
 		// Workspace is part of the identity: the cache is shared across
 		// repositories, so two runs of the same scenario on the same host label
-		// in different workspaces are distinct evidence.
-		const identity = `${record.workspace ?? ""}\u0000${record.host.label}\u0000${record.scenarioId}\u0000${record.scenarioSha256}\u0000${record.taxonomyClass ?? ""}\u0000${record.timestamp}\u0000${record.commitHash ?? ""}`;
+		// in different workspaces are distinct evidence. Verdict is part of it
+		// too, so a PASS and a HOLD recorded in the same millisecond stay
+		// distinct and the HOLD can win.
+		const identity = `${record.workspace ?? ""}\u0000${record.host.label}\u0000${record.scenarioId}\u0000${record.scenarioSha256}\u0000${record.taxonomyClass ?? ""}\u0000${record.verdict}\u0000${record.timestamp}\u0000${record.commitHash ?? ""}`;
 		if (seen.has(identity)) continue;
 		seen.add(identity);
 		unique.push(record);
