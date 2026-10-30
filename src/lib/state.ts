@@ -478,9 +478,10 @@ function retainNewestPerHost(records: DogfoodResult[]): DogfoodResult[] {
 /**
  * Records a dogfood run for a workspace.
  *
- * A HOLD is kept in memory so its taxonomy class stays diagnosable, but only
- * passing records are persisted: caching a failed run would let a later
- * preflight read it as evidence.
+ * A HOLD is kept in memory so its taxonomy class stays diagnosable, and it is
+ * never persisted: caching a failed run would let a later preflight read it as
+ * evidence. A HOLD does evict that host's previously cached passes, because a
+ * restart would otherwise drop the in-memory HOLD and serve the older pass.
  *
  * Records accumulate rather than replacing each other, because a deploy matrix
  * needs one record per host. Keeping only the newest would make a multi-host
@@ -503,20 +504,55 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
 	// A HOLD must evict that host's cached passes. Otherwise the durable cache
 	// keeps an older green run for the same host, and a process restart drops
 	// the in-memory HOLD and serves the stale pass: the gate would re-open on a
-	// host whose most recent run held. Passes from other hosts stay untouched.
+	// host whose most recent run held.
+	//
+	// The persisted set is computed from disk unioned with memory, never from
+	// memory alone. In a cold process the in-memory list holds only the record
+	// just made, so filtering it would delete every other host's cached pass and
+	// re-open the gate for a host that never changed.
+	const merged = retainNewestPerHost(dedupeDogfoodRecords([...dogfoodRecords, ...loadDogfoodCache()]));
 	const cacheCandidates = stored.verdict === "pass"
-		? dogfoodRecords
-		: dogfoodRecords.filter((record) => record.host.label !== stored.host.label);
-	persistDogfoodCache(cacheCandidates.filter((record) => record.verdict === "pass"));
+		? merged
+		: merged.filter((record) => record.host.label !== stored.host.label);
+	// A failed write here is not cosmetic: after a HOLD it leaves the stale pass
+	// on disk, and a restart would serve it as evidence. Journal the failure so
+	// the durable state disagreeing with memory is visible.
+	if (!persistDogfoodCache(cacheCandidates.filter((record) => record.verdict === "pass"))) {
+		audit({
+			ts: new Date().toISOString(),
+			sessionID: targetSessionID,
+			tool: "dogfood.cache",
+			decision: "allow",
+			phase: "event",
+			reason: "dogfood_cache_write_failed",
+			evidence: { dogfoodVerdict: stored.verdict === "hold" ? "hold" : "pass", dogfoodHost: stored.host.label },
+		});
+	}
 	return stored;
+}
+
+/**
+ * Collapses records that describe the same run, so merging memory with disk
+ * does not double count. Retention and the durable cache both count records,
+ * so a duplicate would let itself evict a sibling host's only pass.
+ */
+function dedupeDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
+	const seen = new Set<string>();
+	const unique: DogfoodResult[] = [];
+	for (const record of records) {
+		const identity = `${record.host.label}\u0000${record.scenarioId}\u0000${record.scenarioSha256}\u0000${record.taxonomyClass ?? ""}\u0000${record.timestamp}\u0000${record.commitHash ?? ""}`;
+		if (seen.has(identity)) continue;
+		seen.add(identity);
+		unique.push(record);
+	}
+	return unique;
 }
 
 /**
  * Candidate dogfood records for one worktree.
  *
  * Memory and disk are merged, so a pass recorded in a previous process is
- * still a candidate next to one recorded now. A record written to both must
- * stay one record, or the same run would be counted twice in status output.
+ * still a candidate next to one recorded now.
  *
  * Exact-worktree candidates win over same-repository ones, so a sibling
  * worktree's run cannot displace this worktree's evidence. Same-repository
@@ -526,15 +562,11 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
  */
 export function getDogfoodRecordsForWorkspace(root: string): DogfoodResult[] {
 	const workspace = projectRootKey(root);
-	const seen = new Set<string>();
-	const all: Array<DogfoodResult & { workspace: string }> = [];
-	for (const result of [...dogfoodRecords, ...loadDogfoodCache()]) {
-		if (result?.workspace == null) continue;
-		const identity = `${result.host.label}\u0000${result.scenarioId}\u0000${result.scenarioSha256}\u0000${result.taxonomyClass ?? ""}\u0000${result.timestamp}\u0000${result.commitHash ?? ""}`;
-		if (seen.has(identity)) continue;
-		seen.add(identity);
-		all.push(result as DogfoodResult & { workspace: string });
-	}
+	const all = dedupeDogfoodRecords(
+		[...dogfoodRecords, ...loadDogfoodCache()].filter(
+			(result): result is DogfoodResult & { workspace: string } => result?.workspace != null,
+		),
+	) as Array<DogfoodResult & { workspace: string }>;
 	const exact = all.filter((result) => projectRootKey(result.workspace) === workspace);
 	if (exact.length > 0) return exact;
 	return all.filter((result) => isSameGitRepo(result.workspace, root));

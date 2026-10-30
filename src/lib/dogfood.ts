@@ -67,12 +67,8 @@ export function evaluateDogfoodGate(root: string): DogfoodGateResult {
 	// Only the newest record per host can count. An older pass is superseded by
 	// a newer run of the same host, including a newer HOLD, so a stale pass
 	// cannot hide a regression the same host later found. A same-millisecond
-	// tie resolves to the HOLD explicitly: re-running is cheap, and trusting a
-	// stale pass is the failure that matters.
-	// A record that cannot be judged either way must not win by luck. Records
-	// arrive newest first, so the later entry wins a same-millisecond tie, and a
-	// HOLD is preferred explicitly: re-running is cheap, and trusting a stale
-	// pass is the failure that matters.
+	// tie resolves to the HOLD regardless of arrival order: re-running is cheap,
+	// and trusting a stale pass is the failure that matters.
 	const newestPerHost = new Map<string, DogfoodResult>();
 	for (const record of records) {
 		const seen = newestPerHost.get(record.host.label);

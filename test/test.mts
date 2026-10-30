@@ -3074,6 +3074,66 @@ check(
 	loadDogfoodCache().some((record) => record.host.label === "bluefin") && !loadDogfoodCache().some((record) => record.verdict === "hold"),
 );
 
+// A HOLD must evict only the holding host's passes. In a cold process the
+// in-memory list holds just the new record, so a filter over memory alone would
+// delete every other host's durable pass and re-open the gate for a host that
+// never changed.
+resetDogfoodState();
+recordDogfoodResult({
+	verdict: "pass",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	checks: [{ id: "exit-code", status: "pass" }],
+	runCount: 1,
+	host: { label: "bluefin" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+recordDogfoodResult({
+	verdict: "pass",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	checks: [{ id: "exit-code", status: "pass" }],
+	runCount: 1,
+	host: { label: "windows-ci" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+check("both hosts are durable before the regression", existsSync(getDogfoodCacheFilePath()));
+const diskBeforeHold = loadDogfoodCache();
+// Cold process: the cache file survives and memory is empty. `resetDogfoodState`
+// deletes both, so the cache is written back by hand to model a restart.
+resetDogfoodState();
+persistDogfoodCache(diskBeforeHold);
+recordDogfoodResult({
+	verdict: "hold",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	taxonomyClass: "permission-bypass",
+	checks: [{ id: "exit-code", status: "hold" }],
+	runCount: 1,
+	host: { label: "windows-ci" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+check(
+	"a HOLD in a cold process keeps another host's durable pass",
+	loadDogfoodCache().some((record) => record.host.label === "bluefin"),
+);
+check(
+	"a HOLD in a cold process removes only that host's cached pass",
+	!loadDogfoodCache().some((record) => record.host.label === "windows-ci"),
+);
+// Simulate a further restart: drop in-memory state only, keeping the cache.
+const diskAfterColdHold = loadDogfoodCache();
+resetDogfoodState();
+persistDogfoodCache(diskAfterColdHold);
+const afterColdHold = evaluateDogfoodGate(dogfoodRepo);
+check(
+	"after a cold HOLD the gate still needs the holding host, not the untouched one",
+	afterColdHold.missingHosts.includes("windows-ci") && !afterColdHold.missingHosts.includes("bluefin"),
+);
+
 // A HOLD must evict that host's cached passes. Otherwise a restart drops the
 // in-memory HOLD and serves the older green run, re-opening the gate on a host
 // whose most recent run held.

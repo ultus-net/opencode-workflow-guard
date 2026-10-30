@@ -198,20 +198,27 @@ export function loadReviewCache(): ReviewResult | undefined {
  * in memory so the taxonomy is diagnosable without a failed run later reading
  * as evidence. Records are kept as an array, because a deploy matrix needs one
  * pass per host.
+ *
+ * Never throws: a cache write must not break a tool call. A failure returns
+ * false so the caller can journal it, because a failed HOLD eviction would
+ * otherwise leave a stale pass that re-opens the gate after a restart.
  */
-export function persistDogfoodCache(dogfoodData: DogfoodResult[]): void {
+export function persistDogfoodCache(dogfoodData: DogfoodResult[]): boolean {
 	try {
 		// An empty list means no passing evidence remains, so the file is
 		// removed rather than left as an empty array. A hold on the only host
 		// must leave no durable evidence behind.
 		if (dogfoodData.length === 0) {
 			if (existsSync(DOGFOOD_CACHE_FILE)) unlinkSync(DOGFOOD_CACHE_FILE);
-			return;
+			return true;
 		}
 		mkdirSync(AUDIT_DIR, { recursive: true });
 		writeFileSync(DOGFOOD_CACHE_FILE, JSON.stringify(dogfoodData, null, 2), { encoding: "utf8", mode: 0o600 });
 		chmodSync(DOGFOOD_CACHE_FILE, 0o600);
-	} catch {}
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**
