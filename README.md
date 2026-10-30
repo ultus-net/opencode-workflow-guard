@@ -43,9 +43,9 @@ WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # Also run policy probes with Ope
 
 ## Core Guardrails Overview
 
-The plugin enforces **26 deterministic policy rules** across four main pillars:
+The plugin enforces **27 deterministic policy rules** across four main pillars:
 
-* **Branch & History Protection:** Enforces feature-branch workflows and blocks edits and commits on `main`/`master`. Direct and forced pushes to protected branches are hard-blocked. The guard checks mergeability before PR creation, requires secondary review approval bound to the reviewed worktree content, and requires a PR changelog or changeset.
+* **Branch & History Protection:** Enforces feature-branch workflows and blocks edits and commits on `main`/`master`. Direct and forced pushes to protected branches are hard-blocked. The guard checks mergeability before PR creation, requires secondary review approval bound to the reviewed worktree content, and requires a PR changelog or changeset. An opt-in dogfood gate can additionally require a recorded run of the change on real hardware before a PR opens.
 * **Task & Verification Discipline:** Gates file mutations on active `todowrite` tasks, which subagents inherit. A task can be marked completed only after its own recorded work. Review and investigation tasks use an audited `[read-only]` marker instead. The guard also blocks concurrent direct edits to the same canonical file across sessions. It requires a same-session fresh read before `edit`/`write` can replace an existing file. Silent task deletion is blocked, and task completion requires fresh test verification evidence. Completion claims and sweeping repository claims are journaled against their evidence. Repeated failures force a live-documentation lookup instead of a guess from training data.
 * **Secrets & Workspace Confinement:** Confines edit tools and recognized shell/git mutations to the workspace root, including symlink and `../` escape checks. Agent subshells have sensitive environment variables scrubbed, and `.env` reads return a safe schema mask. Arbitrary executables are not OS-sandboxed. Use containers or filesystem isolation when hard confinement is required.
 * **Destructive CLI & Environment Safety:** Intercepts destructive cloud, database, and infrastructure commands. Stops script laundering and interpreter evasion, blocks TTY hangs such as `vim`, `nano`, and `sudo`, and guards against dangerous package manager flags.
@@ -59,7 +59,7 @@ For complete policy specifications and override rules, see [docs/policies.md](do
 Enforcement is only half the surface. The plugin also registers first-class agent tools under the same names on OpenCode 1.x and 2.x, so disciplined workflow is the path of least resistance:
 
 * **Task Planning:** `guard_next_tasks` surfaces durable repository planning context at session start or during planning. It reads `TODO.md`, `ROADMAP.md`, `PLAN.md`, `TASKS.md`, `BACKLOG.md`, their `docs/` counterparts, and plans under `docs/plans/`. `guard_status` reports active guardrails, branch protection, mutation counts, outstanding verification and review gates, a read-only git-hygiene snapshot, and the loaded `pluginVersion`.
-* **Review & Verification:** before PR creation, a secondary reviewer subagent evaluates the diff against `guard_review_rubric`. The rubric covers five axes: test integrity, task completeness, cleanliness, security, and platform. The reviewer records its verdict with `record_review`, and approvals bind to the reviewed worktree content.
+* **Review & Verification:** before PR creation, a secondary reviewer subagent evaluates the diff against `guard_review_rubric`. The rubric covers five axes: test integrity, task completeness, cleanliness, security, and platform. The reviewer records its verdict with `record_review`, and approvals bind to the reviewed worktree content. An opt-in dogfood gate adds a recorded end-to-end run on real hardware with `record_dogfood`.
 * **Worktree Isolation:** `guard_worktree_create` and `guard_worktree_cleanup` give parallel subagents isolated linked worktrees, so concurrent mutations never collide.
 * **Technical Debt:** `guard_review_followups` lists open P2/P3 durable review follow-ups. `guard_review_followup_resolve` closes one after the underlying issue is fixed and verified.
 * **Policy Simulation:** `guard_why` returns the structured policy decision for a tool call or command without performing it. `guard_audit` shows recent audited policy entries.
@@ -74,7 +74,7 @@ The context modules are project memory, Socratic learning, and recovery checkpoi
 
 | Guide | Description |
 |---|---|
-| [**Policy Reference**](docs/policies.md) | Specification of all 26 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
+| [**Policy Reference**](docs/policies.md) | Specification of all 27 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
 | [**Installation & Configuration**](docs/installation.md) | Setup options, global and local install, worktree isolation, and project configuration |
 | [**Static Policy Posture**](docs/policy-posture.md) | How the guard emits host-level policies for invariants a repository cannot lift. Covers both host envelopes (`experimental.policies` on 2.0.x, top-level `policies` on 2.1.x), precedence, and residual risk |
 | [**Managed Deployment**](docs/managed-deployment.md) | Administrator-managed OpenCode policy, platform locations, and startup diagnostics |

@@ -51,6 +51,19 @@ export interface ProjectConfig {
 	requireSubagentReview?: boolean;
 	requireDocumentation?: boolean;
 	/**
+	 * Dogfood gate (pre-deployment evidence). Off by default: a repository
+	 * opts in once its runner exists. When true, PR preflight requires a fresh
+	 * passing dogfood record bound to the tree the PR would publish.
+	 */
+	requireDogfood?: boolean;
+	/**
+	 * Host labels that must each carry a fresh passing dogfood record before a
+	 * PR. Unset means the recorded host alone satisfies the gate. A matrix is
+	 * a configuration fact, not a code path: a Linux pass never vouches for
+	 * Windows.
+	 */
+	dogfoodDeployMatrix?: string[];
+	/**
 	 * Policy 25 (live-documentation research floor). Enabled by default: after
 	 * `liveDocFailureThreshold` failed tool calls with no live-documentation
 	 * lookup since the last failure, mutating/shell tools are blocked until the
@@ -120,9 +133,53 @@ export interface ReviewResult {
 
 export type EvidenceConfidence = "deterministic_observation" | "attestation" | "derived_state" | "agent_assertion";
 
+export type DogfoodVerdict = "pass" | "hold";
+
+/**
+ * One deterministic check row. `observed` is what the runner actually saw and
+ * `expected` is what the scenario declared, so a HOLD is diagnosable without
+ * re-running the scenario. `detail` carries the failing artifact excerpt.
+ */
+export interface DogfoodCheck {
+	id: string;
+	status: "pass" | "hold" | "skip";
+	expected?: string;
+	observed?: string;
+	detail?: string;
+}
+
+export interface DogfoodHost {
+	/** Stable per-machine label the deploy matrix is written against. */
+	label: string;
+	os?: string;
+	arch?: string;
+	opencodeVersion?: string;
+	actorModel?: string;
+	judgeModel?: string;
+	/** Hash of the staged harness tree the actor actually ran against. */
+	stagedTreeHash?: string;
+}
+
+export interface DogfoodResult {
+	verdict: DogfoodVerdict;
+	scenarioId: string;
+	scenarioSha256: string;
+	taxonomySha256: string;
+	taxonomyClass?: string;
+	checks: DogfoodCheck[];
+	runCount: number;
+	host: DogfoodHost;
+	timestamp: number;
+	workspace?: string;
+	commitHash?: string;
+	gitStatus?: string;
+	worktreeFingerprint?: string;
+	sessionID?: string;
+}
+
 export interface EvidenceRecord {
 	id: string;
-	kind: "verification" | "review" | "tool_outcome" | "policy_evaluation" | "lifecycle_state" | "agent_assertion";
+	kind: "verification" | "review" | "dogfood" | "tool_outcome" | "policy_evaluation" | "lifecycle_state" | "agent_assertion";
 	confidence: EvidenceConfidence;
 	observedAt: number;
 	subject: {
@@ -167,6 +224,12 @@ export interface AuditEntry {
 		};
 		allowLive?: boolean;
 		reviewVerdict?: "approved" | "changes_requested" | "rejected";
+		/** Dogfood verdicts: pass/hold are recorded, rejected is refused. */
+		dogfoodVerdict?: "pass" | "hold" | "rejected";
+		dogfoodScenarioId?: string;
+		dogfoodHost?: string;
+		/** Every host a satisfied deploy matrix covered, not just the newest. */
+		dogfoodCoveredHosts?: string[];
 		evidenceId?: string;
 		reviewer?: string;
 		reviewTimestamp?: number;

@@ -1,7 +1,7 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { audit, getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
+import { audit, getDogfoodCacheFilePath, getReviewCacheFilePath, loadDogfoodCache, loadReviewCache, persistDogfoodCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { findGitRoot, getCachedProjectConfig, isSameGitRepo, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { normalizeLiveControlPlaneRoots } from "./live-control-plane.ts";
@@ -10,6 +10,7 @@ import type {
 	ProjectConfig,
 	VerifyResult,
 	ReviewResult,
+	DogfoodResult,
 } from "./types.ts";
 
 export let workspaceRoot = process.cwd();
@@ -454,6 +455,177 @@ export function resetReviewState(): void {
 	} catch {}
 }
 
+let dogfoodRecords: DogfoodResult[] = [];
+/**
+ * Retention per workspace and host. This bounds in-memory and merged history so
+ * one busy key cannot grow without limit. Only the newest record per key is ever
+ * durable, so this cap never decides what survives a restart.
+ */
+const MAX_DOGFOOD_RECORDS_PER_WORKSPACE_HOST = 3;
+
+/**
+ * Retention key. Workspace is part of the key because the durable cache is
+ * shared across repositories: keying on the host label alone would let a busy
+ * host in one repository evict another repository's record for the same label.
+ */
+function dogfoodRetentionKey(record: DogfoodResult): string {
+	return `${record.workspace ?? ""}\u0000${record.host.label}`;
+}
+
+function retainNewestPerWorkspaceHost(records: DogfoodResult[]): DogfoodResult[] {
+	const byKey = new Map<string, DogfoodResult[]>();
+	for (const record of records) {
+		const key = dogfoodRetentionKey(record);
+		byKey.set(key, [...(byKey.get(key) ?? []), record]);
+	}
+	return [...byKey.values()].flatMap((keyRecords) =>
+		keyRecords
+			.sort((left, right) => right.timestamp - left.timestamp)
+			.slice(0, MAX_DOGFOOD_RECORDS_PER_WORKSPACE_HOST),
+	);
+}
+
+/**
+ * Every dogfood record this process can see: memory plus the durable cache,
+ * deduplicated and retained. The eviction path and the read path must agree
+ * about which records exist, so both call this rather than the pieces.
+ */
+function mergedDogfoodRecords(): DogfoodResult[] {
+	return retainNewestPerWorkspaceHost(dedupeDogfoodRecords([...dogfoodRecords, ...loadDogfoodCache()]));
+}
+
+/**
+ * The records that may be durable, given everything currently known.
+ *
+ * One per workspace and host: the newest. Persisting an older pass would
+ * resurrect it after a restart even when a newer HOLD already superseded it,
+ * because the HOLD itself is never written to disk. Keeping only the newest
+ * record per key means a HOLD tombstones that key by leaving nothing behind.
+ */
+function durableDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
+	const newest = new Map<string, DogfoodResult>();
+	for (const record of records) {
+		const key = dogfoodRetentionKey(record);
+		const seen = newest.get(key);
+		// A same-millisecond tie must resolve the same way the gate resolves it,
+		// to the HOLD. Otherwise a pass could be persisted alongside a HOLD that
+		// supersedes it, and a restart would serve the pass.
+		if (!seen || record.timestamp > seen.timestamp || (record.timestamp === seen.timestamp && record.verdict === "hold")) {
+			newest.set(key, record);
+		}
+	}
+	return [...newest.values()].filter((record) => record.verdict === "pass");
+}
+
+/**
+ * Records a dogfood run for a workspace.
+ *
+ * A HOLD is kept in memory so its taxonomy class stays diagnosable, and it is
+ * never persisted: caching a failed run would let a later preflight read it as
+ * evidence. A HOLD does evict that host's previously cached passes, because a
+ * restart would otherwise drop the in-memory HOLD and serve the older pass.
+ *
+ * Only the newest record per workspace and host is durable, but records for
+ * different hosts accumulate, because a deploy matrix needs one pass per host.
+ */
+export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "commitHash" | "gitStatus" | "worktreeFingerprint" | "timestamp"> & { workspace?: string }, targetSessionID?: string): DogfoodResult {
+	const root = projectRootKey(result.workspace ?? getWorkspaceRoot());
+	const stored: DogfoodResult = {
+		...result,
+		timestamp: Date.now(),
+		workspace: root,
+		commitHash: getCurrentGitCommitHash(root),
+		gitStatus: getGitStatusSummary(root),
+		// Bind to tracked content only, matching review: the dogfood run
+		// covered the change, and untracked scratch files are not part of it.
+		worktreeFingerprint: getTrackedWorktreeFingerprint(root),
+		sessionID: targetSessionID,
+	};
+	dogfoodRecords = retainNewestPerWorkspaceHost([stored, ...dogfoodRecords]);
+	// Only the newest record per workspace and host may be durable. A HOLD is
+	// never written, so it tombstones its key by leaving nothing behind. That
+	// also stops a later PASS for a different host from re-persisting a pass
+	// that a newer HOLD already superseded: after a restart the HOLD is gone,
+	// and that resurrected pass would re-open the gate on a held host.
+	//
+	// The durable set comes from merged state, never memory alone: in a cold
+	// process memory holds only the record just made, so using memory alone
+	// would delete every other host's cached pass.
+	const durable = durableDogfoodRecords(mergedDogfoodRecords());
+	// A failed write here is not cosmetic: after a HOLD it leaves the stale pass
+	// on disk, and a restart would serve it as evidence. Journal the failure so
+	// the durable state disagreeing with memory is visible.
+	if (!persistDogfoodCache(durable)) {
+		audit({
+			ts: new Date().toISOString(),
+			sessionID: targetSessionID,
+			tool: "dogfood.cache",
+			decision: "allow",
+			phase: "event",
+			reason: "dogfood_cache_write_failed",
+			evidence: { dogfoodVerdict: stored.verdict === "hold" ? "hold" : "pass", dogfoodHost: stored.host.label },
+		});
+	}
+	return stored;
+}
+
+/**
+ * Collapses records that describe the same run, so merging memory with disk
+ * does not double count. Retention and the durable cache both count records,
+ * so a duplicate would let itself evict a sibling host's only pass.
+ */
+function dedupeDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
+	const seen = new Set<string>();
+	const unique: DogfoodResult[] = [];
+	for (const record of records) {
+		// Workspace is part of the identity: the cache is shared across
+		// repositories, so two runs of the same scenario on the same host label
+		// in different workspaces are distinct evidence. Verdict is part of it
+		// too, so a PASS and a HOLD recorded in the same millisecond stay
+		// distinct and the HOLD can win.
+		const identity = `${record.workspace ?? ""}\u0000${record.host.label}\u0000${record.scenarioId}\u0000${record.scenarioSha256}\u0000${record.taxonomyClass ?? ""}\u0000${record.verdict}\u0000${record.timestamp}\u0000${record.commitHash ?? ""}`;
+		if (seen.has(identity)) continue;
+		seen.add(identity);
+		unique.push(record);
+	}
+	return unique;
+}
+
+/**
+ * Candidate dogfood records for one worktree.
+ *
+ * Memory and disk are merged, so a pass recorded in a previous process is
+ * still a candidate next to one recorded now.
+ *
+ * Exact-worktree candidates win over same-repository ones, so a sibling
+ * worktree's run cannot displace this worktree's evidence. Same-repository
+ * candidates are returned when this worktree has none, which is what lets a
+ * run in a linked worktree satisfy the parent when the tracked content matches.
+ * Freshness is judged per record by the caller, never here.
+ */
+export function getDogfoodRecordsForWorkspace(root: string): DogfoodResult[] {
+	const workspace = projectRootKey(root);
+	const all = mergedDogfoodRecords().filter(
+		(result): result is DogfoodResult & { workspace: string } => result?.workspace != null,
+	);
+	const exact = all.filter((result) => projectRootKey(result.workspace) === workspace);
+	if (exact.length > 0) return exact;
+	return all.filter((result) => isSameGitRepo(result.workspace, root));
+}
+
+export function getLastDogfoodResultForWorkspace(root: string): DogfoodResult | undefined {
+	const records = getDogfoodRecordsForWorkspace(root);
+	return records.reduce<DogfoodResult | undefined>((best, result) => !best || result.timestamp > best.timestamp ? result : best, undefined);
+}
+
+export function resetDogfoodState(): void {
+	dogfoodRecords = [];
+	try {
+		const p = getDogfoodCacheFilePath();
+		if (existsSync(p)) unlinkSync(p);
+	} catch {}
+}
+
 export async function resolveEffectiveWorkspace(options: {
 	sessionID?: string;
 	directory?: string;
@@ -541,6 +713,54 @@ export function isDocumentationRequired(root: string): boolean {
 	if (process.env.WORKFLOW_GUARD_REQUIRE_DOCS === "1") return true;
 	const cfg = getProjectConfig(root);
 	return cfg.requireDocumentation === true;
+}
+
+/**
+ * Dogfood gate (pre-deployment evidence). Off by default, per the rule that
+ * every write path ships opt-in first: a repository opts in only once its
+ * runner exists, and an unset flag keeps today's PR behavior.
+ */
+export function isDogfoodRequired(root: string): boolean {
+	const env = process.env.WORKFLOW_GUARD_REQUIRE_DOGFOOD?.toLowerCase();
+	if (env === "0" || env === "false" || env === "off") return false;
+	if (env === "1" || env === "true" || env === "on") return true;
+	return getProjectConfig(root).requireDogfood === true;
+}
+
+/**
+ * Host labels that must each carry a passing dogfood record. Unset means the
+ * recorded host alone satisfies the gate, so a single-machine setup needs no
+ * matrix. Blank and duplicate labels are dropped; a non-array value is
+ * ignored rather than throwing, matching the other config readers.
+ */
+export function getDogfoodDeployMatrix(root: string): string[] {
+	const env = process.env.WORKFLOW_GUARD_DOGFOOD_DEPLOY_MATRIX;
+	const raw = env !== undefined && env.trim() !== "" ? env.split(",") : getProjectConfig(root).dogfoodDeployMatrix;
+	if (!Array.isArray(raw)) return [];
+	return [...new Set(raw.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean))];
+}
+
+/**
+ * Dogfood recursion depth for this process. The runner sets
+ * `WORKFLOW_GUARD_DOGFOOD_DEPTH` on the actor it spawns, so the marker is
+ * inherited rather than handshaken. Unparseable or negative values fail
+ * closed to depth 1, because a corrupt marker must not read as a clean root.
+ */
+export function getDogfoodDepth(): number {
+	const env = process.env.WORKFLOW_GUARD_DOGFOOD_DEPTH;
+	if (env === undefined || env.trim() === "") return 0;
+	const parsed = Number(env.trim());
+	return Number.isInteger(parsed) && parsed >= 0 ? parsed : 1;
+}
+
+/**
+ * True when this process is a dogfood actor, that is, a session spawned by the
+ * runner to be tested. Every policy still applies; the marker only refuses
+ * self-certification and stops dogfood evidence from being persisted.
+ */
+export function isDogfoodActor(): boolean {
+	if (process.env.WORKFLOW_GUARD_DOGFOOD_ACTOR === "1") return true;
+	return getDogfoodDepth() > 0;
 }
 
 /**

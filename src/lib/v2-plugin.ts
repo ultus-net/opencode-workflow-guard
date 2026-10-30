@@ -41,7 +41,9 @@ import {
 	isLiveDocsRequired,
 	getLiveDocFailureThreshold,
 	getResearchToolPatterns,
+	isDogfoodRequired,
 } from "./state.ts";
+
 import {
 	openProjectMemory,
 	ensureProjectMemoryExcluded,
@@ -72,7 +74,7 @@ import { asRecord, showBlockToast, isSensitiveEnvKey } from "./utils.ts";
 import { loadedPluginVersion } from "./version.ts";
 import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, recordUserMessage } from "../policies/continuation.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, nextRecoveryRun } from "./checkpoint.ts";
-import { buildCompactionContext, guardToolCall } from "../workflow-guard.ts";
+import { buildCompactionContext, evaluateDogfoodGate, guardToolCall } from "../workflow-guard.ts";
 import { registerPluginInstance, releasePluginInstance } from "./plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim } from "./call-claims.ts";
 import { evaluatePermissionSeat } from "./permission-seat.ts";
@@ -459,6 +461,7 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				projectMemoryEnabled,
 				learningEnabled,
 				recoveryCheckpointsEnabled: isRecoveryCheckpointsEnabled(effectiveRoot),
+				dogfoodRequired: isDogfoodRequired(effectiveRoot),
 				isReadOnly,
 			});
 			event.system.push({ type: "text", text: guidance });
@@ -516,6 +519,14 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			if (lastR) {
 				stateLines.push(
 					`- Secondary Review: ${lastR.passed ? "APPROVED" : "CHANGES REQUESTED"} by ${lastR.reviewer}`,
+				);
+			}
+			const dogfoodCtxGate = evaluateDogfoodGate(effectiveRoot);
+			if (dogfoodCtxGate.required) {
+				stateLines.push(
+					dogfoodCtxGate.missingHosts.length === 0
+						? `- Dogfood Evidence: PASS on ${(dogfoodCtxGate.matchedRecords ?? []).map((record) => record.host.label).join(", ") || "recorded host"}`
+						: `- Dogfood Evidence: MISSING for ${dogfoodCtxGate.missingHosts.join(", ")} (required before PR creation)`,
 				);
 			}
 			let openFollowups: ReturnType<typeof listReviewFollowups> = [];

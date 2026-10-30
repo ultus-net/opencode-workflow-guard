@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { audit, loadVerifyCache } from "./audit.ts";
 import { isEvidenceFresh, reviewEvidence, verificationEvidence } from "./evidence.ts";
 import { findGitRoot, isSameGitRepo, projectRootKey } from "./project-config.ts";
+import { evaluateDogfoodGate } from "./dogfood.ts";
 import {
 	getLastReviewResultForWorkspace,
 	getLiveControlPlaneRoots,
@@ -686,6 +687,35 @@ export async function guardToolCallImpl(
 				}
 			}
 			if (isDocumentationRequired(prRoot) && !branchHasDocumentationChange(prRoot)) preflightFailures.push("Documentation update is required (Policy 21); update README.md or relevant documentation in docs/.");
+			// Dogfood gate (pre-deployment evidence), off by default. The
+			// evaluation lives in lib/dogfood.ts so preflight and guard_status
+			// cannot disagree about whether the gate is satisfied.
+			const dogfoodGate = evaluateDogfoodGate(prRoot);
+			if (dogfoodGate.matched && !context?.simulate) {
+				audit({
+					ts: new Date().toISOString(),
+					sessionID: context?.sessionID,
+					tool: "pr-preflight.dogfood-binding",
+					decision: "allow",
+					phase: "event",
+					reason: "dogfood_evidence_matched",
+					evidence: {
+						evidenceId: dogfoodGate.evidenceId,
+						dogfoodScenarioId: dogfoodGate.matched.scenarioId,
+						dogfoodHost: dogfoodGate.matched.host.label,
+						// Journal every host the matrix required, not just the
+						// newest one. A single-host entry would understate a
+						// multi-host pass and mislead an auditor later.
+						dogfoodCoveredHosts: (dogfoodGate.matchedRecords ?? []).map((record) => record.host.label),
+						binding: {
+							workspace: projectRootKey(prRoot),
+							commitHash: getCurrentGitCommitHash(prRoot),
+							worktreeFingerprint: getTrackedWorktreeFingerprint(prRoot)?.slice(0, 16),
+						},
+					},
+				});
+			}
+			if (dogfoodGate.missingHosts.length > 0 && dogfoodGate.reason) preflightFailures.push(dogfoodGate.reason);
 			const branchChangelog = branchHasChangelogChange(prRoot);
 			let shellCwdKnown = true;
 			const prSegments: Array<{ segment: string; invocationRoot: string | null }> = [];
