@@ -103,6 +103,17 @@ function repositoryDependent(command: string): boolean {
 }
 
 /**
+ * Policies whose verdict is derived from the selected checkout.
+ *
+ * A block from one of these may be an artifact of judging the wrong tree: the
+ * original defect was a push denied for the protected branch of the primary
+ * checkout while the command targeted a linked feature worktree. A block from
+ * any other policy (destructive, shell-safety, secrets, tamper, todo) is a
+ * finding about the command text itself, so no working directory can change it.
+ */
+const CHECKOUT_DERIVED_POLICIES = new Set(["git", "pr-preflight"]);
+
+/**
  * Map one simulated policy decision onto the seat's effect.
  *
  * Only `needs_approval` abstains. That status means the simulated core could
@@ -161,26 +172,32 @@ export async function evaluatePermissionSeat(
 		let deferred: PermissionSeatResult | undefined;
 		for (const resource of resources) {
 			// Where the command runs is part of the decision for some commands,
-			// and this seat cannot see the tool's `workdir`. Defer those:
-			// `execute.before` sees the raw arguments, resolves them against the
-			// call's workspace, and enforces. Evaluation of the remaining
-			// resources still runs first, so a genuine finding in a compound
-			// command is never hidden behind the deferral.
-			if (mapping.tool === "bash" && repositoryDependent(resource)) {
+			// and this seat cannot see the tool's `workdir`. Both directions of a
+			// checkout-derived verdict are then unreliable: a block may be the
+			// protected branch of the wrong tree, and an allow may be a feature
+			// checkout that hides a push to a protected destination. Defer those
+			// to `execute.before`, which resolves the shell's workdir.
+			const cwdDependent = mapping.tool === "bash" && repositoryDependent(resource);
+			const decision = await decide(mapping.tool, mapping.input(resource));
+			const verdict = seatVerdict(decision, mapping.tool);
+			if (cwdDependent) {
+				// A block from any OTHER policy is a finding about the command
+				// text itself (`cat .env` or a destructive live command in the
+				// same compound command), so no working directory can change it
+				// and it keeps its denial. Everything else defers.
+				if (verdict?.effect === "deny" && !CHECKOUT_DERIVED_POLICIES.has(decision.policy ?? "")) return verdict;
 				deferred = {
 					effect: "abstain",
 					mappedTool: mapping.tool,
 					decision: {
 						status: "needs_approval",
-						policy: "git",
+						policy: decision.policy ?? "git",
 						code: "repository_unidentified",
 						message: "[workflow-guard permission.evaluate] Deferred: this command's verdict depends on the directory it runs in, which the permission seat cannot see. `execute.before` resolves the shell's workdir and enforces there.",
 					},
 				};
 				continue;
 			}
-			const decision = await decide(mapping.tool, mapping.input(resource));
-			const verdict = seatVerdict(decision, mapping.tool);
 			if (verdict) return verdict;
 		}
 		return deferred ?? { effect: "allow", mappedTool: mapping.tool };

@@ -80,6 +80,10 @@ export function clearTodoSessionState(sessionID: string): void {
 // instance must never outrank the call's own context or the host fallback.
 const sessionWorkspaceBound = new Set<string>();
 
+// Last directory the HOST named per session, so a repeated `session.updated`
+// costs one string comparison instead of a `git rev-parse` child process.
+const sessionHostDirectories = new Map<string, string>();
+
 export function setSessionWorkspace(sessionID: string, workspace: string): void {
 	if (!sessionID || !workspace) return;
 	const gitRoot = findGitRoot(workspace);
@@ -250,12 +254,16 @@ function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: s
  * boundary statement from the host, in the same class as a per-call worktree,
  * so it may widen a already-bound session. It is journaled for that reason.
  *
- * An update that does not actually move the session (the host re-emits
- * `session.updated` for unrelated reasons) is a no-op, so repeated events cost
- * nothing after the first resolution.
+ * `session.updated` is a hot event, emitted for title and cost changes too, so
+ * the last directory the host named per session is remembered. An update that
+ * repeats it returns without spawning git. That costs one process per genuine
+ * move instead of one per update.
  */
 export function rebindSessionWorkspaceFromHost(sessionID: string | undefined, directory: string | undefined): void {
 	if (!sessionID || !directory) return;
+	const seen = sessionHostDirectories.get(sessionID);
+	if (seen === directory) return;
+	sessionHostDirectories.set(sessionID, directory);
 	const gitRoot = findGitRoot(directory);
 	if (!gitRoot) return;
 	const previous = sessionWorkspaces.get(sessionID);

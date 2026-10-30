@@ -5963,6 +5963,17 @@ try {
 		"seat denies an explicitly named repository outside the workspace",
 		foreignRepoSeat.effect === "deny" && foreignRepoSeat.decision?.policy === "boundary",
 	);
+	// Deferring a checkout-derived verdict must never hide a finding about the
+	// command text itself. A secret read in the same compound command is a real
+	// block, no matter which checkout the push would have used.
+	const compoundSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["cat .env && git push origin feature/push-seat"]), sessionID: "s-seat-compound" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"a genuine non-checkout finding in a compound command is still denied",
+		compoundSeat.effect === "deny" && compoundSeat.decision?.policy === "secrets",
+	);
 	const askedSeat = await evaluatePermissionSeat(
 		{ ...seatEvent(["git push origin feature/push-seat"], "ask"), sessionID: "s-seat-ask" },
 		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
