@@ -395,8 +395,19 @@ export async function guardShellMutation(
 	command: string,
 	sessionID: string | undefined,
 	record = true,
+	shellRoot?: string,
 ): Promise<string | undefined> {
-	const root = getWorkspaceRoot();
+	// Judge the tree the command RUNS in. A linked worktree of this repository
+	// is a legitimate workdir, and its branch or relative targets are not the
+	// session checkout's: validating against that checkout blocked a mutation
+	// in a feature worktree as if it happened on the primary `main`.
+	const workspaceRoot = getWorkspaceRoot();
+	const root = shellRoot ?? workspaceRoot;
+	// Both trees are this workspace: the checkout the command runs in and the
+	// session's own checkout. Absolute paths into either are legitimate, so a
+	// target is outside only when it leaves both.
+	const outsideWorkspace = (target: string): boolean =>
+		isPathOutsideWorkspace(target, root) && isPathOutsideWorkspace(target, workspaceRoot);
 	let hasMutation = false;
 	for (const rawSegment of command.split(/[\n|;&]+/)) {
 		// Same residue analysis as detectShellMutation: quoted arguments of
@@ -417,7 +428,7 @@ export async function guardShellMutation(
 				if (isProtectedPath(source)) {
 					return PROTECTED_PATH_REASON;
 				}
-				if (isPathOutsideWorkspace(source, root)) {
+				if (outsideWorkspace(source)) {
 					if (hasUnresolvableVariable(source)) {
 						return `Blocked: mv source '${source}' contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${root}). Use a literal workspace-relative path.`;
 					}
@@ -448,7 +459,7 @@ export async function guardShellMutation(
 			if (target && isProtectedPath(target)) {
 				return PROTECTED_PATH_REASON;
 			}
-			if (target && isPathOutsideWorkspace(target, root)) {
+			if (target && outsideWorkspace(target)) {
 				// The workspace boundary has no override: a write outside the
 				// workspace is out of bounds even with WORKFLOW_GUARD_ALLOW_LIVE
 				// (that override covers live-system commands, not the boundary).

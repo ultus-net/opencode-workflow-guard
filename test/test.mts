@@ -3807,6 +3807,22 @@ check(
 	parseGitInvocation("GIT_DIR=/repo git commit")?.repoDir === "/repo" &&
 		parseGitInvocation("GIT_DIR=/repo git commit")?.explicitRepoDir === true,
 );
+// A dangling `-C` names no repository, but the flag is still in the text. Both
+// seats must then agree the command is unclassifiable: the seat defers, and
+// execute.before decides. Reporting it as an assumed base let the seat judge a
+// command whose repository it could not know.
+check(
+	"a dangling -C is reported as an explicit claim, not silent text truncation",
+	parseGitInvocation("git -C")?.explicitRepoDir === true && parseGitInvocation("git -C")?.rest === "",
+);
+check(
+	"a dangling --git-dir is reported as an explicit claim",
+	parseGitInvocation("git --git-dir")?.explicitRepoDir === true,
+);
+check(
+	"a dangling option that names no repository is not a claim",
+	parseGitInvocation("git -c")?.explicitRepoDir === false,
+);
 check(
 	"a wrapped GIT_DIR= prefix is still a repository claim",
 	parseGitInvocation("timeout 30 env GIT_DIR=/repo git commit")?.repoDir === "/repo" &&
@@ -3874,6 +3890,30 @@ try {
 	if (prevWtReview === undefined) delete process.env.WORKFLOW_GUARD_REQUIRE_REVIEW;
 	else process.env.WORKFLOW_GUARD_REQUIRE_REVIEW = prevWtReview;
 }
+// A workdir outside the workspace is only legible when it is a linked
+// worktree of the SAME repository. A genuinely foreign repository cannot be
+// judged: the command runs there, so `rm -rf dist` or `> artifact.txt` would be
+// validated against the workspace root while changing another tree.
+const foreignWtRepo = mkdtempSync(join(tmpdir(), "wg-foreign-workdir-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: foreignWtRepo });
+spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: foreignWtRepo });
+todo("s-wt-foreign", item("probe foreign workdir", "in_progress"));
+const foreignWrite = await call("bash", { command: "echo x > artifact.txt", workdir: foreignWtRepo }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a relative shell mutation in a foreign workdir is blocked instead of judged against the workspace",
+	blocked(foreignWrite) && String(foreignWrite).includes(foreignWtRepo),
+);
+const foreignGitWrite = await call("bash", { command: "git commit -m x --allow-empty", workdir: foreignWtRepo }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a git write in a foreign workdir is blocked", blocked(foreignGitWrite));
+const foreignRead = await call("bash", { command: "ls -la", workdir: foreignWtRepo }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a read-only command in a foreign workdir stays allowed", !blocked(foreignRead));
+const linkedWrite = await call("bash", { command: "echo x > .tmp-linked.txt", workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a relative shell mutation in a linked worktree of the same repository is allowed", !blocked(linkedWrite));
+const linkedAbsoluteWrite = await call("bash", { command: `echo x > ${join(wtRepo, "abs.txt")}`, workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an absolute target in the primary checkout stays allowed from a linked worktree", !blocked(linkedAbsoluteWrite));
+const linkedOutsideWrite = await call("bash", { command: `echo x > ${join(foreignWtRepo, "outside.txt")}`, workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an absolute target outside both checkouts is still blocked from a linked worktree", blocked(linkedOutsideWrite));
+rmSync(foreignWtRepo, { recursive: true, force: true });
 spawnSync("git", ["worktree", "remove", "--force", wtLinked], { cwd: wtRepo });
 rmSync(wtRepo, { recursive: true, force: true });
 

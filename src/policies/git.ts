@@ -117,8 +117,13 @@ export function parseGitInvocation(command: string, baseDir?: string): GitInvoca
 		const tok = tokens[i]!;
 		if (GIT_DIR_OPTION_TAKES_VALUE.has(tok)) {
 			const value = tokens[i + 1];
-			if (value === undefined) return { repoDir, rest: "" };
-			if (tok === "-C" || tok === "--git-dir" || tok === "--work-tree") {
+			const namesRepository = tok === "-C" || tok === "--git-dir" || tok === "--work-tree";
+			// A trailing `-C` with no value names no repository, but the flag is
+			// still present in the text. Report it as a claim so both seats agree
+			// the command is unclassifiable rather than one judging it and the
+			// other deferring it. `-c` and `--config-env` name no repository.
+			if (value === undefined) return { repoDir, rest: "", explicitRepoDir: sawDirOption || namesRepository };
+			if (namesRepository) {
 				repoDir = resolve(root, value);
 				sawDirOption = true;
 			}
@@ -142,7 +147,6 @@ export function parseGitInvocation(command: string, baseDir?: string): GitInvoca
 		}
 		break;
 	}
-	if (!sawDirOption) repoDir = root;
 	return { repoDir, rest: tokens.slice(i).join(" "), explicitRepoDir: sawDirOption };
 }
 

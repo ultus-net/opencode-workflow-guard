@@ -30,7 +30,6 @@ import {
 } from "./shell.ts";
 import { asRecord, extractTargetPath } from "./utils.ts";
 import type { PolicyDecision } from "./types.ts";
-import { getProjectMemoryIdentity } from "./project-memory.ts";
 import {
 	detectVerifyCommand,
 	getCurrentGitCommitHash,
@@ -449,9 +448,13 @@ export async function guardToolCallImpl(
 	if (!SHELL_TOOL_NAMES.has(toolName)) return allow();
 	const shellWorkdir = asRecord(input)?.workdir;
 	const requestedShellRoot = typeof shellWorkdir === "string" ? resolve(currentRoot, shellWorkdir) : currentRoot;
-	const shellRoot = !isPathOutsideWorkspace(requestedShellRoot, currentRoot) || getProjectMemoryIdentity(requestedShellRoot) === getProjectMemoryIdentity(currentRoot)
-		? requestedShellRoot
-		: currentRoot;
+	// A workdir outside the workspace is only usable when it is a linked
+	// worktree of the SAME repository: those commands mutate a tree of this
+	// workspace. A genuinely foreign repository cannot be judged here at all,
+	// because the command executes there while relative targets would be
+	// validated against the workspace root.
+	const foreignShellRoot = isPathOutsideWorkspace(requestedShellRoot, currentRoot) && !isSameGitRepo(requestedShellRoot, currentRoot);
+	const shellRoot = foreignShellRoot ? currentRoot : requestedShellRoot;
 
 	for (const raw of extractCommands(input)) {
 		const dynamicSyntax = dynamicShellSyntaxIn(raw);
@@ -474,6 +477,22 @@ export async function guardToolCallImpl(
 		if (hasUnsafeGitAlias(command)) return block("git", "unsafe_git_alias", "Blocked: per-invocation Git aliases cannot be used because they can hide guarded Git operations.");
 		const gitInvocations = splitShellSegments(command).map((segment) => parseGitInvocation(segment.trim(), shellRoot)).filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
 		const effectiveRoot = gitInvocations[0]?.repoDir ?? currentRoot;
+		// The command executes in `requestedShellRoot`, not in the workspace, so
+		// every relative target in it would be validated against the wrong tree:
+		// `rm -rf dist` in a foreign workdir would be checked as
+		// `<workspace>/dist`. Reads elsewhere are fine, mutations are not.
+		const mutatesTree = (invocation: NonNullable<ReturnType<typeof parseGitInvocation>>): boolean => {
+			const text = `git ${invocation.rest}`;
+			return GIT_WRITE_RE.test(text) || GIT_BRANCH_CREATE_RE.test(text) || /\bgit\s+push\b/.test(text);
+		};
+		if (foreignShellRoot && (detectShellMutation(command) || gitInvocations.some(mutatesTree))) {
+			logPolicyBlock(`[workflow-guard] blocked mutation in a workdir outside workspace: ${requestedShellRoot}`);
+			return block(
+				"boundary",
+				"workspace_escape",
+				`Blocked: the shell's workdir '${requestedShellRoot}' is outside workspace root (${currentRoot}) and is not a linked worktree of this repository, so relative targets cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`,
+			);
+		}
 		for (const invocation of gitInvocations) {
 			const normalizedInvocation = `git ${invocation.rest}`;
 			// A linked worktree of the SAME repository is not foreign state: the
@@ -572,7 +591,7 @@ export async function guardToolCallImpl(
 			const secretPath = secretPathInPayload(payload);
 			if (secretPath) return block("secrets", "secret_read", `Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted.`);
 		}
-		const shellMutationReason = await guardShellMutation(command, context?.sessionID, !context?.simulate);
+		const shellMutationReason = await guardShellMutation(command, context?.sessionID, !context?.simulate, shellRoot);
 		if (shellMutationReason) {
 			logPolicyBlock(`[workflow-guard] blocked shell mutation: ${command.slice(0, 120)}`);
 			return block("boundary", "shell_mutation", shellMutationReason);
@@ -627,14 +646,22 @@ export async function guardToolCallImpl(
 			const sourceBranch = prSegment ? prSourceBranch(unwrapShellCommand(prSegment)) : undefined;
 			let prRoot = shellRoot;
 			let branch = currentGitBranch(shellRoot);
+			let missingSourceCheckout: string | undefined;
 			if (sourceBranch) {
-				prRoot = findWorktreeForBranch(shellRoot, sourceBranch) ?? findWorktreeForBranch(currentRoot, sourceBranch) ?? shellRoot;
+				const holder = findWorktreeForBranch(shellRoot, sourceBranch) ?? findWorktreeForBranch(currentRoot, sourceBranch);
+				prRoot = holder ?? shellRoot;
 				branch = sourceBranch;
+				// Review and merge evidence bind to the CONTENT of a checkout.
+				// Substituting the caller's checkout would let an approval of one
+				// tree satisfy a PR that publishes another, so a named branch no
+				// local checkout holds is refused instead.
+				if (!holder) missingSourceCheckout = sourceBranch;
 			}
 			const isAz = /\baz\s+repos\s+pr\s+create\b/.test(normalizedCommand);
 			const prTool = isAz ? "az repos pr create" : "gh pr create";
 			const descFlag = isAz ? "--description" : "--body";
 			const preflightFailures: string[] = [];
+			if (missingSourceCheckout) preflightFailures.push(`Source branch '${missingSourceCheckout}' is not checked out in any worktree of this repository, so review and merge evidence cannot be bound to the content this PR would publish. Check that branch out (a linked worktree is fine) and re-run, or omit the source-branch flag to judge the current checkout.`);
 			if (prBodyHasLiteralLineBreakEscapes(raw)) preflightFailures.push(`PR description contains literal \\n/\\r escapes that will render as text; use real newlines, ANSI-C quoting ($'...\\n...'), or a body/description file instead.`);
 			const conflictCheck = checkMergeConflicts(prRoot, branch);
 			if (conflictCheck.hasConflicts) preflightFailures.push(conflictCheck.reason ?? "Branch has merge conflicts with its base branch.");
