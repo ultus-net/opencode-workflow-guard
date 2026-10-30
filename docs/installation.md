@@ -262,7 +262,7 @@ The guard supplies the gate, the evidence record, and the recursion refusal. It 
 
 A recorded run binds to the commit hash and tracked-content worktree fingerprint of the directory it covered, exactly like review evidence. Commit every tracked change and run the scenario afterwards, so one pass satisfies both the review and dogfood gates. Only a `pass` verdict is durable. A `hold` stays diagnosable in memory with its taxonomy class and never becomes evidence. Recording a `hold` also discards that host's cached passes, so a process restart cannot re-open the gate on an older green run.
 
-Records accumulate, so a multi-host deploy matrix keeps one pass per host. Only the newest record per host counts. A newer `hold` on a host therefore reopens the gate even when that host passed earlier, so a later regression cannot hide behind an older green run.
+Records accumulate, so a multi-host deploy matrix keeps one pass per host. Only the newest record per host counts. A newer `hold` on a host therefore reopens the gate even when that host passed earlier, so a later regression cannot hide behind an older green run. Retention and hold eviction are scoped to the workspace, so one repository's runs never touch another's evidence.
 
 The runner sets `WORKFLOW_GUARD_DOGFOOD_ACTOR=1` and `WORKFLOW_GUARD_DOGFOOD_DEPTH` on the session it spawns. That session runs the full plugin with every policy intact, and the marker only refuses `record_dogfood`, so a tested session cannot certify its own run.
 

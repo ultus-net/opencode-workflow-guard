@@ -19,8 +19,9 @@ default, so no existing repository changes behavior.
   observation. A `hold` must name a taxonomy class.
 - `requireDogfood` and `dogfoodDeployMatrix` (or `WORKFLOW_GUARD_REQUIRE_DOGFOOD`
   and `WORKFLOW_GUARD_DOGFOOD_DEPLOY_MATRIX`) enable the gate and declare the
-  host labels that each need a passing run. Retention is per host, so repeated
-  runs on one host cannot evict another host's only pass.
+  host labels that each need a passing run. Retention and hold eviction are per
+  host and scoped to the workspace, so repeated runs in one repository or on one
+  host cannot evict another repository's or host's only pass.
 - `WORKFLOW_GUARD_DOGFOOD_ACTOR`/`WORKFLOW_GUARD_DOGFOOD_DEPTH` mark a session
   spawned by a repository runner. Every policy still applies there, and the
   marker only refuses `record_dogfood`, so a tested session cannot certify

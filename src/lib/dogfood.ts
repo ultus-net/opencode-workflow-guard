@@ -84,18 +84,26 @@ export function evaluateDogfoodGate(root: string): DogfoodGateResult {
 	const stale: Array<{ record: DogfoodResult; reason: string }> = [];
 	const matchedRecords: DogfoodResult[] = [];
 	for (const [host, record] of newestPerHost) {
+		// A host outside the deploy matrix cannot block the gate, so its HOLD or
+		// staleness must not be reported as the reason: that would name the wrong
+		// remedy. Only in-scope hosts collect their cause.
+		const inScope = matrix.length === 0 || matrix.includes(host);
 		if (record.verdict !== "pass") {
-			held.push(record);
-			if (matrix.length === 0 || matrix.includes(host)) unmatched.push(host);
+			if (inScope) {
+				held.push(record);
+				unmatched.push(host);
+			}
 			continue;
 		}
 		const reason = stalenessReason(record, commitHash, fingerprint);
 		if (reason) {
-			stale.push({ record, reason });
-			if (matrix.length === 0 || matrix.includes(host)) unmatched.push(host);
+			if (inScope) {
+				stale.push({ record, reason });
+				unmatched.push(host);
+			}
 			continue;
 		}
-		if (matrix.length > 0 && !matrix.includes(host)) continue;
+		if (!inScope) continue;
 		matchedRecords.push(record);
 	}
 

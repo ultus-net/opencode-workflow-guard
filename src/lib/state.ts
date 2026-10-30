@@ -463,16 +463,35 @@ let dogfoodRecords: DogfoodResult[] = [];
  */
 const MAX_DOGFOOD_RECORDS_PER_HOST = 3;
 
+/**
+ * Retention key. Workspace is part of the key because the durable cache is
+ * shared across repositories: keying on the host label alone would let a busy
+ * host in one repository evict another repository's record for the same label.
+ */
+function dogfoodRetentionKey(record: DogfoodResult): string {
+	return `${record.workspace ?? ""}\u0000${record.host.label}`;
+}
+
 function retainNewestPerHost(records: DogfoodResult[]): DogfoodResult[] {
 	const byHost = new Map<string, DogfoodResult[]>();
 	for (const record of records) {
-		byHost.set(record.host.label, [...(byHost.get(record.host.label) ?? []), record]);
+		const key = dogfoodRetentionKey(record);
+		byHost.set(key, [...(byHost.get(key) ?? []), record]);
 	}
 	return [...byHost.values()].flatMap((hostRecords) =>
 		hostRecords
 			.sort((left, right) => right.timestamp - left.timestamp)
 			.slice(0, MAX_DOGFOOD_RECORDS_PER_HOST),
 	);
+}
+
+/**
+ * Every dogfood record this process can see: memory plus the durable cache,
+ * deduplicated and retained. The eviction path and the read path must agree
+ * about which records exist, so both call this rather than the pieces.
+ */
+function mergedDogfoodRecords(): DogfoodResult[] {
+	return retainNewestPerHost(dedupeDogfoodRecords([...dogfoodRecords, ...loadDogfoodCache()]));
 }
 
 /**
@@ -506,14 +525,15 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
 	// the in-memory HOLD and serves the stale pass: the gate would re-open on a
 	// host whose most recent run held.
 	//
-	// The persisted set is computed from disk unioned with memory, never from
-	// memory alone. In a cold process the in-memory list holds only the record
-	// just made, so filtering it would delete every other host's cached pass and
-	// re-open the gate for a host that never changed.
-	const merged = retainNewestPerHost(dedupeDogfoodRecords([...dogfoodRecords, ...loadDogfoodCache()]));
+	// The eviction set comes from merged state, never memory alone: in a cold
+	// process memory holds only the record just made, so filtering memory would
+	// delete every other host's cached pass. It is also scoped to this
+	// workspace, because the cache is shared across repositories and a HOLD in
+	// one repository must not erase another repository's record for the label.
+	const merged = mergedDogfoodRecords();
 	const cacheCandidates = stored.verdict === "pass"
 		? merged
-		: merged.filter((record) => record.host.label !== stored.host.label);
+		: merged.filter((record) => dogfoodRetentionKey(record) !== dogfoodRetentionKey(stored));
 	// A failed write here is not cosmetic: after a HOLD it leaves the stale pass
 	// on disk, and a restart would serve it as evidence. Journal the failure so
 	// the durable state disagreeing with memory is visible.
@@ -562,11 +582,9 @@ function dedupeDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
  */
 export function getDogfoodRecordsForWorkspace(root: string): DogfoodResult[] {
 	const workspace = projectRootKey(root);
-	const all = dedupeDogfoodRecords(
-		[...dogfoodRecords, ...loadDogfoodCache()].filter(
-			(result): result is DogfoodResult & { workspace: string } => result?.workspace != null,
-		),
-	) as Array<DogfoodResult & { workspace: string }>;
+	const all = mergedDogfoodRecords().filter(
+		(result): result is DogfoodResult & { workspace: string } => result?.workspace != null,
+	);
 	const exact = all.filter((result) => projectRootKey(result.workspace) === workspace);
 	if (exact.length > 0) return exact;
 	return all.filter((result) => isSameGitRepo(result.workspace, root));

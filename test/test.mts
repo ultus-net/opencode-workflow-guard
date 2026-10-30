@@ -3124,6 +3124,44 @@ check(
 	"a HOLD in a cold process removes only that host's cached pass",
 	!loadDogfoodCache().some((record) => record.host.label === "windows-ci"),
 );
+// The durable cache is shared across repositories, so eviction is scoped to the
+// workspace that held. Otherwise a HOLD in one repository would erase another
+// repository's record for the same host label.
+const otherRepo = join(dogfoodRepo, "..", "dogfood-other-repo");
+mkdirSync(join(otherRepo, ".opencode"), { recursive: true });
+writeFileSync(join(otherRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: false, requireDogfood: true }));
+writeFileSync(join(otherRepo, "code.txt"), "other\n");
+spawnSync("git", ["init", "-q", "-b", "main"], { cwd: otherRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: otherRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: otherRepo });
+spawnSync("git", ["add", "-A"], { cwd: otherRepo });
+spawnSync("git", ["commit", "-qm", "init"], { cwd: otherRepo });
+recordDogfoodResult({
+	verdict: "pass",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	checks: [{ id: "exit-code", status: "pass" }],
+	runCount: 1,
+	host: { label: "windows-ci" },
+	workspace: otherRepo,
+}, "s-dogfood");
+const passesBeforeScopedHold = loadDogfoodCache().filter((record) => record.workspace === otherRepo).length;
+recordDogfoodResult({
+	verdict: "hold",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	taxonomyClass: "permission-bypass",
+	checks: [{ id: "exit-code", status: "hold" }],
+	runCount: 1,
+	host: { label: "windows-ci" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+check(
+	"a HOLD in one workspace keeps another workspace's pass for the same host label",
+	passesBeforeScopedHold > 0 && loadDogfoodCache().filter((record) => record.workspace === otherRepo).length === passesBeforeScopedHold,
+);
 // Simulate a further restart: drop in-memory state only, keeping the cache.
 const diskAfterColdHold = loadDogfoodCache();
 resetDogfoodState();
@@ -3207,6 +3245,33 @@ check(
 	"per-host retention keeps only the newest few runs for the busiest host",
 	getDogfoodRecordsForWorkspace(dogfoodRepo).filter((record) => record.host.label === "bluefin").length <= 3,
 );
+resetDogfoodState();
+
+// A HOLD on a host outside the deploy matrix cannot block the gate, so it must
+// not be reported as the reason: that would name the wrong host and remedy.
+writeFileSync(join(dogfoodRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: false, requireDogfood: true, dogfoodDeployMatrix: ["bluefin"] }));
+reloadProjectConfig(dogfoodRepo);
+recordDogfoodResult({
+	verdict: "hold",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	taxonomyClass: "permission-bypass",
+	checks: [{ id: "exit-code", status: "hold" }],
+	runCount: 1,
+	host: { label: "windows-ci" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+const outsideMatrixHold = evaluateDogfoodGate(dogfoodRepo);
+check(
+	"an out-of-matrix HOLD is not reported as the blocking cause",
+	outsideMatrixHold.missingHosts.includes("bluefin") &&
+		!outsideMatrixHold.missingHosts.includes("windows-ci") &&
+		!/(HOLD|permission-bypass)/.test(outsideMatrixHold.reason ?? ""),
+);
+resetDogfoodState();
+writeFileSync(join(dogfoodRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: false, requireDogfood: true, dogfoodDeployMatrix: ["bluefin", "windows-ci"] }));
+reloadProjectConfig(dogfoodRepo);
 resetDogfoodState();
 
 // Compaction must carry the dogfood state, so a context summary cannot lose the
