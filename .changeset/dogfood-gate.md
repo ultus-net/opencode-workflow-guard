@@ -10,10 +10,10 @@ default, so no existing repository changes behavior.
 - `record_dogfood` records a run as `dogfood` evidence bound to the workspace,
   commit hash, and tracked-content worktree fingerprint. A tracked edit or new
   commit after the run makes the evidence stale.
-- Only a `pass` is durable. A `hold` stays diagnosable in memory with its
-  taxonomy class and never becomes evidence. Recording a `hold` also discards
-  that host's cached passes, so a process restart cannot re-open the gate on an
-  older green run.
+- Only a `pass` is durable, and only the newest record per workspace and host
+  is kept. A `hold` stays diagnosable in memory with its taxonomy class and
+  never becomes evidence. Recording a `hold` also discards that host's cached
+  passes, so a process restart cannot re-open the gate on an older green run.
 - A `pass` requires every check row to be `pass` and at least one check row
   to exist, so the gate cannot be satisfied by a skipped check or by an empty
   observation. A `hold` must name a taxonomy class.

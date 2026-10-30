@@ -457,11 +457,11 @@ export function resetReviewState(): void {
 
 let dogfoodRecords: DogfoodResult[] = [];
 /**
- * Per-host retention, not a global cap. A global cap would let 20 passes on one
- * host evict another host's only pass, silently reopening the gate for a host
- * that never changed.
+ * Retention per workspace and host, not a global cap. A global cap would let 20
+ * passes in one workspace or on one host evict another workspace's or host's
+ * only pass, silently reopening the gate for a target that never changed.
  */
-const MAX_DOGFOOD_RECORDS_PER_HOST = 3;
+const MAX_DOGFOOD_RECORDS_PER_WORKSPACE_HOST = 3;
 
 /**
  * Retention key. Workspace is part of the key because the durable cache is
@@ -472,16 +472,16 @@ function dogfoodRetentionKey(record: DogfoodResult): string {
 	return `${record.workspace ?? ""}\u0000${record.host.label}`;
 }
 
-function retainNewestPerHost(records: DogfoodResult[]): DogfoodResult[] {
-	const byHost = new Map<string, DogfoodResult[]>();
+function retainNewestPerWorkspaceHost(records: DogfoodResult[]): DogfoodResult[] {
+	const byKey = new Map<string, DogfoodResult[]>();
 	for (const record of records) {
 		const key = dogfoodRetentionKey(record);
-		byHost.set(key, [...(byHost.get(key) ?? []), record]);
+		byKey.set(key, [...(byKey.get(key) ?? []), record]);
 	}
-	return [...byHost.values()].flatMap((hostRecords) =>
-		hostRecords
+	return [...byKey.values()].flatMap((keyRecords) =>
+		keyRecords
 			.sort((left, right) => right.timestamp - left.timestamp)
-			.slice(0, MAX_DOGFOOD_RECORDS_PER_HOST),
+			.slice(0, MAX_DOGFOOD_RECORDS_PER_WORKSPACE_HOST),
 	);
 }
 
@@ -491,7 +491,25 @@ function retainNewestPerHost(records: DogfoodResult[]): DogfoodResult[] {
  * about which records exist, so both call this rather than the pieces.
  */
 function mergedDogfoodRecords(): DogfoodResult[] {
-	return retainNewestPerHost(dedupeDogfoodRecords([...dogfoodRecords, ...loadDogfoodCache()]));
+	return retainNewestPerWorkspaceHost(dedupeDogfoodRecords([...dogfoodRecords, ...loadDogfoodCache()]));
+}
+
+/**
+ * The records that may be durable, given everything currently known.
+ *
+ * One per workspace and host: the newest. Persisting an older pass would
+ * resurrect it after a restart even when a newer HOLD already superseded it,
+ * because the HOLD itself is never written to disk. Keeping only the newest
+ * record per key means a HOLD tombstones that key by leaving nothing behind.
+ */
+function durableDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
+	const newest = new Map<string, DogfoodResult>();
+	for (const record of records) {
+		const key = dogfoodRetentionKey(record);
+		const seen = newest.get(key);
+		if (!seen || record.timestamp > seen.timestamp) newest.set(key, record);
+	}
+	return [...newest.values()].filter((record) => record.verdict === "pass");
 }
 
 /**
@@ -502,9 +520,8 @@ function mergedDogfoodRecords(): DogfoodResult[] {
  * evidence. A HOLD does evict that host's previously cached passes, because a
  * restart would otherwise drop the in-memory HOLD and serve the older pass.
  *
- * Records accumulate rather than replacing each other, because a deploy matrix
- * needs one record per host. Keeping only the newest would make a multi-host
- * matrix impossible to satisfy.
+ * Only the newest record per workspace and host is durable, but records for
+ * different hosts accumulate, because a deploy matrix needs one pass per host.
  */
 export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "commitHash" | "gitStatus" | "worktreeFingerprint" | "timestamp"> & { workspace?: string }, targetSessionID?: string): DogfoodResult {
 	const root = projectRootKey(result.workspace ?? getWorkspaceRoot());
@@ -519,25 +536,21 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
 		worktreeFingerprint: getTrackedWorktreeFingerprint(root),
 		sessionID: targetSessionID,
 	};
-	dogfoodRecords = retainNewestPerHost([stored, ...dogfoodRecords]);
-	// A HOLD must evict that host's cached passes. Otherwise the durable cache
-	// keeps an older green run for the same host, and a process restart drops
-	// the in-memory HOLD and serves the stale pass: the gate would re-open on a
-	// host whose most recent run held.
+	dogfoodRecords = retainNewestPerWorkspaceHost([stored, ...dogfoodRecords]);
+	// Only the newest record per workspace and host may be durable. A HOLD is
+	// never written, so it tombstones its key by leaving nothing behind. That
+	// also stops a later PASS for a different host from re-persisting a pass
+	// that a newer HOLD already superseded: after a restart the HOLD is gone,
+	// and that resurrected pass would re-open the gate on a held host.
 	//
-	// The eviction set comes from merged state, never memory alone: in a cold
-	// process memory holds only the record just made, so filtering memory would
-	// delete every other host's cached pass. It is also scoped to this
-	// workspace, because the cache is shared across repositories and a HOLD in
-	// one repository must not erase another repository's record for the label.
-	const merged = mergedDogfoodRecords();
-	const cacheCandidates = stored.verdict === "pass"
-		? merged
-		: merged.filter((record) => dogfoodRetentionKey(record) !== dogfoodRetentionKey(stored));
+	// The durable set comes from merged state, never memory alone: in a cold
+	// process memory holds only the record just made, so using memory alone
+	// would delete every other host's cached pass.
+	const durable = durableDogfoodRecords(mergedDogfoodRecords());
 	// A failed write here is not cosmetic: after a HOLD it leaves the stale pass
 	// on disk, and a restart would serve it as evidence. Journal the failure so
 	// the durable state disagreeing with memory is visible.
-	if (!persistDogfoodCache(cacheCandidates.filter((record) => record.verdict === "pass"))) {
+	if (!persistDogfoodCache(durable)) {
 		audit({
 			ts: new Date().toISOString(),
 			sessionID: targetSessionID,
@@ -560,7 +573,10 @@ function dedupeDogfoodRecords(records: DogfoodResult[]): DogfoodResult[] {
 	const seen = new Set<string>();
 	const unique: DogfoodResult[] = [];
 	for (const record of records) {
-		const identity = `${record.host.label}\u0000${record.scenarioId}\u0000${record.scenarioSha256}\u0000${record.taxonomyClass ?? ""}\u0000${record.timestamp}\u0000${record.commitHash ?? ""}`;
+		// Workspace is part of the identity: the cache is shared across
+		// repositories, so two runs of the same scenario on the same host label
+		// in different workspaces are distinct evidence.
+		const identity = `${record.workspace ?? ""}\u0000${record.host.label}\u0000${record.scenarioId}\u0000${record.scenarioSha256}\u0000${record.taxonomyClass ?? ""}\u0000${record.timestamp}\u0000${record.commitHash ?? ""}`;
 		if (seen.has(identity)) continue;
 		seen.add(identity);
 		unique.push(record);

@@ -3074,6 +3074,55 @@ check(
 	loadDogfoodCache().some((record) => record.host.label === "bluefin") && !loadDogfoodCache().some((record) => record.verdict === "hold"),
 );
 
+// A later PASS on a different host must not resurrect a pass that a newer HOLD
+// already superseded. The HOLD is never written to disk, so re-persisting every
+// pass would leave the old green run behind and a restart would serve it as
+// evidence for the held host.
+resetDogfoodState();
+recordDogfoodResult({
+	verdict: "pass",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "c".repeat(64),
+	taxonomySha256: "d".repeat(64),
+	checks: [{ id: "exit-code", status: "pass" }],
+	runCount: 1,
+	host: { label: "bluefin" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+recordDogfoodResult({
+	verdict: "hold",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "c".repeat(64),
+	taxonomySha256: "d".repeat(64),
+	taxonomyClass: "permission-bypass",
+	checks: [{ id: "exit-code", status: "hold" }],
+	runCount: 1,
+	host: { label: "bluefin" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+recordDogfoodResult({
+	verdict: "pass",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "c".repeat(64),
+	taxonomySha256: "d".repeat(64),
+	checks: [{ id: "exit-code", status: "pass" }],
+	runCount: 1,
+	host: { label: "windows-ci" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+check(
+	"a later pass on another host does not resurrect a held host's cached pass",
+	!loadDogfoodCache().some((record) => record.host.label === "bluefin") &&
+		loadDogfoodCache().some((record) => record.host.label === "windows-ci"),
+);
+const diskAfterResurrection = loadDogfoodCache();
+resetDogfoodState();
+persistDogfoodCache(diskAfterResurrection);
+check(
+	"a restart after that still reports the held host as unsatisfied",
+	evaluateDogfoodGate(dogfoodRepo).missingHosts.includes("bluefin"),
+);
+
 // A HOLD must evict only the holding host's passes. In a cold process the
 // in-memory list holds just the new record, so a filter over memory alone would
 // delete every other host's durable pass and re-open the gate for a host that
