@@ -3260,6 +3260,53 @@ check(
 	evaluateDogfoodGate(dogfoodRepo).missingHosts.length > 0,
 );
 
+// A PASS and a HOLD for one host can land in the same millisecond. The tie must
+// resolve to the HOLD in the durable view too, because the HOLD is never cached:
+// persisting the pass would let a restart serve it. Pinning Date.now is the only
+// way to exercise the tie, since two real runs cannot finish in one millisecond.
+// The HOLD is recorded first because memory is newest-first: a later PASS for
+// the same key is met first by the durable selector, which is where a strict
+// ">" tie-break picks the pass.
+resetDogfoodState();
+const realNow = Date.now;
+Date.now = () => 1_700_000_000_000;
+try {
+	recordDogfoodResult({
+		verdict: "hold",
+		scenarioId: "permission-rule-reorder",
+		scenarioSha256: "e".repeat(64),
+		taxonomySha256: "f".repeat(64),
+		taxonomyClass: "permission-bypass",
+		checks: [{ id: "exit-code", status: "hold" }],
+		runCount: 1,
+		host: { label: "bluefin" },
+		workspace: dogfoodRepo,
+	}, "s-dogfood");
+	recordDogfoodResult({
+		verdict: "pass",
+		scenarioId: "permission-rule-reorder",
+		scenarioSha256: "e".repeat(64),
+		taxonomySha256: "f".repeat(64),
+		checks: [{ id: "exit-code", status: "pass" }],
+		runCount: 1,
+		host: { label: "bluefin" },
+		workspace: dogfoodRepo,
+	}, "s-dogfood");
+} finally {
+	Date.now = realNow;
+}
+check(
+	"a same-millisecond HOLD then PASS leaves no cached pass",
+	!loadDogfoodCache().some((record) => record.host.label === "bluefin"),
+);
+const tiedDisk = loadDogfoodCache();
+resetDogfoodState();
+persistDogfoodCache(tiedDisk);
+check(
+	"a restart after a same-millisecond HOLD then PASS stays unsatisfied",
+	evaluateDogfoodGate(dogfoodRepo).missingHosts.includes("bluefin"),
+);
+
 // Retention is per host. A global cap would let repeated passes on one host
 // evict another host's only pass and silently reopen the gate for a host that
 // never changed.
