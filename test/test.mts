@@ -75,6 +75,10 @@ import {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	findWorktreeForBranch,
+	parseGitInvocation,
+	prSourceBranch,
+	rebindSessionWorkspaceFromHost,
 	checkLockfileSync,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
@@ -3722,6 +3726,114 @@ check(
 	blocked(staleShaRedirect) && (staleShaRedirect as string).includes("start point") && (staleShaRedirect as string).includes(staleStartSha),
 );
 check("variable start point behind a redirect still fails closed", blocked(await shell("git switch -c wg-var-redir $WG_REF 2>/dev/null")));
+
+// Worktree-aware git verdicts: a git command is judged against the checkout it
+// runs in, not against the session-bound one. The regression these pin: a
+// linked worktree on a feature branch was resolved to the primary checkout on
+// `main`, so its commits were blocked as protected-branch writes, and PR
+// preflight judged the wrong tree.
+console.log("- Worktree-aware git verdicts -");
+check(
+	"parseGitInvocation resolves a bare git command against the supplied workdir",
+	parseGitInvocation("git status", "/tmp/some-worktree")?.repoDir === "/tmp/some-worktree",
+);
+check(
+	"parseGitInvocation marks an assumed base as not explicit",
+	parseGitInvocation("git status", "/tmp/some-worktree")?.explicitRepoDir === false,
+);
+check(
+	"parseGitInvocation treats -C as an explicit repository",
+	parseGitInvocation("git -C /tmp/named status")?.repoDir === "/tmp/named" &&
+		parseGitInvocation("git -C /tmp/named status")?.explicitRepoDir === true,
+);
+check("prSourceBranch reads gh --head", prSourceBranch("gh pr create --head feat/x --body b") === "feat/x");
+check("prSourceBranch reads the gh -H short form", prSourceBranch("gh pr create -H feat/x --body b") === "feat/x");
+check("prSourceBranch reads --head=value", prSourceBranch("gh pr create --head=feat/x --body b") === "feat/x");
+check("prSourceBranch reads the attached -Hvalue form", prSourceBranch("gh pr create -Hfeat/x --body b") === "feat/x");
+check("prSourceBranch reads az --source-branch", prSourceBranch("az repos pr create --source-branch feat/x --description b") === "feat/x");
+check("prSourceBranch strips a fork owner prefix", prSourceBranch("gh pr create --head someone:feature/y --body b") === "feature/y");
+check("prSourceBranch returns undefined when no branch is named", prSourceBranch("gh pr create --body b") === undefined);
+
+const wtRepo = mkdtempSync(join(tmpdir(), "wg-workdir-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: wtRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: wtRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: wtRepo });
+writeFileSync(join(wtRepo, "shared.txt"), "base\n");
+spawnSync("git", ["add", "-A"], { cwd: wtRepo });
+spawnSync("git", ["commit", "-qm", "init"], { cwd: wtRepo });
+spawnSync("git", ["switch", "-c", "feat/wt-branch"], { cwd: wtRepo });
+writeFileSync(join(wtRepo, "shared.txt"), "branch content\n");
+spawnSync("git", ["commit", "-qam", "branch edit"], { cwd: wtRepo });
+spawnSync("git", ["switch", "main"], { cwd: wtRepo });
+writeFileSync(join(wtRepo, "shared.txt"), "main content\n");
+spawnSync("git", ["commit", "-qam", "main edit"], { cwd: wtRepo });
+const wtLinked = mkdtempSync(join(tmpdir(), "wg-workdir-linked-"));
+rmSync(wtLinked, { recursive: true, force: true });
+spawnSync("git", ["worktree", "add", wtLinked, "feat/wt-branch"], { cwd: wtRepo });
+check("findWorktreeForBranch resolves the checkout holding a branch", findWorktreeForBranch(wtRepo, "feat/wt-branch") === wtLinked);
+check("findWorktreeForBranch accepts a full ref name", findWorktreeForBranch(wtRepo, "refs/heads/feat/wt-branch") === wtLinked);
+check("findWorktreeForBranch returns undefined for an absent branch", findWorktreeForBranch(wtRepo, "feat/absent") === undefined);
+check(
+	"checkMergeConflicts judges an explicitly named branch that is not checked out",
+	checkMergeConflicts(wtRepo, "feat/wt-branch").hasConflicts &&
+		(checkMergeConflicts(wtRepo, "feat/wt-branch").reason ?? "").includes("'feat/wt-branch'"),
+);
+// The protected-branch gate follows the workdir: the primary checkout is on
+// `main`, yet a commit run in the linked feature worktree is legitimate.
+const wtCommit = await call("bash", { command: "git commit -m x --allow-empty", workdir: wtLinked }, { sessionID: "s-wt-commit", worktree: wtRepo, directory: wtRepo });
+check("a commit in a linked feature worktree is not blocked as a protected-branch write", !blocked(wtCommit));
+const primaryCommit = await call("bash", { command: "git commit -m x --allow-empty", workdir: wtRepo }, { sessionID: "s-wt-commit-primary", worktree: wtRepo, directory: wtRepo });
+check("a commit in the primary checkout on main stays blocked", blocked(primaryCommit));
+// PR preflight follows --head to the branch's own worktree, so its merge
+// conflict is found even though the shell sits in the primary checkout.
+const prevWtReview = process.env.WORKFLOW_GUARD_REQUIRE_REVIEW;
+process.env.WORKFLOW_GUARD_REQUIRE_REVIEW = "0";
+try {
+	const headPr = await call(
+		"bash",
+		{ command: "gh pr create --head feat/wt-branch --title t --body 'Changelog: fixed'", workdir: wtRepo },
+		{ sessionID: "s-wt-pr-head", worktree: wtRepo, directory: wtRepo },
+	);
+	check(
+		"PR preflight resolves --head to the linked worktree and names its conflict",
+		blocked(headPr) && String(headPr).includes("'feat/wt-branch'") && String(headPr).includes("merge conflicts"),
+	);
+	const barePr = await call(
+		"bash",
+		{ command: "gh pr create --title t --body 'Changelog: fixed'", workdir: wtRepo },
+		{ sessionID: "s-wt-pr-bare", worktree: wtRepo, directory: wtRepo },
+	);
+	check("a bare PR command still judges the shell's checkout", !blocked(barePr));
+	if (blocked(barePr)) console.log("   blocked:", barePr);
+} finally {
+	if (prevWtReview === undefined) delete process.env.WORKFLOW_GUARD_REQUIRE_REVIEW;
+	else process.env.WORKFLOW_GUARD_REQUIRE_REVIEW = prevWtReview;
+}
+spawnSync("git", ["worktree", "remove", "--force", wtLinked], { cwd: wtRepo });
+rmSync(wtRepo, { recursive: true, force: true });
+
+// Host session moves rebind the workspace: `session_move` relocates a session
+// between checkouts, and a stale binding made every later decision judge the
+// tree the session had left.
+const moveRepoA = mkdtempSync(join(tmpdir(), "wg-move-a-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: moveRepoA });
+spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: moveRepoA });
+const moveRepoB = mkdtempSync(join(tmpdir(), "wg-move-b-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: moveRepoB });
+spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: moveRepoB });
+setSessionWorkspace("s-host-move", moveRepoA);
+rebindSessionWorkspaceFromHost("s-host-move", moveRepoB);
+check("a host session move rebinds the session workspace", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoB));
+check("a host session move is journaled as a granted widening", getRecentAuditEntries(20).some((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_session_move" && entry.sessionID === "s-host-move"));
+const beforeNoop = getRecentAuditEntries(200).filter((entry) => entry.reason === "workspace_rebind_session_move").length;
+rebindSessionWorkspaceFromHost("s-host-move", moveRepoB);
+const afterNoop = getRecentAuditEntries(200).filter((entry) => entry.reason === "workspace_rebind_session_move").length;
+check("a repeated move event to the same directory is a no-op", afterNoop === beforeNoop);
+rebindSessionWorkspaceFromHost(undefined, moveRepoA);
+rebindSessionWorkspaceFromHost("s-host-move", undefined);
+check("an incomplete move event never binds", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoB));
+rmSync(moveRepoA, { recursive: true, force: true });
+rmSync(moveRepoB, { recursive: true, force: true });
 
 // Lockfile synchronization tests
 const lockRepo = mkdtempSync(join(tmpdir(), "wg-lock-repo-"));

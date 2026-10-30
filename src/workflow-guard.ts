@@ -293,6 +293,9 @@ import {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	findWorktreeForBranch,
+	parseGitInvocation,
+	prSourceBranch,
 } from "./policies/git.ts";
 
 export {
@@ -300,6 +303,9 @@ export {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	findWorktreeForBranch,
+	parseGitInvocation,
+	prSourceBranch,
 };
 
 import {
