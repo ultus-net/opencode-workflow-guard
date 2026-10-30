@@ -79,6 +79,7 @@ import {
 	parseGitInvocation,
 	prSourceBranch,
 	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	checkLockfileSync,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
@@ -3753,6 +3754,34 @@ check("prSourceBranch reads the attached -Hvalue form", prSourceBranch("gh pr cr
 check("prSourceBranch reads az --source-branch", prSourceBranch("az repos pr create --source-branch feat/x --description b") === "feat/x");
 check("prSourceBranch strips a fork owner prefix", prSourceBranch("gh pr create --head someone:feature/y --body b") === "feature/y");
 check("prSourceBranch returns undefined when no branch is named", prSourceBranch("gh pr create --body b") === undefined);
+// A repository claim must be an actual assignment. A commit message that
+// happens to contain `GIT_DIR=` previously read as one, which was harmless
+// while the value only picked a base directory but is not harmless now that the
+// permission seat trusts `explicitRepoDir` to decide whether it may judge.
+check(
+	"an unquoted GIT_DIR= inside a commit message is not a repository claim",
+	parseGitInvocation("git commit -m GIT_DIR=/repo")?.explicitRepoDir === false,
+);
+check(
+	"a quoted GIT_DIR= inside a commit message is not a repository claim",
+	parseGitInvocation("git commit -m 'GIT_DIR=/repo'")?.explicitRepoDir === false,
+);
+check(
+	"a real GIT_DIR= prefix is a repository claim",
+	parseGitInvocation("GIT_DIR=/repo git commit")?.repoDir === "/repo" &&
+		parseGitInvocation("GIT_DIR=/repo git commit")?.explicitRepoDir === true,
+);
+check(
+	"a wrapped GIT_DIR= prefix is still a repository claim",
+	parseGitInvocation("timeout 30 env GIT_DIR=/repo git commit")?.repoDir === "/repo" &&
+		parseGitInvocation("sudo -u x env GIT_DIR=/repo git commit")?.repoDir === "/repo",
+);
+check(
+	"a bare git command wrapped in env/nohup/timeout is still parsed",
+	parseGitInvocation("env git push origin feature/x")?.rest === "push origin feature/x" &&
+		parseGitInvocation("timeout 60 git push origin feature/x")?.rest === "push origin feature/x" &&
+		parseGitInvocation("nohup git -C /repo commit")?.repoDir === "/repo",
+);
 
 const wtRepo = mkdtempSync(join(tmpdir(), "wg-workdir-repo-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: wtRepo });
@@ -3832,6 +3861,18 @@ check("a repeated move event to the same directory is a no-op", afterNoop === be
 rebindSessionWorkspaceFromHost(undefined, moveRepoA);
 rebindSessionWorkspaceFromHost("s-host-move", undefined);
 check("an incomplete move event never binds", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoB));
+// An unresolved directory is not cached, so a later event for the same path
+// retries instead of being suppressed forever by a stale "already seen".
+const notYetRepo = mkdtempSync(join(tmpdir(), "wg-host-retry-"));
+setSessionWorkspace("s-host-retry", moveRepoA);
+rebindSessionWorkspaceFromHost("s-host-retry", notYetRepo);
+check("an unresolved host directory leaves the binding alone", getSessionBoundWorkspace("s-host-retry") === resolve(moveRepoA));
+spawnSync("git", ["init", "-b", "main"], { cwd: notYetRepo });
+rebindSessionWorkspaceFromHost("s-host-retry", notYetRepo);
+check("a later event for the same now-resolvable directory rebinds", getSessionBoundWorkspace("s-host-retry") === resolve(notYetRepo));
+forgetSessionWorkspace("s-host-retry");
+check("deleting a session drops its binding", getSessionBoundWorkspace("s-host-retry") === undefined);
+rmSync(notYetRepo, { recursive: true, force: true });
 rmSync(moveRepoA, { recursive: true, force: true });
 rmSync(moveRepoB, { recursive: true, force: true });
 

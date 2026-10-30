@@ -238,7 +238,7 @@ export function splitShellSegments(command: string): string[] {
 	return segments;
 }
 
-function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: boolean } {
+function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: boolean; assignments: string[] } {
 	let cleanCmd = decodeShellEscapes(command.trim());
 	// Strip outer grouping parentheses/braces if present e.g. ( git commit ) or { git commit; }
 	while (
@@ -252,6 +252,12 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 	const words = shellWords(cleanCmd);
 	let i = 0;
 	let changesCwd = false;
+	// Environment assignments consumed while unwrapping wrappers. They apply to
+	// the command that follows, so callers must not read them out of the command
+	// arguments instead: `git commit -m GIT_DIR=/repo` is message text, not an
+	// assignment, and treating it as one would claim a repository that the
+	// invocation never named.
+	const assignments: string[] = [];
 	while (i < words.length) {
 		const rawWord = words[i]!;
 		const word = rawWord.replace(/^[\({]+/, "").replace(/[\)};]+$/, "");
@@ -360,6 +366,7 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 					break;
 				}
 				if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) {
+					assignments.push(w);
 					i++;
 					continue;
 				}
@@ -408,6 +415,7 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 			continue;
 		}
 		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+			assignments.push(word);
 			i++;
 			continue;
 		}
@@ -416,11 +424,16 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 	return { words: words
 		.slice(i)
 		.map((w) => w.replace(/^[\({]+/, "").replace(/[\)};]+$/, ""))
-		.filter(Boolean), changesCwd };
+		.filter(Boolean), changesCwd, assignments };
 }
 
 export function unwrapShellWords(command: string): string[] {
 	return unwrapShellWordsImpl(command).words;
+}
+
+/** Environment assignments that precede the command word, after unwrapping. */
+export function shellPrefixAssignments(command: string): string[] {
+	return unwrapShellWordsImpl(command).assignments;
 }
 
 export function shellWrappersChangeCwd(command: string): boolean {

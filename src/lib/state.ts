@@ -91,6 +91,18 @@ export function setSessionWorkspace(sessionID: string, workspace: string): void 
 	sessionWorkspaceBound.add(sessionID);
 }
 
+/**
+ * Drop a deleted session's workspace binding and host-directory cache entry.
+ *
+ * Both are keyed by session id, so a deleted session can never read them again.
+ * Leaving them would grow both maps for the life of a long-lived server.
+ */
+export function forgetSessionWorkspace(sessionID: string): void {
+	sessionWorkspaces.delete(sessionID);
+	sessionWorkspaceBound.delete(sessionID);
+	sessionHostDirectories.delete(sessionID);
+}
+
 export function getSessionWorkspace(sessionID?: string): string | undefined {
 	if (!sessionID) return undefined;
 	return sessionWorkspaces.get(sessionID);
@@ -257,15 +269,16 @@ function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: s
  * `session.updated` is a hot event, emitted for title and cost changes too, so
  * the last directory the host named per session is remembered. An update that
  * repeats it returns without spawning git. That costs one process per genuine
- * move instead of one per update.
+ * move instead of one per update. The cache stores the directory that actually
+ * resolved to a repository root: an unresolved directory is not cached, so a
+ * later event for the same path retries instead of being suppressed forever.
  */
 export function rebindSessionWorkspaceFromHost(sessionID: string | undefined, directory: string | undefined): void {
 	if (!sessionID || !directory) return;
-	const seen = sessionHostDirectories.get(sessionID);
-	if (seen === directory) return;
-	sessionHostDirectories.set(sessionID, directory);
+	if (sessionHostDirectories.get(sessionID) === directory) return;
 	const gitRoot = findGitRoot(directory);
 	if (!gitRoot) return;
+	sessionHostDirectories.set(sessionID, directory);
 	const previous = sessionWorkspaces.get(sessionID);
 	if (previous === gitRoot) {
 		// A bootstrap entry that was never bound still needs binding: the host

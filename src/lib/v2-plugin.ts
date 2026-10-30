@@ -29,6 +29,7 @@ import {
 	setSdkClient,
 	getSessionBoundWorkspace,
 	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	registerSessionWorkspaceFromToolCall,
 	runWithRuntimeState,
 	getSessionMutationCount,
@@ -877,6 +878,7 @@ async function handleV2Event(
 			clearTodoSessionState(sessionID);
 			toolLifecycle.takeRecoveryRun(sessionID);
 			await runWithRuntimeState(effectiveRoot, client, () => clearContinuationState(sessionID));
+			forgetSessionWorkspace(sessionID);
 		}
 		return;
 	}

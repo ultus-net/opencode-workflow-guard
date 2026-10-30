@@ -92,6 +92,7 @@ import {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	registerSessionWorkspaceFromToolCall,
 	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
@@ -132,6 +133,7 @@ export {
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
 	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	registerSessionWorkspaceFromToolCall,
 	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
@@ -963,6 +965,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					toolLifecycle.takeRecoveryRun(sessionID);
 					clearLiveDocsFloor(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
+					forgetSessionWorkspace(sessionID);
 				}
 			}
 			if (

@@ -9,6 +9,7 @@ import {
 import {
 	unwrapShellWords,
 	splitShellSegments,
+	shellPrefixAssignments,
 } from "../lib/shell.ts";
 
 export const PROTECTED_BRANCHES = new Set(["main", "master"]);
@@ -60,8 +61,30 @@ const GIT_GLOBAL_BOOLEAN_OPTIONS = new Set([
 	"--exec-path",
 ]);
 
-const GIT_ENV_DIR_RE =
-	/(?:^|\s)(?:env\s+(?:-\S+\s+)*)?(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=(?:"([^"]*)"|'([^']*)'|(\S+))/;
+// Repository selection from the environment. It is read from the assignments
+// that precede the command word, never from the rest of the command text. A
+// bare `GIT_DIR=` used to be matched anywhere in the string, so an unquoted
+// commit message such as `git commit -m GIT_DIR=/repo` claimed an explicit
+// repository. That was harmless while the value only picked a base directory,
+// but `explicitRepoDir` is now a fact the permission seat trusts, so the claim
+// must be real. A `-c` config override is deliberately not a repository
+// selector: `GIT_DIR` is an environment variable, not a git config key.
+const GIT_REPO_ENV_ASSIGNMENT = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=(.*)$/s;
+
+/**
+ * The repository an environment assignment selects, or undefined.
+ *
+ * Only assignments that the shell unwrapper actually consumed before the
+ * command word count. A value that merely appears inside an argument cannot be
+ * mistaken for one.
+ */
+function repoEnvironmentOverride(command: string): string | undefined {
+	for (const assignment of shellPrefixAssignments(command)) {
+		const match = GIT_REPO_ENV_ASSIGNMENT.exec(assignment);
+		if (match?.[1]) return match[1];
+	}
+	return undefined;
+}
 
 /**
  * Parse one git invocation.
@@ -84,13 +107,10 @@ export function parseGitInvocation(command: string, baseDir?: string): GitInvoca
 	let repoDir = root;
 	let sawDirOption = false;
 
-	const envDirMatch = command.match(GIT_ENV_DIR_RE);
-	if (envDirMatch) {
-		const envVal = envDirMatch[1] ?? envDirMatch[2] ?? envDirMatch[3];
-		if (envVal) {
-			repoDir = resolve(root, envVal);
-			sawDirOption = true;
-		}
+	const envDirValue = repoEnvironmentOverride(command);
+	if (envDirValue) {
+		repoDir = resolve(root, envDirValue);
+		sawDirOption = true;
 	}
 
 	while (i < tokens.length) {
