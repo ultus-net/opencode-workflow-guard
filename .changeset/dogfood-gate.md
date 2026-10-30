@@ -11,7 +11,9 @@ default, so no existing repository changes behavior.
   commit hash, and tracked-content worktree fingerprint. A tracked edit or new
   commit after the run makes the evidence stale.
 - Only a `pass` is durable. A `hold` stays diagnosable in memory with its
-  taxonomy class and never becomes evidence.
+  taxonomy class and never becomes evidence. Recording a `hold` also discards
+  that host's cached passes, so a process restart cannot re-open the gate on an
+  older green run.
 - A `pass` requires every check row to be `pass` and at least one check row
   to exist, so the gate cannot be satisfied by a skipped check or by an empty
   observation. A `hold` must name a taxonomy class.

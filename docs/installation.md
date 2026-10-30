@@ -260,7 +260,7 @@ Policy 27 gates PR creation on a recorded run of the change on real hardware. It
 
 The guard supplies the gate, the evidence record, and the recursion refusal. It does not spawn the actor session; the plugin may constrain, record, and explain, but it does not delegate. A repository supplies the runner, the frozen scenario bank, and the taxonomy, then records the outcome with `record_dogfood`.
 
-A recorded run binds to the commit hash and tracked-content worktree fingerprint of the directory it covered, exactly like review evidence. Commit every tracked change and run the scenario afterwards, so one pass satisfies both the review and dogfood gates. Only a `pass` verdict is durable. A `hold` stays diagnosable in memory with its taxonomy class and never becomes evidence.
+A recorded run binds to the commit hash and tracked-content worktree fingerprint of the directory it covered, exactly like review evidence. Commit every tracked change and run the scenario afterwards, so one pass satisfies both the review and dogfood gates. Only a `pass` verdict is durable. A `hold` stays diagnosable in memory with its taxonomy class and never becomes evidence. Recording a `hold` also discards that host's cached passes, so a process restart cannot re-open the gate on an older green run.
 
 Records accumulate, so a multi-host deploy matrix keeps one pass per host. Only the newest record per host counts. A newer `hold` on a host therefore reopens the gate even when that host passed earlier, so a later regression cannot hide behind an older green run.
 

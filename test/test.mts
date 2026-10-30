@@ -221,9 +221,10 @@ const call = (
 ) => guardToolCall(toolName, input, context);
 const shell = (cmd: string) => call("bash", { command: cmd });
 const blocked = (r: unknown): boolean => typeof r === "string";
-// An allow is anything that is not a block string. Asserting that explicitly
-// keeps "not a string" from silently accepting an unrelated error object.
-const allowed = (r: unknown): boolean => !blocked(r);
+// The guard's allow path returns undefined and its block path returns a string
+// (see guardToolCall). Asserting exactly undefined keeps a stray object, such
+// as an unrelated internal error, from reading as an allow.
+const allowed = (r: unknown): boolean => r === undefined;
 
 console.log("- Policy 1: native todo gate -");
 todo("s-empty");
@@ -3037,6 +3038,18 @@ check(
 	"the durable cache keeps passing records for every matrix host",
 	Array.isArray(cachedPasses) && cachedPasses.every((record) => record.verdict === "pass") && ["bluefin", "windows-ci"].every((host) => cachedPasses.some((record) => record.host.label === host)),
 );
+// The PR audit entry must name every host the matrix covered, not just the
+// newest record, or an auditor would read a multi-host pass as a single-host one.
+const matrixPr = await shell("gh pr create --title t --body 'Changelog: update'");
+check("a satisfied multi-host matrix allows PR creation", allowed(matrixPr));
+const matrixPrAudit = getRecentAuditEntries(500).filter(
+	(entry) => entry.reason === "dogfood_evidence_matched" && (entry.evidence?.dogfoodCoveredHosts ?? []).length > 1,
+);
+check(
+	"the PR preflight journals every host the dogfood matrix covered",
+	matrixPrAudit.length > 0 &&
+		JSON.stringify([...(matrixPrAudit.pop()?.evidence?.dogfoodCoveredHosts ?? [])].sort()) === JSON.stringify(["bluefin", "windows-ci"]),
+);
 
 // A newer HOLD on a host supersedes that host's older pass: a regression the
 // host later found must not be hidden behind the earlier green run.
@@ -3059,6 +3072,45 @@ check(
 check(
 	"a HOLD on one host does not discard another host's cached pass",
 	loadDogfoodCache().some((record) => record.host.label === "bluefin") && !loadDogfoodCache().some((record) => record.verdict === "hold"),
+);
+
+// A HOLD must evict that host's cached passes. Otherwise a restart drops the
+// in-memory HOLD and serves the older green run, re-opening the gate on a host
+// whose most recent run held.
+resetDogfoodState();
+recordDogfoodResult({
+	verdict: "pass",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	checks: [{ id: "exit-code", status: "pass" }],
+	runCount: 1,
+	host: { label: "bluefin" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+check("the earlier pass is durable before the regression", existsSync(getDogfoodCacheFilePath()));
+recordDogfoodResult({
+	verdict: "hold",
+	scenarioId: "permission-rule-reorder",
+	scenarioSha256: "e".repeat(64),
+	taxonomySha256: "f".repeat(64),
+	taxonomyClass: "permission-bypass",
+	checks: [{ id: "exit-code", status: "hold" }],
+	runCount: 1,
+	host: { label: "bluefin" },
+	workspace: dogfoodRepo,
+}, "s-dogfood");
+check(
+	"a HOLD removes that host's cached pass from disk",
+	!loadDogfoodCache().some((record) => record.host.label === "bluefin"),
+);
+// Simulate a restart: drop in-memory state only, keeping the disk cache.
+const diskAfterHold = loadDogfoodCache();
+resetDogfoodState();
+persistDogfoodCache(diskAfterHold);
+check(
+	"a restart after a HOLD cannot re-satisfy the gate from a stale cached pass",
+	evaluateDogfoodGate(dogfoodRepo).missingHosts.length > 0,
 );
 
 // Retention is per host. A global cap would let repeated passes on one host

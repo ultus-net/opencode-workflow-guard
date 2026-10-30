@@ -1,4 +1,4 @@
-import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, statSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, chmodSync, existsSync, mkdirSync, openSync, readSync, closeSync, renameSync, statSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -201,6 +201,13 @@ export function loadReviewCache(): ReviewResult | undefined {
  */
 export function persistDogfoodCache(dogfoodData: DogfoodResult[]): void {
 	try {
+		// An empty list means no passing evidence remains, so the file is
+		// removed rather than left as an empty array. A hold on the only host
+		// must leave no durable evidence behind.
+		if (dogfoodData.length === 0) {
+			if (existsSync(DOGFOOD_CACHE_FILE)) unlinkSync(DOGFOOD_CACHE_FILE);
+			return;
+		}
 		mkdirSync(AUDIT_DIR, { recursive: true });
 		writeFileSync(DOGFOOD_CACHE_FILE, JSON.stringify(dogfoodData, null, 2), { encoding: "utf8", mode: 0o600 });
 		chmodSync(DOGFOOD_CACHE_FILE, 0o600);

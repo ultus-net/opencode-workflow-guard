@@ -228,6 +228,8 @@ export interface AuditEntry {
 		dogfoodVerdict?: "pass" | "hold" | "rejected";
 		dogfoodScenarioId?: string;
 		dogfoodHost?: string;
+		/** Every host a satisfied deploy matrix covered, not just the newest. */
+		dogfoodCoveredHosts?: string[];
 		evidenceId?: string;
 		reviewer?: string;
 		reviewTimestamp?: number;

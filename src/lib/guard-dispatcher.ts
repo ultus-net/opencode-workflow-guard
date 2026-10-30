@@ -703,6 +703,10 @@ export async function guardToolCallImpl(
 						evidenceId: dogfoodGate.evidenceId,
 						dogfoodScenarioId: dogfoodGate.matched.scenarioId,
 						dogfoodHost: dogfoodGate.matched.host.label,
+						// Journal every host the matrix required, not just the
+						// newest one. A single-host entry would understate a
+						// multi-host pass and mislead an auditor later.
+						dogfoodCoveredHosts: (dogfoodGate.matchedRecords ?? []).map((record) => record.host.label),
 						binding: {
 							workspace: projectRootKey(prRoot),
 							commitHash: getCurrentGitCommitHash(prRoot),

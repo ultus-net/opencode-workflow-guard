@@ -500,7 +500,14 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
 		sessionID: targetSessionID,
 	};
 	dogfoodRecords = retainNewestPerHost([stored, ...dogfoodRecords]);
-	if (stored.verdict === "pass") persistDogfoodCache(dogfoodRecords.filter((record) => record.verdict === "pass"));
+	// A HOLD must evict that host's cached passes. Otherwise the durable cache
+	// keeps an older green run for the same host, and a process restart drops
+	// the in-memory HOLD and serves the stale pass: the gate would re-open on a
+	// host whose most recent run held. Passes from other hosts stay untouched.
+	const cacheCandidates = stored.verdict === "pass"
+		? dogfoodRecords
+		: dogfoodRecords.filter((record) => record.host.label !== stored.host.label);
+	persistDogfoodCache(cacheCandidates.filter((record) => record.verdict === "pass"));
 	return stored;
 }
 
@@ -509,8 +516,7 @@ export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "c
  *
  * Memory and disk are merged, so a pass recorded in a previous process is
  * still a candidate next to one recorded now. A record written to both must
- * stay one record, because the per-host retention cap counts them: a
- * double-counted record would let itself evict a sibling host's only pass.
+ * stay one record, or the same run would be counted twice in status output.
  *
  * Exact-worktree candidates win over same-repository ones, so a sibling
  * worktree's run cannot displace this worktree's evidence. Same-repository
@@ -524,7 +530,7 @@ export function getDogfoodRecordsForWorkspace(root: string): DogfoodResult[] {
 	const all: Array<DogfoodResult & { workspace: string }> = [];
 	for (const result of [...dogfoodRecords, ...loadDogfoodCache()]) {
 		if (result?.workspace == null) continue;
-		const identity = `${result.host.label}\u0000${result.scenarioId}\u0000${result.timestamp}\u0000${result.commitHash ?? ""}`;
+		const identity = `${result.host.label}\u0000${result.scenarioId}\u0000${result.scenarioSha256}\u0000${result.taxonomyClass ?? ""}\u0000${result.timestamp}\u0000${result.commitHash ?? ""}`;
 		if (seen.has(identity)) continue;
 		seen.add(identity);
 		all.push(result as DogfoodResult & { workspace: string });
