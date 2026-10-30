@@ -237,6 +237,7 @@ export {
 	getGitWorktreeFingerprint,
 	getTrackedWorktreeFingerprint,
 };
+export type { VerifyRun } from "./lib/verify.ts";
 
 // ── Secondary review rubric ──────────────────────────────────────────────────
 import { buildReviewRubric } from "./lib/review.ts";
@@ -930,7 +931,9 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 				// `session_move` relocates a session between checkouts, and the
 				// host re-emits `session.updated` for the moved session. Its
 				// `directory` is the authoritative post-move location; without
-				// this rebind the session kept judging the tree it left.
+				// this rebind the session kept judging the tree it left. The
+				// rebind only takes a genuine move, so a title or cost update on
+				// a session bound to a linked worktree cannot drag it back.
 				const info = (event.properties as { info?: { id?: unknown; directory?: unknown } })?.info;
 				if (typeof info?.id === "string" && typeof info.directory === "string") {
 					rebindSessionWorkspaceFromHost(info.id, info.directory);

@@ -264,26 +264,54 @@ function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: s
  * every later boundary, branch, and PR decision judged the tree the session had
  * left: the move looked like it had no effect. A host move is an explicit
  * boundary statement from the host, in the same class as a per-call worktree,
- * so it may widen a already-bound session. It is journaled for that reason.
+ * so it may widen an already-bound session. It is journaled for that reason.
  *
- * `session.updated` is a hot event, emitted for title and cost changes too, so
- * the last directory the host named per session is remembered. An update that
- * repeats it returns without spawning git. That costs one process per genuine
- * move instead of one per update. The cache stores the directory that actually
- * resolved to a repository root: an unresolved directory is not cached, so a
- * later event for the same path retries instead of being suppressed forever.
+ * The hard part is telling a move from a routine update. `session.updated` is a
+ * hot event, emitted for title and cost changes, and it names the session's
+ * creation directory. A session bound to a LINKED WORKTREE by its own tool-call
+ * `workdir` legitimately differs from that directory, so treating every update
+ * as a move pulled the session back to the checkout it had deliberately left.
+ * Three signals therefore count, and nothing else does:
+ *
+ * - The host announced the relocation itself (`moved: true`, from
+ *   `session.next.moved`).
+ * - The directory the host names now differs from the one it named last for
+ *   this session.
+ * - The named repository is a DIFFERENT repository from the bound workspace. A
+ *   linked worktree is the same repository, so this catches the cross-repository
+ *   move that a first observation would otherwise miss on OpenCode 1.x, which
+ *   has no move event.
+ *
+ * The last directory is remembered so a repeated update costs one string
+ * comparison instead of a `git rev-parse` child process. The cache stores a
+ * directory that actually resolved to a repository root: an unresolved
+ * directory is not cached, so a later event for the same path retries instead
+ * of being suppressed forever.
  */
-export function rebindSessionWorkspaceFromHost(sessionID: string | undefined, directory: string | undefined): void {
+export function rebindSessionWorkspaceFromHost(
+	sessionID: string | undefined,
+	directory: string | undefined,
+	options: { moved?: boolean } = {},
+): void {
 	if (!sessionID || !directory) return;
-	if (sessionHostDirectories.get(sessionID) === directory) return;
 	const gitRoot = findGitRoot(directory);
 	if (!gitRoot) return;
+	const previousHostDirectory = sessionHostDirectories.get(sessionID);
 	sessionHostDirectories.set(sessionID, directory);
 	const previous = sessionWorkspaces.get(sessionID);
-	if (previous === gitRoot) {
+	const moved =
+		options.moved === true
+		|| (previousHostDirectory !== undefined && previousHostDirectory !== directory)
+		|| (previous !== undefined && gitRoot !== previous && !isSameGitRepo(gitRoot, previous));
+	if (!moved) {
+		if (sessionWorkspaceBound.has(sessionID)) return;
 		// A bootstrap entry that was never bound still needs binding: the host
 		// just named the session's real directory.
-		if (sessionWorkspaceBound.has(sessionID)) return;
+		sessionWorkspaces.set(sessionID, gitRoot);
+		sessionWorkspaceBound.add(sessionID);
+		return;
+	}
+	if (previous === gitRoot) {
 		sessionWorkspaceBound.add(sessionID);
 		return;
 	}

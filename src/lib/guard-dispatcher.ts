@@ -279,7 +279,7 @@ export async function guardToolCallImpl(
 							// that would restate the misattribution.
 							const tail = snipVerifyOutput(result.output, result.timedOut === true).slice(-500);
 							const reason = result.timedOut
-								? `Blocked todowrite: verification did not finish within ${formatTimeoutLimit(result.timeoutMs)} so the result is unknown rather than failing (${command}). Raise the limit in the project .opencode/workflow-guard.json (verifyTimeoutMs) or with WORKFLOW_GUARD_VERIFY_TIMEOUT_MS, then complete the tasks again; output tail: ${tail}`
+								? `Blocked todowrite: verification did not finish within ${formatTimeoutLimit(result.timeoutMs)} so the result is unknown rather than failing (${command}). Only the user can raise the limit, in the project .opencode/workflow-guard.json or .jsonc (verifyTimeoutMs) or with WORKFLOW_GUARD_VERIFY_TIMEOUT_MS set before the guard starts; ask them, then complete the tasks again. Output tail: ${tail}`
 								: `Blocked todowrite: all tasks marked done but verification is failing (${command}). Fix the failure before finishing; output tail: ${tail}`;
 							logPolicyBlock(`[workflow-guard] ${reason}`);
 							return block("verification", result.timedOut ? "verification_timed_out" : "verification_failed", reason);
@@ -481,7 +481,11 @@ export async function guardToolCallImpl(
 			// isolated checkout, and judging those commands is the point of the
 			// workdir-aware parse above. A genuinely different repository stays
 			// confined, exactly as before.
-			const foreignRepo = isPathOutsideWorkspace(invocation.repoDir, currentRoot) && !isSameGitRepo(invocation.repoDir, currentRoot);
+			// An indeterminate repository is foreign: `findGitRoot` walks up to
+			// the nearest existing ancestor, so `git -C $OTHER_REPO commit`
+			// resolved to the workspace's own root and read as the same repo.
+			const foreignRepo = hasUnresolvableVariable(invocation.repoDir)
+				|| (isPathOutsideWorkspace(invocation.repoDir, currentRoot) && !isSameGitRepo(invocation.repoDir, currentRoot));
 			if (foreignRepo && (GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))) {
 				logPolicyBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
 				return block(

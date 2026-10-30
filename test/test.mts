@@ -2196,6 +2196,27 @@ check("GIT_DIR prefix to external repository is blocked for writes", blocked(awa
 check("env GIT_DIR prefix to external repository is blocked for writes", blocked(await shell(`env GIT_DIR=${externalRepo}/.git git commit -m test`)));
 check("GIT_DIR prefix push to external repository is blocked", blocked(await shell(`GIT_DIR=${externalRepo}/.git git push origin feat/external`)));
 
+// An indeterminate repository is outside the boundary, even when the session
+// itself sits in a git workspace. `findGitRoot` walks up to the nearest
+// existing ancestor, so `$OTHER_REPO` resolved to the workspace's own root and
+// passed the same-repo test that admits linked worktrees. The feature branch
+// keeps the protected-branch gate quiet so this pins the boundary decision.
+const varRepo = mkdtempSync(join(tmpdir(), "wg-var-repo-"));
+spawnSync("git", ["init", "-b", "feat/var"], { cwd: varRepo });
+setWorkspaceRoot(varRepo);
+const variableGit = await shell("git -C $OTHER_REPO commit -m x");
+check(
+	"git -C with an unresolvable variable stays blocked inside a git workspace",
+	blocked(variableGit) && String(variableGit).includes("unresolvable variable reference"),
+);
+const variableGitDir = await shell("GIT_DIR=$OTHER_REPO/.git git push origin feat/x");
+check(
+	"GIT_DIR with an unresolvable variable stays blocked inside a git workspace",
+	blocked(variableGitDir) && String(variableGitDir).includes("unresolvable variable reference"),
+);
+setWorkspaceRoot(root);
+rmSync(varRepo, { recursive: true, force: true });
+
 rmSync(externalRepo, { recursive: true, force: true });
 
 // 5. Verification isolation and privilege checks
@@ -2394,6 +2415,21 @@ check(
 check(
 	"verification timeout names a remedy the agent can actually apply",
 	String(timeoutFinalRes).includes("verifyTimeoutMs") && String(timeoutFinalRes).includes("WORKFLOW_GUARD_VERIFY_TIMEOUT_MS"),
+);
+check(
+	"verification timeout names the user as the actor for a limit the agent cannot raise",
+	String(timeoutFinalRes).includes("Only the user can raise the limit") && String(timeoutFinalRes).includes(".jsonc"),
+);
+// Machine consumers (audit, evidence, the V2 seat) branch on the code, not the
+// prose, so pin the timeout's own code rather than only its message.
+const timeoutDecision = await guardToolDecision(
+	"todowrite",
+	{ todos: [item("timeout work", "completed")] },
+	{ sessionID: "s-verify-timeout" },
+);
+check(
+	"a verification timeout carries its own structured code",
+	timeoutDecision.status === "blocked" && timeoutDecision.code === "verification_timed_out",
 );
 setWorkspaceRoot(verifyRepo);
 reloadProjectConfig(verifyRepo);
@@ -3843,7 +3879,9 @@ rmSync(wtRepo, { recursive: true, force: true });
 
 // Host session moves rebind the workspace: `session_move` relocates a session
 // between checkouts, and a stale binding made every later decision judge the
-// tree the session had left.
+// tree the session had left. A session bound to a LINKED WORKTREE by its own
+// tool-call workdir differs from the directory `session.updated` reports, so an
+// update alone must never move it back.
 const moveRepoA = mkdtempSync(join(tmpdir(), "wg-move-a-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: moveRepoA });
 spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: moveRepoA });
@@ -3851,25 +3889,48 @@ const moveRepoB = mkdtempSync(join(tmpdir(), "wg-move-b-"));
 spawnSync("git", ["init", "-b", "main"], { cwd: moveRepoB });
 spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: moveRepoB });
 setSessionWorkspace("s-host-move", moveRepoA);
-rebindSessionWorkspaceFromHost("s-host-move", moveRepoB);
-check("a host session move rebinds the session workspace", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoB));
-check("a host session move is journaled as a granted widening", getRecentAuditEntries(20).some((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_session_move" && entry.sessionID === "s-host-move"));
+rebindSessionWorkspaceFromHost("s-host-move", moveRepoB, { moved: true });
+check("an announced host move rebinds the session workspace", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoB));
+check("an announced host move is journaled as a granted widening", getRecentAuditEntries(20).some((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_session_move" && entry.sessionID === "s-host-move"));
 const beforeNoop = getRecentAuditEntries(200).filter((entry) => entry.reason === "workspace_rebind_session_move").length;
 rebindSessionWorkspaceFromHost("s-host-move", moveRepoB);
 const afterNoop = getRecentAuditEntries(200).filter((entry) => entry.reason === "workspace_rebind_session_move").length;
 check("a repeated move event to the same directory is a no-op", afterNoop === beforeNoop);
+// The regression: a session whose own tool-call workdir bound it to a LINKED
+// WORKTREE must survive a routine `session.updated` that names the primary
+// checkout of the same repository. Both resolve to the same repository, so the
+// update only records the baseline.
+const moveLinked = join(mkdtempSync(join(tmpdir(), "wg-move-linked-")), "wt");
+spawnSync("git", ["worktree", "add", "-b", "feat/host-move", moveLinked], { cwd: moveRepoA });
+setSessionWorkspace("s-host-linked", moveLinked);
+rebindSessionWorkspaceFromHost("s-host-linked", moveRepoA);
+check(
+	"a routine update naming the primary checkout keeps a linked-worktree binding",
+	getSessionBoundWorkspace("s-host-linked") === resolve(moveLinked),
+);
+// A directory that resolves to a DIFFERENT repository is a move even on the
+// first observation, which is how OpenCode 1.x sees one (it has no move event).
+rebindSessionWorkspaceFromHost("s-host-linked", moveRepoB);
+check("an update naming another repository rebinds", getSessionBoundWorkspace("s-host-linked") === resolve(moveRepoB));
+forgetSessionWorkspace("s-host-linked");
+spawnSync("git", ["worktree", "remove", "--force", moveLinked], { cwd: moveRepoA });
+// A later update that names a DIFFERENT directory than the last one is a move
+// even without the `session.next.moved` announcement.
+rebindSessionWorkspaceFromHost("s-host-move", moveRepoA);
+check("an update naming a new directory rebinds without an announcement", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoA));
 rebindSessionWorkspaceFromHost(undefined, moveRepoA);
 rebindSessionWorkspaceFromHost("s-host-move", undefined);
-check("an incomplete move event never binds", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoB));
+check("an incomplete move event never binds", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoA));
 // An unresolved directory is not cached, so a later event for the same path
-// retries instead of being suppressed forever by a stale "already seen".
+// retries instead of being suppressed forever by a stale "already seen". A path
+// that resolves to another repository is then a move.
 const notYetRepo = mkdtempSync(join(tmpdir(), "wg-host-retry-"));
 setSessionWorkspace("s-host-retry", moveRepoA);
 rebindSessionWorkspaceFromHost("s-host-retry", notYetRepo);
 check("an unresolved host directory leaves the binding alone", getSessionBoundWorkspace("s-host-retry") === resolve(moveRepoA));
 spawnSync("git", ["init", "-b", "main"], { cwd: notYetRepo });
 rebindSessionWorkspaceFromHost("s-host-retry", notYetRepo);
-check("a later event for the same now-resolvable directory rebinds", getSessionBoundWorkspace("s-host-retry") === resolve(notYetRepo));
+check("a retry for the now-resolvable directory rebinds when it is another repository", getSessionBoundWorkspace("s-host-retry") === resolve(notYetRepo));
 forgetSessionWorkspace("s-host-retry");
 check("deleting a session drops its binding", getSessionBoundWorkspace("s-host-retry") === undefined);
 rmSync(notYetRepo, { recursive: true, force: true });
@@ -5986,6 +6047,22 @@ try {
 		"seat denies a push to a protected destination regardless of the working directory",
 		protectedDestSeat.effect === "deny",
 	);
+	// A CONFIGURED protected branch is not that case: the seat recognizes the
+	// built-in pair only, so the verdict still depends on the checkout and
+	// defers to execute.before, which resolves the workdir and reads config.
+	mkdirSync(join(seatFeatureRepo, ".opencode"), { recursive: true });
+	writeFileSync(join(seatFeatureRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ protectedBranches: ["release/prod"] }));
+	reloadProjectConfig(seatFeatureRepo);
+	const configuredDestSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["git push origin release/prod"]), sessionID: "s-seat-configured-dest" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat defers a push to a configured protected branch instead of judging the session checkout",
+		configuredDestSeat.effect === "abstain" && configuredDestSeat.decision?.code === "repository_unidentified",
+	);
+	rmSync(join(seatFeatureRepo, ".opencode"), { recursive: true, force: true });
+	reloadProjectConfig(seatFeatureRepo);
 	const explicitProtectedSeat = await evaluatePermissionSeat(
 		{ ...seatEvent([`git -C ${seatMainRepo} push origin feature/push-seat`]), sessionID: "s-seat-explicit-protected" },
 		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
