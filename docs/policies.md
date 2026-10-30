@@ -142,6 +142,7 @@ This is a policy and enforcement layer, not an agent harness. Policies may const
   - Active Git branch name and protected branch status.
   - Test verification status (passed/failed, test command, and commit hash).
   - Secondary review verdicts (reviewer name and approval status).
+  - Dogfood evidence state when Policy 27 is enabled, naming the deploy-matrix hosts still missing a passing run.
   - Uncommitted mutation counts.
 - Compacted project-memory context points back to `project_memory_search` for deeper historical retrieval instead of attempting to embed the full durable store.
 - Preserves policy-relevant context across session compactions without assigning, prioritizing, or sequencing tasks for the model.
@@ -203,6 +204,17 @@ This is a policy and enforcement layer, not an agent harness. Policies may const
 - Uses the `experimental.text.complete` hook to compare a sweeping claim against this session's read coverage (`sessionReadFileCount`: distinct files read or authored). A sweeping claim backed by fewer than 2 touched files is journaled to the audit trail (`Sweeping claim '<phrase>' with N file(s) read`) and logged at info level.
 - **Observability, not gating**, matching Policy 24. The response is never blocked or rewritten, because a grep-heavy investigation can legitimately support "no other callers" while touching few files. Prior art covers the EPISTEMIC LEDGER "bare assertion" (arXiv 2602.07549) and the agent-control-tower false-completion study. Both find that more context does not fix overclaiming, and that the check belongs in the system, not in self-report.
 
+### 27. Pre-Deployment Dogfood Evidence (opt-in)
+- Gates PR creation on a recorded run of the change on real hardware. Off by default: a repository enables it with `.opencode/workflow-guard.json` (`requireDogfood: true`) or `WORKFLOW_GUARD_REQUIRE_DOGFOOD=1`, and disables it with `WORKFLOW_GUARD_REQUIRE_DOGFOOD=0`.
+- The guard owns the gate, the evidence record, and the recursion refusal. It does not spawn the actor session, because the plugin's scope excludes planning and delegation. A repository supplies its own runner, scenario bank, and frozen taxonomy, then records the outcome with `record_dogfood`.
+- **Evidence, not a receipt.** A run is recorded as `dogfood` evidence bound to the same subject as review evidence: workspace, commit hash, and tracked-content worktree fingerprint. Any tracked edit or new commit after the run makes the evidence stale, so the gate asks for a re-run rather than trusting a stale pass. No pre-commit layer is involved.
+- **A HOLD is never durable.** A `hold` verdict stays in memory so its taxonomy class is diagnosable, and it is never written to the disk cache. Only a `pass` is cached, so a failed run can never later read as evidence.
+- **A pass must be complete.** `record_dogfood` refuses a `pass` verdict when any check row is not `pass`. A skipped check is a HOLD by the design's own rule, so accepting it would let the gate pass by omission. A HOLD must name a taxonomy class.
+- **Deploy matrix.** `dogfoodDeployMatrix` (or `WORKFLOW_GUARD_DOGFOOD_DEPLOY_MATRIX`, comma-separated) lists the host labels that each need a passing record. Unset means the recorded host alone satisfies the gate. Records accumulate rather than replacing each other, so one host's pass never overwrites another's. Only the newest record per host counts, which means a newer HOLD on a host reopens the gate even if that host passed earlier.
+- **Recursion by refusal, not absence.** The runner sets `WORKFLOW_GUARD_DOGFOOD_ACTOR=1` and `WORKFLOW_GUARD_DOGFOOD_DEPTH` on the session it spawns. Every policy still applies in that session, and the plugin is present and enforcing. The marker only refuses `record_dogfood`, so the tested session cannot certify itself. An unparseable marker fails closed to a non-zero depth.
+- Freshness is content-scoped like the review gate, so a nested run in a linked worktree can inherit the binding for identical tracked content. A record for unrelated content never satisfies the gate.
+- `guard_status` reports `lastDogfood` and adds `dogfood` to `outstandingRequirements` when the gate is unsatisfied, naming the matrix hosts still missing a passing run.
+
 ### Tool Description Honesty & Cross-Model Adherence
 - Via the `tool.definition` hook, the guard enriches tool descriptions to keep them honest and proactive across all model families. The families are OpenAI, Gemini, Claude, and open-weights models:
   - `todowrite`: Explains its replacement-list lifecycle, finalization verification gate, and directs models to `guard_next_tasks` for roadmap discovery and `guard_status` for gate checks.
@@ -245,6 +257,14 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 - **`requireSubagentReview` strict recorder mode (opt-in):** Projects that cannot tolerate root-session self-approval can set `requireSubagentReview: true` in `.opencode/workflow-guard.json`. They can also set `WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=1` in the environment. In that mode `record_review` rejects APPROVALS recorded by the root session itself, which is a session with no parent. The rejection carries an actionable message and a `subagent_recorder_required` audit entry. The verdict is not recorded and the review gate stays unsatisfied. Changes-requested verdicts remain relayable from any session. `WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=0` disables the requirement even when project config enables it. The default keeps the documented relay flow for read-only reviewer toolsets.
 - **Durable Lower-Priority Follow-ups:** Accepted review summaries containing a P2 or P3 finding are persisted in the project's local Workflow Guard SQLite database. Open findings are included in compacted agent context. They remain open across sessions until explicitly resolved with `guard_review_followup_resolve`, and they are not silently discarded with the review session.
 - **Privacy-Safe Local Telemetry:** Guard decisions remain in the local audit JSONL. Tool after-hook observations add `callID` and duration records for local diagnosis and performance analysis. The current hook API does not distinguish success from every failure path, so these records do not claim a success outcome. Command and patch bodies are never written to the journal. Only their byte count and SHA-256 fingerprint are retained for correlation.
+
+### `record_dogfood`
+- Records a pre-deployment dogfood run for Policy 27: `record_dogfood(scenarioId, scenarioSha256, taxonomySha256, verdict, checks, hostLabel, ...)`.
+- `checks` is a JSON array of `{id, status, expected, observed, detail}` rows. `expected` sits beside `observed` so a HOLD is diagnosable from the record alone, without re-running the scenario.
+- The verdict binds to the recording session's resolved directory, or to an explicit `directory`. It is refused, loudly and without recording, when no tracked-content fingerprint can be computed for that directory.
+- A `pass` requires every check to be `pass`, and a `hold` must name a taxonomy class. Both refusals are journaled under `record_dogfood.verdict` with `decision: "block"`.
+- A session carrying `WORKFLOW_GUARD_DOGFOOD_ACTOR=1` or a non-zero `WORKFLOW_GUARD_DOGFOOD_DEPTH` is refused. The tested session cannot certify its own run.
+- The recorded digest pair is part of the evidence source, so replaying a passing run onto a different scenario or taxonomy changes the evidence id.
 
 ---
 

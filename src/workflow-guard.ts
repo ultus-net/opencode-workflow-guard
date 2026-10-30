@@ -24,9 +24,11 @@ import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
 import { guardToolCallImpl, isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./lib/guard-dispatcher.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./lib/custom-tools.ts";
+import { evaluateDogfoodGate } from "./lib/dogfood.ts";
 import type { PolicyDecision, TodoSdkClient } from "./lib/types.ts";
 export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
 export { extractReviewFollowups, buildWorkflowGuardSystemGuidance } from "./lib/custom-tools.ts";
+export { evaluateDogfoodGate } from "./lib/dogfood.ts";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 export type {
@@ -47,7 +49,7 @@ export type {
 	LearningOpportunity,
 } from "./lib/types.ts";
 export type { TodoSdkClient };
-export { verificationEvidence, reviewEvidence, toolOutcomeEvidence, policyDecisionEvidence, lifecycleStateEvidence, agentAssertionEvidence, evidenceMatchesSubject, isEvidenceFresh } from "./lib/evidence.ts";
+export { verificationEvidence, reviewEvidence, dogfoodEvidence, toolOutcomeEvidence, policyDecisionEvidence, lifecycleStateEvidence, agentAssertionEvidence, evidenceMatchesSubject, isEvidenceFresh } from "./lib/evidence.ts";
 export { getRalphOutcome } from "./policies/continuation.ts";
 
 // ── State & runtime context ──────────────────────────────────────────────────
@@ -76,6 +78,10 @@ import {
 	isReviewRequired,
 	isSubagentReviewRequired,
 	isDocumentationRequired,
+	isDogfoodRequired,
+	getDogfoodDeployMatrix,
+	getDogfoodDepth,
+	isDogfoodActor,
 	isLiveDocsRequired,
 	getLiveDocFailureThreshold,
 	getResearchToolPatterns,
@@ -88,6 +94,10 @@ import {
 	getLastReviewResultForWorkspace,
 	resetReviewState,
 	sessionReviews,
+	recordDogfoodResult,
+	getLastDogfoodResultForWorkspace,
+	getDogfoodRecordsForWorkspace,
+	resetDogfoodState,
 	setSessionWorkspace,
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
@@ -117,6 +127,10 @@ export {
 	isReviewRequired,
 	isSubagentReviewRequired,
 	isDocumentationRequired,
+	isDogfoodRequired,
+	getDogfoodDeployMatrix,
+	getDogfoodDepth,
+	isDogfoodActor,
 	isLiveDocsRequired,
 	getLiveDocFailureThreshold,
 	getResearchToolPatterns,
@@ -127,6 +141,10 @@ export {
 	getLastReviewResult,
 	getLastReviewResultForWorkspace,
 	resetReviewState,
+	recordDogfoodResult,
+	getLastDogfoodResultForWorkspace,
+	getDogfoodRecordsForWorkspace,
+	resetDogfoodState,
 	setSessionWorkspace,
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
@@ -194,7 +212,7 @@ import {
 	summarizeInput,
 } from "./lib/audit.ts";
 
-export { getAuditFilePath, getVerifyCacheFilePath, getReviewCacheFilePath, getVerifyHistoryFilePath, persistVerifyCache, loadVerifyCache, persistReviewCache, loadReviewCache, getRecentAuditEntries, getRecentVerifyHistory } from "./lib/audit.ts";
+export { getAuditFilePath, getVerifyCacheFilePath, getReviewCacheFilePath, getDogfoodCacheFilePath, getVerifyHistoryFilePath, persistVerifyCache, loadVerifyCache, persistReviewCache, loadReviewCache, persistDogfoodCache, loadDogfoodCache, getRecentAuditEntries, getRecentVerifyHistory } from "./lib/audit.ts";
 export { summarizeInput };
 
 export function managedConfigDiagnostic(platform = process.platform, env: NodeJS.ProcessEnv = process.env): string {
@@ -694,6 +712,14 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 						`- Secondary Review: ${lastR.passed ? "APPROVED" : "CHANGES REQUESTED"} by ${lastR.reviewer}`,
 					);
 				}
+				const dogfoodCtxGate = evaluateDogfoodGate(effectiveRoot);
+				if (dogfoodCtxGate.required) {
+					stateLines.push(
+						dogfoodCtxGate.missingHosts.length === 0
+							? `- Dogfood Evidence: PASS on ${(dogfoodCtxGate.matchedRecords ?? []).map((record) => record.host.label).join(", ") || "recorded host"}`
+							: `- Dogfood Evidence: MISSING for ${dogfoodCtxGate.missingHosts.join(", ")} (required before PR creation)`,
+					);
+				}
 				let openFollowups: ReturnType<typeof listReviewFollowups> = [];
 				try { openFollowups = followupStore ? listReviewFollowups(followupStore, "open", 8) : []; } catch {}
 				if (openFollowups.length > 0) {
@@ -838,6 +864,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					projectMemoryEnabled,
 					learningEnabled,
 					recoveryCheckpointsEnabled: isRecoveryCheckpointsEnabled(effectiveRoot),
+					dogfoodRequired: isDogfoodRequired(effectiveRoot),
 					isReadOnly,
 				});
 				output.system.push(guidance);

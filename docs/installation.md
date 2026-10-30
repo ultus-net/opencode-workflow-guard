@@ -245,6 +245,29 @@ For stricter environments, set `requireSubagentReview: true` in `.opencode/workf
 
 ---
 
+## Pre-Deployment Dogfood Gate
+
+Policy 27 gates PR creation on a recorded run of the change on real hardware. It is **off by default**, because a gate is only meaningful once a repository has a runner that can produce a real run. Enable it after that runner exists:
+
+```json
+{
+  "requireDogfood": true,
+  "dogfoodDeployMatrix": ["bluefin", "windows-ci"]
+}
+```
+
+`WORKFLOW_GUARD_REQUIRE_DOGFOOD=1` enables the gate for any project, and `WORKFLOW_GUARD_REQUIRE_DOGFOOD=0` disables it even when project config enables it. `WORKFLOW_GUARD_DOGFOOD_DEPLOY_MATRIX` (comma-separated) overrides the matrix.
+
+The guard supplies the gate, the evidence record, and the recursion refusal. It does not spawn the actor session; the plugin may constrain, record, and explain, but it does not delegate. A repository supplies the runner, the frozen scenario bank, and the taxonomy, then records the outcome with `record_dogfood`.
+
+A recorded run binds to the commit hash and tracked-content worktree fingerprint of the directory it covered, exactly like review evidence. Commit every tracked change and run the scenario afterwards, so one pass satisfies both the review and dogfood gates. Only a `pass` verdict is durable. A `hold` stays diagnosable in memory with its taxonomy class and never becomes evidence.
+
+Records accumulate, so a multi-host deploy matrix keeps one pass per host. Only the newest record per host counts. A newer `hold` on a host therefore reopens the gate even when that host passed earlier, so a later regression cannot hide behind an older green run.
+
+The runner sets `WORKFLOW_GUARD_DOGFOOD_ACTOR=1` and `WORKFLOW_GUARD_DOGFOOD_DEPTH` on the session it spawns. That session runs the full plugin with every policy intact, and the marker only refuses `record_dogfood`, so a tested session cannot certify its own run.
+
+---
+
 ## Live-Documentation Research Floor
 
 Policy 25 is enabled by default. A session that accumulates failed tool calls with no live-documentation lookup since gets its next mutating or shell call blocked. The block holds until the agent consults a current source. Only non-research failures count, so a failed `websearch` never deepens the block. Reads, greps, and research tools are never gated.

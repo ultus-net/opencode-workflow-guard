@@ -1,7 +1,7 @@
 import { existsSync, unlinkSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { audit, getReviewCacheFilePath, loadReviewCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
+import { audit, getDogfoodCacheFilePath, getReviewCacheFilePath, loadDogfoodCache, loadReviewCache, persistDogfoodCache, persistReviewCache, persistVerifyCache, persistVerifyHistory } from "./audit.ts";
 import { findGitRoot, getCachedProjectConfig, isSameGitRepo, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { snipVerifyOutput, getCurrentGitCommitHash, getGitStatusSummary, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
 import { normalizeLiveControlPlaneRoots } from "./live-control-plane.ts";
@@ -10,6 +10,7 @@ import type {
 	ProjectConfig,
 	VerifyResult,
 	ReviewResult,
+	DogfoodResult,
 } from "./types.ts";
 
 export let workspaceRoot = process.cwd();
@@ -454,6 +455,74 @@ export function resetReviewState(): void {
 	} catch {}
 }
 
+let dogfoodRecords: DogfoodResult[] = [];
+const MAX_DOGFOOD_RECORDS = 20;
+
+/**
+ * Records a dogfood run for a workspace.
+ *
+ * A HOLD is kept in memory so its taxonomy class stays diagnosable, but only
+ * passing records are persisted: caching a failed run would let a later
+ * preflight read it as evidence.
+ *
+ * Records accumulate rather than replacing each other, because a deploy matrix
+ * needs one record per host. Keeping only the newest would make a multi-host
+ * matrix impossible to satisfy.
+ */
+export function recordDogfoodResult(result: Omit<DogfoodResult, "workspace" | "commitHash" | "gitStatus" | "worktreeFingerprint" | "timestamp"> & { workspace?: string }, targetSessionID?: string): DogfoodResult {
+	const root = projectRootKey(result.workspace ?? getWorkspaceRoot());
+	const stored: DogfoodResult = {
+		...result,
+		timestamp: Date.now(),
+		workspace: root,
+		commitHash: getCurrentGitCommitHash(root),
+		gitStatus: getGitStatusSummary(root),
+		// Bind to tracked content only, matching review: the dogfood run
+		// covered the change, and untracked scratch files are not part of it.
+		worktreeFingerprint: getTrackedWorktreeFingerprint(root),
+		sessionID: targetSessionID,
+	};
+	dogfoodRecords = [stored, ...dogfoodRecords].slice(0, MAX_DOGFOOD_RECORDS);
+	if (stored.verdict === "pass") persistDogfoodCache(dogfoodRecords.filter((record) => record.verdict === "pass"));
+	return stored;
+}
+
+/**
+ * Candidate dogfood records for one worktree.
+ *
+ * Memory and disk are merged, so a pass recorded in a previous process is
+ * still a candidate next to one recorded now. Duplicates are harmless because
+ * the gate keeps only the newest record per host.
+ *
+ * Exact-worktree candidates win over same-repository ones, so a sibling
+ * worktree's run cannot displace this worktree's evidence. Same-repository
+ * candidates are returned when this worktree has none, which is what lets a
+ * run in a linked worktree satisfy the parent when the tracked content matches.
+ * Freshness is judged per record by the caller, never here.
+ */
+export function getDogfoodRecordsForWorkspace(root: string): DogfoodResult[] {
+	const workspace = projectRootKey(root);
+	const all = [...dogfoodRecords, ...loadDogfoodCache()].filter(
+		(result): result is DogfoodResult & { workspace: string } => result?.workspace != null,
+	);
+	const exact = all.filter((result) => projectRootKey(result.workspace) === workspace);
+	if (exact.length > 0) return exact;
+	return all.filter((result) => isSameGitRepo(result.workspace, root));
+}
+
+export function getLastDogfoodResultForWorkspace(root: string): DogfoodResult | undefined {
+	const records = getDogfoodRecordsForWorkspace(root);
+	return records.reduce<DogfoodResult | undefined>((best, result) => !best || result.timestamp > best.timestamp ? result : best, undefined);
+}
+
+export function resetDogfoodState(): void {
+	dogfoodRecords = [];
+	try {
+		const p = getDogfoodCacheFilePath();
+		if (existsSync(p)) unlinkSync(p);
+	} catch {}
+}
+
 export async function resolveEffectiveWorkspace(options: {
 	sessionID?: string;
 	directory?: string;
@@ -541,6 +610,54 @@ export function isDocumentationRequired(root: string): boolean {
 	if (process.env.WORKFLOW_GUARD_REQUIRE_DOCS === "1") return true;
 	const cfg = getProjectConfig(root);
 	return cfg.requireDocumentation === true;
+}
+
+/**
+ * Dogfood gate (pre-deployment evidence). Off by default, per the rule that
+ * every write path ships opt-in first: a repository opts in only once its
+ * runner exists, and an unset flag keeps today's PR behavior.
+ */
+export function isDogfoodRequired(root: string): boolean {
+	const env = process.env.WORKFLOW_GUARD_REQUIRE_DOGFOOD?.toLowerCase();
+	if (env === "0" || env === "false" || env === "off") return false;
+	if (env === "1" || env === "true" || env === "on") return true;
+	return getProjectConfig(root).requireDogfood === true;
+}
+
+/**
+ * Host labels that must each carry a passing dogfood record. Unset means the
+ * recorded host alone satisfies the gate, so a single-machine setup needs no
+ * matrix. Blank and duplicate labels are dropped; a non-array value is
+ * ignored rather than throwing, matching the other config readers.
+ */
+export function getDogfoodDeployMatrix(root: string): string[] {
+	const env = process.env.WORKFLOW_GUARD_DOGFOOD_DEPLOY_MATRIX;
+	const raw = env !== undefined && env.trim() !== "" ? env.split(",") : getProjectConfig(root).dogfoodDeployMatrix;
+	if (!Array.isArray(raw)) return [];
+	return [...new Set(raw.filter((value): value is string => typeof value === "string").map((value) => value.trim()).filter(Boolean))];
+}
+
+/**
+ * Dogfood recursion depth for this process. The runner sets
+ * `WORKFLOW_GUARD_DOGFOOD_DEPTH` on the actor it spawns, so the marker is
+ * inherited rather than handshaken. Unparseable or negative values fail
+ * closed to depth 1, because a corrupt marker must not read as a clean root.
+ */
+export function getDogfoodDepth(): number {
+	const env = process.env.WORKFLOW_GUARD_DOGFOOD_DEPTH;
+	if (env === undefined || env.trim() === "") return 0;
+	const parsed = Number(env.trim());
+	return Number.isInteger(parsed) && parsed >= 0 ? parsed : 1;
+}
+
+/**
+ * True when this process is a dogfood actor, that is, a session spawned by the
+ * runner to be tested. Every policy still applies; the marker only refuses
+ * self-certification and stops dogfood evidence from being persisted.
+ */
+export function isDogfoodActor(): boolean {
+	if (process.env.WORKFLOW_GUARD_DOGFOOD_ACTOR === "1") return true;
+	return getDogfoodDepth() > 0;
 }
 
 /**
