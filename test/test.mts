@@ -3913,6 +3913,48 @@ const linkedAbsoluteWrite = await call("bash", { command: `echo x > ${join(wtRep
 check("an absolute target in the primary checkout stays allowed from a linked worktree", !blocked(linkedAbsoluteWrite));
 const linkedOutsideWrite = await call("bash", { command: `echo x > ${join(foreignWtRepo, "outside.txt")}`, workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
 check("an absolute target outside both checkouts is still blocked from a linked worktree", blocked(linkedOutsideWrite));
+
+// An in-command `cd` moves the tree later segments run in, so the walk has to
+// follow it. Judging every segment against the shell's initial `workdir` let
+// `cd <foreign> && git commit` be checked as a commit in the session's own
+// checkout, which both allowed a foreign write and denied nothing.
+const cdForeignCommit = await call("bash", { command: `cd ${foreignWtRepo} && git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"an in-command cd into a foreign repository is blocked for a git write",
+	blocked(cdForeignCommit) && String(cdForeignCommit).includes(foreignWtRepo),
+);
+const cdForeignWrite = await call("bash", { command: `cd ${foreignWtRepo} && echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an in-command cd into a foreign repository is blocked for a shell mutation", blocked(cdForeignWrite));
+const cdForeignRead = await call("bash", { command: `cd ${foreignWtRepo} && ls -la` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an in-command cd into a foreign repository stays allowed for a read", !blocked(cdForeignRead));
+const cdIndeterminate = await call("bash", { command: "cd $WG_UNKNOWN_TREE && git commit -m x" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"an indeterminate cd target followed by a write fails closed",
+	blocked(cdIndeterminate) && String(cdIndeterminate).includes("cannot be determined"),
+);
+const cdWorkspaceSubdir = await call("bash", { command: "mkdir -p nested && cd nested && echo x > artifact.txt" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"an in-command cd into a workspace subdirectory is judged where it lands, not as a foreign tree",
+	String(cdWorkspaceSubdir).includes("protected branch") && !String(cdWorkspaceSubdir).includes("outside workspace root"),
+);
+const cdLinkedSubdir = await call("bash", { command: "mkdir -p nested && cd nested && echo x > artifact.txt" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("an in-command cd into a linked-worktree subdirectory is allowed", !blocked(cdLinkedSubdir));
+const cdLinkedCommit = await call("bash", { command: `cd ${wtLinked} && git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an in-command cd into a linked worktree is not blocked as a foreign tree", !blocked(cdLinkedCommit));
+const wrapperCwdCommit = await call("bash", { command: `env -C ${foreignWtRepo} git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a wrapper -C into a foreign repository is blocked for a git write", blocked(wrapperCwdCommit));
+// The nested payload is one shell word to the outer shell, so its own `cd` and
+// its own `cwd` option were invisible to the top-level walk.
+const nestedCd = await call("bash", { command: `bash -c 'cd ${foreignWtRepo} && git commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested shell payload that cds into a foreign repository is blocked", blocked(nestedCd) && String(nestedCd).includes(foreignWtRepo));
+const nestedExecCwd = await call("bash", { command: `node -e "require('child_process').execSync('git commit -m x --allow-empty', {cwd:'${foreignWtRepo}'})"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested interpreter command with a foreign cwd is blocked", blocked(nestedExecCwd) && String(nestedExecCwd).includes(foreignWtRepo));
+const nestedLocal = await call("bash", { command: `node -e "require('child_process').execSync('git status', {cwd:'${wtRepo}'})"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested interpreter command in the workspace stays allowed", !blocked(nestedLocal));
+const nestedLinked = await call("bash", { command: `bash -c 'cd ${wtLinked} && git commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested payload cd into a linked worktree is not blocked as foreign", !blocked(nestedLinked));
+
+rmSync(join(wtLinked, "nested"), { recursive: true, force: true });
 rmSync(foreignWtRepo, { recursive: true, force: true });
 spawnSync("git", ["worktree", "remove", "--force", wtLinked], { cwd: wtRepo });
 rmSync(wtRepo, { recursive: true, force: true });
@@ -3955,7 +3997,7 @@ check("an update naming another repository rebinds", getSessionBoundWorkspace("s
 forgetSessionWorkspace("s-host-linked");
 spawnSync("git", ["worktree", "remove", "--force", moveLinked], { cwd: moveRepoA });
 // A later update that names a DIFFERENT directory than the last one is a move
-// even without the `session.next.moved` announcement.
+// even without the `session.moved` announcement.
 rebindSessionWorkspaceFromHost("s-host-move", moveRepoA);
 check("an update naming a new directory rebinds without an announcement", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoA));
 rebindSessionWorkspaceFromHost(undefined, moveRepoA);

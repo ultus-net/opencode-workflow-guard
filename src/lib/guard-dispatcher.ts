@@ -24,6 +24,7 @@ import {
 	dynamicShellSyntaxIn,
 	extractCommands,
 	normalize,
+	planShellSegments,
 	shellWrappersChangeCwd,
 	splitShellSegments,
 	unwrapShellCommand,
@@ -40,7 +41,7 @@ import {
 	resolveVerifyTimeoutMs,
 	snipVerifyOutput,
 } from "./verify.ts";
-import { detectShellMutation, extractPatchPaths, guardShellMutation, hasUnresolvableVariable, isEnvironmentScratchTarget, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR } from "../policies/boundary.ts";
+import { detectShellMutation, extractPatchPaths, foreignSegmentMutationReason, guardShellMutation, hasUnresolvableVariable, isEnvironmentScratchTarget, isPathOutsideWorkspace, nestedPayloadMutationReason, OPENCODE_SCRATCH_DIR } from "../policies/boundary.ts";
 import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyHasLiteralLineBreakEscapes, prBodyIncludesChangelog } from "../policies/changelog.ts";
 import { extractEditContent, liveMutationIn } from "../policies/destructive.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
@@ -475,7 +476,15 @@ export async function guardToolCallImpl(
 		}
 		const normalizedCommand = normalizeGitCommands(command);
 		if (hasUnsafeGitAlias(command)) return block("git", "unsafe_git_alias", "Blocked: per-invocation Git aliases cannot be used because they can hide guarded Git operations.");
-		const gitInvocations = splitShellSegments(command).map((segment) => parseGitInvocation(segment.trim(), shellRoot)).filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
+		// Each segment is judged in the directory it actually runs in. A `cd`
+		// earlier in the command moves the ones that follow, so parsing them all
+		// against the shell's initial `workdir` hid a mutation in another tree:
+		// `cd <other-repo> && git commit` was judged as a commit in the session's
+		// own checkout.
+		const segmentPlan = planShellSegments(command, shellRoot);
+		const gitInvocations = segmentPlan
+			.map(({ segment, root }) => parseGitInvocation(segment.trim(), root))
+			.filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
 		const effectiveRoot = gitInvocations[0]?.repoDir ?? currentRoot;
 		// The command executes in `requestedShellRoot`, not in the workspace, so
 		// every relative target in it would be validated against the wrong tree:
@@ -492,6 +501,11 @@ export async function guardToolCallImpl(
 				"workspace_escape",
 				`Blocked: the shell's workdir '${requestedShellRoot}' is outside workspace root (${currentRoot}) and is not a linked worktree of this repository, so relative targets cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`,
 			);
+		}
+		const foreignSegmentReason = foreignSegmentMutationReason(segmentPlan, currentRoot);
+		if (foreignSegmentReason) {
+			logPolicyBlock(`[workflow-guard] blocked mutation in a directory outside workspace: ${command.slice(0, 120)}`);
+			return block("boundary", "workspace_escape", foreignSegmentReason);
 		}
 		for (const invocation of gitInvocations) {
 			const normalizedInvocation = `git ${invocation.rest}`;
@@ -558,6 +572,14 @@ export async function guardToolCallImpl(
 				logPolicyBlock(`[workflow-guard] blocked shell read of secret file: ${secretFile}`);
 				return block("secrets", "secret_read", `Blocked: reading sensitive credential/secret file '${secretFile}' via shell is not permitted. Reference environment variables by name or inspect safe templates (e.g. .env.example) instead.`);
 			}
+		}
+		// A nested payload changes a tree this session may not judge when it
+		// changes directory itself, or names a foreign `cwd`. The outer shell
+		// sees one word, so the top-level walk above cannot see it.
+		const nestedTreeReason = nestedPayloadMutationReason(extractInterpreterPayload, writePathsInPayload, command, shellRoot, currentRoot);
+		if (nestedTreeReason) {
+			logPolicyBlock(`[workflow-guard] blocked nested interpreter mutation outside workspace: ${command.slice(0, 120)}`);
+			return block("boundary", "workspace_escape", nestedTreeReason);
 		}
 		for (const payload of extractInterpreterPayload(raw)) {
 			const outsidePath = outsideWritePathInPayload(payload, currentRoot);

@@ -2,14 +2,16 @@ import { realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ShellMutation } from "../lib/types.ts";
+import type { ShellSegmentPlan } from "../lib/shell.ts";
 import {
 	getWorkspaceRoot,
 	recordMutation,
 } from "../lib/state.ts";
-import { prepareRedirectResidue, shellWords, unwrapShellCommand } from "../lib/shell.ts";
+import { prepareRedirectResidue, planShellSegments, shellWords, unwrapShellCommand } from "../lib/shell.ts";
 import { isCollaborationInvocation, isProtectedPath, PROTECTED_PATH_REASON } from "./tamper.ts";
 import { isSecretPath, secretIn } from "./secrets.ts";
-import { onProtectedBranch, branchGuardReason } from "./git.ts";
+import { GIT_BRANCH_CREATE_RE, GIT_WRITE_RE, branchGuardReason, onProtectedBranch, parseGitInvocation } from "./git.ts";
+import { isSameGitRepo } from "../lib/project-config.ts";
 import {
 	effectiveTodos,
 	effectiveTodoOwnerSessionID,
@@ -372,6 +374,96 @@ function stripQuotedSpans(segment: string): string {
 	return segment.replace(/'[^'\n]*'/g, " ").replace(/"[^"\n]*"/g, " ");
 }
 
+/**
+ * A segment that changes a tree this session may not judge: a mutation or git
+ * write whose directory could not be resolved (`cd $DIR && git commit`) or
+ * whose directory is a foreign repository (`cd /other-repo && rm -rf dist`).
+ *
+ * Relative targets in such a segment would be validated against the session's
+ * own checkout while the command changes another tree. That is the defect a
+ * shell-level `cd` used to hide, so it is refused rather than judged.
+ */
+export function foreignSegmentMutationReason(
+	segments: ShellSegmentPlan[],
+	workspaceRoot: string,
+): string | undefined {
+	for (const { segment, root } of segments) {
+		const mutation = detectShellMutation(segment);
+		const gitWrite = isGitTreeWrite(segment, root ?? workspaceRoot);
+		if (!mutation && !gitWrite) continue;
+		if (root === undefined) {
+			return `Blocked: the command changes directory to a target that cannot be determined without executing shell expansion, then runs a mutation (${mutation?.what ?? "git write"}). Indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal directory inside the workspace.`;
+		}
+		if (!isPathOutsideWorkspace(root, workspaceRoot) || isSameGitRepo(root, workspaceRoot)) continue;
+		return `Blocked: the command changes into '${root}' and mutates it (${mutation?.what ?? "git write"}), but that directory is outside workspace root (${workspaceRoot}) and is not a linked worktree of this repository. Relative targets there cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`;
+	}
+	return undefined;
+}
+
+function isGitTreeWrite(segment: string, baseDir: string): boolean {
+	const invocation = parseGitInvocation(segment.trim(), baseDir);
+	if (!invocation) return false;
+	const text = `git ${invocation.rest}`;
+	return GIT_WRITE_RE.test(text) || GIT_BRANCH_CREATE_RE.test(text) || /\bgit\s+push\b/.test(text);
+}
+
+/**
+ * The working directory an inline interpreter payload names for the commands it
+ * runs, when it names one.
+ *
+ * `execSync('git commit', {cwd: '<dir>'})` carries the tree directly instead of
+ * changing directory first, so the payload walk alone cannot see it.
+ */
+export function payloadWorkingRoot(payload: string): string | undefined {
+	const quoted = /["'`]([^"'`]*)["'`]/;
+	for (const pattern of [
+		/\bcwd\s*[:=]\s*(["'`][^"'`]*["'`])/i,
+		/\bchdir\s*\(\s*(["'`][^"'`]*["'`])\s*\)/i,
+	]) {
+		const match = pattern.exec(payload);
+		const value = match?.[1] ? quoted.exec(match[1])?.[1] : undefined;
+		if (value) return value;
+	}
+	return undefined;
+}
+
+function payloadMutates(payload: string): boolean {
+	if (detectShellMutation(payload)) return true;
+	return /\bgit\s+(?:add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash|apply|am|restore|reset|update-ref|filter-branch|push|tag|branch|switch|checkout)\b/.test(payload);
+}
+
+/**
+ * The tree a nested interpreter payload changes, when that tree is one this
+ * session may not judge.
+ *
+ * A payload never reaches the top-level segment walk: `bash -c 'cd <other> &&
+ * git commit'` is one shell word to the outer shell, so its nested `cd` and
+ * mutation were invisible. `extractPayloads` and `writesIn` are injected so
+ * this policy does not import the interpreter scanner back.
+ */
+export function nestedPayloadMutationReason(
+	extractPayloads: (segment: string) => string[],
+	writesIn: (payload: string) => string[],
+	command: string,
+	baseDir: string,
+	workspaceRoot: string,
+): string | undefined {
+	for (const { segment, root } of planShellSegments(command, baseDir)) {
+		const launcherRoot = root ?? workspaceRoot;
+		for (const payload of extractPayloads(segment)) {
+			const nested = foreignSegmentMutationReason(planShellSegments(payload, launcherRoot), workspaceRoot);
+			if (nested) return nested;
+			const declaredRoot = payloadWorkingRoot(payload);
+			if (declaredRoot === undefined) continue;
+			if (writesIn(payload).length === 0 && !payloadMutates(payload)) continue;
+			const targetRoot = resolve(launcherRoot, declaredRoot);
+			if (!isPathOutsideWorkspace(targetRoot, workspaceRoot) || isSameGitRepo(targetRoot, workspaceRoot)) continue;
+			return `Blocked: the inline interpreter script runs a mutating command in '${targetRoot}', outside workspace root (${workspaceRoot}) and not a linked worktree of this repository. Relative targets there cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`;
+		}
+	}
+	return undefined;
+}
+
 export function detectShellMutation(command: string): ShellMutation | undefined {
 	for (const rawSegment of command.split(/[\n|;&]+/)) {
 		const segment = isCollaborationInvocation(rawSegment) ? stripQuotedSpans(rawSegment) : rawSegment;
@@ -403,18 +495,23 @@ export async function guardShellMutation(
 	// in a feature worktree as if it happened on the primary `main`.
 	const workspaceRoot = getWorkspaceRoot();
 	const root = shellRoot ?? workspaceRoot;
-	// Both trees are this workspace: the checkout the command runs in and the
-	// session's own checkout. Absolute paths into either are legitimate, so a
-	// target is outside only when it leaves both.
-	const outsideWorkspace = (target: string): boolean =>
-		isPathOutsideWorkspace(target, root) && isPathOutsideWorkspace(target, workspaceRoot);
 	let hasMutation = false;
-	for (const rawSegment of command.split(/[\n|;&]+/)) {
+	for (const { segment, root: segmentRoot } of planShellSegments(command, root)) {
+		// `cd` earlier in the command moves this segment, so its relative targets
+		// resolve against the tree it actually changes. An indeterminate `cd`
+		// falls back to the shell root; the foreign-tree gate refuses that shape
+		// before this runs.
+		const runRoot = segmentRoot ?? root;
+		// Both trees are this workspace: the checkout the command runs in and the
+		// session's own checkout. Absolute paths into either are legitimate, so a
+		// target is outside only when it leaves both.
+		const outsideWorkspace = (target: string): boolean =>
+			isPathOutsideWorkspace(target, runRoot) && isPathOutsideWorkspace(target, workspaceRoot);
 		// Same residue analysis as detectShellMutation: quoted arguments of
 		// gh/glab/az PR/issue commands are command data, not shell redirects,
 		// while unquoted redirects still get full validation below.
-		const segment = isCollaborationInvocation(rawSegment) ? stripQuotedSpans(rawSegment) : rawSegment;
-		const secretSource = secretSourceInFilesystemCommand(segment);
+		const cleanSegment = isCollaborationInvocation(segment) ? stripQuotedSpans(segment) : segment;
+		const secretSource = secretSourceInFilesystemCommand(cleanSegment);
 		if (secretSource) {
 			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;
 		}
@@ -422,36 +519,36 @@ export async function guardShellMutation(
 		// sources must respect the same boundaries as mutation targets: no
 		// moving files in from outside the workspace, no moving protected
 		// (settings/plugin) files to innocuous names.
-		const transfer = filesystemTransferInfo(segment);
-		if (transfer && shellWords(unwrapShellCommand(segment))[0] === "mv") {
+		const transfer = filesystemTransferInfo(cleanSegment);
+		if (transfer && shellWords(unwrapShellCommand(cleanSegment))[0] === "mv") {
 			for (const source of transfer.sources) {
 				if (isProtectedPath(source)) {
 					return PROTECTED_PATH_REASON;
 				}
 				if (outsideWorkspace(source)) {
 					if (hasUnresolvableVariable(source)) {
-						return `Blocked: mv source '${source}' contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${root}). Use a literal workspace-relative path.`;
+						return `Blocked: mv source '${source}' contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal workspace-relative path.`;
 					}
-					return `Blocked: mv would remove source '${source}' from outside the workspace root (${root}). File mutations must stay within the workspace.`;
+					return `Blocked: mv would remove source '${source}' from outside the workspace root (${workspaceRoot}). File mutations must stay within the workspace.`;
 				}
 			}
 		}
-		const simpleMutations = simpleFilesystemMutations(segment);
-		const teeTargets = teeTargetsIn(segment);
+		const simpleMutations = simpleFilesystemMutations(cleanSegment);
+		const teeTargets = teeTargetsIn(cleanSegment);
 		const teeMutations: ShellMutation[] = teeTargets.map((target) => ({
 			kind: "command" as const,
 			target,
 			what: `tee to '${target}'`,
 		}));
-		const redirectMutations = redirectMutationsIn(segment.trim());
+		const redirectMutations = redirectMutationsIn(cleanSegment.trim());
 		const mutations = [...simpleMutations, ...teeMutations, ...redirectMutations];
 		if (mutations.length === 0) {
-			const fallbackMutation = shellMutationIn(segment.trim());
+			const fallbackMutation = shellMutationIn(cleanSegment.trim());
 			if (fallbackMutation) mutations.push(fallbackMutation);
 		}
 		for (const mutation of mutations) {
 			hasMutation = true;
-			const secret = secretIn(segment);
+			const secret = secretIn(cleanSegment);
 			if (secret) {
 				return `Blocked: shell file mutation payload appears to contain a ${secret}. Secrets must not be written to disk from agent commands.`;
 			}
@@ -464,14 +561,14 @@ export async function guardShellMutation(
 				// workspace is out of bounds even with WORKFLOW_GUARD_ALLOW_LIVE
 				// (that override covers live-system commands, not the boundary).
 				if (hasUnresolvableVariable(target)) {
-					return `Blocked: shell mutation '${mutation.what}' targets '${target}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${root}). Use a literal workspace-relative path.`;
+					return `Blocked: shell mutation '${mutation.what}' targets '${target}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal workspace-relative path.`;
 				}
-				if (isEnvironmentScratchTarget(target, root)) {
-					return `Blocked: shell mutation '${mutation.what}' targets '${target}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${root}) instead (for example .tmp-notes.md).`;
+				if (isEnvironmentScratchTarget(target, runRoot)) {
+					return `Blocked: shell mutation '${mutation.what}' targets '${target}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${workspaceRoot}) instead (for example .tmp-notes.md).`;
 				}
-				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${root}). All changes must stay within the workspace.`;
+				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
 			}
-			if (onProtectedBranch(root)) {
+			if (onProtectedBranch(runRoot)) {
 				return branchGuardReason();
 			}
 			const todos = await effectiveTodos(sessionID);

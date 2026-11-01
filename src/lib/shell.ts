@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { isAbsolute, join, resolve } from "node:path";
+
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
 		return undefined;
@@ -238,7 +241,7 @@ export function splitShellSegments(command: string): string[] {
 	return segments;
 }
 
-function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: boolean; assignments: string[] } {
+function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: boolean; cwdTarget?: string; assignments: string[] } {
 	let cleanCmd = decodeShellEscapes(command.trim());
 	// Strip outer grouping parentheses/braces if present e.g. ( git commit ) or { git commit; }
 	while (
@@ -252,6 +255,10 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 	const words = shellWords(cleanCmd);
 	let i = 0;
 	let changesCwd = false;
+	// Directory a wrapper (`env -C`, `sudo -D`) runs its command in. Recorded
+	// so a caller can judge a nested command in the tree it actually runs in
+	// instead of the shell's initial workdir.
+	let cwdTarget: string | undefined;
 	// Environment assignments consumed while unwrapping wrappers. They apply to
 	// the command that follows, so callers must not read them out of the command
 	// arguments instead: `git commit -m GIT_DIR=/repo` is message text, not an
@@ -343,7 +350,12 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 			]);
 			while (i < words.length && words[i]!.startsWith("-")) {
 				const option = words[i++]!;
-				if (option === "-D" || (option.startsWith("-D") && option !== "-D") || option === "--chdir" || option.startsWith("--chdir=")) changesCwd = true;
+				if (option === "-D" || (option.startsWith("-D") && option !== "-D") || option === "--chdir" || option.startsWith("--chdir=")) {
+					changesCwd = true;
+					// The target is the next word unless it was attached (-Ddir).
+					if (option === "-D" || option === "--chdir") cwdTarget = words[i];
+					else cwdTarget = option.replace(/^-D|^--chdir=/, "");
+				}
 				if (valueOptions.has(option) && i < words.length) i++;
 			}
 			continue;
@@ -376,7 +388,8 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 				if (clustered?.[1] === "C") {
 					changesCwd = true;
 					i++;
-					if (!clustered[2] && i < words.length) i++;
+					if (clustered[2]) cwdTarget = clustered[2];
+					else if (i < words.length) cwdTarget = words[i++];
 					continue;
 				}
 				if (clustered?.[1] === "S") {
@@ -404,12 +417,18 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 				}
 				if (w.startsWith("-C") && w !== "-C") {
 					changesCwd = true;
+					cwdTarget = w.slice(2);
 					i++;
 					continue;
 				}
 				if (!w.startsWith("-")) break;
 				i++;
-				if (w === "-C" || w === "--chdir" || w.startsWith("--chdir=")) changesCwd = true;
+				if (w === "-C" || w === "--chdir" || w.startsWith("--chdir=")) {
+					changesCwd = true;
+					if (w === "--chdir") cwdTarget = words[i];
+					else if (w.startsWith("--chdir=")) cwdTarget = w.slice("--chdir=".length);
+					else cwdTarget = words[i];
+				}
 				if (valueOptions.has(w) && i < words.length) i++;
 			}
 			continue;
@@ -424,11 +443,104 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 	return { words: words
 		.slice(i)
 		.map((w) => w.replace(/^[\({]+/, "").replace(/[\)};]+$/, ""))
-		.filter(Boolean), changesCwd, assignments };
+		.filter(Boolean), changesCwd, cwdTarget, assignments };
 }
 
 export function unwrapShellWords(command: string): string[] {
 	return unwrapShellWordsImpl(command).words;
+}
+
+/**
+ * The directory a wrapper (`env -C`, `sudo -D`) runs its command in, if it
+ * names one. The target is left unexpanded: the caller knows the directory it
+ * is relative to.
+ */
+export function shellWrapperCwd(command: string): string | undefined {
+	return unwrapShellWordsImpl(command).cwdTarget;
+}
+
+/**
+ * One shell segment and the directory it runs in.
+ *
+ * `root` is `undefined` when the walk cannot determine it: an unresolvable
+ * `cd` target (`cd $DIR`, `cd -`), a `pushd` that swaps the directory stack,
+ * or a `popd` with no tracked push. Callers treat that as indeterminate
+ * instead of assuming the session's checkout, because that assumption is how a
+ * `cd` into another tree used to hide a mutation from the boundary policy.
+ */
+export interface ShellSegmentPlan {
+	segment: string;
+	root: string | undefined;
+}
+
+const CWD_WORDS = new Set(["cd", "pushd", "popd"]);
+
+/** Expands only the directory forms a shell expands deterministically. */
+function expandCwdTarget(target: string): string | undefined {
+	const home = process.env.HOME || homedir();
+	if (target === "~") return home;
+	if (target.startsWith("~/")) return join(home, target.slice(2));
+	if (/^\$(?:HOME|\{HOME\})(?:$|[/\\])/.test(target)) {
+		return target.replace(/^\$(?:HOME|\{HOME\})/, home);
+	}
+	if (target.includes("$")) return undefined;
+	return target;
+}
+
+function cwdChangeIn(segment: string): { word: string; target?: string } | undefined {
+	const words = unwrapShellWords(segment);
+	let i = 0;
+	while (i < words.length && (words[i] === "builtin" || words[i] === "command")) i += 1;
+	const word = words[i];
+	if (!word || !CWD_WORDS.has(word)) return undefined;
+	if (word === "popd") return { word };
+	let target: string | undefined;
+	for (let j = i + 1; j < words.length; j += 1) {
+		const candidate = words[j]!;
+		if (candidate === "--") continue;
+		// `cd -` moves to OLDPWD, which this walk does not track.
+		if (candidate === "-") return { word, target: undefined };
+		if (candidate.startsWith("-")) continue;
+		target = candidate;
+		break;
+	}
+	if (target !== undefined) return { word, target };
+	// A bare `cd` moves to $HOME, a known directory. A bare `pushd` swaps the
+	// top two entries of the directory stack, which is not tracked here.
+	return { word, target: word === "cd" ? "~" : undefined };
+}
+
+/**
+ * Walk a multi-segment command and resolve the directory each segment runs in.
+ *
+ * Later segments run in the directory an earlier `cd`/`pushd` selected, and a
+ * wrapper `-C`/`-D` moves only its own command. Judging every segment against
+ * the shell's initial `workdir` let `cd <other-tree> && git commit` be checked
+ * as if it happened in the session's own checkout.
+ */
+export function planShellSegments(command: string, baseDir: string | undefined): ShellSegmentPlan[] {
+	const plan: ShellSegmentPlan[] = [];
+	let cwd = baseDir;
+	const dirStack: Array<string | undefined> = [];
+	for (const segment of splitShellSegments(command)) {
+		const wrapperCwd = shellWrapperCwd(segment);
+		let root = cwd;
+		if (wrapperCwd !== undefined) {
+			const expanded = expandCwdTarget(wrapperCwd);
+			root = expanded === undefined || cwd === undefined ? undefined : resolve(cwd, expanded);
+		}
+		plan.push({ segment, root });
+		const change = cwdChangeIn(segment);
+		if (!change) continue;
+		if (change.word === "popd") {
+			cwd = dirStack.pop();
+			continue;
+		}
+		if (change.word === "pushd") dirStack.push(cwd);
+		const expanded = change.target === undefined ? undefined : expandCwdTarget(change.target);
+		cwd = cwd === undefined || expanded === undefined ? undefined : resolve(cwd, expanded);
+	}
+	return plan;
 }
 
 /** Environment assignments that precede the command word, after unwrapping. */

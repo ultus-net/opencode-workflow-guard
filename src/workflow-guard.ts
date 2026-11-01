@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { loadedPluginVersion } from "./lib/version.ts";
 import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
-import { extractCommands, splitShellSegments } from "./lib/shell.ts";
+import { extractCommands, planShellSegments } from "./lib/shell.ts";
 import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, redirectMutationsIn } from "./policies/boundary.ts";
 import { beginReadObservation, clearReadFingerprints, recordMutationObservation, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
 import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
@@ -589,13 +589,13 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					const shellCwd = shellWorkdir ? resolve(toolWorktree, shellWorkdir) : toolWorktree;
 					const snapshots: FileSnapshot[] = [];
 					for (const command of extractCommands(args)) {
-						for (const segment of splitShellSegments(command)) {
+						for (const { segment, root } of planShellSegments(command, shellCwd)) {
 							for (const mutation of redirectMutationsIn(segment)) {
 								const target = mutation.target ?? "";
 								if (!target || target === "/dev/null") continue;
 								const expanded = expandShellTargetPath(target);
 								if (!expanded) continue;
-								const resolvedTarget = resolve(shellCwd, expanded);
+								const resolvedTarget = resolve(root ?? shellCwd, expanded);
 								if (resolvedTarget === OPENCODE_SCRATCH_DIR || resolvedTarget.startsWith(OPENCODE_SCRATCH_DIR + "/")) continue;
 								if (isPathOutsideWorkspace(resolvedTarget, toolWorktree)) continue;
 								snapshots.push(snapshotFile(resolvedTarget));
