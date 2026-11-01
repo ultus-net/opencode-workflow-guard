@@ -10,7 +10,7 @@ import {
 import { prepareRedirectResidue, planShellSegments, shellWords, unwrapShellCommand } from "../lib/shell.ts";
 import { isCollaborationInvocation, isProtectedPath, PROTECTED_PATH_REASON } from "./tamper.ts";
 import { isSecretPath, secretIn } from "./secrets.ts";
-import { GIT_BRANCH_CREATE_RE, GIT_WRITE_RE, branchGuardReason, onProtectedBranch, parseGitInvocation } from "./git.ts";
+import { isGitTreeWriteText, branchGuardReason, onProtectedBranch, parseGitInvocation } from "./git.ts";
 import { isSameGitRepo } from "../lib/project-config.ts";
 import {
 	effectiveTodos,
@@ -403,8 +403,7 @@ export function foreignSegmentMutationReason(
 function isGitTreeWrite(segment: string, baseDir: string): boolean {
 	const invocation = parseGitInvocation(segment.trim(), baseDir);
 	if (!invocation) return false;
-	const text = `git ${invocation.rest}`;
-	return GIT_WRITE_RE.test(text) || GIT_BRANCH_CREATE_RE.test(text) || /\bgit\s+push\b/.test(text);
+	return isGitTreeWriteText(`git ${invocation.rest}`);
 }
 
 /**
@@ -425,7 +424,15 @@ export type PayloadWorkingRoot =
 	| { status: "resolved"; root: string }
 	| { status: "indeterminate"; raw: string };
 
-const SPAWN_CALL_CWD = /\b(?:execSync|execFileSync|spawnSync|exec|execFile|spawn|fork)\s*\([^)]*?\bcwd\s*:\s*([^,)}]+)/;
+// Only a call site that actually spawns a process names a working directory.
+// `execSync`, `spawn`, and friends are unambiguous. A bare `exec` is guarded by
+// its preceding token so `regex.exec(str, {cwd: …})` is not a spawn, while
+// `child_process.exec(...)` still is. A bare `cwd:` key in an unrelated object
+// literal names no working directory at all.
+const SPAWN_CALLEE = String.raw`(?:(?:child_process|cp)\.)?(?:execSync|execFileSync|spawnSync|execFile|spawn|fork)|(?:child_process|cp)\.exec|(?<![.\w$])exec`;
+const SPAWN_CALL_CWD = new RegExp(
+	String.raw`(?:${SPAWN_CALLEE})\s*\([^)]*?\bcwd\s*:\s*([^,)}]+)`,
+);
 const PROCESS_CHDIR = /\bprocess\s*\.\s*chdir\s*\(\s*([^)]+?)\s*\)/;
 
 export function payloadWorkingRoot(payload: string): PayloadWorkingRoot {
@@ -442,9 +449,7 @@ export function payloadWorkingRoot(payload: string): PayloadWorkingRoot {
 
 function payloadMutates(payload: string): boolean {
 	if (detectShellMutation(payload)) return true;
-	// Exactly the git write sets `isGitTreeWrite` uses for a shell segment, so a
-	// payload and a `cd`-ed segment reach the same verdict for the same command.
-	return GIT_WRITE_RE.test(payload) || GIT_BRANCH_CREATE_RE.test(payload) || /\bgit\s+push\b/.test(payload);
+	return isGitTreeWriteText(payload);
 }
 
 /**
@@ -464,8 +469,22 @@ export function nestedPayloadMutationReason(
 	workspaceRoot: string,
 ): string | undefined {
 	for (const { segment, root } of planShellSegments(command, baseDir)) {
-		const launcherRoot = root ?? workspaceRoot;
-		for (const payload of extractPayloads(segment)) {
+		const payloads = extractPayloads(segment);
+		if (payloads.length === 0) continue;
+		// A launcher whose directory is indeterminate must not be assumed to be
+		// the workspace root: `cd $DIR && node -e "writeFileSync('x')"` would then
+		// read as a workspace write. The payload's own relative targets cannot be
+		// validated against a tree this walk could not resolve, so a mutation
+		// fails closed, matching the shell rule for the same shape.
+		const launcherRoot = root;
+		if (launcherRoot === undefined) {
+			const mutates = payloads.some((payload) => writesIn(payload).length > 0 || payloadMutates(payload));
+			if (mutates) {
+				return `Blocked: the command changes directory to a target that cannot be determined without executing shell expansion, then runs an inline interpreter script that mutates. Indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal directory inside the workspace.`;
+			}
+			continue;
+		}
+		for (const payload of payloads) {
 			const nested = foreignSegmentMutationReason(planShellSegments(payload, launcherRoot), workspaceRoot);
 			if (nested) return nested;
 			const declared = payloadWorkingRoot(payload);

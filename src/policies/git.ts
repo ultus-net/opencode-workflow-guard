@@ -162,6 +162,17 @@ export function normalizeGitCommands(command: string): string {
 export const GIT_WRITE_RE =
 	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)(?:[^|;&]*\s)?(?:-d\b|--delete\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?-[dDM]\b/;
 
+/**
+ * True when `text` invokes git in a way that changes a tree's refs or content.
+ *
+ * One predicate for every caller: the shell segment walk, the nested payload
+ * check, and the foreign-workdir gate. Keeping copies is how the payload check
+ * drifted wider than the segment check once already.
+ */
+export function isGitTreeWriteText(text: string): boolean {
+	return GIT_WRITE_RE.test(text) || GIT_BRANCH_CREATE_RE.test(text) || /\bgit\s+push\b/.test(text);
+}
+
 export function currentGitBranch(root: string): string | undefined {
 	const result = spawnSync("git", ["branch", "--show-current"], {
 		cwd: root,

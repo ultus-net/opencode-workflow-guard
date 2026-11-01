@@ -59,6 +59,7 @@ import {
 	findWorktreeForBranch,
 	hasUnsafeGitAlias,
 	isBranchAlreadyMergedOrClosed,
+	isGitTreeWriteText,
 	normalizeGitCommands,
 	onProtectedBranch,
 	parseGitInvocation,
@@ -491,10 +492,8 @@ export async function guardToolCallImpl(
 		// every relative target in it would be validated against the wrong tree:
 		// `rm -rf dist` in a foreign workdir would be checked as
 		// `<workspace>/dist`. Reads elsewhere are fine, mutations are not.
-		const mutatesTree = (invocation: NonNullable<ReturnType<typeof parseGitInvocation>>): boolean => {
-			const text = `git ${invocation.rest}`;
-			return GIT_WRITE_RE.test(text) || GIT_BRANCH_CREATE_RE.test(text) || /\bgit\s+push\b/.test(text);
-		};
+		const mutatesTree = (invocation: NonNullable<ReturnType<typeof parseGitInvocation>>): boolean =>
+			isGitTreeWriteText(`git ${invocation.rest}`);
 		if (foreignShellRoot && (detectShellMutation(command) || gitInvocations.some(mutatesTree))) {
 			logPolicyBlock(`[workflow-guard] blocked mutation in a workdir outside workspace: ${requestedShellRoot}`);
 			return block(
@@ -520,7 +519,7 @@ export async function guardToolCallImpl(
 			// resolved to the workspace's own root and read as the same repo.
 			const foreignRepo = hasUnresolvableVariable(invocation.repoDir)
 				|| (isPathOutsideWorkspace(invocation.repoDir, currentRoot) && !isSameGitRepo(invocation.repoDir, currentRoot));
-			if (foreignRepo && (GIT_WRITE_RE.test(normalizedInvocation) || /\bgit\s+push\b/.test(normalizedInvocation))) {
+			if (foreignRepo && isGitTreeWriteText(normalizedInvocation)) {
 				logPolicyBlock(`[workflow-guard] blocked git mutation on repository outside workspace: ${invocation.repoDir}`);
 				return block(
 					"boundary",

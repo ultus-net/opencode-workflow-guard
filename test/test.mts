@@ -4603,6 +4603,26 @@ check(
 	"a payload mutating with an unresolvable cwd fails closed",
 	blocked(payloadUnresolvableCwd) && String(payloadUnresolvableCwd).includes("cannot be determined"),
 );
+// An indeterminate launcher tree must not be assumed to be the workspace root.
+// `cd $DIR && node -e "writeFileSync('x')"` used to read as a workspace write
+// because the payload walk substituted the workspace root for the unknown one.
+const payloadIndeterminateLauncher = await call("bash", { command: `cd $WG_UNKNOWN_WT && node -e "require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a payload mutating under an indeterminate launcher tree fails closed",
+	blocked(payloadIndeterminateLauncher) && String(payloadIndeterminateLauncher).includes("cannot be determined"),
+);
+const payloadIndeterminateLauncherGit = await call("bash", { command: `cd $WG_UNKNOWN_WT && node -e "require('child_process').execSync('git commit -m x --allow-empty')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload git write under an indeterminate launcher tree fails closed", blocked(payloadIndeterminateLauncherGit));
+const payloadIndeterminateLauncherRead = await call("bash", { command: `cd $WG_UNKNOWN_WT && node -e "console.log(1)"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a read-only payload under an indeterminate launcher tree stays allowed", !blocked(payloadIndeterminateLauncherRead));
+// The spawn anchor must not read `regex.exec(str, {cwd})` as a spawned process.
+// Asserted in the linked worktree, where a write is allowed outright, so the
+// verdict cannot pass for the unrelated protected-branch reason.
+const payloadRegexExec = await call("bash", { command: `node -e "const r=/a/.exec('b',{cwd:'${foreignWtRepo}'}); require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check(
+	"a RegExp exec with a cwd key is not treated as a spawn working directory",
+	!blocked(payloadRegexExec) && !String(payloadRegexExec).includes(foreignWtRepo),
+);
 
 rmSync(join(wtLinked, "nested"), { recursive: true, force: true });
 rmSync(foreignWtRepo, { recursive: true, force: true });
