@@ -442,10 +442,9 @@ export function payloadWorkingRoot(payload: string): PayloadWorkingRoot {
 
 function payloadMutates(payload: string): boolean {
 	if (detectShellMutation(payload)) return true;
-	// Composition of the git write sets the rest of the policy already uses, so
-	// this cannot drift from them. `switch`, `checkout`, and `tag` are included
-	// because they move or create refs in the tree the payload runs against.
-	return GIT_WRITE_RE.test(payload) || GIT_BRANCH_CREATE_RE.test(payload) || /\bgit\s+(?:push|switch|checkout|tag)\b/.test(payload);
+	// Exactly the git write sets `isGitTreeWrite` uses for a shell segment, so a
+	// payload and a `cd`-ed segment reach the same verdict for the same command.
+	return GIT_WRITE_RE.test(payload) || GIT_BRANCH_CREATE_RE.test(payload) || /\bgit\s+push\b/.test(payload);
 }
 
 /**
