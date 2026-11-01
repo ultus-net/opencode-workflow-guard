@@ -409,27 +409,43 @@ function isGitTreeWrite(segment: string, baseDir: string): boolean {
 
 /**
  * The working directory an inline interpreter payload names for the commands it
- * runs, when it names one.
+ * runs.
  *
  * `execSync('git commit', {cwd: '<dir>'})` carries the tree directly instead of
- * changing directory first, so the payload walk alone cannot see it.
+ * changing directory first, so the payload walk alone cannot see it. The match
+ * is anchored to a spawn-family call or `process.chdir`, because a bare `cwd:`
+ * key in an unrelated object literal does not choose a working directory.
+ *
+ * A named directory that is not a literal (`{cwd: process.env.OTHER}`) is
+ * reported as indeterminate rather than ignored, matching the shell rule that
+ * an unresolvable destination fails closed for a mutation.
  */
-export function payloadWorkingRoot(payload: string): string | undefined {
-	const quoted = /["'`]([^"'`]*)["'`]/;
-	for (const pattern of [
-		/\bcwd\s*[:=]\s*(["'`][^"'`]*["'`])/i,
-		/\bchdir\s*\(\s*(["'`][^"'`]*["'`])\s*\)/i,
-	]) {
+export type PayloadWorkingRoot =
+	| { status: "none" }
+	| { status: "resolved"; root: string }
+	| { status: "indeterminate"; raw: string };
+
+const SPAWN_CALL_CWD = /\b(?:execSync|execFileSync|spawnSync|exec|execFile|spawn|fork)\s*\([^)]*?\bcwd\s*:\s*([^,)}]+)/;
+const PROCESS_CHDIR = /\bprocess\s*\.\s*chdir\s*\(\s*([^)]+?)\s*\)/;
+
+export function payloadWorkingRoot(payload: string): PayloadWorkingRoot {
+	for (const pattern of [SPAWN_CALL_CWD, PROCESS_CHDIR]) {
 		const match = pattern.exec(payload);
-		const value = match?.[1] ? quoted.exec(match[1])?.[1] : undefined;
-		if (value) return value;
+		const raw = match?.[1]?.trim();
+		if (!raw) continue;
+		const literal = /^(["'`])([^"'`]*)\1$/.exec(raw);
+		if (literal?.[2]) return { status: "resolved", root: literal[2] };
+		return { status: "indeterminate", raw };
 	}
-	return undefined;
+	return { status: "none" };
 }
 
 function payloadMutates(payload: string): boolean {
 	if (detectShellMutation(payload)) return true;
-	return /\bgit\s+(?:add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash|apply|am|restore|reset|update-ref|filter-branch|push|tag|branch|switch|checkout)\b/.test(payload);
+	// Composition of the git write sets the rest of the policy already uses, so
+	// this cannot drift from them. `switch`, `checkout`, and `tag` are included
+	// because they move or create refs in the tree the payload runs against.
+	return GIT_WRITE_RE.test(payload) || GIT_BRANCH_CREATE_RE.test(payload) || /\bgit\s+(?:push|switch|checkout|tag)\b/.test(payload);
 }
 
 /**
@@ -453,10 +469,13 @@ export function nestedPayloadMutationReason(
 		for (const payload of extractPayloads(segment)) {
 			const nested = foreignSegmentMutationReason(planShellSegments(payload, launcherRoot), workspaceRoot);
 			if (nested) return nested;
-			const declaredRoot = payloadWorkingRoot(payload);
-			if (declaredRoot === undefined) continue;
+			const declared = payloadWorkingRoot(payload);
+			if (declared.status === "none") continue;
 			if (writesIn(payload).length === 0 && !payloadMutates(payload)) continue;
-			const targetRoot = resolve(launcherRoot, declaredRoot);
+			if (declared.status === "indeterminate") {
+				return `Blocked: the inline interpreter script runs a mutating command in a working directory that cannot be determined without executing the script (${declared.raw}). Indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal directory inside the workspace.`;
+			}
+			const targetRoot = resolve(launcherRoot, declared.root);
 			if (!isPathOutsideWorkspace(targetRoot, workspaceRoot) || isSameGitRepo(targetRoot, workspaceRoot)) continue;
 			return `Blocked: the inline interpreter script runs a mutating command in '${targetRoot}', outside workspace root (${workspaceRoot}) and not a linked worktree of this repository. Relative targets there cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`;
 		}
@@ -495,12 +514,17 @@ export async function guardShellMutation(
 	// in a feature worktree as if it happened on the primary `main`.
 	const workspaceRoot = getWorkspaceRoot();
 	const root = shellRoot ?? workspaceRoot;
+	const plan = planShellSegments(command, root);
+	// The foreign-tree gate runs here too, so this function is safe when called
+	// on its own: an indeterminate or foreign `cd` is refused instead of silently
+	// falling back to judging relative targets against the wrong tree.
+	const foreignReason = foreignSegmentMutationReason(plan, workspaceRoot);
+	if (foreignReason) return foreignReason;
 	let hasMutation = false;
-	for (const { segment, root: segmentRoot } of planShellSegments(command, root)) {
+	for (const { segment, root: segmentRoot } of plan) {
 		// `cd` earlier in the command moves this segment, so its relative targets
-		// resolve against the tree it actually changes. An indeterminate `cd`
-		// falls back to the shell root; the foreign-tree gate refuses that shape
-		// before this runs.
+		// resolve against the tree it actually changes. An indeterminate `cd` was
+		// already refused above.
 		const runRoot = segmentRoot ?? root;
 		// Both trees are this workspace: the checkout the command runs in and the
 		// session's own checkout. Absolute paths into either are legitimate, so a

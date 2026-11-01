@@ -511,18 +511,59 @@ function cwdChangeIn(segment: string): { word: string; target?: string } | undef
 }
 
 /**
+ * Unquoted parenthesis counts in a segment.
+ *
+ * `splitShellSegments` splits on `&&`/`;`/`|` but not on grouping, so a
+ * subshell arrives as segments that still carry its parens. A `cd` inside one
+ * must not move the directory of the segments after the subshell closes.
+ */
+function groupParensIn(segment: string): { opens: number; closes: number } {
+	let opens = 0;
+	let closes = 0;
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (const char of segment) {
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			if (!quote) quote = char;
+			else if (quote === char) quote = undefined;
+			continue;
+		}
+		if (quote) continue;
+		if (char === "(") opens += 1;
+		else if (char === ")") closes += 1;
+	}
+	return { opens, closes };
+}
+
+/**
  * Walk a multi-segment command and resolve the directory each segment runs in.
  *
  * Later segments run in the directory an earlier `cd`/`pushd` selected, and a
  * wrapper `-C`/`-D` moves only its own command. Judging every segment against
  * the shell's initial `workdir` let `cd <other-tree> && git commit` be checked
  * as if it happened in the session's own checkout.
+ *
+ * A `cd` inside a grouping subshell is scoped to it, so the segments after the
+ * closing paren keep the outer directory. Without that, `( cd /other && ls )
+ * && rm -rf dist` would read the removal as happening in `/other`.
  */
 export function planShellSegments(command: string, baseDir: string | undefined): ShellSegmentPlan[] {
 	const plan: ShellSegmentPlan[] = [];
 	let cwd = baseDir;
 	const dirStack: Array<string | undefined> = [];
+	// One saved outer directory per open grouping paren.
+	const groupStack: Array<string | undefined> = [];
 	for (const segment of splitShellSegments(command)) {
+		const { opens, closes } = groupParensIn(segment);
+		for (let i = 0; i < opens; i += 1) groupStack.push(cwd);
 		const wrapperCwd = shellWrapperCwd(segment);
 		let root = cwd;
 		if (wrapperCwd !== undefined) {
@@ -531,14 +572,18 @@ export function planShellSegments(command: string, baseDir: string | undefined):
 		}
 		plan.push({ segment, root });
 		const change = cwdChangeIn(segment);
-		if (!change) continue;
-		if (change.word === "popd") {
-			cwd = dirStack.pop();
-			continue;
+		if (change) {
+			if (change.word === "popd") {
+				cwd = dirStack.pop();
+			} else {
+				if (change.word === "pushd") dirStack.push(cwd);
+				const expanded = change.target === undefined ? undefined : expandCwdTarget(change.target);
+				cwd = cwd === undefined || expanded === undefined ? undefined : resolve(cwd, expanded);
+			}
 		}
-		if (change.word === "pushd") dirStack.push(cwd);
-		const expanded = change.target === undefined ? undefined : expandCwdTarget(change.target);
-		cwd = cwd === undefined || expanded === undefined ? undefined : resolve(cwd, expanded);
+		for (let i = 0; i < closes; i += 1) {
+			cwd = groupStack.length > 0 ? groupStack.pop() : cwd;
+		}
 	}
 	return plan;
 }

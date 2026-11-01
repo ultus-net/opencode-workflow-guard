@@ -4580,6 +4580,30 @@ check("a nested interpreter command in the workspace stays allowed", !blocked(ne
 const nestedLinked = await call("bash", { command: `bash -c 'cd ${wtLinked} && git commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
 check("a nested payload cd into a linked worktree is not blocked as foreign", !blocked(nestedLinked));
 
+// A `cd` inside a grouping subshell is scoped to it. Treating it as moving the
+// outer shell made a later workspace mutation read as happening in the foreign
+// tree the subshell visited.
+const subshellCdThenWorkspaceWrite = await call("bash", { command: `( cd ${foreignWtRepo} && ls ) && echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a cd inside a grouping subshell does not move the tree of later segments",
+	!String(subshellCdThenWorkspaceWrite).includes(foreignWtRepo) && !String(subshellCdThenWorkspaceWrite).includes("outside workspace root"),
+);
+const subshellCdThenWorkspaceCommit = await call("bash", { command: `( cd ${foreignWtRepo} && ls ) && git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a subshell cd does not foreign-flag a later commit in the workspace", !String(subshellCdThenWorkspaceCommit).includes(foreignWtRepo));
+// The payload's declared root is only a working directory when a spawn-family
+// call or `process.chdir` names it. An unrelated `{cwd: ...}` key is not one.
+const payloadObjectKey = await call("bash", { command: `node -e "const o={cwd:'${foreignWtRepo}'}; require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an unrelated object cwd key does not foreign-flag a payload write", !String(payloadObjectKey).includes(foreignWtRepo));
+const payloadUnrelatedChdir = await call("bash", { command: `node -e "foo.chdir('${foreignWtRepo}'); require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("chdir on an unrelated object does not foreign-flag a payload write", !String(payloadUnrelatedChdir).includes(foreignWtRepo));
+const payloadProcessChdir = await call("bash", { command: `node -e "process.chdir('${foreignWtRepo}'); require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("process.chdir into a foreign directory before a write is blocked", blocked(payloadProcessChdir) && String(payloadProcessChdir).includes(foreignWtRepo));
+const payloadUnresolvableCwd = await call("bash", { command: "node -e \"require('child_process').execSync('git commit -m x --allow-empty', {cwd: process.env.WG_OTHER});\"" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a payload mutating with an unresolvable cwd fails closed",
+	blocked(payloadUnresolvableCwd) && String(payloadUnresolvableCwd).includes("cannot be determined"),
+);
+
 rmSync(join(wtLinked, "nested"), { recursive: true, force: true });
 rmSync(foreignWtRepo, { recursive: true, force: true });
 spawnSync("git", ["worktree", "remove", "--force", wtLinked], { cwd: wtRepo });
