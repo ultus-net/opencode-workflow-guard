@@ -832,12 +832,13 @@ async function handleV2Event(
 		return;
 	}
 
-	if (event.type === "session.updated" || event.type === "session.next.moved") {
+	if (event.type === "session.updated" || event.type === "session.moved") {
 		// `session_move` relocates a session between checkouts, and the host
-		// announces it. `session.next.moved` carries the destination location
-		// directly and is itself the move signal; `session.updated` carries the
-		// full session record, whose `directory` is the authoritative post-move
-		// path. Without this rebind the session kept judging the tree it left.
+		// announces it. `session.moved` carries `data.sessionID` and the
+		// destination `data.location.directory`, and is itself the move signal.
+		// `session.updated` carries the full session record, whose `directory`
+		// is the authoritative post-move path. Without this rebind the session
+		// kept judging the tree it left.
 		const data = event.data as {
 			sessionID?: unknown;
 			info?: { id?: unknown; directory?: unknown };
@@ -845,7 +846,7 @@ async function handleV2Event(
 		} | undefined;
 		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : typeof data?.info?.id === "string" ? data.info.id : undefined;
 		const directory = typeof data?.location?.directory === "string" ? data.location.directory : typeof data?.info?.directory === "string" ? data.info.directory : undefined;
-		rebindSessionWorkspaceFromHost(sessionID, directory, { moved: event.type === "session.next.moved" });
+		rebindSessionWorkspaceFromHost(sessionID, directory, { moved: event.type === "session.moved" });
 		return;
 	}
 

@@ -274,7 +274,7 @@ function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: s
  * Three signals therefore count, and nothing else does:
  *
  * - The host announced the relocation itself (`moved: true`, from
- *   `session.next.moved`).
+ *   `session.moved`).
  * - The directory the host names now differs from the one it named last for
  *   this session.
  * - The named repository is a DIFFERENT repository from the bound workspace. A
