@@ -1,7 +1,7 @@
 import { tool } from "@opencode-ai/plugin";
 import { spawnSync } from "node:child_process";
 import { resolve } from "node:path";
-import type { AuditEntry, LearningEvidenceKind } from "./types.ts";
+import type { AuditEntry, DogfoodCheck, DogfoodResult, LearningEvidenceKind } from "./types.ts";
 import type { ProjectMemoryStore } from "./project-memory.ts";
 import {
 	exportProjectKnowledge,
@@ -13,22 +13,26 @@ import {
 	searchProjectMemory,
 } from "./project-memory.ts";
 import { loadLearnerProfile, recordLearningEvidence, selectLearningOpportunity, updateLearnerProfile } from "./learning.ts";
-import { isEvidenceFresh, reviewEvidence, verificationEvidence } from "./evidence.ts";
+import { isEvidenceFresh, dogfoodEvidence, reviewEvidence, verificationEvidence } from "./evidence.ts";
 import {
 	getLearningInterventionBudget,
 	getOperationProfile,
 	getProjectConfig,
 	getRalphMaxIterations,
+	getLastDogfoodResultForWorkspace,
+	getDogfoodDeployMatrix,
 	getLastReviewResultForWorkspace,
 	getLastVerifyResultForWorkspace,
 	getWorkspaceMutationCount,
 	getWorkspaceMutationTimestamp,
 	getWorkspaceRoot,
+	isDogfoodActor,
 	isDocumentationRequired,
 	isRecoveryCheckpointsEnabled,
 	isRalphModeEnabled,
 	isReviewRequired,
 	isSubagentReviewRequired,
+	recordDogfoodResult,
 	recordMutation,
 	recordReviewResult,
 	resolveEffectiveWorkspace,
@@ -39,6 +43,7 @@ import { getRalphOutcome } from "../policies/continuation.ts";
 import { todoEvidenceReport } from "../policies/todo.ts";
 import { findGitRoot, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint } from "./verify.ts";
+import { evaluateDogfoodGate } from "./dogfood.ts";
 import { buildReviewRubric } from "./review.ts";
 import { createGitWorktree, cleanupGitWorktree, validateHostWorktreeDirectory } from "./worktree.ts";
 import type { HostWorktreePort } from "./host-worktree.ts";
@@ -73,6 +78,12 @@ export function buildWorkflowGuardSystemGuidance(options: {
 	projectMemoryEnabled?: boolean;
 	learningEnabled?: boolean;
 	recoveryCheckpointsEnabled?: boolean;
+	/**
+	 * Whether this repository's PR preflight also requires dogfood evidence.
+	 * Reported only when the gate is enabled, so an unopted repository never
+	 * advertises a requirement it does not have.
+	 */
+	dogfoodRequired?: boolean;
 	isReadOnly?: boolean;
 }): string {
 	const sections: string[] = [
@@ -103,6 +114,12 @@ export function buildWorkflowGuardSystemGuidance(options: {
 	if (options.learningEnabled) {
 		sections.push(
 			"- Socratic Learning: When facing non-trivial architectural trade-offs, design choices, or debugging breakthroughs, call `learning_checkpoint`. If selected (intervene: true), ask one concise question via `question` before proceeding, and capture observed understanding with `learning_record`.",
+		);
+	}
+
+	if (options.dogfoodRequired && !options.isReadOnly) {
+		sections.push(
+			"- Dogfood Gate: This repository requires a recorded end-to-end run on real hardware before a PR opens. Run the repository's dogfood runner for the change, then record the observed checks with `record_dogfood`. Commit first: the evidence binds to the commit and tracked worktree content, so a later tracked edit or commit makes it stale.",
 		);
 	}
 
@@ -272,9 +289,16 @@ export function createCustomTools(options: {
 				// while any tracked edit or new commit does.
 				const reviewFresh = Boolean(lastR && reviewEvidenceRecord && lastR.passed && isEvidenceFresh(reviewEvidenceRecord, { ...subject, worktreeFingerprint: getTrackedWorktreeFingerprint(root), sessionID: lastR.targetSessionID }, 0));
 				const documentationRequired = isDocumentationRequired(root);
+				// Dogfood is evaluated through the same helper the PR preflight
+				// uses, so the two can never disagree about the gate.
+				const dogfoodGate = evaluateDogfoodGate(root);
+				const lastD = dogfoodGate.matched ?? getLastDogfoodResultForWorkspace(root);
+				const lastDogfoodEvidence = lastD ? dogfoodEvidence(lastD) : undefined;
+				const dogfoodFresh = Boolean(dogfoodGate.required && dogfoodGate.missingHosts.length === 0);
 				const outstandingRequirements = [
 					...(verifyCommand && !verifyFresh ? ["verification"] : []),
 					...(reviewRequired && !reviewFresh ? ["review"] : []),
+					...(dogfoodGate.required && !dogfoodFresh ? ["dogfood"] : []),
 					...(documentationRequired && !branchHasDocumentationChange(root) ? ["documentation"] : []),
 				];
 				const recommendedActions: string[] = [];
@@ -283,6 +307,9 @@ export function createCustomTools(options: {
 				}
 				if (outstandingRequirements.includes("review")) {
 					recommendedActions.push("Call guard_review_rubric to retrieve the 5-axis review rubric, then spawn a secondary reviewer subagent via task to evaluate changes and record verdict with record_review.");
+				}
+				if (outstandingRequirements.includes("dogfood")) {
+					recommendedActions.push(`Run the repository's dogfood runner for this change, then record the result with record_dogfood.${dogfoodGate.missingHosts.length > 0 ? ` Hosts still missing a passing run: ${dogfoodGate.missingHosts.join(", ")}.` : ""}`);
 				}
 				if (outstandingRequirements.includes("documentation")) {
 					recommendedActions.push("Update documentation files (e.g. README.md, docs/) to satisfy the documentation gate before opening a PR.");
@@ -297,7 +324,7 @@ export function createCustomTools(options: {
 				}
 				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
 				const taskEvidence = await runWithRuntimeState(root, client, () => todoEvidenceReport(toolContext.sessionID));
-				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, qualifiedHostVersion: qualifiedHostVersion() ?? null, hostVersion: hostVersion?.() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, todoCapability: todoCapability ? todoCapability() : "available", taskEvidence, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
+				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, qualifiedHostVersion: qualifiedHostVersion() ?? null, hostVersion: hostVersion?.() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, todoCapability: todoCapability ? todoCapability() : "available", taskEvidence, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id } : null, lastDogfood: lastD && lastDogfoodEvidence ? { scenarioId: lastD.scenarioId, verdict: lastD.verdict, host: lastD.host.label, taxonomyClass: lastD.taxonomyClass ?? null, runCount: lastD.runCount, fresh: dogfoodGate.required ? dogfoodFresh : null, evidenceId: lastDogfoodEvidence.id, missingHosts: dogfoodGate.missingHosts, coveredHosts: (dogfoodGate.matchedRecords ?? []).map((record) => record.host.label) } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), requireDogfood: dogfoodGate.required, dogfoodDeployMatrix: dogfoodGate.required ? getDogfoodDeployMatrix(root) : [], recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),
@@ -369,6 +396,130 @@ export function createCustomTools(options: {
 				return args.passed
 					? `[workflow-guard] Review recorded as APPROVED by ${args.reviewer}. ${boundTo} ${recorderNote}`
 					: `[workflow-guard] Review recorded as CHANGES REQUESTED by ${args.reviewer}. ${boundTo} ${recorderNote}`;
+			},
+		}),
+		record_dogfood: tool({
+			description: "Record the verdict of a dogfood run: a change exercised end to end on real hardware before deployment. The runner produces the checks and the transcript; this tool binds the result to the repository content it ran against. A HOLD records the taxonomy class so the failure is diagnosable. Actor sessions spawned by the runner cannot record their own verdict.",
+			args: {
+				scenarioId: tool.schema.string().describe("Scenario identifier the actor ran, for example 'permission-rule-reorder'"),
+				scenarioSha256: tool.schema.string().describe("SHA-256 of the scenario file the actor ran, so the evidence names the frozen input"),
+				taxonomySha256: tool.schema.string().describe("SHA-256 of the frozen taxonomy file the judge classified against"),
+				verdict: tool.schema.string().describe("'pass' when every deterministic check passed, otherwise 'hold'"),
+				checks: tool.schema.string().describe("JSON array of check rows: [{id, status: 'pass'|'hold'|'skip', expected, observed, detail}]"),
+				hostLabel: tool.schema.string().describe("Stable host label the deploy matrix is written against, for example 'bluefin'"),
+				taxonomyClass: tool.schema.string().optional().describe("Taxonomy class naming why a HOLD happened; omit on a pass"),
+				runCount: tool.schema.number().optional().describe("Number of runs behind this verdict (default 1); single runs are flaky"),
+				hostOs: tool.schema.string().optional().describe("Host OS reported by the run"),
+				hostArch: tool.schema.string().optional().describe("Host architecture reported by the run"),
+				opencodeVersion: tool.schema.string().optional().describe("OpenCode version the actor session ran under"),
+				actorModel: tool.schema.string().optional().describe("Model pin used for the actor session"),
+				judgeModel: tool.schema.string().optional().describe("Model pin used for the judge session"),
+				stagedTreeHash: tool.schema.string().optional().describe("Hash of the staged harness tree the actor exercised"),
+				directory: tool.schema.string().optional().describe("Repository directory the run covered. Pass it explicitly when the recorder session has no workspace binding."),
+			},
+			execute: async (args, toolContext) => {
+				const auditVerdict = (verdict: "pass" | "hold" | "rejected", reason: string, binding?: NonNullable<AuditEntry["evidence"]>["binding"]) => audit({ ts: new Date().toISOString(), sessionID: toolContext.sessionID, tool: "record_dogfood.verdict", decision: verdict === "rejected" ? "block" : "allow", phase: "event", reason, evidence: { dogfoodVerdict: verdict, ...(binding ? { binding } : {}) } });
+				// The tested session cannot certify itself. The marker is set by
+				// the runner on the actor it spawns, so this is a refusal, not an
+				// absence: the plugin is present and enforcing in that session.
+				if (isDogfoodActor()) {
+					auditVerdict("rejected", "dogfood_actor_self_certification", { recorderSessionID: toolContext?.sessionID });
+					return `[workflow-guard] Dogfood record rejected: this session is a dogfood actor (WORKFLOW_GUARD_DOGFOOD_ACTOR/DEPTH is set), and the tested session cannot certify itself. The parent runner session records the verdict from the checks it observed.`;
+				}
+				const verdict = args.verdict.trim().toLowerCase();
+				if (verdict !== "pass" && verdict !== "hold") {
+					auditVerdict("rejected", "invalid_dogfood_verdict");
+					return "[workflow-guard] Dogfood record rejected: verdict must be 'pass' or 'hold'.";
+				}
+				// Empty identifiers would make the record unattributable: a scenario
+				// id names the frozen input, and a host label is what the deploy
+				// matrix is written against.
+				if (!args.scenarioId.trim() || !args.hostLabel.trim()) {
+					auditVerdict("rejected", "dogfood_missing_identity");
+					return "[workflow-guard] Dogfood record rejected: scenarioId and hostLabel must both be non-empty, because they identify the frozen input and the host the deploy matrix names.";
+				}
+				let checks: DogfoodCheck[];
+				try {
+					const parsed = JSON.parse(args.checks);
+					if (!Array.isArray(parsed)) throw new Error("not-array");
+					checks = parsed;
+				} catch {
+					auditVerdict("rejected", "invalid_dogfood_checks");
+					return "[workflow-guard] Dogfood record rejected: checks must be a JSON array of {id, status, expected, observed, detail} rows.";
+				}
+				const invalidCheck = checks.find((check) => !check || typeof check.id !== "string" || !["pass", "hold", "skip"].includes(check.status));
+				if (invalidCheck) {
+					auditVerdict("rejected", "invalid_dogfood_check_row");
+					return "[workflow-guard] Dogfood record rejected: every check row needs a string 'id' and a 'status' of pass, hold, or skip.";
+				}
+				// A record with no checks is a claim, not an observation. Without
+				// this, an empty array would slip past the per-row checks below
+				// because `[].some(...)` is false, and a pass would mean nothing.
+				if (checks.length === 0) {
+					auditVerdict("rejected", "dogfood_without_checks");
+					return "[workflow-guard] Dogfood record rejected: at least one check row is required. A verdict with no observed checks carries no information about the run.";
+				}
+				// A pass is only credible when every check actually ran. A skipped
+				// check is a HOLD by the design's own rule, so accepting it here
+				// would let the gate pass by omission.
+				if (verdict === "pass" && checks.some((check) => check.status !== "pass")) {
+					auditVerdict("rejected", "dogfood_pass_with_nonpassing_check");
+					return "[workflow-guard] Dogfood record rejected: a 'pass' verdict requires every check to be 'pass'. A skipped or held check is a HOLD.";
+				}
+				if (verdict === "hold" && !args.taxonomyClass) {
+					auditVerdict("rejected", "dogfood_hold_without_taxonomy_class");
+					return "[workflow-guard] Dogfood record rejected: a HOLD must name its taxonomy class so the failure is diagnosable.";
+				}
+				const hostProvidesWorkspace = Boolean(toolContext?.worktree);
+				const sessionBinding = await resolveSessionBoundWorkspace(toolContext?.sessionID);
+				if (!args.directory && !sessionBinding && !hostProvidesWorkspace) {
+					auditVerdict("rejected", "dogfood_binding_unresolved", { recorderSessionID: toolContext?.sessionID });
+					return "[workflow-guard] Dogfood record rejected: the run's workspace could not be resolved from this call (no explicit 'directory', no session workspace binding, no per-call worktree). Call record_dogfood with 'directory' set to the repository the run exercised.";
+				}
+				const dogfoodWorkspace = await resolveCallWorkspace(toolContext, args.directory);
+				const bindingFingerprint = getTrackedWorktreeFingerprint(dogfoodWorkspace);
+				if (!bindingFingerprint) {
+					auditVerdict("rejected", "dogfood_workspace_unbindingable", { workspace: dogfoodWorkspace, recorderSessionID: toolContext.sessionID });
+					return `[workflow-guard] Dogfood record rejected: the verdict cannot be bound because no tracked-content fingerprint is available for '${dogfoodWorkspace}' (not a git repository, or git is unavailable). The verdict was NOT recorded. Call record_dogfood with 'directory' set to the run's worktree, or run it from a session rooted there.`;
+				}
+				const parentSessionID = await runWithRuntimeState(effectiveRoot, client, () => fetchParentSessionID(toolContext.sessionID));
+				const bindingCommitHash = getCurrentGitCommitHash(dogfoodWorkspace);
+				const binding = {
+					workspace: dogfoodWorkspace,
+					commitHash: bindingCommitHash,
+					worktreeFingerprint: bindingFingerprint.slice(0, 16),
+					recorderSessionID: toolContext.sessionID,
+					recorderRole: parentSessionID ? ("subagent" as const) : ("root" as const),
+					targetSessionID: parentSessionID ?? toolContext.sessionID,
+				};
+				const recorded = recordDogfoodResult({
+					verdict: verdict as DogfoodResult["verdict"],
+					scenarioId: args.scenarioId,
+					scenarioSha256: args.scenarioSha256,
+					taxonomySha256: args.taxonomySha256,
+					taxonomyClass: args.taxonomyClass,
+					checks,
+					runCount: typeof args.runCount === "number" && Number.isFinite(args.runCount) && args.runCount >= 1 ? Math.floor(args.runCount) : 1,
+					host: {
+						label: args.hostLabel,
+						os: args.hostOs,
+						arch: args.hostArch,
+						opencodeVersion: args.opencodeVersion,
+						actorModel: args.actorModel,
+						judgeModel: args.judgeModel,
+						stagedTreeHash: args.stagedTreeHash,
+					},
+					workspace: dogfoodWorkspace,
+				}, parentSessionID ?? toolContext.sessionID);
+				auditVerdict(recorded.verdict, recorded.verdict === "pass" ? "dogfood_passed" : "dogfood_held", binding);
+				const boundTo = `Bound to ${dogfoodWorkspace} (commit ${bindingCommitHash?.slice(0, 12) ?? "unversioned"}, tracked fingerprint ${bindingFingerprint.slice(0, 12)}).`;
+				const recordedNote = parentSessionID
+					? `Recorded for parent session ${parentSessionID}.`
+					: `Recorded by root session ${toolContext.sessionID}.`;
+				const passedChecks = checks.filter((check) => check.status === "pass").length;
+				return recorded.verdict === "pass"
+					? `[workflow-guard] Dogfood recorded as PASS for scenario '${recorded.scenarioId}' on host '${recorded.host.label}' (${passedChecks}/${checks.length} checks passed, ${recorded.runCount} run(s)). ${boundTo} ${recordedNote}`
+					: `[workflow-guard] Dogfood recorded as HOLD for scenario '${recorded.scenarioId}' on host '${recorded.host.label}' with class '${recorded.taxonomyClass}'. A HOLD is not durable evidence: fix the finding and re-run. ${boundTo} ${recordedNote}`;
 			},
 		}),
 		guard_review_followups: tool({ description: "List durable local P2/P3 review follow-ups (technical debt) for this project. Proactively check during planning or before final verification to address open findings.", args: {}, execute: async () => JSON.stringify(followupStore ? listReviewFollowups(followupStore) : [], null, 2) }),

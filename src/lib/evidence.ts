@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { ToolOutcome } from "./tool-outcomes.ts";
-import type { EvidenceRecord, EvidenceSubject, PolicyDecision, ReviewResult, VerifyResult } from "./types.ts";
+import type { DogfoodResult, EvidenceRecord, EvidenceSubject, PolicyDecision, ReviewResult, VerifyResult } from "./types.ts";
 import { isSameGitRepo } from "./project-config.ts";
 
 function evidenceId(kind: EvidenceRecord["kind"], observedAt: number, subject: EvidenceRecord["subject"], source: Record<string, unknown>): string {
@@ -17,6 +17,24 @@ export function reviewEvidence(result: ReviewResult): EvidenceRecord {
 	const subject = { workspace: result.workspace, commitHash: result.commitHash, worktreeFingerprint: result.worktreeFingerprint, sessionID: result.targetSessionID, actor: result.reviewer };
 	const source = { reviewer: result.reviewer, passed: result.passed, summary: result.summary, gitStatus: result.gitStatus };
 	return { id: evidenceId("review", result.timestamp, subject, source), kind: "review", confidence: "attestation", observedAt: result.timestamp, subject, source };
+}
+
+export function dogfoodEvidence(result: DogfoodResult): EvidenceRecord {
+	const subject = { workspace: result.workspace, commitHash: result.commitHash, worktreeFingerprint: result.worktreeFingerprint, sessionID: result.sessionID, actor: result.host.label };
+	// The digest pair is part of the source, so replaying a passing run onto a
+	// different scenario or taxonomy changes the evidence id.
+	const source = {
+		verdict: result.verdict,
+		scenarioId: result.scenarioId,
+		scenarioSha256: result.scenarioSha256,
+		taxonomySha256: result.taxonomySha256,
+		taxonomyClass: result.taxonomyClass,
+		checks: result.checks,
+		runCount: result.runCount,
+		host: result.host,
+		gitStatus: result.gitStatus,
+	};
+	return { id: evidenceId("dogfood", result.timestamp, subject, source), kind: "dogfood", confidence: "attestation", observedAt: result.timestamp, subject, source };
 }
 
 export function toolOutcomeEvidence(outcome: ToolOutcome, observedAt: number, workspace?: string): EvidenceRecord {
