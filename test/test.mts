@@ -4684,6 +4684,23 @@ const conditionalNoCd = await call("bash", { command: `if [ -d .git ]; then echo
 check("a conditional body with no cd keeps the tree of later segments", !blocked(conditionalNoCd));
 const caseArmParen = await call("bash", { command: `( case x in x) cd ${foreignWtRepo} ;; esac ; mkdir -p mk )` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
 check("a case pattern paren is not read as a grouping close", blocked(caseArmParen));
+// A `case` that follows a body opener (`then`, `else`, `do`, `elif`) still opens
+// an arm. Only a leading `case` was recognised, so the arm's `cd` went unseen and
+// the `esac` popped the enclosing frame instead.
+for (const [label, command] of [
+	["then", `if true; then case x in x) cd ${foreignWtRepo};; esac; fi; rm -rf out.txt`],
+	["else", `if true; then :; else case x in x) cd ${foreignWtRepo};; esac; fi; rm -rf out.txt`],
+	["elif", `if a; then :; elif b; then case x in x) cd ${foreignWtRepo};; esac; fi; rm -rf out.txt`],
+	["do", `for i in 1; do case x in x) cd ${foreignWtRepo};; esac; done; rm -rf out.txt`],
+] as const) {
+	const nestedCase = await call("bash", { command }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+	check(`a case arm after '${label}' cannot hide its cd`, blocked(nestedCase));
+}
+// A case arm inside a grouping subshell is scoped like any other subshell cd, so
+// its pattern paren must not consume the subshell's own closing paren.
+const caseInSubshell = await call("bash", { command: `( case x in x) cd ${foreignWtRepo} ;; esac ) ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a case arm inside a grouping subshell stays scoped to it", !blocked(caseInSubshell));
+
 
 // `~user` never means a literal `~user` directory. Reading it as a relative
 // path put the walk inside the workspace while the shell reached that home.

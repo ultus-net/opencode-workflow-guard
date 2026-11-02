@@ -536,18 +536,21 @@ function cwdChangeIn(segment: string, insideCase = false): { word: string; targe
 		// `case x in a) cd /other;; esac` arrives as `a) cd /other`, and
 		// `unwrapShellWords` has already stripped the pattern's closing paren.
 		// The pattern word runs nothing, so the command after it is the body.
-		while (i < words.length && !CWD_WORDS.has(words[i]!) && !TRANSPARENT_PREFIX.has(words[i]!)) i += 1;
-	}
-	// `case x in a) cd /other;; esac` runs the `cd` in the current shell. The
-	// pattern is one word after `in`, and the command follows it.
-	if (words[0] === "case") {
-		const inIndex = words.indexOf("in");
-		i = inIndex >= 0 ? inIndex + 2 : words.length;
+		while (i < words.length && !CWD_WORDS.has(words[i]!) && !TRANSPARENT_PREFIX.has(words[i]!) && words[i] !== "case") i += 1;
 	}
 	while (i < words.length) {
 		const word = words[i]!;
 		if (TRANSPARENT_PREFIX.has(word)) {
 			i += 1;
+			continue;
+		}
+		// `case` opens an arm wherever it appears, including after `then`, `do`,
+		// or `else`: the pattern is one word after `in`, and the body follows the
+		// pattern. Treating only a leading `case` as an arm hid `then case x in x)
+		// cd <other>`, so the `cd` was never seen.
+		if (word === "case") {
+			const inIndex = words.indexOf("in", i);
+			i = inIndex >= 0 ? inIndex + 2 : words.length;
 			continue;
 		}
 		if (CWD_WORDS.has(word)) break;
@@ -598,28 +601,56 @@ function cwdChangeIn(segment: string, insideCase = false): { word: string; targe
  * not counted while a case construct is open.
  */
 function groupParensIn(segment: string, insideCase = false): { opens: number; closes: number } {
-	let opens = 0;
-	let closes = 0;
+	// Which characters sit outside quotes, so a `)` inside a string is never a
+	// group or pattern terminator.
+	const unquoted: boolean[] = [];
 	let quote: "'" | '"' | undefined;
 	let escaped = false;
-	for (const char of segment) {
-		if (escaped) {
-			escaped = false;
-			continue;
-		}
-		if (char === "\\" && quote !== "'") {
-			escaped = true;
-			continue;
-		}
-		if (char === "'" || char === '"') {
+	for (let i = 0; i < segment.length; i += 1) {
+		const char = segment[i]!;
+		let bare = false;
+		if (escaped) escaped = false;
+		else if (char === "\\" && quote !== "'") escaped = true;
+		else if (char === "'" || char === '"') {
 			if (!quote) quote = char;
 			else if (quote === char) quote = undefined;
-			continue;
+		} else if (!quote) bare = true;
+		unquoted.push(bare);
+	}
+	// A `case` arm pattern ends with `)`, which closes no group. An arm can open
+	// in this segment (`case x in x) …`) or arrive already open (`x) …`), so both
+	// forms are recognised. Missing the in-segment form let a pattern's paren pop
+	// a subshell frame, which then swallowed the real closing paren.
+	const patternCloses = new Set<number>();
+	const spelled = unquoted.map((bare, i) => (bare ? segment[i]! : " ")).join("");
+	if (/[^\s]/.test(spelled)) {
+		for (const head of spelled.matchAll(/\bcase\b[^;|&]*?\bin\b/g)) {
+			let from = (head.index ?? 0) + head[0].length;
+			while (from < spelled.length) {
+				const close = spelled.indexOf(")", from);
+				if (close < 0) break;
+				patternCloses.add(close);
+				const nextArm = spelled.indexOf(";;", close);
+				if (nextArm < 0) break;
+				from = nextArm + 2;
+			}
 		}
-		if (quote) continue;
+	}
+	let opens = 0;
+	let closes = 0;
+	// At segment start, `esac )` carries a real group close, not an arm pattern.
+	// Reading it as a pattern left the surrounding subshell open, so the segment
+	// after it inherited the arm's directory instead of the outer one.
+	const startsAtClose = /^\s*(?:esac|fi|done)\b/.test(segment);
+	for (let i = 0; i < segment.length; i += 1) {
+		if (!unquoted[i]) continue;
+		const char = segment[i]!;
 		if (char === "(") opens += 1;
 		else if (char === ")") {
-			if (insideCase && closes + 1 > opens) continue;
+			if (patternCloses.has(i)) continue;
+			// An arm pattern that was already open when this segment began ends
+			// here. It closes no group.
+			if (insideCase && !startsAtClose && closes + 1 > opens) continue;
 			closes += 1;
 		}
 	}
@@ -637,6 +668,12 @@ function constructKeywordIn(segment: string): "open" | "close" | "case-open" | "
 	let i = 0;
 	// Wrappers and negation can precede the keyword: `time if …`, `! case …`.
 	while (i < words.length && (words[i] === "builtin" || words[i] === "command" || words[i] === "time" || words[i] === "!")) i += 1;
+	// A body opener can precede a nested construct: `then case …`, `do case …`.
+	// Without this the nested `case` opened no frame, so its `esac` popped the
+	// enclosing `if`/`for` frame instead and the arm's `cd` was never recorded.
+	// `if`/`while`/`until`/`for` stay out of this list, because they are the
+	// openers this function reports.
+	while (i < words.length && (words[i] === "then" || words[i] === "else" || words[i] === "do" || words[i] === "elif")) i += 1;
 	const word = words[i];
 	if (word === "if" || word === "while" || word === "until" || word === "for") return "open";
 	if (word === "case") return "case-open";
