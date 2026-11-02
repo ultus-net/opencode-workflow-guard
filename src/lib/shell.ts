@@ -1,5 +1,5 @@
 import { homedir, userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -482,14 +482,18 @@ function expandCwdTarget(target: string): string | undefined {
 	if (target.startsWith("~/")) return join(home, target.slice(2));
 	// `cd ~user` resolves to that user's home, never to a literal `~user`
 	// directory. Reading it as a relative path put a `cd ~csh` walk inside the
-	// workspace while the shell reached the real home.
+	// workspace while the shell reached the real home. Any other home base is
+	// unknown to this walk, so it stays indeterminate rather than naming a
+	// directory that does not exist.
 	const named = /^~([^/\s]+)(?:\/|$)/.exec(target);
 	if (named) {
 		try {
-			return named[1] === userInfo().username ? home : join("/home", named[1]!);
+			if (named[1] === userInfo().username) return home;
 		} catch {
 			return undefined;
 		}
+		const parent = dirname(home);
+		return parent && named[1] ? join(parent, named[1]) : undefined;
 	}
 	if (/^\$(?:HOME|\{HOME\})(?:$|[/\\])/.test(target)) {
 		return target.replace(/^\$(?:HOME|\{HOME\})/, home);
@@ -525,9 +529,15 @@ function pushdRotation(operand: string): boolean {
 	return /^[+-]\d+$/.test(operand) || operand === "-n" || /^-n./.test(operand);
 }
 
-function cwdChangeIn(segment: string): { word: string; target?: string; unmodeled?: boolean } | undefined {
+function cwdChangeIn(segment: string, insideCase = false): { word: string; target?: string; unmodeled?: boolean } | undefined {
 	const words = unwrapShellWords(segment);
 	let i = 0;
+	if (insideCase) {
+		// `case x in a) cd /other;; esac` arrives as `a) cd /other`, and
+		// `unwrapShellWords` has already stripped the pattern's closing paren.
+		// The pattern word runs nothing, so the command after it is the body.
+		while (i < words.length && !CWD_WORDS.has(words[i]!) && !TRANSPARENT_PREFIX.has(words[i]!)) i += 1;
+	}
 	// `case x in a) cd /other;; esac` runs the `cd` in the current shell. The
 	// pattern is one word after `in`, and the command follows it.
 	if (words[0] === "case") {
@@ -550,7 +560,11 @@ function cwdChangeIn(segment: string): { word: string; target?: string; unmodele
 	}
 	const word = words[i];
 	if (!word || !CWD_WORDS.has(word)) return undefined;
-	if (word === "popd") return { word };
+	if (word === "popd") {
+		// `popd +N`/`-N` rotate the stack instead of popping it, which this walk
+		// does not model. A plain `popd` consumes the top entry.
+		return words.slice(i + 1).some((operand) => pushdRotation(operand)) ? { word, unmodeled: true } : { word };
+	}
 	let target: string | undefined;
 	let unmodeled = false;
 	for (let j = i + 1; j < words.length; j += 1) {
@@ -566,7 +580,7 @@ function cwdChangeIn(segment: string): { word: string; target?: string; unmodele
 		target = candidate;
 		break;
 	}
-	if (unmodeled) return { word, target: undefined };
+	if (unmodeled) return { word, unmodeled: true };
 	if (target !== undefined) return { word, target };
 	// A bare `cd` moves to $HOME, a known directory. A bare `pushd` swaps the
 	// top two entries of the directory stack, which is not tracked here.
@@ -579,8 +593,11 @@ function cwdChangeIn(segment: string): { word: string; target?: string; unmodele
  * `splitShellSegments` splits on `&&`/`;`/`|` but not on grouping, so a
  * subshell arrives as segments that still carry its parens. A `cd` inside one
  * must not move the directory of the segments after the subshell closes.
+ *
+ * Inside a `case` body a pattern's own `)` is not a grouping close, so it is
+ * not counted while a case construct is open.
  */
-function groupParensIn(segment: string): { opens: number; closes: number } {
+function groupParensIn(segment: string, insideCase = false): { opens: number; closes: number } {
 	let opens = 0;
 	let closes = 0;
 	let quote: "'" | '"' | undefined;
@@ -601,9 +618,31 @@ function groupParensIn(segment: string): { opens: number; closes: number } {
 		}
 		if (quote) continue;
 		if (char === "(") opens += 1;
-		else if (char === ")") closes += 1;
+		else if (char === ")") {
+			if (insideCase && closes + 1 > opens) continue;
+			closes += 1;
+		}
 	}
 	return { opens, closes };
+}
+
+/**
+ * Which construct boundary a segment carries, if any.
+ *
+ * Only a keyword in command position counts: `echo done` and
+ * `git commit -m "if"` carry no construct boundary.
+ */
+function constructKeywordIn(segment: string): "open" | "close" | "case-open" | "case-close" | undefined {
+	const words = unwrapShellWords(segment);
+	let i = 0;
+	// Wrappers and negation can precede the keyword: `time if …`, `! case …`.
+	while (i < words.length && (words[i] === "builtin" || words[i] === "command" || words[i] === "time" || words[i] === "!")) i += 1;
+	const word = words[i];
+	if (word === "if" || word === "while" || word === "until" || word === "for") return "open";
+	if (word === "case") return "case-open";
+	if (word === "esac") return "case-close";
+	if (word === "fi" || word === "done") return "close";
+	return undefined;
 }
 
 /**
@@ -617,6 +656,11 @@ function groupParensIn(segment: string): { opens: number; closes: number } {
  * A `cd` inside a grouping subshell is scoped to it, so the segments after the
  * closing paren keep the outer directory. Without that, `( cd /other && ls )
  * && rm -rf dist` would read the removal as happening in `/other`.
+ *
+ * A `cd` inside a conditional or loop body is NOT scoped: that body runs in the
+ * current shell. Which body runs depends on a condition this walk cannot
+ * evaluate, so a construct whose bodies change directory leaves the later
+ * directory undetermined rather than letting the last body parsed win.
  */
 export function planShellSegments(command: string, baseDir: string | undefined): ShellSegmentPlan[] {
 	const plan: ShellSegmentPlan[] = [];
@@ -626,8 +670,12 @@ export function planShellSegments(command: string, baseDir: string | undefined):
 	// A `pushd` inside `( … )` must not leave an entry a later outer `popd`
 	// consumes: bash discards the subshell's stack with it.
 	const groupStack: Array<{ cwd: string | undefined; dirStack: Array<string | undefined> }> = [];
+	// One frame per open `if`/`while`/`until`/`for`/`case`, recording whether any
+	// body changed directory.
+	const constructStack: Array<{ changed: boolean }> = [];
+	let caseDepth = 0;
 	for (const segment of splitShellSegments(command)) {
-		const { opens, closes } = groupParensIn(segment);
+		const { opens, closes } = groupParensIn(segment, caseDepth > 0);
 		for (let i = 0; i < opens; i += 1) groupStack.push({ cwd, dirStack: [...dirStack] });
 		const wrapperCwd = shellWrapperCwd(segment);
 		let root = cwd;
@@ -636,15 +684,33 @@ export function planShellSegments(command: string, baseDir: string | undefined):
 			root = expanded === undefined || cwd === undefined ? undefined : resolve(cwd, expanded);
 		}
 		plan.push({ segment, root });
-		const change = cwdChangeIn(segment);
+		const keyword = constructKeywordIn(segment);
+		if (keyword === "open") constructStack.push({ changed: false });
+		if (keyword === "case-open") {
+			constructStack.push({ changed: false });
+			caseDepth += 1;
+		}
+		const change = cwdChangeIn(segment, caseDepth > 0);
 		if (change) {
-			if (change.word === "popd") {
-				cwd = dirStack.pop();
+			for (const frame of constructStack) frame.changed = true;
+			if (change.unmodeled) {
+				cwd = undefined;
+			} else if (change.word === "popd") {
+				// `popd` with nothing to pop fails in bash and leaves the
+				// directory alone, so it must not clear a tracked directory.
+				cwd = dirStack.length > 0 ? dirStack.pop() : cwd;
 			} else {
 				if (change.word === "pushd") dirStack.push(cwd);
 				const expanded = change.target === undefined ? undefined : expandCwdTarget(change.target);
 				cwd = cwd === undefined || expanded === undefined ? undefined : resolve(cwd, expanded);
 			}
+		}
+		if (keyword === "case-close") caseDepth = Math.max(0, caseDepth - 1);
+		if (keyword === "close" || keyword === "case-close") {
+			const frame = constructStack.pop();
+			// A body that changed directory only sometimes leaves the later
+			// directory dependent on a condition, which fails closed.
+			if (frame?.changed) cwd = undefined;
 		}
 		for (let i = 0; i < closes; i += 1) {
 			const outer = groupStack.pop();

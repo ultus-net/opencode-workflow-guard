@@ -4639,13 +4639,18 @@ check(
 // stack. bash discards that stack with the subshell, so a later outer `popd`
 // stops at "directory stack empty" and leaves the outer `cd` in force. A walk
 // that leaked the inner entry planned the outer removal back at the workspace.
-const subshellPushdThenPopd = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; popd >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+// The genuine leak shape puts a `cd` between the two, so the outer directory is
+// no longer the workspace and the removal lands in the foreign tree.
+const subshellPushdThenPopd = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; cd ${foreignWtRepo} ; popd >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
 check(
 	"a pushd inside a grouping subshell does not leak into a later outer popd",
-	blocked(subshellPushdThenPopd),
+	blocked(subshellPushdThenPopd) && String(subshellPushdThenPopd).includes(foreignWtRepo),
 );
-const subshellPushdThenPopdCommit = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; popd >/dev/null 2>&1 ; git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
-check("a leaked subshell pushd does not let an outer git write read as the workspace", blocked(subshellPushdThenPopdCommit));
+const subshellPushdThenPopdCommit = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; cd ${foreignWtRepo} ; popd >/dev/null 2>&1 ; git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a leaked subshell pushd does not let an outer git write read as the workspace", blocked(subshellPushdThenPopdCommit) && String(subshellPushdThenPopdCommit).includes(foreignWtRepo));
+// A `popd` that only rotates the stack is not a pop, so it fails closed.
+const popdRotate = await call("bash", { command: `pushd ${foreignWtRepo} >/dev/null 2>&1 ; popd +1 >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a popd stack rotation followed by a mutation fails closed", blocked(popdRotate) && String(popdRotate).includes("cannot be determined"));
 
 // `pushd +N` and `pushd -N` rotate the stack and `-n` only pushes: neither
 // changes directory the way a plain `pushd <dir>` does, so the walk reports
@@ -4657,18 +4662,28 @@ check("a pushd -n that only pushes the stack fails closed before a mutation", bl
 const pushdRotateRead = await call("bash", { command: "pushd +1 >/dev/null 2>&1 ; ls -la" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
 check("a pushd stack rotation followed by a read stays allowed", !blocked(pushdRotateRead));
 
-// A control-flow body runs in the CURRENT shell, so its `cd` moves the
-// directory of every later segment. Only `( … )` scopes a directory.
+// A control-flow body runs in the CURRENT shell, so a `cd` inside it moves the
+// directory of later segments. Which body runs depends on a condition this walk
+// cannot evaluate, so a construct whose bodies disagree about the directory
+// fails closed rather than letting the last body parsed win. Only `( … )`
+// scopes a directory.
 for (const [label, command] of [
 	["then", `if true; then cd ${foreignWtRepo}; fi; rm -rf out.txt`],
+	["else", `if true; then cd ${foreignWtRepo}; else cd .; fi; rm -rf out.txt`],
 	["do", `for i in 1; do cd ${foreignWtRepo}; done; rm -rf out.txt`],
 	["while", `while false; do :; done; cd ${foreignWtRepo}; rm -rf out.txt`],
 	["case", `case x in x) cd ${foreignWtRepo};; esac; rm -rf out.txt`],
 	["brace group", `{ cd ${foreignWtRepo} ; } ; rm -rf out.txt`],
 ] as const) {
 	const flowMutation = await call("bash", { command }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
-	check(`a cd inside a '${label}' body moves the tree of later segments`, blocked(flowMutation) && String(flowMutation).includes(foreignWtRepo));
+	check(`a conditional cd inside a '${label}' body fails closed before a mutation`, blocked(flowMutation));
 }
+// A construct body that mutates without changing directory must stay allowed:
+// the condition does not affect the tree the mutation lands in.
+const conditionalNoCd = await call("bash", { command: `if [ -d .git ]; then echo hi; fi ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a conditional body with no cd keeps the tree of later segments", !blocked(conditionalNoCd));
+const caseArmParen = await call("bash", { command: `( case x in x) cd ${foreignWtRepo} ;; esac ; mkdir -p mk )` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a case pattern paren is not read as a grouping close", blocked(caseArmParen));
 
 // `~user` never means a literal `~user` directory. Reading it as a relative
 // path put the walk inside the workspace while the shell reached that home.

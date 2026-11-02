@@ -470,19 +470,68 @@ function spawnCallArguments(payload: string): string[] {
 	return spans;
 }
 
+/**
+ * The `cwd` of the call's own options object, ignoring a nested one.
+ *
+ * The argument text is split at top-level commas, and only an argument that is
+ * itself an object literal contributes. Without that, `execSync(fn({cwd: '<a>'}),
+ * {cwd: '<b>'})` read the nested object's key first and reported a workspace
+ * directory for a call that actually ran in `<b>`.
+ */
+function callOwnCwd(args: string): string | undefined {
+	let depth = 0;
+	let quote: string | undefined;
+	const topLevel: string[] = [];
+	let current = "";
+	for (let i = 0; i < args.length; i += 1) {
+		const char = args[i]!;
+		if (quote) {
+			if (char === quote && args[i - 1] !== "\\") quote = undefined;
+			current += char;
+			continue;
+		}
+		if (char === "'" || char === '"' || char === "`") {
+			quote = char;
+			current += char;
+			continue;
+		}
+		if (char === "{" || char === "[" || char === "(") depth += 1;
+		else if (char === "}" || char === "]" || char === ")") depth -= 1;
+		if (char === "," && depth === 0) {
+			topLevel.push(current);
+			current = "";
+			continue;
+		}
+		current += char;
+	}
+	topLevel.push(current);
+	for (const argument of topLevel) {
+		const trimmed = argument.trim();
+		if (!trimmed.startsWith("{")) continue;
+		const match = /\bcwd\s*:\s*([^,}]+)/.exec(trimmed);
+		if (match?.[1]) return match[1].trim();
+	}
+	return undefined;
+}
+
 export function payloadWorkingRoot(payload: string): PayloadWorkingRoot {
-	const cwdValues = spawnCallArguments(payload).flatMap((args) => {
-		const match = /\bcwd\s*:\s*([^,)}]+)/.exec(args);
-		return match?.[1] ? [match[1].trim()] : [];
-	});
+	const cwdValues = spawnCallArguments(payload)
+		.map(callOwnCwd)
+		.filter((value): value is string => value !== undefined);
 	const chdir = PROCESS_CHDIR.exec(payload)?.[1]?.trim();
 	if (chdir) cwdValues.push(chdir);
+	// Every call's directory has to agree. Two different trees, or one that is
+	// not a literal, means the payload's real directory is not determinable, and
+	// a mutation then fails closed rather than trusting the first one found.
+	const roots = new Set<string>();
 	for (const raw of cwdValues) {
 		const literal = /^(["'`])([^"'`]*)\1$/.exec(raw);
-		if (literal?.[2]) return { status: "resolved", root: literal[2] };
-		return { status: "indeterminate", raw };
+		if (!literal?.[2]) return { status: "indeterminate", raw };
+		roots.add(literal[2]);
 	}
-	return { status: "none" };
+	if (roots.size === 0) return { status: "none" };
+	if (roots.size > 1) return { status: "indeterminate", raw: [...roots].join(", ") };
+	return { status: "resolved", root: [...roots][0]! };
 }
 
 function payloadMutates(payload: string): boolean {
@@ -528,7 +577,11 @@ export function nestedPayloadMutationReason(
 	workspaceRoot: string,
 	depth = 0,
 ): string | undefined {
-	if (depth > 8) return undefined;
+	// Nesting deeper than this is not modelled. A launcher chain that deep is
+	// refused rather than skipped, so the cap cannot become a way through.
+	if (depth > 8) {
+		return `Blocked: inline interpreter scripts are nested deeper than the ${8} levels this check models, so the tree they mutate cannot be determined. Run the command from a single script file inside the workspace instead.`;
+	}
 	for (const { segment, root } of planShellSegments(command, baseDir)) {
 		const payloads = extractPayloads(segment);
 		if (payloads.length === 0) continue;
