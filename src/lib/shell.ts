@@ -196,6 +196,290 @@ function envSplitWords(value: string): string[] {
 	return words;
 }
 
+export interface HeredocRange {
+	/** Offset of the `<<` that introduces the heredoc. */
+	start: number;
+	/** Offset of the body's first byte. */
+	bodyStart: number;
+	/** Offset of the terminator line, or end of input when unterminated. */
+	bodyEnd: number;
+	/** Offset of the terminator line's newline, or end of input. */
+	end: number;
+}
+
+interface HeredocHeader {
+	start: number;
+	/** Offset just past the delimiter word. */
+	end: number;
+	delimiter: string;
+	stripTabs: boolean;
+}
+
+function heredocHeaderAt(command: string, start: number): HeredocHeader | undefined {
+	// `<<<` is a herestring, whose operand is a single word on the same line.
+	if (command[start + 2] === "<") return undefined;
+	const header = /^<<(-?)[ \t]*(?:'([^'\n]+)'|"([^"\n]+)"|([^\s'";|&()<>\n]+))/.exec(command.slice(start));
+	if (!header) return undefined;
+	const delimiter = header[2] ?? header[3] ?? header[4];
+	if (!delimiter) return undefined;
+	return { start, end: start + header[0].length, delimiter, stripTabs: header[1] === "-" };
+}
+
+function heredocBodyAt(
+	command: string,
+	from: number,
+	delimiter: string,
+	stripTabs: boolean,
+): { bodyStart: number; bodyEnd: number; end: number } {
+	let cursor = from;
+	while (cursor <= command.length) {
+		const nextEnd = command.indexOf("\n", cursor);
+		const line = command.slice(cursor, nextEnd < 0 ? command.length : nextEnd);
+		const comparable = stripTabs ? line.replace(/^\t+/, "") : line;
+		if (comparable === delimiter) {
+			// Stop at the terminator's own newline and let the caller split on it,
+			// so the command that follows the heredoc starts its own segment.
+			return { bodyStart: from, bodyEnd: cursor, end: nextEnd < 0 ? command.length : nextEnd };
+		}
+		if (nextEnd < 0) break;
+		cursor = nextEnd + 1;
+	}
+	// A missing terminator runs to end of input, which is where the shell would
+	// stop reading too. Bash still runs the body it collected.
+	return { bodyStart: from, bodyEnd: command.length, end: command.length };
+}
+
+/**
+ * Every heredoc introduced on the line that starts at `start`.
+ *
+ * One header line can introduce several bodies (`cat <<A <<B`), and the shell
+ * reads them one after another. Ignoring the later ones read a second body as
+ * top-level commands.
+ */
+export function heredocRunAt(command: string, start: number): HeredocRange[] | undefined {
+	const headers: HeredocHeader[] = [];
+	let cursor = start;
+	for (;;) {
+		const header = heredocHeaderAt(command, cursor);
+		if (!header) break;
+		headers.push(header);
+		let next = header.end;
+		while (next < command.length && /[ \t]/.test(command[next]!)) next += 1;
+		if (command[next] !== "<" || command[next + 1] !== "<") break;
+		cursor = next;
+	}
+	if (headers.length === 0) return undefined;
+	const lastHeader = headers[headers.length - 1]!;
+	const lineEnd = command.indexOf("\n", lastHeader.end);
+	if (lineEnd < 0) return undefined;
+	const ranges: HeredocRange[] = [];
+	let bodyStart = lineEnd + 1;
+	for (const header of headers) {
+		const body = heredocBodyAt(command, bodyStart, header.delimiter, header.stripTabs);
+		ranges.push({ start: header.start, ...body });
+		if (body.end >= command.length) break;
+		bodyStart = body.end + 1;
+	}
+	return ranges;
+}
+
+/**
+ * Every heredoc in `command`, found with the same quote tracking the segment
+ * splitter uses.
+ *
+ * A `<<` inside a quoted span opens no heredoc. Scanning for `<<` without that
+ * check read a quoted `"<<"` as a header and masked the code that followed it.
+ */
+export function heredocRanges(command: string): HeredocRange[] {
+	const ranges: HeredocRange[] = [];
+	let quote: "'" | '"' | "ansi" | undefined;
+	let escaped = false;
+	for (let i = 0; i < command.length; i += 1) {
+		const char = command[i]!;
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (!quote && char === "$" && command[i + 1] === "'") {
+			quote = "ansi";
+			i += 1;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (quote === "ansi" && char === "'") {
+			quote = undefined;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			if (!quote) quote = char;
+			else if (quote === char) quote = undefined;
+			continue;
+		}
+		if (quote || char !== "<" || command[i + 1] !== "<") continue;
+		const run = heredocRunAt(command, i);
+		if (!run) continue;
+		ranges.push(...run);
+		// Lines inside a body are data, so a `<<` there opens nothing.
+		i = run[run.length - 1]!.end - 1;
+	}
+	return ranges;
+}
+
+/**
+ * The shells and interpreters that run a heredoc body as code.
+ *
+ * `source` and the `.` builtin execute a body they read from stdin, so their
+ * bodies are code too.
+ */
+const HEREDOC_EXECUTOR_RE = /\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh|source)\b|^\s*\.\s/i;
+
+/**
+ * Commands that read a heredoc body as data.
+ *
+ * The body of these is never executed, so its lines are prose. An unrecognized
+ * command is treated as an executor instead: guessing "data" there would let a
+ * body a shell reads as code escape the scan.
+ *
+ * `sed`, `awk`, and `sort` are deliberately absent. Each can run a command named
+ * inside its own arguments (`sed 'e'`, `awk '{system($0)}'`,
+ * `sort --compress-program`), so a body behind one of them is executed text.
+ */
+const DATA_HEREDOC_CONSUMERS = new Set([
+	"cat",
+	"tee",
+	"echo",
+	"printf",
+	"grep",
+	"egrep",
+	"fgrep",
+	"uniq",
+	"wc",
+	"head",
+	"tail",
+	"tr",
+	"cut",
+	"patch",
+	"diff",
+	"xxd",
+	"od",
+	"base64",
+	"sha1sum",
+	"sha256sum",
+	"md5sum",
+	"jq",
+	"column",
+	"less",
+	"more",
+]);
+
+/*
+ * A program that can run a command named in its own arguments is not a data
+ * consumer. Testing the whole header line matched a word inside a quoted
+ * argument, so `sed -n '1e echo hi'` read as data because of the `echo` in its
+ * script.
+ */
+function consumerWords(before: string): string[] {
+	// Only the command the heredoc belongs to reads the body, so take the last
+	// segment. Earlier commands on the same line never see it.
+	const segments = splitShellSegments(before);
+	return unwrapShellWords(segments[segments.length - 1] ?? "");
+}
+
+/** The program that reads the body, or `undefined` when no word names one. */
+function consumerProgram(before: string): { head: string; sub?: string } | undefined {
+	const words = consumerWords(before);
+	const head = words[0]?.toLowerCase();
+	if (!head) return undefined;
+	return { head, sub: words[1]?.toLowerCase() };
+}
+
+/** Whether a program reads a heredoc body as data rather than executing it. */
+function readsBodyAsData(program: { head: string; sub?: string }): boolean {
+	if (program.head === "git") return program.sub === "commit" || program.sub === "tag";
+	return DATA_HEREDOC_CONSUMERS.has(program.head);
+}
+
+/**
+ * The command word of every stage a header line pipes the body into.
+ *
+ * A pipeline hands the body to every stage, so `| grep x | sh` still ends in a
+ * shell. Only the first stage used to be read, and that masked the body. A `||`
+ * is a logical separator and runs nothing on success, so it is skipped, and a
+ * quoted `|` is an argument character rather than a pipe. `|&` is a real pipe
+ * that also redirects stderr, so only the first of its two characters is a pipe
+ * separator.
+ */
+function pipedStageHeads(text: string): string[] {
+	const heads: string[] = [];
+	let quote: "'" | '"' | undefined;
+	let escaped = false;
+	for (let i = 0; i < text.length; i += 1) {
+		const char = text[i]!;
+		if (escaped) {
+			escaped = false;
+			continue;
+		}
+		if (char === "\\" && quote !== "'") {
+			escaped = true;
+			continue;
+		}
+		if (char === "'" || char === '"') {
+			if (!quote) quote = char;
+			else if (quote === char) quote = undefined;
+			continue;
+		}
+		if (quote || char !== "|") continue;
+		// `||` runs the right side only on failure and hands it no body. `|&` is a
+		// real pipe that also redirects stderr, so it is read as one pipe stage.
+		if (text[i + 1] === "|") {
+			i += 1;
+			continue;
+		}
+		const stageStart = text[i + 1] === "&" ? i + 2 : i + 1;
+		heads.push(shellWords(text.slice(stageStart))[0] ?? "");
+	}
+	return heads;
+}
+
+/** Whether the command on a heredoc's header line executes its body. */
+export function heredocBodyIsCode(command: string, start: number): boolean {
+	const lineStart = command.lastIndexOf("\n", start - 1) + 1;
+	const lineEnd = command.indexOf("\n", start);
+	const line = command.slice(lineStart, lineEnd < 0 ? command.length : lineEnd);
+	const before = command.slice(lineStart, start);
+	if (HEREDOC_EXECUTOR_RE.test(before)) return true;
+	// Every piped stage is a consumer. Treating an unknown one as a filter let
+	// `cat <<EOF | ash` and `cat <<EOF | grep x | sh` run unread.
+	for (const head of pipedStageHeads(line.slice(start - lineStart))) {
+		if (!DATA_HEREDOC_CONSUMERS.has(head.toLowerCase())) return true;
+	}
+	const program = consumerProgram(before);
+	return !program || !readsBodyAsData(program);
+}
+
+/**
+ * `command` with every heredoc body that no command executes replaced by
+ * spaces.
+ *
+ * A body feeding `cat` is prose, so a line in it that looks like a command must
+ * not be judged as one. Newlines are preserved so line-oriented callers still
+ * see the same line structure.
+ */
+export function maskDataHeredocBodies(command: string): string {
+	let out = "";
+	let cursor = 0;
+	for (const range of heredocRanges(command)) {
+		if (heredocBodyIsCode(command, range.start)) continue;
+		out += command.slice(cursor, range.bodyStart);
+		out += command.slice(range.bodyStart, range.bodyEnd).replace(/[^\n]/g, " ");
+		cursor = range.bodyEnd;
+	}
+	return out + command.slice(cursor);
+}
+
 export function splitShellSegments(command: string): string[] {
 	const segments: string[] = [];
 	let current = "";
@@ -229,6 +513,26 @@ export function splitShellSegments(command: string): string[] {
 			else if (quote === char) quote = undefined;
 			current += char;
 			continue;
+		}
+		// A heredoc body belongs to the segment that introduces it. Splitting it
+		// on its newlines made data read as code, so documentation quoting a
+		// blocked command shape was refused, and a code body's own lines looked
+		// like top-level commands.
+		//
+		// One header line can introduce several heredocs (`cat <<A <<B`), and the
+		// shell reads their bodies one after another. Consume the whole run here,
+		// so a later body is not read as top-level commands.
+		if (!quote && char === "<" && command[i + 1] === "<") {
+			const run = heredocRunAt(command, i);
+			if (run) {
+				let cursor = i;
+				for (const range of run) {
+					current += command.slice(cursor, range.end);
+					cursor = range.end;
+				}
+				i = cursor - 1;
+				continue;
+			}
 		}
 		if (!quote && /[\n|;&]/.test(char)) {
 			if (current.trim()) segments.push(current.trim());
@@ -475,25 +779,44 @@ export interface ShellSegmentPlan {
 
 const CWD_WORDS = new Set(["cd", "pushd", "popd"]);
 
+/**
+ * The directory a git repository selector names.
+ *
+ * `git -C ~/repo` reaches a directory through the shell's own expansion, so a
+ * literal `~` must not be read as a workspace-relative path. Only the forms a
+ * shell expands deterministically are expanded here. Anything else keeps its
+ * literal text, so an unresolvable `$VARIABLE` still fails closed through
+ * `hasUnresolvableVariable`.
+ */
+export function resolveGitRepoSelector(baseDir: string, value: string): string {
+	return resolve(baseDir, expandCwdTarget(value) ?? value);
+}
+
 /** Expands only the directory forms a shell expands deterministically. */
-function expandCwdTarget(target: string): string | undefined {
+export function expandCwdTarget(target: string): string | undefined {
 	const home = process.env.HOME || homedir();
 	if (target === "~") return home;
 	if (target.startsWith("~/")) return join(home, target.slice(2));
 	// `cd ~user` resolves to that user's home, never to a literal `~user`
 	// directory. Reading it as a relative path put a `cd ~csh` walk inside the
-	// workspace while the shell reached the real home. Any other home base is
-	// unknown to this walk, so it stays indeterminate rather than naming a
-	// directory that does not exist.
-	const named = /^~([^/\s]+)(?:\/|$)/.exec(target);
+	// workspace while the shell reached the real home. The path after the name
+	// is part of the target, so dropping it judged the wrong directory.
+	const named = /^~([^/\s]+)(\/.*)?$/.exec(target);
 	if (named) {
+		const user = named[1]!;
+		const tail = named[2] ?? "";
+		let base: string;
 		try {
-			if (named[1] === userInfo().username) return home;
+			// The walk cannot read another user's home portably, so it joins the name
+			// onto this home's parent. That is the same heuristic `expandShellTargetPath`
+			// uses, which keeps both scanners agreeing on one directory. A guess that
+			// lands inside the workspace arrives here only when the workspace already
+			// spans the home parent, the same exposure the boundary scan has.
+			base = user === userInfo().username ? home : join(dirname(home), user);
 		} catch {
 			return undefined;
 		}
-		const parent = dirname(home);
-		return parent && named[1] ? join(parent, named[1]) : undefined;
+		return tail === "" ? base : join(base, tail.slice(1));
 	}
 	if (/^\$(?:HOME|\{HOME\})(?:$|[/\\])/.test(target)) {
 		return target.replace(/^\$(?:HOME|\{HOME\})/, home);
@@ -680,6 +1003,33 @@ function constructKeywordIn(segment: string): "open" | "close" | "case-open" | "
 	if (word === "esac") return "case-close";
 	if (word === "fi" || word === "done") return "close";
 	return undefined;
+}
+
+/**
+ * Whether a segment runs `eval` as its command word.
+ *
+ * Only a leading `eval` runs its body in this shell. A prose mention
+ * (`Use eval "…" to show the bypass`) names no command, and forwarding it made
+ * a documentation heredoc look like a directory change. The wrappers that do not
+ * fork (`builtin`, `command`, `time`) and a leading assignment (`A=1 eval …`)
+ * both still reach `eval`, so they are skipped here.
+ */
+export function isLeadingEvalSegment(segment: string): boolean {
+	const words = shellWords(segment);
+	let i = 0;
+	while (i < words.length) {
+		const word = words[i]!;
+		if (word === "builtin" || word === "command" || word === "time") {
+			i += 1;
+			continue;
+		}
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(word)) {
+			i += 1;
+			continue;
+		}
+		break;
+	}
+	return words[i] === "eval";
 }
 
 /**

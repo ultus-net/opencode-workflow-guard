@@ -7,7 +7,7 @@ import {
 	getWorkspaceRoot,
 	recordMutation,
 } from "../lib/state.ts";
-import { prepareRedirectResidue, planShellSegments, shellWords, unwrapShellCommand } from "../lib/shell.ts";
+import { isLeadingEvalSegment, maskDataHeredocBodies, prepareRedirectResidue, planShellSegments, shellWords, unwrapShellCommand } from "../lib/shell.ts";
 import { isCollaborationInvocation, isProtectedPath, PROTECTED_PATH_REASON } from "./tamper.ts";
 import { isSecretPath, secretIn } from "./secrets.ts";
 import { isGitTreeWriteText, branchGuardReason, onProtectedBranch, parseGitInvocation } from "./git.ts";
@@ -586,7 +586,7 @@ export function nestedPayloadMutationReason(
 		// `eval` runs in the current shell, so its body's `cd` moves later
 		// segments. Only an `eval` body counts here; another launcher's payload
 		// runs in a child process and cannot move this shell.
-		return /\beval\b/.test(s) ? extractPayloads(s)[0] : undefined;
+		return isLeadingEvalSegment(s) ? extractPayloads(s)[0] : undefined;
 	})) {
 		const payloads = extractPayloads(segment);
 		if (payloads.length === 0) continue;
@@ -630,7 +630,9 @@ export function nestedPayloadMutationReason(
 }
 
 export function detectShellMutation(command: string): ShellMutation | undefined {
-	for (const rawSegment of command.split(/[\n|;&]+/)) {
+	// A heredoc body no command executes is prose. Splitting it on its newlines
+	// read a documented command shape as a real one.
+	for (const rawSegment of maskDataHeredocBodies(command).split(/[\n|;&]+/)) {
 		const segment = isCollaborationInvocation(rawSegment) ? stripQuotedSpans(rawSegment) : rawSegment;
 		const simpleMutations = simpleFilesystemMutations(segment);
 		if (simpleMutations.length > 0) return simpleMutations[0];
@@ -680,8 +682,10 @@ export async function guardShellMutation(
 			isPathOutsideWorkspace(target, runRoot) && isPathOutsideWorkspace(target, workspaceRoot);
 		// Same residue analysis as detectShellMutation: quoted arguments of
 		// gh/glab/az PR/issue commands are command data, not shell redirects,
-		// while unquoted redirects still get full validation below.
-		const cleanSegment = isCollaborationInvocation(segment) ? stripQuotedSpans(segment) : segment;
+		// while unquoted redirects still get full validation below. A heredoc body
+		// that no command executes is prose, so its lines are not judged either.
+		const masked = maskDataHeredocBodies(segment);
+		const cleanSegment = isCollaborationInvocation(masked) ? stripQuotedSpans(masked) : masked;
 		const secretSource = secretSourceInFilesystemCommand(cleanSegment);
 		if (secretSource) {
 			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;

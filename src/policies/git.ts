@@ -10,6 +10,7 @@ import {
 	unwrapShellWords,
 	splitShellSegments,
 	shellPrefixAssignments,
+	resolveGitRepoSelector,
 } from "../lib/shell.ts";
 
 export const PROTECTED_BRANCHES = new Set(["main", "master"]);
@@ -46,6 +47,10 @@ const GIT_DIR_OPTION_TAKES_VALUE = new Set([
 ]);
 const GIT_DIR_OPTION_PREFIXED =
 	/^(--git-dir=|--work-tree=|--namespace=|-c\S|--config-env=)/;
+// Git also accepts the attached short forms (`-C/path`, `-C~`). An unparsed
+// `-C` leaves the repository at the assumed base, which judges the write in the
+// wrong checkout, so the attached form is read as a claim like the spaced one.
+const GIT_DIR_SHORT_ATTACHED = /^-C(.+)$/;
 const GIT_GLOBAL_BOOLEAN_OPTIONS = new Set([
 	"--version",
 	"--help",
@@ -109,7 +114,7 @@ export function parseGitInvocation(command: string, baseDir?: string): GitInvoca
 
 	const envDirValue = repoEnvironmentOverride(command);
 	if (envDirValue) {
-		repoDir = resolve(root, envDirValue);
+		repoDir = resolveGitRepoSelector(root, envDirValue);
 		sawDirOption = true;
 	}
 
@@ -124,18 +129,25 @@ export function parseGitInvocation(command: string, baseDir?: string): GitInvoca
 			// other deferring it. `-c` and `--config-env` name no repository.
 			if (value === undefined) return { repoDir, rest: "", explicitRepoDir: sawDirOption || namesRepository };
 			if (namesRepository) {
-				repoDir = resolve(root, value);
+				repoDir = resolveGitRepoSelector(root, value);
 				sawDirOption = true;
 			}
 			i += 2;
 			continue;
 		}
+		const attached = GIT_DIR_SHORT_ATTACHED.exec(tok);
+		if (attached) {
+			repoDir = resolveGitRepoSelector(root, attached[1]!);
+			sawDirOption = true;
+			i += 1;
+			continue;
+		}
 		if (GIT_DIR_OPTION_PREFIXED.test(tok)) {
 			if (tok.startsWith("--git-dir=")) {
-				repoDir = resolve(root, tok.slice("--git-dir=".length));
+				repoDir = resolveGitRepoSelector(root, tok.slice("--git-dir=".length));
 				sawDirOption = true;
 			} else if (tok.startsWith("--work-tree=")) {
-				repoDir = resolve(root, tok.slice("--work-tree=".length));
+				repoDir = resolveGitRepoSelector(root, tok.slice("--work-tree=".length));
 				sawDirOption = true;
 			}
 			i += 1;

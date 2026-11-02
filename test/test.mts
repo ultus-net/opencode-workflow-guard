@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync, realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { tmpdir, homedir } from "node:os";
+import { join, resolve, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
@@ -4444,6 +4444,35 @@ check(
 	parseGitInvocation("GIT_DIR=/repo git commit")?.repoDir === "/repo" &&
 		parseGitInvocation("GIT_DIR=/repo git commit")?.explicitRepoDir === true,
 );
+// `git -C ~/repo` reaches that repository through the shell's own expansion. A
+// literal `~` resolved against the workspace base put the write inside the
+// workspace, so a commit to a home-directory repository read as a local one.
+check(
+	"a tilde repository selector expands to the home directory",
+	parseGitInvocation("git -C ~/wg-probe-repo commit")?.repoDir === join(process.env.HOME || homedir(), "wg-probe-repo"),
+);
+check(
+	"a tilde git-dir selector expands to the home directory",
+	parseGitInvocation("git --git-dir=~/.git commit")?.repoDir === join(process.env.HOME || homedir(), ".git"),
+);
+check(
+	"an unresolvable repository selector keeps its literal text instead of collapsing to the root",
+	parseGitInvocation("git -C $OTHER_REPO/wg commit", "/tmp/wg-base")?.repoDir === join("/tmp/wg-base", "$OTHER_REPO", "wg"),
+);
+// `~user` names that user's home. Reading only the home base dropped the path
+// after the name, so `git -C ~csh/repo commit` was judged against the home
+// directory instead of the repository inside it.
+check(
+	"a named-user repository selector keeps the path after the home",
+	parseGitInvocation("git -C ~root/repo commit")?.repoDir === join(dirname(process.env.HOME || homedir()), "root", "repo"),
+);
+// Git also accepts the attached short form. Leaving `-C~/repo` unparsed kept
+// the assumed base, so the commit was judged in the session's own checkout.
+check(
+	"an attached short -C selector names its repository",
+	parseGitInvocation("git -C~/wg-probe-repo commit")?.repoDir === join(process.env.HOME || homedir(), "wg-probe-repo") &&
+		parseGitInvocation("git -C~/wg-probe-repo commit")?.explicitRepoDir === true,
+);
 // A dangling `-C` names no repository, but the flag is still in the text. Both
 // seats must then agree the command is unclassifiable: the seat defers, and
 // execute.before decides. Reporting it as an assumed base let the seat judge a
@@ -4564,6 +4593,85 @@ const cdForeignWrite = await call("bash", { command: `cd ${foreignWtRepo} && ech
 check("an in-command cd into a foreign repository is blocked for a shell mutation", blocked(cdForeignWrite));
 const cdForeignRead = await call("bash", { command: `cd ${foreignWtRepo} && ls -la` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
 check("an in-command cd into a foreign repository stays allowed for a read", !blocked(cdForeignRead));
+// A newline separates commands exactly like `;`. The dispatcher planned its
+// segments from the newline-flattened command, so a newline-separated `cd`
+// moved nothing and every later segment was judged against the shell's start
+// tree. `cd <foreign>` then `rm -rf x` therefore read as a workspace removal.
+for (const [label, command] of [
+	["a removal", `cd ${foreignWtRepo}\nrm -rf out.txt`],
+	["a git write", `cd ${foreignWtRepo}\ngit commit -m x --allow-empty`],
+	["a redirect", `cd ${foreignWtRepo}\necho x > artifact.txt`],
+] as const) {
+	const newlineCd = await call("bash", { command }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a newline-separated cd into a foreign repository is blocked for ${label}`, blocked(newlineCd) && String(newlineCd).includes(foreignWtRepo));
+}
+const newlineCdRead = await call("bash", { command: `cd ${foreignWtRepo}\nls -la` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a newline-separated cd into a foreign repository stays allowed for a read", !blocked(newlineCdRead));
+// A heredoc feeding a shell runs its body as shell text, so the body's `cd`
+// moves the tree its later lines run in just like a `;`-separated command. The
+// body was never re-planned, so the removal looked like a workspace write.
+const heredocCd = await call("bash", { command: `bash <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc shell body that cds into a foreign repository is blocked", blocked(heredocCd) && String(heredocCd).includes(foreignWtRepo));
+const heredocGit = await call("bash", { command: `bash <<'WGEOF'\ncd ${foreignWtRepo}\ngit commit -m x --allow-empty\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc shell body that cds into a foreign repository is blocked for a git write", blocked(heredocGit) && String(heredocGit).includes(foreignWtRepo));
+// Bash still runs a heredoc body it closes at end of input, so an unterminated
+// body is code too. Requiring a terminator line dropped the payload entirely.
+const heredocUnterminated = await call("bash", { command: `bash <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an unterminated heredoc shell body is scanned as code", blocked(heredocUnterminated) && String(heredocUnterminated).includes(foreignWtRepo));
+// `source` executes a body it reads from stdin, so its body is shell text even
+// though the launcher list names only interpreters.
+const heredocSource = await call("bash", { command: `source /dev/stdin <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a source heredoc body that cds into a foreign repository is blocked", blocked(heredocSource) && String(heredocSource).includes(foreignWtRepo));
+// The body feeds `cat`, but the pipe delivers it to a shell, so it runs.
+const heredocPiped = await call("bash", { command: `cat <<'WGEOF' | sh\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body piped into a shell is scanned as code", blocked(heredocPiped) && String(heredocPiped).includes(foreignWtRepo));
+// The pipe decides, and an unrecognized downstream command is not a filter. An
+// allowlist that named only common shells let `| ash` and `| make -f -` run a
+// body the scan had already masked as prose.
+for (const downstream of ["ash", "make -f -", "busybox sh", "xargs sh -c"]) {
+	const pipeUnknown = await call("bash", { command: `cat <<'WGEOF' | ${downstream}\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc body piped into ${downstream} is scanned as code`, blocked(pipeUnknown) && String(pipeUnknown).includes(foreignWtRepo));
+}
+const pipeFilter = await call("bash", { command: `cat <<'WGEOF' | grep build\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body piped into a known filter stays data", allowed(pipeFilter));
+// A pipeline hands the body to every stage, so a filter followed by a shell
+// still executes it. Reading only the first stage masked the body as prose.
+for (const pipeline of ["grep x | sh", "cat | bash", "tee /dev/null | sh"]) {
+	const pipeChain = await call("bash", { command: `cat <<'WGEOF' | ${pipeline}\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc body reaching a shell through ${pipeline} is scanned as code`, blocked(pipeChain) && String(pipeChain).includes(foreignWtRepo));
+}
+// `|&` also pipes, so a body it delivers to a shell runs exactly like a `|`
+// body. `||` runs the right side only on failure and delivers no body.
+for (const operator of ["|& sh", "|& ash"]) {
+	const ampersandPipe = await call("bash", { command: `cat <<'WGEOF' ${operator}\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc body delivered through ${operator} is scanned as code`, blocked(ampersandPipe) && String(ampersandPipe).includes(foreignWtRepo));
+}
+// `|&` into a filter is still a filter, so the body stays prose.
+const ampersandFilter = await call("bash", { command: `cat <<'WGEOF' |& grep build\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body delivered through |& to a filter stays data", allowed(ampersandFilter));
+const logicalOrPipe = await call("bash", { command: `cat <<'WGEOF' || grep build\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body after || stays data because no pipe delivers it", allowed(logicalOrPipe));
+// A program that can run a command named in its own arguments is not a filter.
+// `sed`, `awk`, and `sort` each execute the body's text with a flag or program.
+for (const header of ["sed 'e'", "sed -n '1e echo hi'", `awk '{system($0)}'`, "sort --compress-program='sh'"]) {
+	const execConsumer = await call("bash", { command: `${header} <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc consumed by ${header} is scanned as code`, blocked(execConsumer) && String(execConsumer).includes(foreignWtRepo));
+}
+// A heredoc feeding `cat` is data. Its body is never executed, so documentation
+// that quotes a blocked command shape must stay writable. The shell-backed form
+// above is code; this one is prose.
+const heredocDoc = await call("bash", { command: `cat > notes.md <<'WGEOF'\nbash -c 'cd /other-repo && rm -rf x' is blocked.\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a data heredoc quoting a blocked command shape is not treated as code", allowed(heredocDoc));
+const heredocDocProse = await call("bash", { command: `cat > notes.md <<'WGEOF'\nrm -rf build is blocked by policy.\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a data heredoc body is not read as a shell mutation", allowed(heredocDocProse));
+// The mask has to find the heredoc in the raw text. A quoted `<<` opened a fake
+// body and swallowed the real payload that followed it.
+const heredocMasked = await call("bash", { command: `echo "<<DONE"\npython3 -c "open('${join(foreignWtRepo, "evil")}','w').write('x')"\nDONE` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a quoted << does not mask a later interpreter payload", blocked(heredocMasked) && String(heredocMasked).includes(foreignWtRepo));
+// One header line can introduce two bodies. Only the first was ranged, so the
+// second body was read as top-level commands.
+const heredocPair = await call("bash", { command: `cat <<A <<B\nhello\nA\nrm -rf build is prose\nB` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a second heredoc body on the same header line stays data", !blocked(heredocPair));
 const cdIndeterminate = await call("bash", { command: "cd $WG_UNKNOWN_TREE && git commit -m x" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
 check(
 	"an indeterminate cd target followed by a write fails closed",
@@ -4709,9 +4817,10 @@ const evalMovesOuter = await call("bash", { command: `eval "cd ${foreignWtRepo}"
 check("an eval cd moves the tree of a later outer command", blocked(evalMovesOuter));
 const evalHarmless = await call("bash", { command: `eval "echo hi" ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
 check("a harmless eval leaves the tree of later segments alone", !blocked(evalHarmless));
-
-
-
+// A leading assignment still reaches `eval`, so the `cd` inside it moves the
+// tree of the lines that follow.
+const evalAssignment = await call("bash", { command: `A=1 eval 'cd ${foreignWtRepo}'\nrm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an assignment-prefixed eval moves the tree of later segments", blocked(evalAssignment) && String(evalAssignment).includes(foreignWtRepo));
 // `~user` never means a literal `~user` directory. Reading it as a relative
 // path put the walk inside the workspace while the shell reached that home.
 const tildeUser = await call("bash", { command: "cd ~root && rm -rf out.txt" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });

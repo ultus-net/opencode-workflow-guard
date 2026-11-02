@@ -24,6 +24,8 @@ import {
 import {
 	dynamicShellSyntaxIn,
 	extractCommands,
+	isLeadingEvalSegment,
+	maskDataHeredocBodies,
 	normalize,
 	planShellSegments,
 	shellWrappersChangeCwd,
@@ -482,8 +484,10 @@ export async function guardToolCallImpl(
 		// earlier in the command moves the ones that follow, so parsing them all
 		// against the shell's initial `workdir` hid a mutation in another tree:
 		// `cd <other-repo> && git commit` was judged as a commit in the session's
-		// own checkout.
-		const segmentPlan = planShellSegments(command, shellRoot);
+		// own checkout. Plan from `raw`: `normalize` folds newlines into spaces,
+		// which erases the separator that makes a newline-separated `cd` a real
+		// directory change.
+		const segmentPlan = planShellSegments(raw, shellRoot);
 		const gitInvocations = segmentPlan
 			.map(({ segment, root }) => parseGitInvocation(segment.trim(), root))
 			.filter((invocation): invocation is NonNullable<ReturnType<typeof parseGitInvocation>> => invocation !== undefined);
@@ -566,7 +570,9 @@ export async function guardToolCallImpl(
 			logPolicyBlock(`[workflow-guard] blocked settings tamper: ${command.slice(0, 120)}`);
 			return block("tamper", "settings_tamper", PROTECTED_PATH_REASON);
 		}
-		for (const segment of command.split(/[\n|;&]+/)) {
+		// Mask from `raw`, not the normalized copy: `normalize` folds newlines
+		// into spaces, which erases the heredoc shape the mask needs to find.
+		for (const segment of maskDataHeredocBodies(raw).split(/[\n|;&]+/)) {
 			const secretFile = secretFileReadIn(segment.trim());
 			if (secretFile) {
 				logPolicyBlock(`[workflow-guard] blocked shell read of secret file: ${secretFile}`);
@@ -575,8 +581,10 @@ export async function guardToolCallImpl(
 		}
 		// A nested payload changes a tree this session may not judge when it
 		// changes directory itself, or names a foreign `cwd`. The outer shell
-		// sees one word, so the top-level walk above cannot see it.
-		const nestedTreeReason = nestedPayloadMutationReason(extractInterpreterPayload, writePathsInPayload, command, shellRoot, currentRoot);
+		// sees one word, so the top-level walk above cannot see it. Plan from
+		// `raw` for the same reason the top-level walk does: a heredoc body's
+		// own lines are real commands to the shell that consumes it.
+		const nestedTreeReason = nestedPayloadMutationReason(extractInterpreterPayload, writePathsInPayload, raw, shellRoot, currentRoot);
 		if (nestedTreeReason) {
 			logPolicyBlock(`[workflow-guard] blocked nested interpreter mutation outside workspace: ${command.slice(0, 120)}`);
 			return block("boundary", "workspace_escape", nestedTreeReason);
@@ -615,9 +623,11 @@ export async function guardToolCallImpl(
 		}
 		// `eval` runs its body in the current shell, so a `cd` inside it moves the
 		// directory of later segments. Another launcher's payload runs in a child
-		// process and cannot move this shell, so only `eval` is forwarded.
-		const evalBody = (s: string): string | undefined => (/\beval\b/.test(s) ? extractInterpreterPayload(s)[0] : undefined);
-		const shellMutationReason = await guardShellMutation(command, context?.sessionID, !context?.simulate, shellRoot, evalBody);
+		// process and cannot move this shell, so only `eval` is forwarded. The
+		// predicate lives in the shell walk so both call sites agree on which
+		// `eval` is a command.
+		const leadingEvalBody = (s: string): string | undefined => (isLeadingEvalSegment(s) ? extractInterpreterPayload(s)[0] : undefined);
+		const shellMutationReason = await guardShellMutation(raw, context?.sessionID, !context?.simulate, shellRoot, leadingEvalBody);
 		if (shellMutationReason) {
 			logPolicyBlock(`[workflow-guard] blocked shell mutation: ${command.slice(0, 120)}`);
 			return block("boundary", "shell_mutation", shellMutationReason);

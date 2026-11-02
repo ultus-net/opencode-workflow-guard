@@ -1,5 +1,6 @@
 import { isSecretPath } from "./secrets.ts";
 import { isPathOutsideWorkspace } from "./boundary.ts";
+import { heredocBodyIsCode, heredocRanges, maskDataHeredocBodies } from "../lib/shell.ts";
 
 // `eval` runs its argument as shell text, so its payload is scanned like an
 // inline interpreter body. It is the one launcher with no option word, so the
@@ -78,22 +79,24 @@ function inlinePayloadWord(segment: string, start: number): string | undefined {
 
 export function extractInterpreterPayload(segment: string): string[] {
 	const payloads: string[] = [];
-	const launcher = LAUNCHER_RE.exec(segment);
+	// A heredoc body is prose unless the command reading it executes it, so the
+	// launcher scan runs on the masked text instead of reading documentation as
+	// code (`bash -c 'cd /other && rm -rf x'` quoted inside a `cat` body).
+	const masked = maskDataHeredocBodies(segment);
+	const launcher = LAUNCHER_RE.exec(masked);
 	if (launcher) {
 		const payload = inlinePayloadWord(segment, (launcher.index ?? 0) + launcher[0].length);
 		if (payload !== undefined) payloads.push(payload);
 	}
-	const heredocHeader = segment.match(
-		/\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\b[^\n]*<<(-?)\s*(?:'([^'\n]+)'|"([^"\n]+)"|([^\s'";|&()<>\n]+))[^\n]*\n/i,
-	);
-	if (heredocHeader) {
-		const delimiter = heredocHeader[2] ?? heredocHeader[3] ?? heredocHeader[4];
-		const bodyStart = (heredocHeader.index ?? 0) + heredocHeader[0].length;
-		const lines = segment.slice(bodyStart).split("\n");
-		const terminator = lines.findIndex((line) => (heredocHeader[1] ? line.replace(/^\t+/, "") : line) === delimiter);
-		if (terminator >= 0) payloads.push(lines.slice(0, terminator).join("\n"));
+	// A heredoc body is code when the command that reads it executes it. An
+	// unterminated body still runs, so it is scanned to end of input. The
+	// terminator's own newline is not part of the body.
+	for (const range of heredocRanges(segment)) {
+		if (!heredocBodyIsCode(segment, range.start)) continue;
+		const body = segment.slice(range.bodyStart, range.bodyEnd).replace(/\n$/, "");
+		if (body !== "") payloads.push(body);
 	}
-	const psMatch = segment.match(
+	const psMatch = masked.match(
 		/\b(?:powershell|pwsh)\s+(?:-[a-zA-Z]*enc[a-zA-Z]*\s+)([A-Za-z0-9+/=]+)/i,
 	);
 	if (psMatch?.[1]) {
@@ -102,7 +105,7 @@ export function extractInterpreterPayload(segment: string): string[] {
 			payloads.push(buf.toString("utf8"), buf.toString("utf16le"));
 		} catch {}
 	}
-	const b64PipeMatch = segment.match(
+	const b64PipeMatch = masked.match(
 		/echo\s+["']?([A-Za-z0-9+/=]{4,})["']?\s*\|\s*base64\s+(?:-[a-zA-Z]*d[a-zA-Z]*|--decode)\s*\|\s*(?:bash|sh|zsh)/i,
 	);
 	if (b64PipeMatch?.[1]) {
