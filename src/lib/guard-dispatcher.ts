@@ -613,7 +613,11 @@ export async function guardToolCallImpl(
 			const secretPath = secretPathInPayload(payload);
 			if (secretPath) return block("secrets", "secret_read", `Blocked: reading sensitive credential/secret file '${secretPath}' via inline interpreter script is not permitted.`);
 		}
-		const shellMutationReason = await guardShellMutation(command, context?.sessionID, !context?.simulate, shellRoot);
+		// `eval` runs its body in the current shell, so a `cd` inside it moves the
+		// directory of later segments. Another launcher's payload runs in a child
+		// process and cannot move this shell, so only `eval` is forwarded.
+		const evalBody = (s: string): string | undefined => (/\beval\b/.test(s) ? extractInterpreterPayload(s)[0] : undefined);
+		const shellMutationReason = await guardShellMutation(command, context?.sessionID, !context?.simulate, shellRoot, evalBody);
 		if (shellMutationReason) {
 			logPolicyBlock(`[workflow-guard] blocked shell mutation: ${command.slice(0, 120)}`);
 			return block("boundary", "shell_mutation", shellMutationReason);

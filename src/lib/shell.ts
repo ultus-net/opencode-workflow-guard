@@ -699,7 +699,7 @@ function constructKeywordIn(segment: string): "open" | "close" | "case-open" | "
  * evaluate, so a construct whose bodies change directory leaves the later
  * directory undetermined rather than letting the last body parsed win.
  */
-export function planShellSegments(command: string, baseDir: string | undefined): ShellSegmentPlan[] {
+export function planShellSegments(command: string, baseDir: string | undefined, evalBody?: (segment: string) => string | undefined): ShellSegmentPlan[] {
 	const plan: ShellSegmentPlan[] = [];
 	let cwd = baseDir;
 	const dirStack: Array<string | undefined> = [];
@@ -727,7 +727,11 @@ export function planShellSegments(command: string, baseDir: string | undefined):
 			constructStack.push({ changed: false });
 			caseDepth += 1;
 		}
-		const change = cwdChangeIn(segment, caseDepth > 0);
+		// `eval` runs its body in the current shell, so a `cd` inside it moves the
+		// directory of later segments. The body is supplied by the caller because
+		// extracting it lives in the interpreter policy, not here.
+		const evaluated = evalBody?.(segment);
+		const change = cwdChangeIn(segment, caseDepth > 0) ?? (evaluated === undefined ? undefined : cwdChangeIn(evaluated, caseDepth > 0));
 		if (change) {
 			for (const frame of constructStack) frame.changed = true;
 			if (change.unmodeled) {

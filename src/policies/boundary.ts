@@ -582,7 +582,12 @@ export function nestedPayloadMutationReason(
 	if (depth > 8) {
 		return `Blocked: inline interpreter scripts are nested deeper than the ${8} levels this check models, so the tree they mutate cannot be determined. Run the command from a single script file inside the workspace instead.`;
 	}
-	for (const { segment, root } of planShellSegments(command, baseDir)) {
+	for (const { segment, root } of planShellSegments(command, baseDir, (s) => {
+		// `eval` runs in the current shell, so its body's `cd` moves later
+		// segments. Only an `eval` body counts here; another launcher's payload
+		// runs in a child process and cannot move this shell.
+		return /\beval\b/.test(s) ? extractPayloads(s)[0] : undefined;
+	})) {
 		const payloads = extractPayloads(segment);
 		if (payloads.length === 0) continue;
 		// A launcher whose directory is indeterminate must not be assumed to be
@@ -648,6 +653,7 @@ export async function guardShellMutation(
 	sessionID: string | undefined,
 	record = true,
 	shellRoot?: string,
+	evalBody?: (segment: string) => string | undefined,
 ): Promise<string | undefined> {
 	// Judge the tree the command RUNS in. A linked worktree of this repository
 	// is a legitimate workdir, and its branch or relative targets are not the
@@ -655,7 +661,7 @@ export async function guardShellMutation(
 	// in a feature worktree as if it happened on the primary `main`.
 	const workspaceRoot = getWorkspaceRoot();
 	const root = shellRoot ?? workspaceRoot;
-	const plan = planShellSegments(command, root);
+	const plan = planShellSegments(command, root, evalBody);
 	// The foreign-tree gate runs here too, so this function is safe when called
 	// on its own: an indeterminate or foreign `cd` is refused instead of silently
 	// falling back to judging relative targets against the wrong tree.

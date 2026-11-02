@@ -1,7 +1,10 @@
 import { isSecretPath } from "./secrets.ts";
 import { isPathOutsideWorkspace } from "./boundary.ts";
 
-const LAUNCHER_RE = /\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\s+(?:-[a-zA-Z]*[ce])\s*/i;
+// `eval` runs its argument as shell text, so its payload is scanned like an
+// inline interpreter body. It is the one launcher with no option word, so the
+// quoted body follows the command directly.
+const LAUNCHER_RE = /\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\s+(?:-[a-zA-Z]*[ce])\s*|\beval\s+/i;
 
 /**
  * The quoted shell word that follows an inline interpreter launcher.

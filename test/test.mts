@@ -4700,6 +4700,16 @@ for (const [label, command] of [
 // its pattern paren must not consume the subshell's own closing paren.
 const caseInSubshell = await call("bash", { command: `( case x in x) cd ${foreignWtRepo} ;; esac ) ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
 check("a case arm inside a grouping subshell stays scoped to it", !blocked(caseInSubshell));
+// `eval` runs its body in the current shell, so a `cd` inside it moves the
+// directory of later segments. Both halves are covered: a payload that changes
+// directory and mutates, and a payload whose `cd` moves a later outer command.
+const evalCompound = await call("bash", { command: `eval "cd ${foreignWtRepo} && git commit -m x --allow-empty"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an eval payload that changes directory and mutates is blocked", blocked(evalCompound));
+const evalMovesOuter = await call("bash", { command: `eval "cd ${foreignWtRepo}" ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("an eval cd moves the tree of a later outer command", blocked(evalMovesOuter));
+const evalHarmless = await call("bash", { command: `eval "echo hi" ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a harmless eval leaves the tree of later segments alone", !blocked(evalHarmless));
+
 
 
 // `~user` never means a literal `~user` directory. Reading it as a relative
