@@ -1,13 +1,84 @@
 import { isSecretPath } from "./secrets.ts";
 import { isPathOutsideWorkspace } from "./boundary.ts";
 
+const LAUNCHER_RE = /\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\s+(?:-[a-zA-Z]*[ce])\s*/i;
+
+/**
+ * The quoted shell word that follows an inline interpreter launcher.
+ *
+ * A shell word is one argument however many quoted spans it concatenates, so
+ * `'bash -c '\''cd /other && rm -rf x'\'''` is a single payload. Stopping at
+ * the first closing quote truncated that word to `bash -c `, and the nested
+ * command escaped the payload scan entirely.
+ */
+function inlinePayloadWord(segment: string, start: number): string | undefined {
+	let out = "";
+	let i = start;
+	while (i < segment.length) {
+		const char = segment[i]!;
+		if (char === "'") {
+			i += 1;
+			let closed = false;
+			while (i < segment.length) {
+				const inner = segment[i]!;
+				// `'\''` is the idiom for a literal quote inside a single-quoted
+				// span: the span closes, an escaped quote follows, a new span opens.
+				if (inner === "'" && segment[i + 1] === "\\" && segment[i + 2] === "'" && segment[i + 3] === "'") {
+					out += "'";
+					i += 4;
+					continue;
+				}
+				if (inner === "'") {
+					closed = true;
+					i += 1;
+					break;
+				}
+				out += inner;
+				i += 1;
+			}
+			if (!closed) return undefined;
+			continue;
+		}
+		if (char === '"') {
+			i += 1;
+			let closed = false;
+			while (i < segment.length) {
+				const inner = segment[i]!;
+				if (inner === "\\" && segment[i + 1] !== undefined) {
+					out += segment[i + 1];
+					i += 2;
+					continue;
+				}
+				if (inner === '"') {
+					closed = true;
+					i += 1;
+					break;
+				}
+				out += inner;
+				i += 1;
+			}
+			if (!closed) return undefined;
+			continue;
+		}
+		// Unquoted text ends the word at whitespace or a shell operator.
+		if (/\s/.test(char) || "|&;()<>".includes(char)) break;
+		if (char === "\\" && segment[i + 1] !== undefined) {
+			out += segment[i + 1];
+			i += 2;
+			continue;
+		}
+		out += char;
+		i += 1;
+	}
+	return out === "" ? undefined : out;
+}
+
 export function extractInterpreterPayload(segment: string): string[] {
 	const payloads: string[] = [];
-	const inlineMatch = segment.match(
-		/\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\s+(?:-[a-zA-Z]*[ce])\s*(?:"([^"]*)"|'([^']*)')/i,
-	);
-	if (inlineMatch?.[1] || inlineMatch?.[2]) {
-		payloads.push(inlineMatch[1] ?? inlineMatch[2] ?? "");
+	const launcher = LAUNCHER_RE.exec(segment);
+	if (launcher) {
+		const payload = inlinePayloadWord(segment, (launcher.index ?? 0) + launcher[0].length);
+		if (payload !== undefined) payloads.push(payload);
 	}
 	const heredocHeader = segment.match(
 		/\b(?:python3?|node|perl|ruby|osascript|bash|sh|zsh|dash|ksh)\b[^\n]*<<(-?)\s*(?:'([^'\n]+)'|"([^"\n]+)"|([^\s'";|&()<>\n]+))[^\n]*\n/i,

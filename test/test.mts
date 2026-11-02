@@ -4695,6 +4695,12 @@ check("a cd to a named user's home is not read as a workspace-relative path", bl
 // mutation were never re-planned.
 const doublyNestedPayload = await call("bash", { command: `bash -c "bash -c 'cd ${foreignWtRepo} && git commit -m x --allow-empty'"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
 check("a doubly nested shell payload is re-planned until its mutation is judged", blocked(doublyNestedPayload) && String(doublyNestedPayload).includes(foreignWtRepo));
+// The `'\''` idiom is how a shell nests a single quote inside a single-quoted
+// span. Extraction stopped at the first closing quote, so the payload read as a
+// bare `bash -c ` and the nested mutation was never scanned.
+const quoteEscapePayload = await call("bash", { command: "bash -c 'bash -c '\\''cd " + foreignWtRepo + " && git commit -m x --allow-empty'\\'''" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload nested with the quote-escape idiom is scanned past the first quote", blocked(quoteEscapePayload) && String(quoteEscapePayload).includes(foreignWtRepo));
+
 // `git -C <repo>` carries its repository in the flag, with no `cd` to follow.
 // The payload walk never applied the foreign-repository check to it.
 const payloadGitDashC = await call("bash", { command: `bash -c 'git -C ${foreignWtRepo} commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
