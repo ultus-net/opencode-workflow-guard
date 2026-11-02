@@ -665,7 +665,11 @@ export async function guardToolCallImpl(
 			// reviewed branch lives in an isolated worktree. Every preflight
 			// check then judges that tree instead of the caller's.
 			const prSegment = splitShellSegments(raw).find((segment) => hasPrCreateInvocation(segment));
-			const sourceBranch = prSegment ? prSourceBranch(unwrapShellCommand(prSegment)) : undefined;
+			// Quote-aware on the raw segment: `unwrapShellCommand` joins the
+			// words back without their quotes, so re-parsing the joined text
+			// read a `--head`-looking token inside a quoted `--body` as the
+			// source branch.
+			const sourceBranch = prSegment ? prSourceBranch(prSegment) : undefined;
 			let prRoot = shellRoot;
 			let branch = currentGitBranch(shellRoot);
 			let missingSourceCheckout: string | undefined;

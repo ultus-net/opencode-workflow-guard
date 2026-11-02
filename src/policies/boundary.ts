@@ -430,16 +430,54 @@ export type PayloadWorkingRoot =
 // `child_process.exec(...)` still is. A bare `cwd:` key in an unrelated object
 // literal names no working directory at all.
 const SPAWN_CALLEE = String.raw`(?:(?:child_process|cp)\.)?(?:execSync|execFileSync|spawnSync|execFile|spawn|fork)|(?:child_process|cp)\.exec|(?<![.\w$])exec`;
-const SPAWN_CALL_CWD = new RegExp(
-	String.raw`(?:${SPAWN_CALLEE})\s*\([^)]*?\bcwd\s*:\s*([^,)}]+)`,
-);
 const PROCESS_CHDIR = /\bprocess\s*\.\s*chdir\s*\(\s*([^)]+?)\s*\)/;
 
+/**
+ * The argument text of every spawn-family call, found with a balanced scan.
+ *
+ * A flat `[^)]*` stopped at the first closing paren, so
+ * `execSync(require('path').join('a','b'), {cwd: '/other'})` matched nothing and
+ * its foreign `cwd` went unchecked.
+ */
+function spawnCallArguments(payload: string): string[] {
+	const spans: string[] = [];
+	const callee = new RegExp(String.raw`(?:${SPAWN_CALLEE})\s*\(`, "g");
+	for (let match = callee.exec(payload); match; match = callee.exec(payload)) {
+		let depth = 0;
+		let quote: string | undefined;
+		const start = match.index + match[0].length - 1;
+		for (let i = start; i < payload.length; i += 1) {
+			const char = payload[i]!;
+			if (quote) {
+				if (char === quote && payload[i - 1] !== "\\") quote = undefined;
+				continue;
+			}
+			if (char === "'" || char === '"' || char === "`") {
+				quote = char;
+				continue;
+			}
+			if (char === "(") depth += 1;
+			else if (char === ")") {
+				depth -= 1;
+				if (depth === 0) {
+					spans.push(payload.slice(start + 1, i));
+					break;
+				}
+			}
+		}
+		callee.lastIndex = Math.max(callee.lastIndex, start + 1);
+	}
+	return spans;
+}
+
 export function payloadWorkingRoot(payload: string): PayloadWorkingRoot {
-	for (const pattern of [SPAWN_CALL_CWD, PROCESS_CHDIR]) {
-		const match = pattern.exec(payload);
-		const raw = match?.[1]?.trim();
-		if (!raw) continue;
+	const cwdValues = spawnCallArguments(payload).flatMap((args) => {
+		const match = /\bcwd\s*:\s*([^,)}]+)/.exec(args);
+		return match?.[1] ? [match[1].trim()] : [];
+	});
+	const chdir = PROCESS_CHDIR.exec(payload)?.[1]?.trim();
+	if (chdir) cwdValues.push(chdir);
+	for (const raw of cwdValues) {
 		const literal = /^(["'`])([^"'`]*)\1$/.exec(raw);
 		if (literal?.[2]) return { status: "resolved", root: literal[2] };
 		return { status: "indeterminate", raw };
@@ -450,6 +488,27 @@ export function payloadWorkingRoot(payload: string): PayloadWorkingRoot {
 function payloadMutates(payload: string): boolean {
 	if (detectShellMutation(payload)) return true;
 	return isGitTreeWriteText(payload);
+}
+
+/**
+ * A segment-level git invocation whose repository is outside the workspace.
+ *
+ * The dispatcher applies this check to top-level commands. A payload was never
+ * routed through it, so `bash -c 'git -C <other> commit'` reached a foreign
+ * repository: the `-C` form carries no `cd`, and `isGitTreeWriteText` reads the
+ * `git <verb>` text without resolving the flag.
+ */
+function foreignGitRepositoryIn(segment: string, baseDir: string, workspaceRoot: string): string | undefined {
+	for (const raw of segment.split(/[\n|;&]+/)) {
+		const invocation = parseGitInvocation(raw.trim(), baseDir);
+		if (!invocation) continue;
+		if (!isGitTreeWriteText(`git ${invocation.rest}`)) continue;
+		const repoDir = invocation.repoDir;
+		const foreign = hasUnresolvableVariable(repoDir)
+			|| (isPathOutsideWorkspace(repoDir, workspaceRoot) && !isSameGitRepo(repoDir, workspaceRoot));
+		if (foreign) return repoDir;
+	}
+	return undefined;
 }
 
 /**
@@ -467,7 +526,9 @@ export function nestedPayloadMutationReason(
 	command: string,
 	baseDir: string,
 	workspaceRoot: string,
+	depth = 0,
 ): string | undefined {
+	if (depth > 8) return undefined;
 	for (const { segment, root } of planShellSegments(command, baseDir)) {
 		const payloads = extractPayloads(segment);
 		if (payloads.length === 0) continue;
@@ -485,8 +546,17 @@ export function nestedPayloadMutationReason(
 			continue;
 		}
 		for (const payload of payloads) {
+			const foreignRepo = foreignGitRepositoryIn(payload, launcherRoot, workspaceRoot);
+			if (foreignRepo) {
+				return `Blocked: the inline interpreter script runs a git write against '${foreignRepo}', outside workspace root (${workspaceRoot}) and not a linked worktree of this repository. Run the command from inside the workspace instead.`;
+			}
 			const nested = foreignSegmentMutationReason(planShellSegments(payload, launcherRoot), workspaceRoot);
 			if (nested) return nested;
+			// A payload can launch another interpreter: `bash -c "bash -c 'cd
+			// <other> && git commit'"` only extracts its own quoted body. Re-plan
+			// each payload until the nesting bottoms out.
+			const inner = nestedPayloadMutationReason(extractPayloads, writesIn, payload, launcherRoot, workspaceRoot, depth + 1);
+			if (inner) return inner;
 			const declared = payloadWorkingRoot(payload);
 			if (declared.status === "none") continue;
 			if (writesIn(payload).length === 0 && !payloadMutates(payload)) continue;

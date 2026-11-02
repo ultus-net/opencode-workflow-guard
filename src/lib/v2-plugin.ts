@@ -843,21 +843,20 @@ async function handleV2Event(
 		return;
 	}
 
-	if (event.type === "session.updated" || event.type === "session.moved") {
+	if (event.type === "session.moved") {
 		// `session_move` relocates a session between checkouts, and the host
-		// announces it. `session.moved` carries `data.sessionID` and the
-		// destination `data.location.directory`, and is itself the move signal.
-		// `session.updated` carries the full session record, whose `directory`
-		// is the authoritative post-move path. Without this rebind the session
-		// kept judging the tree it left.
+		// announces it. On the pinned 2.2.0 SDK the V2 union carries
+		// `session.moved` and no `session.updated`, and the move event itself
+		// names the destination: `data.sessionID` plus
+		// `data.location.directory`. Without this rebind the session kept
+		// judging the tree it left.
 		const data = event.data as {
 			sessionID?: unknown;
-			info?: { id?: unknown; directory?: unknown };
 			location?: { directory?: unknown };
 		} | undefined;
-		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : typeof data?.info?.id === "string" ? data.info.id : undefined;
-		const directory = typeof data?.location?.directory === "string" ? data.location.directory : typeof data?.info?.directory === "string" ? data.info.directory : undefined;
-		rebindSessionWorkspaceFromHost(sessionID, directory, { moved: event.type === "session.moved" });
+		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
+		const directory = typeof data?.location?.directory === "string" ? data.location.directory : undefined;
+		rebindSessionWorkspaceFromHost(sessionID, directory, { moved: true });
 		return;
 	}
 

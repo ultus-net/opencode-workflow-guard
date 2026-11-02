@@ -4416,6 +4416,17 @@ check("prSourceBranch reads the attached -Hvalue form", prSourceBranch("gh pr cr
 check("prSourceBranch reads az --source-branch", prSourceBranch("az repos pr create --source-branch feat/x --description b") === "feat/x");
 check("prSourceBranch strips a fork owner prefix", prSourceBranch("gh pr create --head someone:feature/y --body b") === "feature/y");
 check("prSourceBranch returns undefined when no branch is named", prSourceBranch("gh pr create --body b") === undefined);
+// A `--head`-looking token inside a quoted body is command data, not a branch.
+// The dispatcher used to unwrap the segment first, and the joined text lost the
+// quotes, so body prose was re-read as flags.
+check(
+	"a --head token inside a quoted PR body is not read as the source branch",
+	prSourceBranch(`gh pr create --title t --body 'Changelog: ok. Reviewer note: --head innocent'`) === undefined,
+);
+check(
+	"a real --head still wins over a --head token inside the body",
+	prSourceBranch(`gh pr create --head feat/x --body 'Changelog: ok, see --head nope'`) === "feat/x",
+);
 // A repository claim must be an actual assignment. A commit message that
 // happens to contain `GIT_DIR=` previously read as one, which was harmless
 // while the value only picked a base directory but is not harmless now that the
@@ -4623,6 +4634,62 @@ check(
 	"a RegExp exec with a cwd key is not treated as a spawn working directory",
 	!blocked(payloadRegexExec) && !String(payloadRegexExec).includes(foreignWtRepo),
 );
+
+// A `pushd` inside a grouping subshell leaves its entry on the subshell's own
+// stack. bash discards that stack with the subshell, so a later outer `popd`
+// stops at "directory stack empty" and leaves the outer `cd` in force. A walk
+// that leaked the inner entry planned the outer removal back at the workspace.
+const subshellPushdThenPopd = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; popd >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check(
+	"a pushd inside a grouping subshell does not leak into a later outer popd",
+	blocked(subshellPushdThenPopd),
+);
+const subshellPushdThenPopdCommit = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; popd >/dev/null 2>&1 ; git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a leaked subshell pushd does not let an outer git write read as the workspace", blocked(subshellPushdThenPopdCommit));
+
+// `pushd +N` and `pushd -N` rotate the stack and `-n` only pushes: neither
+// changes directory the way a plain `pushd <dir>` does, so the walk reports
+// them as unchecked and a mutation after one fails closed.
+const pushdRotate = await call("bash", { command: "pushd +1 >/dev/null 2>&1 ; rm -rf out.txt" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a pushd stack rotation followed by a mutation fails closed", blocked(pushdRotate) && String(pushdRotate).includes("cannot be determined"));
+const pushdNoChange = await call("bash", { command: `pushd -n ${foreignWtRepo} >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a pushd -n that only pushes the stack fails closed before a mutation", blocked(pushdNoChange));
+const pushdRotateRead = await call("bash", { command: "pushd +1 >/dev/null 2>&1 ; ls -la" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a pushd stack rotation followed by a read stays allowed", !blocked(pushdRotateRead));
+
+// A control-flow body runs in the CURRENT shell, so its `cd` moves the
+// directory of every later segment. Only `( … )` scopes a directory.
+for (const [label, command] of [
+	["then", `if true; then cd ${foreignWtRepo}; fi; rm -rf out.txt`],
+	["do", `for i in 1; do cd ${foreignWtRepo}; done; rm -rf out.txt`],
+	["while", `while false; do :; done; cd ${foreignWtRepo}; rm -rf out.txt`],
+	["case", `case x in x) cd ${foreignWtRepo};; esac; rm -rf out.txt`],
+	["brace group", `{ cd ${foreignWtRepo} ; } ; rm -rf out.txt`],
+] as const) {
+	const flowMutation = await call("bash", { command }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+	check(`a cd inside a '${label}' body moves the tree of later segments`, blocked(flowMutation) && String(flowMutation).includes(foreignWtRepo));
+}
+
+// `~user` never means a literal `~user` directory. Reading it as a relative
+// path put the walk inside the workspace while the shell reached that home.
+const tildeUser = await call("bash", { command: "cd ~root && rm -rf out.txt" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a cd to a named user's home is not read as a workspace-relative path", blocked(tildeUser) && String(tildeUser).includes("outside workspace root"));
+
+// A payload can launch another interpreter. Only the innermost quoted body was
+// extracted, so the outer launcher swallowed the inner one and its `cd` and
+// mutation were never re-planned.
+const doublyNestedPayload = await call("bash", { command: `bash -c "bash -c 'cd ${foreignWtRepo} && git commit -m x --allow-empty'"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a doubly nested shell payload is re-planned until its mutation is judged", blocked(doublyNestedPayload) && String(doublyNestedPayload).includes(foreignWtRepo));
+// `git -C <repo>` carries its repository in the flag, with no `cd` to follow.
+// The payload walk never applied the foreign-repository check to it.
+const payloadGitDashC = await call("bash", { command: `bash -c 'git -C ${foreignWtRepo} commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload git -C into a foreign repository is blocked", blocked(payloadGitDashC) && String(payloadGitDashC).includes(foreignWtRepo));
+const payloadGitDashCLocal = await call("bash", { command: `bash -c 'git -C ${wtLinked} commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload git -C into a linked worktree stays allowed", !blocked(payloadGitDashCLocal));
+// A spawn `cwd` after a call expression is still a spawn `cwd`. A flat `[^)]*`
+// up to the first closing paren matched nothing and left the tree unchecked.
+const spawnCwdAfterCall = await call("bash", { command: `node -e "require('child_process').execSync(String('git commit -m x --allow-empty'), {cwd:'${foreignWtRepo}'})"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a spawn cwd after a nested call is still read as the working directory", blocked(spawnCwdAfterCall) && String(spawnCwdAfterCall).includes(foreignWtRepo));
 
 rmSync(join(wtLinked, "nested"), { recursive: true, force: true });
 rmSync(foreignWtRepo, { recursive: true, force: true });

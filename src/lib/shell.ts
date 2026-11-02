@@ -1,4 +1,4 @@
-import { homedir } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { join, resolve } from "node:path";
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -480,6 +480,17 @@ function expandCwdTarget(target: string): string | undefined {
 	const home = process.env.HOME || homedir();
 	if (target === "~") return home;
 	if (target.startsWith("~/")) return join(home, target.slice(2));
+	// `cd ~user` resolves to that user's home, never to a literal `~user`
+	// directory. Reading it as a relative path put a `cd ~csh` walk inside the
+	// workspace while the shell reached the real home.
+	const named = /^~([^/\s]+)(?:\/|$)/.exec(target);
+	if (named) {
+		try {
+			return named[1] === userInfo().username ? home : join("/home", named[1]!);
+		} catch {
+			return undefined;
+		}
+	}
 	if (/^\$(?:HOME|\{HOME\})(?:$|[/\\])/.test(target)) {
 		return target.replace(/^\$(?:HOME|\{HOME\})/, home);
 	}
@@ -487,23 +498,75 @@ function expandCwdTarget(target: string): string | undefined {
 	return target;
 }
 
-function cwdChangeIn(segment: string): { word: string; target?: string } | undefined {
+/** Words that carry no directory of their own; a control-flow body follows them. */
+const TRANSPARENT_PREFIX = new Set([
+	"builtin",
+	"command",
+	"then",
+	"else",
+	"elif",
+	"do",
+	"if",
+	"while",
+	"until",
+	"for",
+	"!",
+	"time",
+]);
+
+/**
+ * A `pushd` operand that rotates or only pushes the stack.
+ *
+ * `pushd +N`/`-N` swaps entries, and `-n` pushes without changing directory.
+ * The walk tracks a single saved directory, so it cannot model either. Both are
+ * reported as an unchecked change, which fails closed for a mutation.
+ */
+function pushdRotation(operand: string): boolean {
+	return /^[+-]\d+$/.test(operand) || operand === "-n" || /^-n./.test(operand);
+}
+
+function cwdChangeIn(segment: string): { word: string; target?: string; unmodeled?: boolean } | undefined {
 	const words = unwrapShellWords(segment);
 	let i = 0;
-	while (i < words.length && (words[i] === "builtin" || words[i] === "command")) i += 1;
+	// `case x in a) cd /other;; esac` runs the `cd` in the current shell. The
+	// pattern is one word after `in`, and the command follows it.
+	if (words[0] === "case") {
+		const inIndex = words.indexOf("in");
+		i = inIndex >= 0 ? inIndex + 2 : words.length;
+	}
+	while (i < words.length) {
+		const word = words[i]!;
+		if (TRANSPARENT_PREFIX.has(word)) {
+			i += 1;
+			continue;
+		}
+		if (CWD_WORDS.has(word)) break;
+		// A case pattern closes with `)`, and the command after it runs here.
+		if (word.endsWith(")") || word === "}") {
+			i += 1;
+			continue;
+		}
+		return undefined;
+	}
 	const word = words[i];
 	if (!word || !CWD_WORDS.has(word)) return undefined;
 	if (word === "popd") return { word };
 	let target: string | undefined;
+	let unmodeled = false;
 	for (let j = i + 1; j < words.length; j += 1) {
 		const candidate = words[j]!;
 		if (candidate === "--") continue;
+		if (word === "pushd" && pushdRotation(candidate)) {
+			unmodeled = true;
+			continue;
+		}
 		// `cd -` moves to OLDPWD, which this walk does not track.
 		if (candidate === "-") return { word, target: undefined };
 		if (candidate.startsWith("-")) continue;
 		target = candidate;
 		break;
 	}
+	if (unmodeled) return { word, target: undefined };
 	if (target !== undefined) return { word, target };
 	// A bare `cd` moves to $HOME, a known directory. A bare `pushd` swaps the
 	// top two entries of the directory stack, which is not tracked here.
@@ -559,11 +622,13 @@ export function planShellSegments(command: string, baseDir: string | undefined):
 	const plan: ShellSegmentPlan[] = [];
 	let cwd = baseDir;
 	const dirStack: Array<string | undefined> = [];
-	// One saved outer directory per open grouping paren.
-	const groupStack: Array<string | undefined> = [];
+	// Each open grouping paren saves the outer directory and the outer stack.
+	// A `pushd` inside `( … )` must not leave an entry a later outer `popd`
+	// consumes: bash discards the subshell's stack with it.
+	const groupStack: Array<{ cwd: string | undefined; dirStack: Array<string | undefined> }> = [];
 	for (const segment of splitShellSegments(command)) {
 		const { opens, closes } = groupParensIn(segment);
-		for (let i = 0; i < opens; i += 1) groupStack.push(cwd);
+		for (let i = 0; i < opens; i += 1) groupStack.push({ cwd, dirStack: [...dirStack] });
 		const wrapperCwd = shellWrapperCwd(segment);
 		let root = cwd;
 		if (wrapperCwd !== undefined) {
@@ -582,7 +647,12 @@ export function planShellSegments(command: string, baseDir: string | undefined):
 			}
 		}
 		for (let i = 0; i < closes; i += 1) {
-			cwd = groupStack.length > 0 ? groupStack.pop() : cwd;
+			const outer = groupStack.pop();
+			if (outer) {
+				cwd = outer.cwd;
+				dirStack.length = 0;
+				dirStack.push(...outer.dirStack);
+			}
 		}
 	}
 	return plan;
