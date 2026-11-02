@@ -163,6 +163,7 @@ This is a policy and enforcement layer, not an agent harness. Policies may const
 
 ### 18. Interpreter Inline Evasion Scanner
 - Decodes and inspects inline interpreter payloads to prevent smuggling live destructive commands past shell pattern checks. Smuggled content includes settings tampering, secret reads, and out-of-workspace writes. The inspected forms are `python -c`, `node -e`, `perl -e`, `ruby -e`, `osascript -e`, `bash -c`, `sh -c`, `zsh -c`, `powershell -enc`, and `echo <base64> | base64 -d | sh`.
+- A payload is read as one whole shell word, not as the text between the first pair of quotes. Concatenated spans are joined and quote escapes are decoded, because that is what one shell argument is. The `'\''` idiom closes and reopens a single-quoted span, so reading only up to the first closing quote truncated `bash -c 'bash -c '\''cd /other && rm -rf x'\'''` to a bare `bash -c `, and the real nested command escaped the scan. The decoded body is re-planned at its own tree. Nesting past the modelled depth is refused rather than skipped.
 
 ### 19. Conflict-Free Pre-Flight Guard
 - Evaluates `git merge-tree` against the base branch (`origin/main`, `origin/master`, `main`) before PR creation or final task handoff, ensuring changes can be merged cleanly without conflicts.
