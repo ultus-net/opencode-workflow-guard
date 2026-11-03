@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { loadedPluginVersion } from "./lib/version.ts";
 import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } from "./policies/post-edit-validation.ts";
 import { claimFiles, releaseFileClaims } from "./policies/file-claims.ts";
-import { extractCommands, splitShellSegments } from "./lib/shell.ts";
+import { extractCommands, planShellSegments } from "./lib/shell.ts";
 import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, redirectMutationsIn } from "./policies/boundary.ts";
 import { beginReadObservation, clearReadFingerprints, recordMutationObservation, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
 import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
@@ -101,6 +101,8 @@ import {
 	setSessionWorkspace,
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
+	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	registerSessionWorkspaceFromToolCall,
 	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
@@ -148,6 +150,8 @@ export {
 	setSessionWorkspace,
 	getSessionWorkspace,
 	getSessionBoundWorkspace,
+	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	registerSessionWorkspaceFromToolCall,
 	resolveInheritedWorkspace,
 	resolveSessionBoundWorkspace,
@@ -251,6 +255,7 @@ export {
 	getGitWorktreeFingerprint,
 	getTrackedWorktreeFingerprint,
 };
+export type { VerifyRun } from "./lib/verify.ts";
 
 // ── Secondary review rubric ──────────────────────────────────────────────────
 import { buildReviewRubric } from "./lib/review.ts";
@@ -309,6 +314,9 @@ import {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	findWorktreeForBranch,
+	parseGitInvocation,
+	prSourceBranch,
 } from "./policies/git.ts";
 
 export {
@@ -316,6 +324,9 @@ export {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	findWorktreeForBranch,
+	parseGitInvocation,
+	prSourceBranch,
 };
 
 import {
@@ -596,13 +607,13 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					const shellCwd = shellWorkdir ? resolve(toolWorktree, shellWorkdir) : toolWorktree;
 					const snapshots: FileSnapshot[] = [];
 					for (const command of extractCommands(args)) {
-						for (const segment of splitShellSegments(command)) {
+						for (const { segment, root } of planShellSegments(command, shellCwd)) {
 							for (const mutation of redirectMutationsIn(segment)) {
 								const target = mutation.target ?? "";
 								if (!target || target === "/dev/null") continue;
 								const expanded = expandShellTargetPath(target);
 								if (!expanded) continue;
-								const resolvedTarget = resolve(shellCwd, expanded);
+								const resolvedTarget = resolve(root ?? shellCwd, expanded);
 								if (resolvedTarget === OPENCODE_SCRATCH_DIR || resolvedTarget.startsWith(OPENCODE_SCRATCH_DIR + "/")) continue;
 								if (isPathOutsideWorkspace(resolvedTarget, toolWorktree)) continue;
 								snapshots.push(snapshotFile(resolvedTarget));
@@ -943,6 +954,18 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => continueUnfinishedSession(sessionID, settleTitle));
 				}
 			}
+			if (event?.type === "session.updated") {
+				// `session_move` relocates a session between checkouts, and the
+				// host re-emits `session.updated` for the moved session. Its
+				// `directory` is the authoritative post-move location; without
+				// this rebind the session kept judging the tree it left. The
+				// rebind only takes a genuine move, so a title or cost update on
+				// a session bound to a linked worktree cannot drag it back.
+				const info = (event.properties as { info?: { id?: unknown; directory?: unknown } })?.info;
+				if (typeof info?.id === "string" && typeof info.directory === "string") {
+					rebindSessionWorkspaceFromHost(info.id, info.directory);
+				}
+			}
 			if (event?.type === "message.updated") {
 				const info = (event.properties as { info?: { id?: unknown; role?: unknown; sessionID?: unknown; error?: { name?: unknown } } })?.info;
 				if (info?.role === "user" && typeof info.sessionID === "string") {
@@ -972,6 +995,7 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 					toolLifecycle.takeRecoveryRun(sessionID);
 					clearLiveDocsFloor(sessionID);
 					await runWithRuntimeState(effectiveRoot, ctx.client, () => clearContinuationState(sessionID));
+					forgetSessionWorkspace(sessionID);
 				}
 			}
 			if (

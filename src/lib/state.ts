@@ -81,11 +81,27 @@ export function clearTodoSessionState(sessionID: string): void {
 // instance must never outrank the call's own context or the host fallback.
 const sessionWorkspaceBound = new Set<string>();
 
+// Last directory the HOST named per session, so a repeated `session.updated`
+// costs one string comparison instead of a `git rev-parse` child process.
+const sessionHostDirectories = new Map<string, string>();
+
 export function setSessionWorkspace(sessionID: string, workspace: string): void {
 	if (!sessionID || !workspace) return;
 	const gitRoot = findGitRoot(workspace);
 	sessionWorkspaces.set(sessionID, gitRoot ?? projectRootKey(workspace));
 	sessionWorkspaceBound.add(sessionID);
+}
+
+/**
+ * Drop a deleted session's workspace binding and host-directory cache entry.
+ *
+ * Both are keyed by session id, so a deleted session can never read them again.
+ * Leaving them would grow both maps for the life of a long-lived server.
+ */
+export function forgetSessionWorkspace(sessionID: string): void {
+	sessionWorkspaces.delete(sessionID);
+	sessionWorkspaceBound.delete(sessionID);
+	sessionHostDirectories.delete(sessionID);
 }
 
 export function getSessionWorkspace(sessionID?: string): string | undefined {
@@ -236,9 +252,72 @@ function auditWorkspaceRebind(sessionID: string, from: string | undefined, to: s
 		tool: "workspace.binding",
 		decision: "allow",
 		phase: "event",
-		reason: "workspace_rebind_host_worktree",
+		reason: source === "session-move" ? "workspace_rebind_session_move" : "workspace_rebind_host_worktree",
 		input: { from, to, source },
 	});
+}
+
+/**
+ * Rebind a session to the workspace the HOST says it now occupies.
+ *
+ * `session_move` (and the equivalent host move command) relocates a session
+ * between checkouts. Without this the binding stayed on the old checkout, so
+ * every later boundary, branch, and PR decision judged the tree the session had
+ * left: the move looked like it had no effect. A host move is an explicit
+ * boundary statement from the host, in the same class as a per-call worktree,
+ * so it may widen an already-bound session. It is journaled for that reason.
+ *
+ * The hard part is telling a move from a routine update. `session.updated` is a
+ * hot event, emitted for title and cost changes, and it names the session's
+ * creation directory. A session bound to a LINKED WORKTREE by its own tool-call
+ * `workdir` legitimately differs from that directory, so treating every update
+ * as a move pulled the session back to the checkout it had deliberately left.
+ * Three signals therefore count, and nothing else does:
+ *
+ * - The host announced the relocation itself (`moved: true`, from
+ *   `session.moved`).
+ * - The directory the host names now differs from the one it named last for
+ *   this session.
+ * - The named repository is a DIFFERENT repository from the bound workspace. A
+ *   linked worktree is the same repository, so this catches the cross-repository
+ *   move that a first observation would otherwise miss on OpenCode 1.x, which
+ *   has no move event.
+ *
+ * The last directory is remembered so a repeated update costs one string
+ * comparison instead of a `git rev-parse` child process. The cache stores a
+ * directory that actually resolved to a repository root: an unresolved
+ * directory is not cached, so a later event for the same path retries instead
+ * of being suppressed forever.
+ */
+export function rebindSessionWorkspaceFromHost(
+	sessionID: string | undefined,
+	directory: string | undefined,
+	options: { moved?: boolean } = {},
+): void {
+	if (!sessionID || !directory) return;
+	const gitRoot = findGitRoot(directory);
+	if (!gitRoot) return;
+	const previousHostDirectory = sessionHostDirectories.get(sessionID);
+	sessionHostDirectories.set(sessionID, directory);
+	const previous = sessionWorkspaces.get(sessionID);
+	const moved =
+		options.moved === true
+		|| (previousHostDirectory !== undefined && previousHostDirectory !== directory)
+		|| (previous !== undefined && gitRoot !== previous && !isSameGitRepo(gitRoot, previous));
+	if (!moved) {
+		if (sessionWorkspaceBound.has(sessionID)) return;
+		// A bootstrap entry that was never bound still needs binding: the host
+		// just named the session's real directory.
+		sessionWorkspaces.set(sessionID, gitRoot);
+		sessionWorkspaceBound.add(sessionID);
+		return;
+	}
+	if (previous === gitRoot) {
+		sessionWorkspaceBound.add(sessionID);
+		return;
+	}
+	setSessionWorkspace(sessionID, gitRoot);
+	auditWorkspaceRebind(sessionID, previous, gitRoot, "session-move");
 }
 
 /**

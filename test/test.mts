@@ -1,7 +1,7 @@
 import { mkdtempSync, writeFileSync, rmSync, symlinkSync, readFileSync, existsSync, mkdirSync, lstatSync, chmodSync, statSync, utimesSync, readdirSync, realpathSync } from "node:fs";
 import { spawn, spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { tmpdir, homedir } from "node:os";
+import { join, resolve, dirname } from "node:path";
 import { pathToFileURL } from "node:url";
 import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
@@ -89,6 +89,11 @@ import {
 	isBranchAlreadyMergedOrClosed,
 	checkMergeConflicts,
 	checkBranchBaseIsUpToDate,
+	findWorktreeForBranch,
+	parseGitInvocation,
+	prSourceBranch,
+	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	checkLockfileSync,
 	branchHasDocumentationChange,
 	isDocumentationRequired,
@@ -2209,6 +2214,27 @@ check("GIT_DIR prefix to external repository is blocked for writes", blocked(awa
 check("env GIT_DIR prefix to external repository is blocked for writes", blocked(await shell(`env GIT_DIR=${externalRepo}/.git git commit -m test`)));
 check("GIT_DIR prefix push to external repository is blocked", blocked(await shell(`GIT_DIR=${externalRepo}/.git git push origin feat/external`)));
 
+// An indeterminate repository is outside the boundary, even when the session
+// itself sits in a git workspace. `findGitRoot` walks up to the nearest
+// existing ancestor, so `$OTHER_REPO` resolved to the workspace's own root and
+// passed the same-repo test that admits linked worktrees. The feature branch
+// keeps the protected-branch gate quiet so this pins the boundary decision.
+const varRepo = mkdtempSync(join(tmpdir(), "wg-var-repo-"));
+spawnSync("git", ["init", "-b", "feat/var"], { cwd: varRepo });
+setWorkspaceRoot(varRepo);
+const variableGit = await shell("git -C $OTHER_REPO commit -m x");
+check(
+	"git -C with an unresolvable variable stays blocked inside a git workspace",
+	blocked(variableGit) && String(variableGit).includes("unresolvable variable reference"),
+);
+const variableGitDir = await shell("GIT_DIR=$OTHER_REPO/.git git push origin feat/x");
+check(
+	"GIT_DIR with an unresolvable variable stays blocked inside a git workspace",
+	blocked(variableGitDir) && String(variableGitDir).includes("unresolvable variable reference"),
+);
+setWorkspaceRoot(root);
+rmSync(varRepo, { recursive: true, force: true });
+
 rmSync(externalRepo, { recursive: true, force: true });
 
 // 5. Verification isolation and privilege checks
@@ -2407,6 +2433,21 @@ check(
 check(
 	"verification timeout names a remedy the agent can actually apply",
 	String(timeoutFinalRes).includes("verifyTimeoutMs") && String(timeoutFinalRes).includes("WORKFLOW_GUARD_VERIFY_TIMEOUT_MS"),
+);
+check(
+	"verification timeout names the user as the actor for a limit the agent cannot raise",
+	String(timeoutFinalRes).includes("Only the user can raise the limit") && String(timeoutFinalRes).includes(".jsonc"),
+);
+// Machine consumers (audit, evidence, the V2 seat) branch on the code, not the
+// prose, so pin the timeout's own code rather than only its message.
+const timeoutDecision = await guardToolDecision(
+	"todowrite",
+	{ todos: [item("timeout work", "completed")] },
+	{ sessionID: "s-verify-timeout" },
+);
+check(
+	"a verification timeout carries its own structured code",
+	timeoutDecision.status === "blocked" && timeoutDecision.code === "verification_timed_out",
 );
 setWorkspaceRoot(verifyRepo);
 reloadProjectConfig(verifyRepo);
@@ -4348,6 +4389,529 @@ check(
 	blocked(staleShaRedirect) && (staleShaRedirect as string).includes("start point") && (staleShaRedirect as string).includes(staleStartSha),
 );
 check("variable start point behind a redirect still fails closed", blocked(await shell("git switch -c wg-var-redir $WG_REF 2>/dev/null")));
+
+// Worktree-aware git verdicts: a git command is judged against the checkout it
+// runs in, not against the session-bound one. The regression these pin: a
+// linked worktree on a feature branch was resolved to the primary checkout on
+// `main`, so its commits were blocked as protected-branch writes, and PR
+// preflight judged the wrong tree.
+console.log("- Worktree-aware git verdicts -");
+check(
+	"parseGitInvocation resolves a bare git command against the supplied workdir",
+	parseGitInvocation("git status", "/tmp/some-worktree")?.repoDir === "/tmp/some-worktree",
+);
+check(
+	"parseGitInvocation marks an assumed base as not explicit",
+	parseGitInvocation("git status", "/tmp/some-worktree")?.explicitRepoDir === false,
+);
+check(
+	"parseGitInvocation treats -C as an explicit repository",
+	parseGitInvocation("git -C /tmp/named status")?.repoDir === "/tmp/named" &&
+		parseGitInvocation("git -C /tmp/named status")?.explicitRepoDir === true,
+);
+check("prSourceBranch reads gh --head", prSourceBranch("gh pr create --head feat/x --body b") === "feat/x");
+check("prSourceBranch reads the gh -H short form", prSourceBranch("gh pr create -H feat/x --body b") === "feat/x");
+check("prSourceBranch reads --head=value", prSourceBranch("gh pr create --head=feat/x --body b") === "feat/x");
+check("prSourceBranch reads the attached -Hvalue form", prSourceBranch("gh pr create -Hfeat/x --body b") === "feat/x");
+check("prSourceBranch reads az --source-branch", prSourceBranch("az repos pr create --source-branch feat/x --description b") === "feat/x");
+check("prSourceBranch strips a fork owner prefix", prSourceBranch("gh pr create --head someone:feature/y --body b") === "feature/y");
+check("prSourceBranch returns undefined when no branch is named", prSourceBranch("gh pr create --body b") === undefined);
+// A `--head`-looking token inside a quoted body is command data, not a branch.
+// The dispatcher used to unwrap the segment first, and the joined text lost the
+// quotes, so body prose was re-read as flags.
+check(
+	"a --head token inside a quoted PR body is not read as the source branch",
+	prSourceBranch(`gh pr create --title t --body 'Changelog: ok. Reviewer note: --head innocent'`) === undefined,
+);
+check(
+	"a real --head still wins over a --head token inside the body",
+	prSourceBranch(`gh pr create --head feat/x --body 'Changelog: ok, see --head nope'`) === "feat/x",
+);
+// A repository claim must be an actual assignment. A commit message that
+// happens to contain `GIT_DIR=` previously read as one, which was harmless
+// while the value only picked a base directory but is not harmless now that the
+// permission seat trusts `explicitRepoDir` to decide whether it may judge.
+check(
+	"an unquoted GIT_DIR= inside a commit message is not a repository claim",
+	parseGitInvocation("git commit -m GIT_DIR=/repo")?.explicitRepoDir === false,
+);
+check(
+	"a quoted GIT_DIR= inside a commit message is not a repository claim",
+	parseGitInvocation("git commit -m 'GIT_DIR=/repo'")?.explicitRepoDir === false,
+);
+check(
+	"a real GIT_DIR= prefix is a repository claim",
+	parseGitInvocation("GIT_DIR=/repo git commit")?.repoDir === "/repo" &&
+		parseGitInvocation("GIT_DIR=/repo git commit")?.explicitRepoDir === true,
+);
+// `git -C ~/repo` reaches that repository through the shell's own expansion. A
+// literal `~` resolved against the workspace base put the write inside the
+// workspace, so a commit to a home-directory repository read as a local one.
+check(
+	"a tilde repository selector expands to the home directory",
+	parseGitInvocation("git -C ~/wg-probe-repo commit")?.repoDir === join(process.env.HOME || homedir(), "wg-probe-repo"),
+);
+check(
+	"a tilde git-dir selector expands to the home directory",
+	parseGitInvocation("git --git-dir=~/.git commit")?.repoDir === join(process.env.HOME || homedir(), ".git"),
+);
+check(
+	"an unresolvable repository selector keeps its literal text instead of collapsing to the root",
+	parseGitInvocation("git -C $OTHER_REPO/wg commit", "/tmp/wg-base")?.repoDir === join("/tmp/wg-base", "$OTHER_REPO", "wg"),
+);
+// `~user` names that user's home. Reading only the home base dropped the path
+// after the name, so `git -C ~csh/repo commit` was judged against the home
+// directory instead of the repository inside it.
+check(
+	"a named-user repository selector keeps the path after the home",
+	parseGitInvocation("git -C ~root/repo commit")?.repoDir === join(dirname(process.env.HOME || homedir()), "root", "repo"),
+);
+// Git also accepts the attached short form. Leaving `-C~/repo` unparsed kept
+// the assumed base, so the commit was judged in the session's own checkout.
+check(
+	"an attached short -C selector names its repository",
+	parseGitInvocation("git -C~/wg-probe-repo commit")?.repoDir === join(process.env.HOME || homedir(), "wg-probe-repo") &&
+		parseGitInvocation("git -C~/wg-probe-repo commit")?.explicitRepoDir === true,
+);
+// A dangling `-C` names no repository, but the flag is still in the text. Both
+// seats must then agree the command is unclassifiable: the seat defers, and
+// execute.before decides. Reporting it as an assumed base let the seat judge a
+// command whose repository it could not know.
+check(
+	"a dangling -C is reported as an explicit claim, not silent text truncation",
+	parseGitInvocation("git -C")?.explicitRepoDir === true && parseGitInvocation("git -C")?.rest === "",
+);
+check(
+	"a dangling --git-dir is reported as an explicit claim",
+	parseGitInvocation("git --git-dir")?.explicitRepoDir === true,
+);
+check(
+	"a dangling option that names no repository is not a claim",
+	parseGitInvocation("git -c")?.explicitRepoDir === false,
+);
+check(
+	"a wrapped GIT_DIR= prefix is still a repository claim",
+	parseGitInvocation("timeout 30 env GIT_DIR=/repo git commit")?.repoDir === "/repo" &&
+		parseGitInvocation("sudo -u x env GIT_DIR=/repo git commit")?.repoDir === "/repo",
+);
+check(
+	"a bare git command wrapped in env/nohup/timeout is still parsed",
+	parseGitInvocation("env git push origin feature/x")?.rest === "push origin feature/x" &&
+		parseGitInvocation("timeout 60 git push origin feature/x")?.rest === "push origin feature/x" &&
+		parseGitInvocation("nohup git -C /repo commit")?.repoDir === "/repo",
+);
+
+const wtRepo = mkdtempSync(join(tmpdir(), "wg-workdir-repo-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: wtRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: wtRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: wtRepo });
+writeFileSync(join(wtRepo, "shared.txt"), "base\n");
+spawnSync("git", ["add", "-A"], { cwd: wtRepo });
+spawnSync("git", ["commit", "-qm", "init"], { cwd: wtRepo });
+spawnSync("git", ["switch", "-c", "feat/wt-branch"], { cwd: wtRepo });
+writeFileSync(join(wtRepo, "shared.txt"), "branch content\n");
+spawnSync("git", ["commit", "-qam", "branch edit"], { cwd: wtRepo });
+spawnSync("git", ["switch", "main"], { cwd: wtRepo });
+writeFileSync(join(wtRepo, "shared.txt"), "main content\n");
+spawnSync("git", ["commit", "-qam", "main edit"], { cwd: wtRepo });
+const wtLinked = mkdtempSync(join(tmpdir(), "wg-workdir-linked-"));
+rmSync(wtLinked, { recursive: true, force: true });
+spawnSync("git", ["worktree", "add", wtLinked, "feat/wt-branch"], { cwd: wtRepo });
+check("findWorktreeForBranch resolves the checkout holding a branch", findWorktreeForBranch(wtRepo, "feat/wt-branch") === wtLinked);
+check("findWorktreeForBranch accepts a full ref name", findWorktreeForBranch(wtRepo, "refs/heads/feat/wt-branch") === wtLinked);
+check("findWorktreeForBranch returns undefined for an absent branch", findWorktreeForBranch(wtRepo, "feat/absent") === undefined);
+check(
+	"checkMergeConflicts judges an explicitly named branch that is not checked out",
+	checkMergeConflicts(wtRepo, "feat/wt-branch").hasConflicts &&
+		(checkMergeConflicts(wtRepo, "feat/wt-branch").reason ?? "").includes("'feat/wt-branch'"),
+);
+// The protected-branch gate follows the workdir: the primary checkout is on
+// `main`, yet a commit run in the linked feature worktree is legitimate.
+const wtCommit = await call("bash", { command: "git commit -m x --allow-empty", workdir: wtLinked }, { sessionID: "s-wt-commit", worktree: wtRepo, directory: wtRepo });
+check("a commit in a linked feature worktree is not blocked as a protected-branch write", !blocked(wtCommit));
+const primaryCommit = await call("bash", { command: "git commit -m x --allow-empty", workdir: wtRepo }, { sessionID: "s-wt-commit-primary", worktree: wtRepo, directory: wtRepo });
+check("a commit in the primary checkout on main stays blocked", blocked(primaryCommit));
+// PR preflight follows --head to the branch's own worktree, so its merge
+// conflict is found even though the shell sits in the primary checkout.
+const prevWtReview = process.env.WORKFLOW_GUARD_REQUIRE_REVIEW;
+process.env.WORKFLOW_GUARD_REQUIRE_REVIEW = "0";
+try {
+	const headPr = await call(
+		"bash",
+		{ command: "gh pr create --head feat/wt-branch --title t --body 'Changelog: fixed'", workdir: wtRepo },
+		{ sessionID: "s-wt-pr-head", worktree: wtRepo, directory: wtRepo },
+	);
+	check(
+		"PR preflight resolves --head to the linked worktree and names its conflict",
+		blocked(headPr) && String(headPr).includes("'feat/wt-branch'") && String(headPr).includes("merge conflicts"),
+	);
+	const barePr = await call(
+		"bash",
+		{ command: "gh pr create --title t --body 'Changelog: fixed'", workdir: wtRepo },
+		{ sessionID: "s-wt-pr-bare", worktree: wtRepo, directory: wtRepo },
+	);
+	check("a bare PR command still judges the shell's checkout", !blocked(barePr));
+	if (blocked(barePr)) console.log("   blocked:", barePr);
+} finally {
+	if (prevWtReview === undefined) delete process.env.WORKFLOW_GUARD_REQUIRE_REVIEW;
+	else process.env.WORKFLOW_GUARD_REQUIRE_REVIEW = prevWtReview;
+}
+// A workdir outside the workspace is only legible when it is a linked
+// worktree of the SAME repository. A genuinely foreign repository cannot be
+// judged: the command runs there, so `rm -rf dist` or `> artifact.txt` would be
+// validated against the workspace root while changing another tree.
+const foreignWtRepo = mkdtempSync(join(tmpdir(), "wg-foreign-workdir-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: foreignWtRepo });
+spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: foreignWtRepo });
+todo("s-wt-foreign", item("probe foreign workdir", "in_progress"));
+const foreignWrite = await call("bash", { command: "echo x > artifact.txt", workdir: foreignWtRepo }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a relative shell mutation in a foreign workdir is blocked instead of judged against the workspace",
+	blocked(foreignWrite) && String(foreignWrite).includes(foreignWtRepo),
+);
+const foreignGitWrite = await call("bash", { command: "git commit -m x --allow-empty", workdir: foreignWtRepo }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a git write in a foreign workdir is blocked", blocked(foreignGitWrite));
+const foreignRead = await call("bash", { command: "ls -la", workdir: foreignWtRepo }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a read-only command in a foreign workdir stays allowed", !blocked(foreignRead));
+const linkedWrite = await call("bash", { command: "echo x > .tmp-linked.txt", workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a relative shell mutation in a linked worktree of the same repository is allowed", !blocked(linkedWrite));
+const linkedAbsoluteWrite = await call("bash", { command: `echo x > ${join(wtRepo, "abs.txt")}`, workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an absolute target in the primary checkout stays allowed from a linked worktree", !blocked(linkedAbsoluteWrite));
+const linkedOutsideWrite = await call("bash", { command: `echo x > ${join(foreignWtRepo, "outside.txt")}`, workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an absolute target outside both checkouts is still blocked from a linked worktree", blocked(linkedOutsideWrite));
+
+// An in-command `cd` moves the tree later segments run in, so the walk has to
+// follow it. Judging every segment against the shell's initial `workdir` let
+// `cd <foreign> && git commit` be checked as a commit in the session's own
+// checkout, which both allowed a foreign write and denied nothing.
+const cdForeignCommit = await call("bash", { command: `cd ${foreignWtRepo} && git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"an in-command cd into a foreign repository is blocked for a git write",
+	blocked(cdForeignCommit) && String(cdForeignCommit).includes(foreignWtRepo),
+);
+const cdForeignWrite = await call("bash", { command: `cd ${foreignWtRepo} && echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an in-command cd into a foreign repository is blocked for a shell mutation", blocked(cdForeignWrite));
+const cdForeignRead = await call("bash", { command: `cd ${foreignWtRepo} && ls -la` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an in-command cd into a foreign repository stays allowed for a read", !blocked(cdForeignRead));
+// A newline separates commands exactly like `;`. The dispatcher planned its
+// segments from the newline-flattened command, so a newline-separated `cd`
+// moved nothing and every later segment was judged against the shell's start
+// tree. `cd <foreign>` then `rm -rf x` therefore read as a workspace removal.
+for (const [label, command] of [
+	["a removal", `cd ${foreignWtRepo}\nrm -rf out.txt`],
+	["a git write", `cd ${foreignWtRepo}\ngit commit -m x --allow-empty`],
+	["a redirect", `cd ${foreignWtRepo}\necho x > artifact.txt`],
+] as const) {
+	const newlineCd = await call("bash", { command }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a newline-separated cd into a foreign repository is blocked for ${label}`, blocked(newlineCd) && String(newlineCd).includes(foreignWtRepo));
+}
+const newlineCdRead = await call("bash", { command: `cd ${foreignWtRepo}\nls -la` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a newline-separated cd into a foreign repository stays allowed for a read", !blocked(newlineCdRead));
+// A heredoc feeding a shell runs its body as shell text, so the body's `cd`
+// moves the tree its later lines run in just like a `;`-separated command. The
+// body was never re-planned, so the removal looked like a workspace write.
+const heredocCd = await call("bash", { command: `bash <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc shell body that cds into a foreign repository is blocked", blocked(heredocCd) && String(heredocCd).includes(foreignWtRepo));
+const heredocGit = await call("bash", { command: `bash <<'WGEOF'\ncd ${foreignWtRepo}\ngit commit -m x --allow-empty\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc shell body that cds into a foreign repository is blocked for a git write", blocked(heredocGit) && String(heredocGit).includes(foreignWtRepo));
+// Bash still runs a heredoc body it closes at end of input, so an unterminated
+// body is code too. Requiring a terminator line dropped the payload entirely.
+const heredocUnterminated = await call("bash", { command: `bash <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an unterminated heredoc shell body is scanned as code", blocked(heredocUnterminated) && String(heredocUnterminated).includes(foreignWtRepo));
+// `source` executes a body it reads from stdin, so its body is shell text even
+// though the launcher list names only interpreters.
+const heredocSource = await call("bash", { command: `source /dev/stdin <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a source heredoc body that cds into a foreign repository is blocked", blocked(heredocSource) && String(heredocSource).includes(foreignWtRepo));
+// The body feeds `cat`, but the pipe delivers it to a shell, so it runs.
+const heredocPiped = await call("bash", { command: `cat <<'WGEOF' | sh\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body piped into a shell is scanned as code", blocked(heredocPiped) && String(heredocPiped).includes(foreignWtRepo));
+// The pipe decides, and an unrecognized downstream command is not a filter. An
+// allowlist that named only common shells let `| ash` and `| make -f -` run a
+// body the scan had already masked as prose.
+for (const downstream of ["ash", "make -f -", "busybox sh", "xargs sh -c"]) {
+	const pipeUnknown = await call("bash", { command: `cat <<'WGEOF' | ${downstream}\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc body piped into ${downstream} is scanned as code`, blocked(pipeUnknown) && String(pipeUnknown).includes(foreignWtRepo));
+}
+const pipeFilter = await call("bash", { command: `cat <<'WGEOF' | grep build\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body piped into a known filter stays data", allowed(pipeFilter));
+// A pipeline hands the body to every stage, so a filter followed by a shell
+// still executes it. Reading only the first stage masked the body as prose.
+for (const pipeline of ["grep x | sh", "cat | bash", "tee /dev/null | sh"]) {
+	const pipeChain = await call("bash", { command: `cat <<'WGEOF' | ${pipeline}\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc body reaching a shell through ${pipeline} is scanned as code`, blocked(pipeChain) && String(pipeChain).includes(foreignWtRepo));
+}
+// `|&` also pipes, so a body it delivers to a shell runs exactly like a `|`
+// body. `||` runs the right side only on failure and delivers no body.
+for (const operator of ["|& sh", "|& ash"]) {
+	const ampersandPipe = await call("bash", { command: `cat <<'WGEOF' ${operator}\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc body delivered through ${operator} is scanned as code`, blocked(ampersandPipe) && String(ampersandPipe).includes(foreignWtRepo));
+}
+// `|&` into a filter is still a filter, so the body stays prose.
+const ampersandFilter = await call("bash", { command: `cat <<'WGEOF' |& grep build\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body delivered through |& to a filter stays data", allowed(ampersandFilter));
+const logicalOrPipe = await call("bash", { command: `cat <<'WGEOF' || grep build\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a heredoc body after || stays data because no pipe delivers it", allowed(logicalOrPipe));
+// A program that can run a command named in its own arguments is not a filter.
+// `sed`, `awk`, and `sort` each execute the body's text with a flag or program.
+for (const header of ["sed 'e'", "sed -n '1e echo hi'", `awk '{system($0)}'`, "sort --compress-program='sh'"]) {
+	const execConsumer = await call("bash", { command: `${header} <<'WGEOF'\ncd ${foreignWtRepo}\nrm -rf out.txt\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+	check(`a heredoc consumed by ${header} is scanned as code`, blocked(execConsumer) && String(execConsumer).includes(foreignWtRepo));
+}
+// A heredoc feeding `cat` is data. Its body is never executed, so documentation
+// that quotes a blocked command shape must stay writable. The shell-backed form
+// above is code; this one is prose.
+const heredocDoc = await call("bash", { command: `cat > notes.md <<'WGEOF'\nbash -c 'cd /other-repo && rm -rf x' is blocked.\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a data heredoc quoting a blocked command shape is not treated as code", allowed(heredocDoc));
+const heredocDocProse = await call("bash", { command: `cat > notes.md <<'WGEOF'\nrm -rf build is blocked by policy.\nWGEOF` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a data heredoc body is not read as a shell mutation", allowed(heredocDocProse));
+// The mask has to find the heredoc in the raw text. A quoted `<<` opened a fake
+// body and swallowed the real payload that followed it.
+const heredocMasked = await call("bash", { command: `echo "<<DONE"\npython3 -c "open('${join(foreignWtRepo, "evil")}','w').write('x')"\nDONE` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a quoted << does not mask a later interpreter payload", blocked(heredocMasked) && String(heredocMasked).includes(foreignWtRepo));
+// One header line can introduce two bodies. Only the first was ranged, so the
+// second body was read as top-level commands.
+const heredocPair = await call("bash", { command: `cat <<A <<B\nhello\nA\nrm -rf build is prose\nB` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a second heredoc body on the same header line stays data", !blocked(heredocPair));
+const cdIndeterminate = await call("bash", { command: "cd $WG_UNKNOWN_TREE && git commit -m x" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"an indeterminate cd target followed by a write fails closed",
+	blocked(cdIndeterminate) && String(cdIndeterminate).includes("cannot be determined"),
+);
+const cdWorkspaceSubdir = await call("bash", { command: "mkdir -p nested && cd nested && echo x > artifact.txt" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"an in-command cd into a workspace subdirectory is judged where it lands, not as a foreign tree",
+	String(cdWorkspaceSubdir).includes("protected branch") && !String(cdWorkspaceSubdir).includes("outside workspace root"),
+);
+const cdLinkedSubdir = await call("bash", { command: "mkdir -p nested && cd nested && echo x > artifact.txt" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("an in-command cd into a linked-worktree subdirectory is allowed", !blocked(cdLinkedSubdir));
+const cdLinkedCommit = await call("bash", { command: `cd ${wtLinked} && git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an in-command cd into a linked worktree is not blocked as a foreign tree", !blocked(cdLinkedCommit));
+const wrapperCwdCommit = await call("bash", { command: `env -C ${foreignWtRepo} git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a wrapper -C into a foreign repository is blocked for a git write", blocked(wrapperCwdCommit));
+// The nested payload is one shell word to the outer shell, so its own `cd` and
+// its own `cwd` option were invisible to the top-level walk.
+const nestedCd = await call("bash", { command: `bash -c 'cd ${foreignWtRepo} && git commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested shell payload that cds into a foreign repository is blocked", blocked(nestedCd) && String(nestedCd).includes(foreignWtRepo));
+const nestedExecCwd = await call("bash", { command: `node -e "require('child_process').execSync('git commit -m x --allow-empty', {cwd:'${foreignWtRepo}'})"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested interpreter command with a foreign cwd is blocked", blocked(nestedExecCwd) && String(nestedExecCwd).includes(foreignWtRepo));
+const nestedLocal = await call("bash", { command: `node -e "require('child_process').execSync('git status', {cwd:'${wtRepo}'})"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested interpreter command in the workspace stays allowed", !blocked(nestedLocal));
+const nestedLinked = await call("bash", { command: `bash -c 'cd ${wtLinked} && git commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a nested payload cd into a linked worktree is not blocked as foreign", !blocked(nestedLinked));
+
+// A `cd` inside a grouping subshell is scoped to it. Treating it as moving the
+// outer shell made a later workspace mutation read as happening in the foreign
+// tree the subshell visited.
+const subshellCdThenWorkspaceWrite = await call("bash", { command: `( cd ${foreignWtRepo} && ls ) && echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a cd inside a grouping subshell does not move the tree of later segments",
+	!String(subshellCdThenWorkspaceWrite).includes(foreignWtRepo) && !String(subshellCdThenWorkspaceWrite).includes("outside workspace root"),
+);
+const subshellCdThenWorkspaceCommit = await call("bash", { command: `( cd ${foreignWtRepo} && ls ) && git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a subshell cd does not foreign-flag a later commit in the workspace", !String(subshellCdThenWorkspaceCommit).includes(foreignWtRepo));
+// The payload's declared root is only a working directory when a spawn-family
+// call or `process.chdir` names it. An unrelated `{cwd: ...}` key is not one.
+const payloadObjectKey = await call("bash", { command: `node -e "const o={cwd:'${foreignWtRepo}'}; require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an unrelated object cwd key does not foreign-flag a payload write", !String(payloadObjectKey).includes(foreignWtRepo));
+const payloadUnrelatedChdir = await call("bash", { command: `node -e "foo.chdir('${foreignWtRepo}'); require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("chdir on an unrelated object does not foreign-flag a payload write", !String(payloadUnrelatedChdir).includes(foreignWtRepo));
+const payloadProcessChdir = await call("bash", { command: `node -e "process.chdir('${foreignWtRepo}'); require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("process.chdir into a foreign directory before a write is blocked", blocked(payloadProcessChdir) && String(payloadProcessChdir).includes(foreignWtRepo));
+const payloadUnresolvableCwd = await call("bash", { command: "node -e \"require('child_process').execSync('git commit -m x --allow-empty', {cwd: process.env.WG_OTHER});\"" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a payload mutating with an unresolvable cwd fails closed",
+	blocked(payloadUnresolvableCwd) && String(payloadUnresolvableCwd).includes("cannot be determined"),
+);
+// An indeterminate launcher tree must not be assumed to be the workspace root.
+// `cd $DIR && node -e "writeFileSync('x')"` used to read as a workspace write
+// because the payload walk substituted the workspace root for the unknown one.
+const payloadIndeterminateLauncher = await call("bash", { command: `cd $WG_UNKNOWN_WT && node -e "require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check(
+	"a payload mutating under an indeterminate launcher tree fails closed",
+	blocked(payloadIndeterminateLauncher) && String(payloadIndeterminateLauncher).includes("cannot be determined"),
+);
+const payloadIndeterminateLauncherGit = await call("bash", { command: `cd $WG_UNKNOWN_WT && node -e "require('child_process').execSync('git commit -m x --allow-empty')"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload git write under an indeterminate launcher tree fails closed", blocked(payloadIndeterminateLauncherGit));
+const payloadIndeterminateLauncherRead = await call("bash", { command: `cd $WG_UNKNOWN_WT && node -e "console.log(1)"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a read-only payload under an indeterminate launcher tree stays allowed", !blocked(payloadIndeterminateLauncherRead));
+// The spawn anchor must not read `regex.exec(str, {cwd})` as a spawned process.
+// Asserted in the linked worktree, where a write is allowed outright, so the
+// verdict cannot pass for the unrelated protected-branch reason.
+const payloadRegexExec = await call("bash", { command: `node -e "const r=/a/.exec('b',{cwd:'${foreignWtRepo}'}); require('fs').writeFileSync('probe.txt','y')"` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check(
+	"a RegExp exec with a cwd key is not treated as a spawn working directory",
+	!blocked(payloadRegexExec) && !String(payloadRegexExec).includes(foreignWtRepo),
+);
+
+// A `pushd` inside a grouping subshell leaves its entry on the subshell's own
+// stack. bash discards that stack with the subshell, so a later outer `popd`
+// stops at "directory stack empty" and leaves the outer `cd` in force. A walk
+// that leaked the inner entry planned the outer removal back at the workspace.
+// The genuine leak shape puts a `cd` between the two, so the outer directory is
+// no longer the workspace and the removal lands in the foreign tree.
+const subshellPushdThenPopd = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; cd ${foreignWtRepo} ; popd >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check(
+	"a pushd inside a grouping subshell does not leak into a later outer popd",
+	blocked(subshellPushdThenPopd) && String(subshellPushdThenPopd).includes(foreignWtRepo),
+);
+const subshellPushdThenPopdCommit = await call("bash", { command: `( pushd ${foreignWtRepo} >/dev/null ) ; cd ${foreignWtRepo} ; popd >/dev/null 2>&1 ; git commit -m x --allow-empty` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a leaked subshell pushd does not let an outer git write read as the workspace", blocked(subshellPushdThenPopdCommit) && String(subshellPushdThenPopdCommit).includes(foreignWtRepo));
+// A `popd` that only rotates the stack is not a pop, so it fails closed.
+const popdRotate = await call("bash", { command: `pushd ${foreignWtRepo} >/dev/null 2>&1 ; popd +1 >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a popd stack rotation followed by a mutation fails closed", blocked(popdRotate) && String(popdRotate).includes("cannot be determined"));
+
+// `pushd +N` and `pushd -N` rotate the stack and `-n` only pushes: neither
+// changes directory the way a plain `pushd <dir>` does, so the walk reports
+// them as unchecked and a mutation after one fails closed.
+const pushdRotate = await call("bash", { command: "pushd +1 >/dev/null 2>&1 ; rm -rf out.txt" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a pushd stack rotation followed by a mutation fails closed", blocked(pushdRotate) && String(pushdRotate).includes("cannot be determined"));
+const pushdNoChange = await call("bash", { command: `pushd -n ${foreignWtRepo} >/dev/null 2>&1 ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a pushd -n that only pushes the stack fails closed before a mutation", blocked(pushdNoChange));
+const pushdRotateRead = await call("bash", { command: "pushd +1 >/dev/null 2>&1 ; ls -la" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a pushd stack rotation followed by a read stays allowed", !blocked(pushdRotateRead));
+
+// A control-flow body runs in the CURRENT shell, so a `cd` inside it moves the
+// directory of later segments. Which body runs depends on a condition this walk
+// cannot evaluate, so a construct whose bodies disagree about the directory
+// fails closed rather than letting the last body parsed win. Only `( … )`
+// scopes a directory.
+for (const [label, command] of [
+	["then", `if true; then cd ${foreignWtRepo}; fi; rm -rf out.txt`],
+	["else", `if true; then cd ${foreignWtRepo}; else cd .; fi; rm -rf out.txt`],
+	["do", `for i in 1; do cd ${foreignWtRepo}; done; rm -rf out.txt`],
+	["while", `while false; do :; done; cd ${foreignWtRepo}; rm -rf out.txt`],
+	["case", `case x in x) cd ${foreignWtRepo};; esac; rm -rf out.txt`],
+	["brace group", `{ cd ${foreignWtRepo} ; } ; rm -rf out.txt`],
+] as const) {
+	const flowMutation = await call("bash", { command }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+	check(`a conditional cd inside a '${label}' body fails closed before a mutation`, blocked(flowMutation));
+}
+// A construct body that mutates without changing directory must stay allowed:
+// the condition does not affect the tree the mutation lands in.
+const conditionalNoCd = await call("bash", { command: `if [ -d .git ]; then echo hi; fi ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a conditional body with no cd keeps the tree of later segments", !blocked(conditionalNoCd));
+const caseArmParen = await call("bash", { command: `( case x in x) cd ${foreignWtRepo} ;; esac ; mkdir -p mk )` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a case pattern paren is not read as a grouping close", blocked(caseArmParen));
+// A `case` that follows a body opener (`then`, `else`, `do`, `elif`) still opens
+// an arm. Only a leading `case` was recognised, so the arm's `cd` went unseen and
+// the `esac` popped the enclosing frame instead.
+for (const [label, command] of [
+	["then", `if true; then case x in x) cd ${foreignWtRepo};; esac; fi; rm -rf out.txt`],
+	["else", `if true; then :; else case x in x) cd ${foreignWtRepo};; esac; fi; rm -rf out.txt`],
+	["elif", `if a; then :; elif b; then case x in x) cd ${foreignWtRepo};; esac; fi; rm -rf out.txt`],
+	["do", `for i in 1; do case x in x) cd ${foreignWtRepo};; esac; done; rm -rf out.txt`],
+] as const) {
+	const nestedCase = await call("bash", { command }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+	check(`a case arm after '${label}' cannot hide its cd`, blocked(nestedCase));
+}
+// A case arm inside a grouping subshell is scoped like any other subshell cd, so
+// its pattern paren must not consume the subshell's own closing paren.
+const caseInSubshell = await call("bash", { command: `( case x in x) cd ${foreignWtRepo} ;; esac ) ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a case arm inside a grouping subshell stays scoped to it", !blocked(caseInSubshell));
+// `eval` runs its body in the current shell, so a `cd` inside it moves the
+// directory of later segments. Both halves are covered: a payload that changes
+// directory and mutates, and a payload whose `cd` moves a later outer command.
+const evalCompound = await call("bash", { command: `eval "cd ${foreignWtRepo} && git commit -m x --allow-empty"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an eval payload that changes directory and mutates is blocked", blocked(evalCompound));
+const evalMovesOuter = await call("bash", { command: `eval "cd ${foreignWtRepo}" ; rm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("an eval cd moves the tree of a later outer command", blocked(evalMovesOuter));
+const evalHarmless = await call("bash", { command: `eval "echo hi" ; echo x > out.txt` }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a harmless eval leaves the tree of later segments alone", !blocked(evalHarmless));
+// A leading assignment still reaches `eval`, so the `cd` inside it moves the
+// tree of the lines that follow.
+const evalAssignment = await call("bash", { command: `A=1 eval 'cd ${foreignWtRepo}'\nrm -rf out.txt` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("an assignment-prefixed eval moves the tree of later segments", blocked(evalAssignment) && String(evalAssignment).includes(foreignWtRepo));
+// `~user` never means a literal `~user` directory. Reading it as a relative
+// path put the walk inside the workspace while the shell reached that home.
+const tildeUser = await call("bash", { command: "cd ~root && rm -rf out.txt" }, { sessionID: "s-wt-foreign", worktree: wtLinked, directory: wtLinked });
+check("a cd to a named user's home is not read as a workspace-relative path", blocked(tildeUser) && String(tildeUser).includes("outside workspace root"));
+
+// A payload can launch another interpreter. Only the innermost quoted body was
+// extracted, so the outer launcher swallowed the inner one and its `cd` and
+// mutation were never re-planned.
+const doublyNestedPayload = await call("bash", { command: `bash -c "bash -c 'cd ${foreignWtRepo} && git commit -m x --allow-empty'"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a doubly nested shell payload is re-planned until its mutation is judged", blocked(doublyNestedPayload) && String(doublyNestedPayload).includes(foreignWtRepo));
+// The `'\''` idiom is how a shell nests a single quote inside a single-quoted
+// span. Extraction stopped at the first closing quote, so the payload read as a
+// bare `bash -c ` and the nested mutation was never scanned.
+const quoteEscapePayload = await call("bash", { command: "bash -c 'bash -c '\\''cd " + foreignWtRepo + " && git commit -m x --allow-empty'\\'''" }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload nested with the quote-escape idiom is scanned past the first quote", blocked(quoteEscapePayload) && String(quoteEscapePayload).includes(foreignWtRepo));
+
+// `git -C <repo>` carries its repository in the flag, with no `cd` to follow.
+// The payload walk never applied the foreign-repository check to it.
+const payloadGitDashC = await call("bash", { command: `bash -c 'git -C ${foreignWtRepo} commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload git -C into a foreign repository is blocked", blocked(payloadGitDashC) && String(payloadGitDashC).includes(foreignWtRepo));
+const payloadGitDashCLocal = await call("bash", { command: `bash -c 'git -C ${wtLinked} commit -m x --allow-empty'` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a payload git -C into a linked worktree stays allowed", !blocked(payloadGitDashCLocal));
+// A spawn `cwd` after a call expression is still a spawn `cwd`. A flat `[^)]*`
+// up to the first closing paren matched nothing and left the tree unchecked.
+const spawnCwdAfterCall = await call("bash", { command: `node -e "require('child_process').execSync(String('git commit -m x --allow-empty'), {cwd:'${foreignWtRepo}'})"` }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
+check("a spawn cwd after a nested call is still read as the working directory", blocked(spawnCwdAfterCall) && String(spawnCwdAfterCall).includes(foreignWtRepo));
+
+rmSync(join(wtLinked, "nested"), { recursive: true, force: true });
+rmSync(foreignWtRepo, { recursive: true, force: true });
+spawnSync("git", ["worktree", "remove", "--force", wtLinked], { cwd: wtRepo });
+rmSync(wtRepo, { recursive: true, force: true });
+
+// Host session moves rebind the workspace: `session_move` relocates a session
+// between checkouts, and a stale binding made every later decision judge the
+// tree the session had left. A session bound to a LINKED WORKTREE by its own
+// tool-call workdir differs from the directory `session.updated` reports, so an
+// update alone must never move it back.
+const moveRepoA = mkdtempSync(join(tmpdir(), "wg-move-a-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: moveRepoA });
+spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: moveRepoA });
+const moveRepoB = mkdtempSync(join(tmpdir(), "wg-move-b-"));
+spawnSync("git", ["init", "-b", "main"], { cwd: moveRepoB });
+spawnSync("git", ["-c", "user.name=T", "-c", "user.email=t@e", "commit", "--allow-empty", "-m", "init"], { cwd: moveRepoB });
+setSessionWorkspace("s-host-move", moveRepoA);
+rebindSessionWorkspaceFromHost("s-host-move", moveRepoB, { moved: true });
+check("an announced host move rebinds the session workspace", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoB));
+check("an announced host move is journaled as a granted widening", getRecentAuditEntries(20).some((entry) => entry.tool === "workspace.binding" && entry.reason === "workspace_rebind_session_move" && entry.sessionID === "s-host-move"));
+const beforeNoop = getRecentAuditEntries(200).filter((entry) => entry.reason === "workspace_rebind_session_move").length;
+rebindSessionWorkspaceFromHost("s-host-move", moveRepoB);
+const afterNoop = getRecentAuditEntries(200).filter((entry) => entry.reason === "workspace_rebind_session_move").length;
+check("a repeated move event to the same directory is a no-op", afterNoop === beforeNoop);
+// The regression: a session whose own tool-call workdir bound it to a LINKED
+// WORKTREE must survive a routine `session.updated` that names the primary
+// checkout of the same repository. Both resolve to the same repository, so the
+// update only records the baseline.
+const moveLinked = join(mkdtempSync(join(tmpdir(), "wg-move-linked-")), "wt");
+spawnSync("git", ["worktree", "add", "-b", "feat/host-move", moveLinked], { cwd: moveRepoA });
+setSessionWorkspace("s-host-linked", moveLinked);
+rebindSessionWorkspaceFromHost("s-host-linked", moveRepoA);
+check(
+	"a routine update naming the primary checkout keeps a linked-worktree binding",
+	getSessionBoundWorkspace("s-host-linked") === resolve(moveLinked),
+);
+// A directory that resolves to a DIFFERENT repository is a move even on the
+// first observation, which is how OpenCode 1.x sees one (it has no move event).
+rebindSessionWorkspaceFromHost("s-host-linked", moveRepoB);
+check("an update naming another repository rebinds", getSessionBoundWorkspace("s-host-linked") === resolve(moveRepoB));
+forgetSessionWorkspace("s-host-linked");
+spawnSync("git", ["worktree", "remove", "--force", moveLinked], { cwd: moveRepoA });
+// A later update that names a DIFFERENT directory than the last one is a move
+// even without the `session.moved` announcement.
+rebindSessionWorkspaceFromHost("s-host-move", moveRepoA);
+check("an update naming a new directory rebinds without an announcement", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoA));
+rebindSessionWorkspaceFromHost(undefined, moveRepoA);
+rebindSessionWorkspaceFromHost("s-host-move", undefined);
+check("an incomplete move event never binds", getSessionBoundWorkspace("s-host-move") === resolve(moveRepoA));
+// An unresolved directory is not cached, so a later event for the same path
+// retries instead of being suppressed forever by a stale "already seen". A path
+// that resolves to another repository is then a move.
+const notYetRepo = mkdtempSync(join(tmpdir(), "wg-host-retry-"));
+setSessionWorkspace("s-host-retry", moveRepoA);
+rebindSessionWorkspaceFromHost("s-host-retry", notYetRepo);
+check("an unresolved host directory leaves the binding alone", getSessionBoundWorkspace("s-host-retry") === resolve(moveRepoA));
+spawnSync("git", ["init", "-b", "main"], { cwd: notYetRepo });
+rebindSessionWorkspaceFromHost("s-host-retry", notYetRepo);
+check("a retry for the now-resolvable directory rebinds when it is another repository", getSessionBoundWorkspace("s-host-retry") === resolve(notYetRepo));
+forgetSessionWorkspace("s-host-retry");
+check("deleting a session drops its binding", getSessionBoundWorkspace("s-host-retry") === undefined);
+rmSync(notYetRepo, { recursive: true, force: true });
+rmSync(moveRepoA, { recursive: true, force: true });
+rmSync(moveRepoB, { recursive: true, force: true });
 
 // Lockfile synchronization tests
 const lockRepo = mkdtempSync(join(tmpdir(), "wg-lock-repo-"));
@@ -6423,20 +6987,86 @@ try {
 		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
 	);
 	check(
-		"seat abstains on a non-protected push whose remote PR state is unverified",
-		pushSeat.effect !== "deny" && pushSeat.effect === "abstain",
+		"seat defers a cwd-dependent push instead of judging the session checkout",
+		pushSeat.effect === "abstain" && pushSeat.decision?.code === "repository_unidentified",
+	);
+	// An explicit `-C` names the repository in the command text, so the seat is
+	// back on facts and runs the core. That is the path that reports the
+	// deliberately skipped remote PR probe.
+	const explicitPushSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatFeatureRepo} push origin feature/push-seat`]), sessionID: "s-seat-explicit" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
 	);
 	check(
-		"seat keeps the undecidable decision for audit attribution",
-		pushSeat.decision?.status === "needs_approval" && pushSeat.decision?.code === "remote_state_unchecked",
+		"seat still runs the core when the command names its repository",
+		explicitPushSeat.effect === "abstain" && explicitPushSeat.decision?.code === "remote_state_unchecked",
 	);
-	const protectedPushSeat = await evaluatePermissionSeat(
+	// The bug this fixes: the session sat in the primary checkout while the
+	// command targeted a linked worktree, and the seat denied on the primary
+	// checkout's protected branch. A cwd-dependent push must never be judged
+	// against a checkout the command does not name.
+	const protectedCheckoutSeat = await evaluatePermissionSeat(
 		{ ...seatEvent(["git push origin feature/push-seat"]), sessionID: "s-seat-block" },
 		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
 	);
 	check(
-		"seat still denies a real finding (push from a protected branch)",
-		protectedPushSeat.effect === "deny" && protectedPushSeat.decision?.status === "blocked" && /protected branch/i.test(String(protectedPushSeat.decision?.message)),
+		"seat no longer denies a cwd-dependent push from a protected session checkout",
+		protectedCheckoutSeat.effect === "abstain" && protectedCheckoutSeat.decision?.code === "repository_unidentified",
+	);
+	// A push whose DESTINATION is protected is a finding in every checkout, so
+	// the workdir cannot change the verdict and the seat keeps its denial.
+	const protectedDestSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["git push origin main"]), sessionID: "s-seat-dest" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat denies a push to a protected destination regardless of the working directory",
+		protectedDestSeat.effect === "deny",
+	);
+	// A CONFIGURED protected branch is not that case: the seat recognizes the
+	// built-in pair only, so the verdict still depends on the checkout and
+	// defers to execute.before, which resolves the workdir and reads config.
+	mkdirSync(join(seatFeatureRepo, ".opencode"), { recursive: true });
+	writeFileSync(join(seatFeatureRepo, ".opencode", "workflow-guard.json"), JSON.stringify({ protectedBranches: ["release/prod"] }));
+	reloadProjectConfig(seatFeatureRepo);
+	const configuredDestSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["git push origin release/prod"]), sessionID: "s-seat-configured-dest" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat defers a push to a configured protected branch instead of judging the session checkout",
+		configuredDestSeat.effect === "abstain" && configuredDestSeat.decision?.code === "repository_unidentified",
+	);
+	rmSync(join(seatFeatureRepo, ".opencode"), { recursive: true, force: true });
+	reloadProjectConfig(seatFeatureRepo);
+	const explicitProtectedSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatMainRepo} push origin feature/push-seat`]), sessionID: "s-seat-explicit-protected" },
+		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat denies a push from an explicitly named protected checkout",
+		explicitProtectedSeat.effect === "deny" && explicitProtectedSeat.decision?.status === "blocked" && /protected branch/i.test(String(explicitProtectedSeat.decision?.message)),
+	);
+	// Naming a repository outside the session's workspace stays a boundary
+	// finding, and the seat keeps denying it for that reason.
+	const foreignRepoSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatMainRepo} commit -m x`]), sessionID: "s-seat-foreign" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat denies an explicitly named repository outside the workspace",
+		foreignRepoSeat.effect === "deny" && foreignRepoSeat.decision?.policy === "boundary",
+	);
+	// Deferring a checkout-derived verdict must never hide a finding about the
+	// command text itself. A secret read in the same compound command is a real
+	// block, no matter which checkout the push would have used.
+	const compoundSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["cat .env && git push origin feature/push-seat"]), sessionID: "s-seat-compound" },
+		{ workspaceRoot: seatFeatureRepo, client: fakeClient as unknown },
+	);
+	check(
+		"a genuine non-checkout finding in a compound command is still denied",
+		compoundSeat.effect === "deny" && compoundSeat.decision?.policy === "secrets",
 	);
 	const askedSeat = await evaluatePermissionSeat(
 		{ ...seatEvent(["git push origin feature/push-seat"], "ask"), sessionID: "s-seat-ask" },
@@ -6448,9 +7078,9 @@ try {
 	rmSync(seatMainRepo, { recursive: true, force: true });
 }
 
-// The end-to-end seat: the same undecidable push through the registered hook
-// must leave the configured effect and message untouched, and journal the
-// deferral so the skipped remote probe stays legible.
+// The end-to-end seat: a deferred command through the registered hook must
+// leave the configured effect and message untouched, and journal the deferral
+// so a skipped decision stays legible.
 {
 	resetPluginInstancesForTesting();
 	const seatHookRepo = makeSeatRepo("feature/push-seat-hook");
@@ -6461,22 +7091,32 @@ try {
 	const seatAskEvent = { ...permissionEvent("shell", ["git push origin feature/push-seat-hook"], "s-seat-hook-ask"), effect: "ask" as "allow" | "deny" | "ask" };
 	await seatCtx.state.permissionHooks[0]?.(seatAskEvent);
 	check(
-		"evaluate leaves a configured ask in place when the simulation abstains",
+		"evaluate leaves a configured ask in place when the seat defers",
 		seatAskEvent.effect === "ask" && seatAskEvent.message === undefined,
 	);
 	const seatPushEvent = permissionEvent("shell", ["git push origin feature/push-seat-hook"], "s-seat-hook");
 	await seatCtx.state.permissionHooks[0]?.(seatPushEvent);
 	check(
-		"evaluate does not deny a non-protected push it cannot decide",
+		"evaluate does not deny a cwd-dependent push it cannot locate",
 		seatPushEvent.effect === "allow" && seatPushEvent.message === undefined,
 	);
-	const abstainAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.reason === "deferred_to_execute_before");
+	const deferAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.reason === "deferred_to_execute_before");
 	check(
-		"an abstention is journaled as deferred to execute.before, not as a plain allow",
-		abstainAudit !== undefined &&
-			abstainAudit.policyDecision?.status === "needs_approval" &&
-			abstainAudit.policyDecision?.code === "remote_state_unchecked" &&
-			(abstainAudit.input as any)?.deferred === "execute.before",
+		"a cwd-dependent deferral is journaled with its own code, not as a plain allow",
+		deferAudit !== undefined &&
+			deferAudit.policyDecision?.status === "needs_approval" &&
+			deferAudit.policyDecision?.code === "repository_unidentified" &&
+			(deferAudit.input as any)?.deferred === "execute.before",
+	);
+	// The remote-probe deferral still exists for commands that name their
+	// repository, because the seat's simulation skips that probe on purpose.
+	const explicitSeatEvent = permissionEvent("shell", [`git -C ${seatHookRepo} push origin feature/push-seat-hook`], "s-seat-hook-explicit");
+	await seatCtx.state.permissionHooks[0]?.(explicitSeatEvent);
+	const remoteProbeAudit = getRecentAuditEntries(20).find((entry) => entry.tool === "permission.ask" && entry.phase === "decision" && entry.sessionID === "s-seat-hook-explicit");
+	check(
+		"a repository-naming command keeps the remote-probe deferral",
+		explicitSeatEvent.effect === "allow" &&
+			remoteProbeAudit?.policyDecision?.code === "remote_state_unchecked",
 	);
 	seatCleanup?.();
 	if (prevSeatDataHome === undefined) delete process.env.XDG_DATA_HOME;

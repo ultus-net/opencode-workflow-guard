@@ -9,6 +9,8 @@ import {
 import {
 	unwrapShellWords,
 	splitShellSegments,
+	shellPrefixAssignments,
+	resolveGitRepoSelector,
 } from "../lib/shell.ts";
 
 export const PROTECTED_BRANCHES = new Set(["main", "master"]);
@@ -45,6 +47,10 @@ const GIT_DIR_OPTION_TAKES_VALUE = new Set([
 ]);
 const GIT_DIR_OPTION_PREFIXED =
 	/^(--git-dir=|--work-tree=|--namespace=|-c\S|--config-env=)/;
+// Git also accepts the attached short forms (`-C/path`, `-C~`). An unparsed
+// `-C` leaves the repository at the assumed base, which judges the write in the
+// wrong checkout, so the attached form is read as a claim like the spaced one.
+const GIT_DIR_SHORT_ATTACHED = /^-C(.+)$/;
 const GIT_GLOBAL_BOOLEAN_OPTIONS = new Set([
 	"--version",
 	"--help",
@@ -60,44 +66,88 @@ const GIT_GLOBAL_BOOLEAN_OPTIONS = new Set([
 	"--exec-path",
 ]);
 
-const GIT_ENV_DIR_RE =
-	/(?:^|\s)(?:env\s+(?:-\S+\s+)*)?(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=(?:"([^"]*)"|'([^']*)'|(\S+))/;
+// Repository selection from the environment. It is read from the assignments
+// that precede the command word, never from the rest of the command text. A
+// bare `GIT_DIR=` used to be matched anywhere in the string, so an unquoted
+// commit message such as `git commit -m GIT_DIR=/repo` claimed an explicit
+// repository. That was harmless while the value only picked a base directory,
+// but `explicitRepoDir` is now a fact the permission seat trusts, so the claim
+// must be real. A `-c` config override is deliberately not a repository
+// selector: `GIT_DIR` is an environment variable, not a git config key.
+const GIT_REPO_ENV_ASSIGNMENT = /^(?:GIT_DIR|GIT_WORK_TREE|GIT_COMMON_DIR)=(.*)$/s;
 
-export function parseGitInvocation(command: string): GitInvocation | undefined {
-	const root = getWorkspaceRoot();
+/**
+ * The repository an environment assignment selects, or undefined.
+ *
+ * Only assignments that the shell unwrapper actually consumed before the
+ * command word count. A value that merely appears inside an argument cannot be
+ * mistaken for one.
+ */
+function repoEnvironmentOverride(command: string): string | undefined {
+	for (const assignment of shellPrefixAssignments(command)) {
+		const match = GIT_REPO_ENV_ASSIGNMENT.exec(assignment);
+		if (match?.[1]) return match[1];
+	}
+	return undefined;
+}
+
+/**
+ * Parse one git invocation.
+ *
+ * `baseDir` is the directory the command actually runs in: a shell call's
+ * `workdir`, resolved against the call's workspace by the caller. It defaults
+ * to the ambient workspace root for callers that only classify command text.
+ * Without it, `git push` inside a linked worktree was resolved against the
+ * session-bound checkout, so every branch-state check judged the wrong tree.
+ *
+ * `explicitRepoDir` records whether the command text named the repository
+ * itself. A caller that cannot see `workdir` uses that flag to tell a fact
+ * from an assumption.
+ */
+export function parseGitInvocation(command: string, baseDir?: string): GitInvocation | undefined {
+	const root = baseDir ?? getWorkspaceRoot();
 	const tokens = unwrapShellWords(command);
 	if (tokens[0] !== "git") return undefined;
 	let i = 1;
 	let repoDir = root;
 	let sawDirOption = false;
 
-	const envDirMatch = command.match(GIT_ENV_DIR_RE);
-	if (envDirMatch) {
-		const envVal = envDirMatch[1] ?? envDirMatch[2] ?? envDirMatch[3];
-		if (envVal) {
-			repoDir = resolve(root, envVal);
-			sawDirOption = true;
-		}
+	const envDirValue = repoEnvironmentOverride(command);
+	if (envDirValue) {
+		repoDir = resolveGitRepoSelector(root, envDirValue);
+		sawDirOption = true;
 	}
 
 	while (i < tokens.length) {
 		const tok = tokens[i]!;
 		if (GIT_DIR_OPTION_TAKES_VALUE.has(tok)) {
 			const value = tokens[i + 1];
-			if (value === undefined) return { repoDir, rest: "" };
-			if (tok === "-C" || tok === "--git-dir" || tok === "--work-tree") {
-				repoDir = resolve(root, value);
+			const namesRepository = tok === "-C" || tok === "--git-dir" || tok === "--work-tree";
+			// A trailing `-C` with no value names no repository, but the flag is
+			// still present in the text. Report it as a claim so both seats agree
+			// the command is unclassifiable rather than one judging it and the
+			// other deferring it. `-c` and `--config-env` name no repository.
+			if (value === undefined) return { repoDir, rest: "", explicitRepoDir: sawDirOption || namesRepository };
+			if (namesRepository) {
+				repoDir = resolveGitRepoSelector(root, value);
 				sawDirOption = true;
 			}
 			i += 2;
 			continue;
 		}
+		const attached = GIT_DIR_SHORT_ATTACHED.exec(tok);
+		if (attached) {
+			repoDir = resolveGitRepoSelector(root, attached[1]!);
+			sawDirOption = true;
+			i += 1;
+			continue;
+		}
 		if (GIT_DIR_OPTION_PREFIXED.test(tok)) {
 			if (tok.startsWith("--git-dir=")) {
-				repoDir = resolve(root, tok.slice("--git-dir=".length));
+				repoDir = resolveGitRepoSelector(root, tok.slice("--git-dir=".length));
 				sawDirOption = true;
 			} else if (tok.startsWith("--work-tree=")) {
-				repoDir = resolve(root, tok.slice("--work-tree=".length));
+				repoDir = resolveGitRepoSelector(root, tok.slice("--work-tree=".length));
 				sawDirOption = true;
 			}
 			i += 1;
@@ -109,8 +159,7 @@ export function parseGitInvocation(command: string): GitInvocation | undefined {
 		}
 		break;
 	}
-	if (!sawDirOption) repoDir = root;
-	return { repoDir, rest: tokens.slice(i).join(" ") };
+	return { repoDir, rest: tokens.slice(i).join(" "), explicitRepoDir: sawDirOption };
 }
 
 export function normalizeGitCommands(command: string): string {
@@ -124,6 +173,17 @@ export function normalizeGitCommands(command: string): string {
 
 export const GIT_WRITE_RE =
 	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)(?:[^|;&]*\s)?(?:-d\b|--delete\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?-[dDM]\b/;
+
+/**
+ * True when `text` invokes git in a way that changes a tree's refs or content.
+ *
+ * One predicate for every caller: the shell segment walk, the nested payload
+ * check, and the foreign-workdir gate. Keeping copies is how the payload check
+ * drifted wider than the segment check once already.
+ */
+export function isGitTreeWriteText(text: string): boolean {
+	return GIT_WRITE_RE.test(text) || GIT_BRANCH_CREATE_RE.test(text) || /\bgit\s+push\b/.test(text);
+}
 
 export function currentGitBranch(root: string): string | undefined {
 	const result = spawnSync("git", ["branch", "--show-current"], {
@@ -304,14 +364,76 @@ export function isBranchAlreadyMergedOrClosed(
 	return { merged: false };
 }
 
-export function checkMergeConflicts(root: string): {
+/**
+ * The source branch a PR-creation command names, if any.
+ *
+ * `gh` names it with `--head`/`-H`, and Azure DevOps with `--source-branch`.
+ * Fork forms carry an `owner:` prefix; a ref cannot contain `:`, so the last
+ * segment is the local branch name the caller looks up. Callers fall back to
+ * the invoking checkout when the branch is not checked out anywhere locally.
+ */
+export function prSourceBranch(command: string): string | undefined {
+	const words = unwrapShellWords(command);
+	let source: string | undefined;
+	for (let i = 0; i < words.length; i++) {
+		const word = words[i]!;
+		let raw: string | undefined;
+		if (word === "--head" || word === "-H" || word === "--source-branch") {
+			raw = words[i + 1];
+		} else if (/^--(?:head|source-branch)=/.test(word)) {
+			raw = word.slice(word.indexOf("=") + 1);
+		} else if (/^-H\S/.test(word)) {
+			raw = word.slice(2);
+		}
+		if (raw === undefined) continue;
+		const branch = raw.includes(":") ? raw.slice(raw.lastIndexOf(":") + 1) : raw;
+		if (branch) source = branch;
+	}
+	return source;
+}
+
+/**
+ * Which checkout of this repository has `branch` checked out, if any.
+ *
+ * A PR is evaluated against the tree the branch actually lives in, not against
+ * whatever the caller's checkout happens to hold. Linked worktrees are the
+ * normal case: a session may sit in the primary checkout while the reviewed
+ * branch is checked out in an isolated worktree.
+ */
+export function findWorktreeForBranch(root: string, branch: string): string | undefined {
+	const target = branch.replace(/^refs\/heads\//, "").trim();
+	if (!target) return undefined;
+	const res = spawnSync("git", ["worktree", "list", "--porcelain"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 10_000,
+	});
+	if (res.status !== 0) return undefined;
+	let current: string | undefined;
+	for (const line of res.stdout.split("\n")) {
+		if (line.startsWith("worktree ")) {
+			current = line.slice("worktree ".length).trim();
+			continue;
+		}
+		if (line.startsWith("branch ") && current) {
+			if (line.slice("branch ".length).trim().replace(/^refs\/heads\//, "") === target) return current;
+		}
+	}
+	return undefined;
+}
+
+export function checkMergeConflicts(root: string, ref?: string): {
 	hasConflicts: boolean;
 	baseBranch?: string;
 	reason?: string;
 } {
+	// A branch that is not checked out anywhere still has to be judged; the
+	// caller passes its ref, and HEAD stands in only when no ref was named.
+	const subject = typeof ref === "string" && ref.trim() ? ref.trim() : "HEAD";
+	const subjectLabel = subject === "HEAD" ? "" : `Branch '${subject}'`;
 	const candidates = ["origin/HEAD", "origin/main", "origin/master", "main", "master"];
 	for (const base of candidates) {
-		const mergeBaseRes = spawnSync("git", ["merge-base", "HEAD", base], {
+		const mergeBaseRes = spawnSync("git", ["merge-base", subject, base], {
 			cwd: root,
 			encoding: "utf8",
 			timeout: 5_000,
@@ -319,7 +441,7 @@ export function checkMergeConflicts(root: string): {
 		if (mergeBaseRes.status !== 0 || !mergeBaseRes.stdout.trim()) continue;
 		const mergeBase = mergeBaseRes.stdout.trim();
 
-		const treeRes = spawnSync("git", ["merge-tree", mergeBase, "HEAD", base], {
+		const treeRes = spawnSync("git", ["merge-tree", mergeBase, subject, base], {
 			cwd: root,
 			encoding: "utf8",
 			timeout: 10_000,
@@ -328,7 +450,7 @@ export function checkMergeConflicts(root: string): {
 			return {
 				hasConflicts: true,
 				baseBranch: base,
-				reason: `Branch has merge conflicts with base branch '${base}'. Rebase or merge '${base}' to resolve all conflicts before opening a PR or handing off.`,
+				reason: `${subjectLabel || "Branch"} has merge conflicts with base branch '${base}'. Rebase or merge '${base}' to resolve all conflicts before opening a PR or handing off.`,
 			};
 		}
 	}

@@ -453,10 +453,13 @@ if (isOpenCodeV2) {
 			headlessAccountability?.seat?.deny?.decision?.policy === "secrets" &&
 			headlessAccountability?.seat?.deny?.decision?.code === "secret_read",
 	);
+	// A bare `git push` names no repository. Its checkout comes from the tool's
+	// workdir, which the seat cannot see, so the seat defers it as
+	// cwd-dependent and `execute.before` enforces with the resolved workdir.
 	check(
 		"V2 permission seat abstains on an undecidable push instead of denying it",
 		headlessAccountability?.seat?.push?.effect === "abstain" &&
-			headlessAccountability?.seat?.push?.decision?.code === "remote_state_unchecked",
+			headlessAccountability?.seat?.push?.decision?.code === "repository_unidentified",
 	);
 }
 

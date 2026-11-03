@@ -28,6 +28,8 @@ import {
 	setWorkspaceRoot,
 	setSdkClient,
 	getSessionBoundWorkspace,
+	rebindSessionWorkspaceFromHost,
+	forgetSessionWorkspace,
 	registerSessionWorkspaceFromToolCall,
 	runWithRuntimeState,
 	getSessionMutationCount,
@@ -841,6 +843,23 @@ async function handleV2Event(
 		return;
 	}
 
+	if (event.type === "session.moved") {
+		// `session_move` relocates a session between checkouts, and the host
+		// announces it. On the pinned 2.2.0 SDK the V2 union carries
+		// `session.moved` and no `session.updated`, and the move event itself
+		// names the destination: `data.sessionID` plus
+		// `data.location.directory`. Without this rebind the session kept
+		// judging the tree it left.
+		const data = event.data as {
+			sessionID?: unknown;
+			location?: { directory?: unknown };
+		} | undefined;
+		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
+		const directory = typeof data?.location?.directory === "string" ? data.location.directory : undefined;
+		rebindSessionWorkspaceFromHost(sessionID, directory, { moved: true });
+		return;
+	}
+
 	if (event.type === "session.idle") {
 		const data = event.data as { sessionID?: unknown } | undefined;
 		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
@@ -870,6 +889,7 @@ async function handleV2Event(
 			clearTodoSessionState(sessionID);
 			toolLifecycle.takeRecoveryRun(sessionID);
 			await runWithRuntimeState(effectiveRoot, client, () => clearContinuationState(sessionID));
+			forgetSessionWorkspace(sessionID);
 		}
 		return;
 	}
