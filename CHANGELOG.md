@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.19.3
+
+### Patch Changes
+
+- 553810f: Narrow the V2 event subscription, honor the per-call abort signal, and wake the title settle on the delivered rename.
+
+    - `ctx.event.subscribe()` now passes its `types` filter, so only the ten event types `handleV2Event` acts on cross the stream. Every other host event is dropped by the server before it reaches the plugin. The list is exported as `V2_EVENT_TYPES`, and the suite asserts it matches the handler's comparisons in both directions and that every entry is in `EventManifest.ServerDefinitions`. A type added to the handler but not the filter would otherwise become dead code that still compiles, which is how the previously repaired handlers broke.
+    - The long-running guard tools that spawn subprocesses (`guard_worktree_create`, `guard_worktree_cleanup`, `guard_review_rubric`, `guard_recovery_restore`) now stop before starting work when the session was already interrupted. They read the per-call abort signal, which OpenCode 2's promise-layer tool context names `signal` and OpenCode 1's names `abort`. A cancelled call returns a `Cancelled` result instead of running to its own timeout. The check is placed before the work because `spawnSync` cannot observe an abort mid-flight. Short git-backed reads keep their five-second bound and are out of scope.
+    - The title settle wait now ends as soon as the delivered `session.renamed` event reports that the title committed, instead of always sleeping the full 8 x 250 ms poll. The wake-up is registered before the session read, so a rename that lands during the read is still observed rather than costing an extra interval. A host that does not emit the event keeps the exact previous timing, and `titleSettleWorkaround: false` still disables the wait entirely.
+    - `test:install` no longer fails its own cleanup with `ENOTEMPTY`. `opencode debug config` auto-starts a detached `serve --service` under the probe's isolated `XDG_*` roots, and killing the probe child left that service running and writing into the temporary project. The harness now stops every service it started before removing the directory, then retries the removal.
+
 ## 1.19.2
 
 ### Patch Changes
