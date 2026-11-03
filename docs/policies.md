@@ -256,7 +256,7 @@ Besides enforcement hooks, the guard registers companion tools in OpenCode:
 
 ### Hook-Context Safety
 - All spawned git commands run with a sanitized environment. Inherited git context variables (`GIT_INDEX_FILE`, `GIT_DIR`, `GIT_WORK_TREE`, and others) are stripped, so the tools resolve the repository from their working directory alone. This makes them safe to invoke from inside git hooks, which export those variables.
-- **Abort propagation:** The two hosts name the per-call abort signal differently. OpenCode 2's promise-layer tool context supplies `signal`, and OpenCode 1's supplies `abort`. The subprocess-spawning tools (`guard_worktree_create`, `guard_worktree_cleanup`, `guard_review_rubric`) read either one before starting work, so a call whose session was interrupted before it started returns a `Cancelled` result instead of running to its own timeout. The check runs before the work rather than during it, because `spawnSync` cannot observe an abort mid-flight.
+- **Abort propagation:** The two hosts name the per-call abort signal differently. OpenCode 2's promise-layer tool context supplies `signal`, and OpenCode 1's supplies `abort`. Every guard tool that spawns a subprocess (`guard_worktree_create`, `guard_worktree_cleanup`, `guard_review_rubric`, `guard_recovery_restore`) reads either one before starting work, so a call whose session was interrupted before it started returns a `Cancelled` result instead of running to its own timeout. The check runs before the work rather than during it, because `spawnSync` cannot observe an abort mid-flight.
 
 ### Inspection Tools
 ### `guard_status`

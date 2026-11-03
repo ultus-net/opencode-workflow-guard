@@ -206,6 +206,8 @@ export function createCustomTools(options: {
 				description: "Restore this root session's workspace to its pre-run recovery checkpoint. Refuses if the run has not gone idle or if the workspace changed after that boundary.",
 				args: { run: tool.schema.number() },
 				execute: async (args, toolContext) => {
+					const cancelled = abortedMessage(toolContext);
+					if (cancelled) return cancelled;
 					if (!Number.isInteger(args.run) || args.run < 1) return "[workflow-guard] Recovery rejected: run must be a positive integer.";
 					const parent = await fetchParentSession(toolContext.sessionID);
 					if (!parent.ok) return "[workflow-guard] Recovery rejected: could not confirm this is a root session.";

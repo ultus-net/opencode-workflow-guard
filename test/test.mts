@@ -7922,6 +7922,10 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 	const subscribed = new Set<string>(V2_EVENT_TYPES);
 	const missingFromFilter = [...handled].filter((type) => !subscribed.has(type));
 	const unusedInHandler = [...subscribed].filter((type) => !handled.has(type));
+	// The scan is a regex, so a refactor to `switch (event.type)` would match
+	// nothing and leave both checks green while every feature went dead. Assert
+	// it matched real comparisons, matching the E5 block's non-vacuity guard.
+	check("the event-type scan matched real handler comparisons", handled.size >= 5);
 	check("the event filter covers every type the handler acts on", missingFromFilter.length === 0);
 	check("the event filter names no type the handler ignores", unusedInHandler.length === 0);
 	if (missingFromFilter.length > 0) console.log(`    not subscribed: ${missingFromFilter.join(", ")}`);
@@ -7970,6 +7974,24 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 		{ sessionID: "s-abort", directory: abortRoot, abort: cancel.signal },
 	);
 	check("an aborted call is cancelled through the V1 `abort` key", String(abortedViaAbortKey).includes("Cancelled"));
+	// Recovery restore spawns git too, and it is only registered when the
+	// project enables checkpoints, so cover it under its own config.
+	writeFileSync(join(abortRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ recoveryCheckpoints: true }));
+	const recoveryTools = createCustomTools({
+		effectiveRoot: abortRoot,
+		projectMemoryEnabled: false,
+		learningEnabled: false,
+		projectMemory: undefined,
+		followupStore: undefined,
+		portableMemoryPath: join(abortRoot, "memory.jsonl"),
+		learningInterventions: new Map(),
+		client: fakeClient,
+	});
+	const abortedRecovery = await (recoveryTools as Record<string, any>).guard_recovery_restore.execute(
+		{ run: 1 },
+		{ sessionID: "s-abort", directory: abortRoot, signal: cancel.signal },
+	);
+	check("an aborted call cancels a recovery restore before it runs", String(abortedRecovery).includes("Cancelled"));
 	rmSync(abortRoot, { recursive: true, force: true });
 }
 
