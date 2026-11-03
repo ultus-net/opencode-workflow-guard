@@ -7852,11 +7852,11 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 	resetGuardedMcpTokensForTesting();
 }
 
-// E6: the idle trigger moved from the deprecated `session.idle` to
-// `session.status` with `status.type === "idle"` (A5). Nothing pinned the new
-// trigger, so a regression could silently disable automatic continuation. The
-// assertion is the delivered continuation prompt, not just the return value:
-// `busy` must not prompt, `idle` must.
+// E6: the idle trigger. The host keeps two event types for it and neither is
+// established as the one the server publishes: `session.status` with
+// `status.type === "idle"`, and the deprecated `session.idle`. Handling only
+// one silently disables automatic continuation if the other is what arrives.
+// The assertions are delivered continuation prompts, not return values.
 {
 	const makeIdleState = (client: unknown) => ({
 		effectiveRoot: root,
@@ -7878,10 +7878,34 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 	check("a busy session.status does not continue the session", idlePrompts.length === 0);
 	await handleV2Event({ type: "session.status", data: { sessionID: idleSession, status: { type: "idle" } } }, makeIdleState(idleClient) as any);
 	check("an idle session.status continues the session", idlePrompts.length === 1);
-	// The deprecated type must no longer be the trigger, or the move did nothing.
+	// The deprecated trigger must still work: a host that emits only this one
+	// would otherwise lose auto-continuation entirely.
 	await handleV2Event({ type: "session.idle", data: { sessionID: idleSession } }, makeIdleState(idleClient) as any);
-	check("the deprecated session.idle no longer triggers continuation", idlePrompts.length === 1);
+	check("the deprecated session.idle still continues the session", idlePrompts.length === 2);
 	await runWithRuntimeState(root, idleClient, () => clearContinuationState(idleSession));
+
+	// A host that emits both types for one transition must produce one prompt.
+	// Each event is handled on its own call, so this pins the in-flight lock
+	// rather than any per-call dedupe.
+	const bothSession = "s-v2-idle-both";
+	todo(bothSession, item("unfinished work", "pending"));
+	let bothPrompts = 0;
+	let releaseBoth!: () => void;
+	const bothGate = new Promise<void>((resolve) => { releaseBoth = resolve; });
+	const bothClient = {
+		session: {
+			todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+			get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+			promptAsync: async () => { bothPrompts++; await bothGate; },
+		},
+	};
+	const firstTrigger = handleV2Event({ type: "session.status", data: { sessionID: bothSession, status: { type: "idle" } } }, makeIdleState(bothClient) as any);
+	const secondTrigger = handleV2Event({ type: "session.idle", data: { sessionID: bothSession } }, makeIdleState(bothClient) as any);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	releaseBoth();
+	await Promise.all([firstTrigger, secondTrigger]);
+	check("both idle event types for one transition yield a single continuation prompt", bothPrompts === 1);
+	await runWithRuntimeState(root, bothClient, () => clearContinuationState(bothSession));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

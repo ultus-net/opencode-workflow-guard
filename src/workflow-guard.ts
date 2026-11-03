@@ -25,7 +25,7 @@ import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts
 import { isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./lib/guard-dispatcher.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./lib/custom-tools.ts";
 import { evaluateDogfoodGate } from "./lib/dogfood.ts";
-import type { PolicyDecision, TodoSdkClient } from "./lib/types.ts";
+import type { TodoSdkClient } from "./lib/types.ts";
 export { isReadOnlyRole } from "./lib/guard-dispatcher.ts";
 export { extractReviewFollowups, buildWorkflowGuardSystemGuidance } from "./lib/custom-tools.ts";
 export { evaluateDogfoodGate } from "./lib/dogfood.ts";

@@ -924,12 +924,21 @@ export async function handleV2Event(
 		return;
 	}
 
-	// `session.idle` is deprecated in the installed schema and superseded by
-	// `session.status` carrying `status.type === "idle"`. The idle side effects
-	// keep their original order and behavior.
-	if (event.type === "session.status") {
+	// Idle is the trigger for automatic continuation. The host keeps two
+	// event types for it: `session.status` with `status.type === "idle"`, and
+	// the deprecated `session.idle`. Both are in
+	// `EventManifest.ServerDefinitions` on 2.0.15, 2.1.3, and 2.2.0, but which
+	// one the server actually publishes is not settled: the TUI derives idle
+	// from `session.execution.*` instead of consuming `session.status`, and an
+	// upstream report says `session.status` is declared but never published.
+	// Handling both keeps continuation working whichever one arrives, and adds
+	// no new trigger beyond what each host already emits. A host that emits
+	// both for one transition still sends a single prompt, because
+	// `continueUnfinishedSession` holds a per-session in-flight lock for the
+	// whole awaited send. The side effects keep their original order.
+	if (event.type === "session.status" || event.type === "session.idle") {
 		const data = event.data as { sessionID?: unknown; status?: { type?: unknown } } | undefined;
-		if (data?.status?.type !== "idle") return;
+		if (event.type === "session.status" && data?.status?.type !== "idle") return;
 		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
 		if (typeof sessionID === "string") {
 			releaseFileClaims(sessionID);
