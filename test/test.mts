@@ -7844,5 +7844,37 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 	resetGuardedMcpTokensForTesting();
 }
 
+// E6: the idle trigger moved from the deprecated `session.idle` to
+// `session.status` with `status.type === "idle"` (A5). Nothing pinned the new
+// trigger, so a regression could silently disable automatic continuation. The
+// assertion is the delivered continuation prompt, not just the return value:
+// `busy` must not prompt, `idle` must.
+{
+	const makeIdleState = (client: unknown) => ({
+		effectiveRoot: root,
+		client,
+		toolLifecycle: new ToolInvocationLifecycle(),
+		toolOutcomes: new ToolOutcomeTracker(),
+	});
+	const idleSession = "s-v2-idle-status";
+	todo(idleSession, item("unfinished work", "pending"));
+	const idlePrompts: string[] = [];
+	const idleClient = {
+		session: {
+			todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+			get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+			promptAsync: async ({ path }: { path: { id: string } }) => { idlePrompts.push(path.id); },
+		},
+	};
+	await handleV2Event({ type: "session.status", data: { sessionID: idleSession, status: { type: "busy" } } }, makeIdleState(idleClient) as any);
+	check("a busy session.status does not continue the session", idlePrompts.length === 0);
+	await handleV2Event({ type: "session.status", data: { sessionID: idleSession, status: { type: "idle" } } }, makeIdleState(idleClient) as any);
+	check("an idle session.status continues the session", idlePrompts.length === 1);
+	// The deprecated type must no longer be the trigger, or the move did nothing.
+	await handleV2Event({ type: "session.idle", data: { sessionID: idleSession } }, makeIdleState(idleClient) as any);
+	check("the deprecated session.idle no longer triggers continuation", idlePrompts.length === 1);
+	await runWithRuntimeState(root, idleClient, () => clearContinuationState(idleSession));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;

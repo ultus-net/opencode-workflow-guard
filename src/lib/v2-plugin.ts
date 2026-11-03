@@ -766,8 +766,22 @@ function recordV2ToolOutcome(
 		// The host's `execute.after` always carries a terminal status. A partial
 		// event from a harness or stub leaves it unknown, so record the
 		// optimistic completion that this hook used to record unconditionally
-		// rather than dropping the call from telemetry entirely.
-		toolOutcomes.recordFallbackCompleted(event.sessionID ?? "", event.callID, event.tool, startedAt === undefined ? undefined : Date.now() - startedAt);
+		// rather than dropping the call from telemetry entirely. The audit row
+		// is kept here so this path does not lose the coverage it had before
+		// outcomes moved onto `execute.after`.
+		const fallback = toolOutcomes.recordFallbackCompleted(event.sessionID ?? "", event.callID, event.tool, startedAt === undefined ? undefined : Date.now() - startedAt);
+		if (fallback) {
+			audit({
+				ts: new Date().toISOString(),
+				sessionID: fallback.sessionID,
+				callID: fallback.callID,
+				tool: fallback.tool,
+				decision: "allow",
+				phase: "outcome",
+				durationMs: fallback.durationMs,
+				reason: fallback.status,
+			});
+		}
 		return;
 	}
 	const error = typeof event.error === "string" ? event.error : event.error?.message;
