@@ -34,6 +34,20 @@ console.log("- OpenCode Plugin Installation & Runtime Load Test -");
 // checks run even when the optional live OpenCode binary is unavailable.
 const testDir = mkdtempSync(join(tmpdir(), "wg-install-test-"));
 
+// Every isolated XDG root that a live probe may start a managed service under.
+const liveServiceEnvs: NodeJS.ProcessEnv[] = [];
+// `opencode debug config` auto-starts a detached `serve --service` under the
+// probe's own XDG roots. Killing the probe child leaves that service running and
+// writing into testDir, so a bare rmSync races it and fails with ENOTEMPTY.
+// Stop each tracked service first, then retry the removal.
+const cleanupTestDir = (): void => {
+	if (process.env.WG_E2E_KEEP) return;
+	for (const env of liveServiceEnvs) {
+		spawnSync("opencode", ["service", "stop"], { cwd: testDir, encoding: "utf8", env, timeout: 30_000 });
+	}
+	rmSync(testDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+};
+
 // Verify the publish artifact resolves its modular entrypoint, not only the
 // checkout/local-copy layout used by the live plugin test below.
 const packResult = spawnSync("npm", ["pack", "--pack-destination", testDir], {
@@ -143,7 +157,7 @@ check("server and TUI package specs resolve to different modules", installedPack
 const opencodeCheck = spawnSync("opencode", ["--version"], { encoding: "utf8" });
 if (opencodeCheck.status !== 0) {
 	console.log("SKIP: opencode CLI is not available in PATH. Package checks passed; skipping live runtime load tests.");
-	if (!process.env.WG_E2E_KEEP) rmSync(testDir, { recursive: true, force: true });
+	cleanupTestDir();
 	console.log(`\n${pass} passed, ${fail} failed`);
 	process.exit(fail > 0 ? 1 : 0);
 }
@@ -326,6 +340,7 @@ const runtimeEnv: NodeJS.ProcessEnv = {
 	XDG_STATE_HOME: join(testDir, "runtime-state"),
 	XDG_DATA_HOME: join(testDir, "runtime-data"),
 };
+liveServiceEnvs.push(runtimeEnv);
 delete runtimeEnv.OPENCODE_PID;
 delete runtimeEnv.OPENCODE_PURE;
 delete runtimeEnv.OPENCODE;
@@ -482,6 +497,7 @@ if (isOpenCodeV2 && (opencodeMajor > 2 || (opencodeMajor === 2 && hostMinor >= 1
 		XDG_STATE_HOME: join(testDir, "runtime-state-todo"),
 		XDG_DATA_HOME: join(testDir, "runtime-data-todo"),
 	};
+	liveServiceEnvs.push(todoEnv);
 	const todoPort = 49400 + ((process.pid + 500) % 1000);
 	spawnSync("opencode", ["service", "set", "port", String(todoPort)], { cwd: testDir, encoding: "utf8", env: todoEnv, timeout: 30_000 });
 	try {
@@ -537,7 +553,7 @@ if (isOpenCodeV2 && (opencodeMajor > 2 || (opencodeMajor === 2 && hostMinor >= 1
 
 if (process.env.WORKFLOW_GUARD_LIVE_E2E !== "1") {
 	console.log("SKIP: model-driven policy probes require WORKFLOW_GUARD_LIVE_E2E=1.");
-	if (!process.env.WG_E2E_KEEP) rmSync(testDir, { recursive: true, force: true });
+	cleanupTestDir();
 	console.log(`\n${pass} passed, ${fail} failed`);
 	process.exit(fail > 0 ? 1 : 0);
 }
@@ -557,7 +573,7 @@ try {
 const liveModel = process.env.WORKFLOW_GUARD_LIVE_MODEL?.trim() || recentModel;
 if (!liveModel) {
 	console.error(`FAIL: no recent OpenCode model found in ${recentModelPath}; select a model in OpenCode or set WORKFLOW_GUARD_LIVE_MODEL=provider/model.`);
-	if (!process.env.WG_E2E_KEEP) rmSync(testDir, { recursive: true, force: true });
+	cleanupTestDir();
 	process.exit(1);
 }
 console.log(`  Using live model: ${liveModel}`);
@@ -608,7 +624,7 @@ if (!run3AccountedFor) {
 }
 
 // Clean up
-if (!process.env.WG_E2E_KEEP) rmSync(testDir, { recursive: true, force: true });
+cleanupTestDir();
 
 console.log(`\n${pass} passed, ${fail} failed, ${unavailable} live unavailable`);
 process.exit(fail ? 1 : 0);

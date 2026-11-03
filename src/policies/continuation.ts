@@ -36,14 +36,78 @@ export async function waitForSessionTitle(sessionID: string): Promise<void> {
 	const session = getSdkClient()?.session;
 	if (typeof session?.get !== "function") return;
 	for (let attempt = 0; attempt < TITLE_SETTLE_ATTEMPTS; attempt++) {
+		// Register the wake-up BEFORE reading, then release it once the read is
+		// done. A rename that commits during the read is therefore still
+		// observed: registering afterwards would let it land in the gap between
+		// the read and the registration, which reads as "not yet renamed" and
+		// costs a whole extra interval even though the title already settled.
+		const wait = beginRenameWait(sessionID);
+		let settled = false;
 		try {
 			const current = (await session.get({ path: { id: sessionID } }))?.data;
-			if (current?.parentID || typeof current?.title !== "string" || !DEFAULT_SESSION_TITLE.test(current.title)) return;
+			settled = Boolean(current?.parentID) || typeof current?.title !== "string" || !DEFAULT_SESSION_TITLE.test(current.title);
 		} catch {
+			wait.cancel();
 			return;
 		}
-		if (attempt + 1 < TITLE_SETTLE_ATTEMPTS) await new Promise((resolve) => setTimeout(resolve, TITLE_SETTLE_MS));
+		if (settled) {
+			wait.cancel();
+			return;
+		}
+		if (attempt + 1 >= TITLE_SETTLE_ATTEMPTS) {
+			wait.cancel();
+			return;
+		}
+		await wait.promise;
 	}
+}
+
+/**
+ * A pending wait for one session's title, resolved by `session.renamed` or by
+ * one poll interval elapsing.
+ *
+ * The poll exists because the host generates a title asynchronously and a
+ * continuation sent too early can be titled with the placeholder. `title` is a
+ * model-request hook, so it runs *before* the title is written and cannot
+ * report that the write happened. `session.renamed` is delivered when it does,
+ * so the normal case ends as soon as the title commits while the worst case
+ * stays the old interval. A host that never emits the event keeps the old
+ * timing exactly.
+ */
+function beginRenameWait(sessionID: string): { promise: Promise<void>; cancel: () => void } {
+	const waiters = renaming.get(sessionID) ?? new Set<() => void>();
+	renaming.set(sessionID, waiters);
+	let finish!: () => void;
+	const promise = new Promise<void>((resolve) => {
+		finish = resolve;
+	});
+	let settled = false;
+	const done = (): void => {
+		if (settled) return;
+		settled = true;
+		waiters.delete(done);
+		if (waiters.size === 0) renaming.delete(sessionID);
+		clearTimeout(timer);
+		finish();
+	};
+	waiters.add(done);
+	// A plain timer, not `unref`: an unref'd timer lets the process exit while
+	// this promise is still pending, which would drop the wait.
+	const timer = setTimeout(done, TITLE_SETTLE_MS);
+	return { promise, cancel: done };
+}
+
+/** Named `renaming` rather than `sessions` to read as the event, not the store. */
+const renaming = new Map<string, Set<() => void>>();
+
+/**
+ * Wake any wait for this session's title. Called from the `session.renamed`
+ * subscription; a session with no waiter is a no-op.
+ */
+export function notifySessionRenamed(sessionID: string): void {
+	const waiters = renaming.get(sessionID);
+	if (!waiters) return;
+	for (const waiter of [...waiters]) waiter();
 }
 
 function getState(): ContinuationState | undefined {
