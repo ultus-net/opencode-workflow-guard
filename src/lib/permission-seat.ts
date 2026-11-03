@@ -205,8 +205,10 @@ export async function evaluatePermissionSeat(
 
 	// `<server>_<tool>` MCP actions: only the guarded live-system servers are
 	// mapped (GitHub/Azure DevOps), matching the execute.before MCP policy.
+	// Cache the host action's mutability to avoid recomputing it on every iteration.
+	const actionIsMutating = mcpMutationTool(event.action);
 	for (const resource of resources) {
-		if (!mcpMutationTool(event.action) && !mcpMutationTool(resource)) continue;
+		if (!actionIsMutating && !mcpMutationTool(resource)) continue;
 		const decision = await decide(event.action, {});
 		return seatVerdict(decision, event.action) ?? { effect: "allow", mappedTool: event.action };
 	}

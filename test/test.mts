@@ -7,6 +7,8 @@ import { DatabaseSync } from "node:sqlite";
 import type { PluginModule } from "@opencode-ai/plugin";
 import { getRalphMaxIterations, runWithRuntimeState } from "../src/lib/state.ts";
 import { isGeneratedContinuationMessage } from "../src/policies/continuation.ts";
+import { clearContinuationState, continueUnfinishedSession, recordUserMessage } from "../src/policies/continuation.ts";
+import { ToolInvocationLifecycle } from "../src/lib/tool-lifecycle.ts";
 import {
 	guardToolCall,
 	guardToolDecision,
@@ -7646,5 +7648,265 @@ rmSync(liveBase, { recursive: true, force: true });
 
 rmSync(root, { recursive: true, force: true });
 if (prevLive !== undefined) process.env.WORKFLOW_GUARD_ALLOW_LIVE = prevLive;
+
+// ── V2 delivered event handlers ──────────────────────────────────────────────
+// `ctx.event.subscribe()` is served from EventManifest.ServerDefinitions. A type
+// present in `Definitions` but absent from that manifest is never delivered,
+// even when a plugin handles it. Three handlers were built on such types, so
+// tool-outcome telemetry, the Policy 25 research floor, the MCP inventory
+// refresh, and the command audit were all silently dead on V2. These tests pin
+// the repaired paths and add a structural guard against the recurrence.
+console.log("- V2 delivered event handlers -");
+
+const v2EventModule = await import("../src/lib/v2-plugin.ts");
+const { handleV2Event } = v2EventModule;
+const { EventManifest } = await import("@opencode/schema/event-manifest");
+const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].map((entry) => entry.type as string));
+
+// E5 (structural, highest value): every literal the plugin compares against
+// `event.type` must be a type the host actually delivers. This is what would
+// have caught the three dead handlers before they shipped.
+{
+	const pluginSource = readFileSync("src/lib/v2-plugin.ts", "utf8");
+	const literals = [...pluginSource.matchAll(/event\??\.type\s*(?:===|!==)\s*"([^"]+)"/g)].map((match) => match[1]);
+	const unique = [...new Set(literals)];
+	const undelivered = unique.filter((type) => !serverEventTypes.has(type));
+	check("V2 event-liveness scan finds the plugin's event comparisons", unique.length >= 5);
+	check("every event.type literal in v2-plugin.ts is in EventManifest.ServerDefinitions", undelivered.length === 0);
+	if (undelivered.length > 0) console.log(`    undelivered literal(s): ${undelivered.join(", ")}`);
+	// The three types that made A1/A3/A4 dead must not come back as literals.
+	check("the replay-only tool-content type is no longer handled", !unique.includes("session.message.content.updated"));
+	check("the ephemeral mcp.tools.changed type is no longer handled", !unique.includes("mcp.tools.changed"));
+	check("the replay-only command.executed type is no longer handled", !unique.includes("command.executed"));
+}
+
+// E1: the deny contract. `execute.before` may reject, and that rejection is what
+// fails the call with the guard's reason. Source-only fact: the adapter wraps
+// only that hook in `Effect.tryPromise`. A real V2 instance is driven so the
+// assertion covers the shipped registration, not a re-creation of it.
+{
+	resetPluginInstancesForTesting();
+	resetToolCallClaimsForTesting();
+	const denyRoot = mkdtempSync(join(tmpdir(), "wg-v2-deny-"));
+	const v2Deny = makeV2Context(denyRoot);
+	await (defaultExport.setup as any)(v2Deny.ctx);
+	const beforeHook = v2Deny.state.beforeHooks[0];
+	check("V2 registers exactly one execute.before hook", v2Deny.state.beforeHooks.length === 1);
+	let rejected: unknown;
+	let allowedReason: unknown = "sentinel";
+	try {
+		await beforeHook({ tool: "write", sessionID: "s-v2-deny", id: "call-deny", agent: "build", messageID: "m1", input: { filePath: join(denyRoot, "..", "escape.txt"), content: "x" } });
+	} catch (error) {
+		rejected = error;
+	}
+	check("a blocked execute.before rejects the call", rejected instanceof Error);
+	check("the rejection carries the workflow-guard reason prefix", rejected instanceof Error && rejected.message.includes("[workflow-guard]"));
+	check("the rejection carries an actionable policy reason", rejected instanceof Error && rejected.message.length > "[workflow-guard] ".length + 10);
+	// A permitted call must stay silent: the hook resolves without throwing.
+	try {
+		allowedReason = await beforeHook({ tool: "read", sessionID: "s-v2-deny", id: "call-allow", agent: "build", messageID: "m2", input: { filePath: join(denyRoot, "ok.txt") } });
+	} catch (error) {
+		allowedReason = error;
+	}
+	check("a permitted execute.before resolves without throwing", !(allowedReason instanceof Error));
+	rmSync(denyRoot, { recursive: true, force: true });
+}
+
+// E2: tool-outcome telemetry (A1). The old subscription keyed on a replay-only
+// event, so nothing ever reached the tracker and the circuit breaker could not
+// fire. Recording now happens in `execute.after`, which does fire for a failed
+// call, so an error accrues failure debt and a success clears it.
+{
+	resetPluginInstancesForTesting();
+	resetToolCallClaimsForTesting();
+	const outcomeRoot = mkdtempSync(join(tmpdir(), "wg-v2-outcome-"));
+	const v2Outcome = makeV2Context(outcomeRoot);
+	await (defaultExport.setup as any)(v2Outcome.ctx);
+	const beforeHook = v2Outcome.state.beforeHooks[0];
+	const afterHook = v2Outcome.state.afterHooks[0];
+	const breaker = (error: unknown) => error instanceof Error && error.message.includes("[Workflow Guard Circuit Breaker");
+	// One error is not enough: the suffix starts at a count of 2.
+	await afterHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-a", agent: "build", messageID: "m1", input: {}, status: "error", error: new Error("boom") });
+	let firstError: unknown;
+	try {
+		await beforeHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-b", agent: "build", messageID: "m2", input: { filePath: join(outcomeRoot, "..", "escape.txt"), content: "x" } });
+	} catch (error) {
+		firstError = error;
+	}
+	check("one failure stays below the circuit-breaker threshold", !breaker(firstError));
+	// A second equivalent error crosses the threshold.
+	await afterHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-c", agent: "build", messageID: "m3", input: {}, status: "error", error: new Error("boom") });
+	let secondError: unknown;
+	try {
+		await beforeHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-d", agent: "build", messageID: "m4", input: { filePath: join(outcomeRoot, "..", "escape.txt"), content: "x" } });
+	} catch (error) {
+		secondError = error;
+	}
+	check("two equivalent tool errors raise the circuit-breaker path", breaker(secondError));
+	// A completed call clears the debt, so the suffix disappears again.
+	await afterHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-e", agent: "build", messageID: "m5", input: {}, status: "completed", result: { content: "ok" } });
+	let clearedError: unknown;
+	try {
+		await beforeHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-f", agent: "build", messageID: "m6", input: { filePath: join(outcomeRoot, "..", "escape.txt"), content: "x" } });
+	} catch (error) {
+		clearedError = error;
+	}
+	check("the circuit-breaker suffix is gone after a success", !breaker(clearedError));
+	check("the failure outcome is journaled for diagnosis", getRecentAuditEntries(50).some((entry) => entry.sessionID === "s-v2-outcome" && entry.phase === "outcome" && entry.reason === "error"));
+	// Read the counter directly, so the debt assertions cannot pass on a call
+	// that throws for an unrelated reason. Two errors accrued, one completion
+	// cleared them; the audit rows are the durable witness for the same state.
+	const outcomeAudit = getRecentAuditEntries(50).filter((entry) => entry.sessionID === "s-v2-outcome" && entry.phase === "outcome");
+	check("two failures and one completion are each journaled", outcomeAudit.filter((entry) => entry.reason === "error").length === 2 && outcomeAudit.some((entry) => entry.reason === "completed"));
+	// A partial event with no terminal status takes the fallback path. That path
+	// must still journal its outcome row, which is the coverage the move onto
+	// `execute.after` nearly dropped.
+	await afterHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-g", agent: "build", messageID: "m7", input: {}, result: { content: "ok" } });
+	check("a status-less after event still journals an outcome row", getRecentAuditEntries(50).some((entry) => entry.sessionID === "s-v2-outcome" && entry.callID === "call-g" && entry.phase === "outcome"));
+	rmSync(outcomeRoot, { recursive: true, force: true });
+}
+
+// E3: a user interrupt suspends continuation on V2 (A2). Only reason `user` is
+// user intent; the other three are host-lifecycle events and must not stop the
+// session's own unfinished work from continuing.
+{
+	const makeState = (root: string, client: unknown) => ({
+		effectiveRoot: root,
+		client,
+		toolLifecycle: new ToolInvocationLifecycle(),
+		toolOutcomes: new ToolOutcomeTracker(),
+	});
+	const interrupts = [
+		{ reason: "user", suspends: true },
+		{ reason: "shutdown", suspends: false },
+		{ reason: "superseded", suspends: false },
+		{ reason: "inactivity", suspends: false },
+	];
+	for (const { reason, suspends } of interrupts) {
+		const sessionID = `s-v2-int-${reason}`;
+		todo(sessionID, item("unfinished work", "pending"));
+		// A continuation can only be observed if the client can actually prompt,
+		// and continuation state is keyed on the client object, so each case
+		// gets its own client and asserts on the delivered prompt rather than on
+		// a false-negative return value.
+		const prompted: string[] = [];
+		const continuationClient = {
+			session: {
+				todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+				get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+				promptAsync: async ({ path }: { path: { id: string } }) => { prompted.push(path.id); },
+			},
+		};
+		await handleV2Event({ type: "session.execution.interrupted", data: { sessionID, reason } }, makeState(root, continuationClient) as any);
+		const continued = await runWithRuntimeState(root, continuationClient, () => continueUnfinishedSession(sessionID));
+		check(`session.execution.interrupted reason "${reason}" ${suspends ? "suspends" : "does not suspend"} continuation`, continued === !suspends && prompted.length === (suspends ? 0 : 1));
+		await runWithRuntimeState(root, continuationClient, () => clearContinuationState(sessionID));
+	}
+	// A genuine user message re-enables a suspended session, proven by an
+	// actual continuation prompt: suspension must block it, user input must not.
+	const resumedSession = "s-v2-int-resume";
+	todo(resumedSession, item("unfinished work", "pending"));
+	const resumedPrompts: string[] = [];
+	const resumeClient = {
+		session: {
+			todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+			get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+			promptAsync: async ({ path }: { path: { id: string } }) => { resumedPrompts.push(path.id); },
+		},
+	};
+	await handleV2Event({ type: "session.execution.interrupted", data: { sessionID: resumedSession, reason: "user" } }, makeState(root, resumeClient) as any);
+	const suspendedResult = await runWithRuntimeState(root, resumeClient, () => continueUnfinishedSession(resumedSession));
+	check("a suspended session sends no continuation prompt", suspendedResult === false && resumedPrompts.length === 0);
+	// Continuation state is keyed on the client object, so the user-message
+	// record must run against the same client the session was suspended under.
+	await runWithRuntimeState(root, resumeClient, () => recordUserMessage(resumedSession));
+	const afterUserInput = await runWithRuntimeState(root, resumeClient, () => continueUnfinishedSession(resumedSession));
+	check("genuine user input re-enables a suspended continuation", afterUserInput === true && resumedPrompts.length === 1);
+	await runWithRuntimeState(root, resumeClient, () => clearContinuationState(resumedSession));
+}
+
+// E4: the MCP inventory refresh keys on a delivered event (A3), and widening is
+// additive only. A guarded server that connects mid-session must be guarded
+// without waiting for the next session, and a quieter roster must never unguard
+// a token that a static rule already covers.
+{
+	const refreshCalls: string[] = [];
+	const state = {
+		effectiveRoot: root,
+		client: fakeClient,
+		toolLifecycle: new ToolInvocationLifecycle(),
+		toolOutcomes: new ToolOutcomeTracker(),
+		refreshMcpInventory: async () => { refreshCalls.push("refresh"); },
+	};
+	await handleV2Event({ type: "mcp.status.changed", data: { server: "github-enterprise" } }, state as any);
+	check("a delivered mcp.status.changed triggers the inventory refresh", refreshCalls.length === 1);
+	await handleV2Event({ type: "mcp.tools.changed", data: { server: "github-enterprise" } }, state as any);
+	check("the undelivered mcp.tools.changed no longer triggers anything", refreshCalls.length === 1);
+	// Widening is additive: a later roster without the server cannot remove it.
+	resetGuardedMcpTokensForTesting();
+	const added = recordHostMcpServers(["github-enterprise"]);
+	const widened = [...guardedMcpServers()];
+	check("a host-declared guarded server widens the token set", added.length > 0 && widened.some((token) => added.includes(token)));
+	recordHostMcpServers([]);
+	check("an emptied roster never narrows the guarded token set", [...guardedMcpServers()].length >= widened.length);
+	resetGuardedMcpTokensForTesting();
+}
+
+// E6: the idle trigger. The host keeps two event types for it and neither is
+// established as the one the server publishes: `session.status` with
+// `status.type === "idle"`, and the deprecated `session.idle`. Handling only
+// one silently disables automatic continuation if the other is what arrives.
+// The assertions are delivered continuation prompts, not return values.
+{
+	const makeIdleState = (client: unknown) => ({
+		effectiveRoot: root,
+		client,
+		toolLifecycle: new ToolInvocationLifecycle(),
+		toolOutcomes: new ToolOutcomeTracker(),
+	});
+	const idleSession = "s-v2-idle-status";
+	todo(idleSession, item("unfinished work", "pending"));
+	const idlePrompts: string[] = [];
+	const idleClient = {
+		session: {
+			todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+			get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+			promptAsync: async ({ path }: { path: { id: string } }) => { idlePrompts.push(path.id); },
+		},
+	};
+	await handleV2Event({ type: "session.status", data: { sessionID: idleSession, status: { type: "busy" } } }, makeIdleState(idleClient) as any);
+	check("a busy session.status does not continue the session", idlePrompts.length === 0);
+	await handleV2Event({ type: "session.status", data: { sessionID: idleSession, status: { type: "idle" } } }, makeIdleState(idleClient) as any);
+	check("an idle session.status continues the session", idlePrompts.length === 1);
+	// The deprecated trigger must still work: a host that emits only this one
+	// would otherwise lose auto-continuation entirely.
+	await handleV2Event({ type: "session.idle", data: { sessionID: idleSession } }, makeIdleState(idleClient) as any);
+	check("the deprecated session.idle still continues the session", idlePrompts.length === 2);
+	await runWithRuntimeState(root, idleClient, () => clearContinuationState(idleSession));
+
+	// A host that emits both types for one transition must produce one prompt.
+	// Each event is handled on its own call, so this pins the in-flight lock
+	// rather than any per-call dedupe.
+	const bothSession = "s-v2-idle-both";
+	todo(bothSession, item("unfinished work", "pending"));
+	let bothPrompts = 0;
+	let releaseBoth!: () => void;
+	const bothGate = new Promise<void>((resolve) => { releaseBoth = resolve; });
+	const bothClient = {
+		session: {
+			todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+			get: async ({ path }: { path: { id: string } }) => ({ data: { id: path.id, parentID: fakeParents.get(path.id) } }),
+			promptAsync: async () => { bothPrompts++; await bothGate; },
+		},
+	};
+	const firstTrigger = handleV2Event({ type: "session.status", data: { sessionID: bothSession, status: { type: "idle" } } }, makeIdleState(bothClient) as any);
+	const secondTrigger = handleV2Event({ type: "session.idle", data: { sessionID: bothSession } }, makeIdleState(bothClient) as any);
+	await new Promise((resolve) => setTimeout(resolve, 0));
+	releaseBoth();
+	await Promise.all([firstTrigger, secondTrigger]);
+	check("both idle event types for one transition yield a single continuation prompt", bothPrompts === 1);
+	await runWithRuntimeState(root, bothClient, () => clearContinuationState(bothSession));
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exitCode = fail ? 1 : 0;

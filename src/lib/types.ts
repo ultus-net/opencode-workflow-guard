@@ -19,8 +19,14 @@ export interface TodoSdkClient {
 		get?: (opts: { path: { id: string } }) => Promise<{ data?: { parentID?: unknown; title?: unknown; time?: { idle?: unknown } } }>;
 		promptAsync?: (opts: {
 			path: { id: string };
-			body: { messageID?: string; parts: Array<{ type: "text"; text: string; synthetic?: boolean }> };
+			body: { messageID?: string; parts: Array<{ type: "text"; text: string; synthetic?: boolean }>; delivery?: "steer" | "queue"; resume?: boolean };
 		}) => Promise<unknown>;
+		/**
+		 * V2 only. The shim forwards a synthetic continuation through here, and
+		 * the presence of this method is what marks a V2 client in
+		 * `policies/continuation.ts` for `delivery`/`resume` support.
+		 */
+		synthetic?: (opts: { sessionID: string; text: string; delivery?: "steer" | "queue"; resume?: boolean }) => Promise<unknown>;
 	};
 	tui?: {
 		showToast?: (opts: { body: { title?: string; message: string; variant?: string } }) => Promise<unknown>;

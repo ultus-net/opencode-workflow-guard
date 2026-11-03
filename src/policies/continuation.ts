@@ -19,6 +19,19 @@ type ContinuationState = {
 export type RalphOutcome = "running" | "completed" | "blocked" | "budget_exhausted" | "user_stopped";
 const states = new WeakMap<object, Map<string, ContinuationState>>();
 
+/**
+ * Whether the active client is the V2 shim, which can carry `delivery` and
+ * `resume` on a synthetic continuation. `session.synthetic` is the
+ * discriminator: the V2 shim supplies it, and the V1 SDK client does not
+ * declare it. `session.todo` is required alongside it only because this module
+ * reads todos through the same surface, so a client missing it cannot be the
+ * V2 shim for our purposes.
+ */
+function isV2Host(): boolean {
+	const session = getSdkClient()?.session as { synthetic?: unknown; todo?: unknown } | undefined;
+	return typeof session?.synthetic === "function" && typeof session?.todo === "function";
+}
+
 export async function waitForSessionTitle(sessionID: string): Promise<void> {
 	const session = getSdkClient()?.session;
 	if (typeof session?.get !== "function") return;
@@ -95,17 +108,34 @@ export async function continueUnfinishedSession(sessionID: string, settleTitle =
 			: "";
 
 		try {
-			await session.promptAsync({
-				path: { id: sessionID },
-				body: {
-					messageID,
-					parts: [{
-						type: "text",
-						text: `Workflow Guard: unfinished todos remain. Continue working through them.${tasksSummary}\nIf you need user input, use the question tool instead of ending the run. Check guard_status for outstanding verification/review requirements, and guard_review_rubric before final completion.`,
-						synthetic: true,
-					}],
-				},
-			});
+			// Delivery and resume are stated explicitly so a V2 synthetic
+			// continuation does not depend on host defaults. `queue` keeps it in
+			// the session's inbox instead of steering an in-flight turn, and
+			// `resume: true` starts a run when the session is idle.
+			//
+			// The fields are V2-only. The V1 SDK body type declares neither
+			// (`SessionPromptAsyncData` in @opencode-ai/sdk), so adding them
+			// there would send unmodelled fields to a strict server. The V2
+			// client shim reads them off this same object, so the values travel
+			// without changing the V1 request shape.
+			const promptBody: {
+				messageID: string;
+				parts: Array<{ type: "text"; text: string; synthetic?: boolean }>;
+				delivery?: "steer" | "queue";
+				resume?: boolean;
+			} = {
+				messageID,
+				parts: [{
+					type: "text" as const,
+					text: `Workflow Guard: unfinished todos remain. Continue working through them.${tasksSummary}\nIf you need user input, use the question tool instead of ending the run. Check guard_status for outstanding verification/review requirements, and guard_review_rubric before final completion.`,
+					synthetic: true,
+				}],
+			};
+			if (isV2Host()) {
+				promptBody.delivery = "queue";
+				promptBody.resume = true;
+			}
+			await session.promptAsync({ path: { id: sessionID }, body: promptBody });
 			return true;
 		} catch {
 			state.counts.set(sessionID, count);
