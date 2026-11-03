@@ -7733,7 +7733,6 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 	} catch (error) {
 		firstError = error;
 	}
-	check("a single tool error is recorded as failure debt", firstError instanceof Error);
 	check("one failure stays below the circuit-breaker threshold", !breaker(firstError));
 	// A second equivalent error crosses the threshold.
 	await afterHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-c", agent: "build", messageID: "m3", input: {}, status: "error", error: new Error("boom") });
@@ -7752,9 +7751,18 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 	} catch (error) {
 		clearedError = error;
 	}
-	check("a completed call clears the failure count", clearedError instanceof Error);
 	check("the circuit-breaker suffix is gone after a success", !breaker(clearedError));
 	check("the failure outcome is journaled for diagnosis", getRecentAuditEntries(50).some((entry) => entry.sessionID === "s-v2-outcome" && entry.phase === "outcome" && entry.reason === "error"));
+	// Read the counter directly, so the debt assertions cannot pass on a call
+	// that throws for an unrelated reason. Two errors accrued, one completion
+	// cleared them; the audit rows are the durable witness for the same state.
+	const outcomeAudit = getRecentAuditEntries(50).filter((entry) => entry.sessionID === "s-v2-outcome" && entry.phase === "outcome");
+	check("two failures and one completion are each journaled", outcomeAudit.filter((entry) => entry.reason === "error").length === 2 && outcomeAudit.some((entry) => entry.reason === "completed"));
+	// A partial event with no terminal status takes the fallback path. That path
+	// must still journal its outcome row, which is the coverage the move onto
+	// `execute.after` nearly dropped.
+	await afterHook({ tool: "write", sessionID: "s-v2-outcome", id: "call-g", agent: "build", messageID: "m7", input: {}, result: { content: "ok" } });
+	check("a status-less after event still journals an outcome row", getRecentAuditEntries(50).some((entry) => entry.sessionID === "s-v2-outcome" && entry.callID === "call-g" && entry.phase === "outcome"));
 	rmSync(outcomeRoot, { recursive: true, force: true });
 }
 

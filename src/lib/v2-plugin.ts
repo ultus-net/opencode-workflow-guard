@@ -979,6 +979,6 @@ export async function handleV2Event(
 	}
 	// Note on V1 events without a V2 counterpart:
 	// - `permission.updated`: replaced by `permission.asked`/`permission.replied` above.
-	// - `session.created`: exists in the V2 union but needed no V1 behavior beyond
-	//   the audit above; session state resets happen on `session.deleted`.
+	// - `session.created`: V2 journals no create event; session state resets on
+	//   `session.deleted`.
 }

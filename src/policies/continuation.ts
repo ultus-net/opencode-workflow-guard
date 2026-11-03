@@ -21,10 +21,11 @@ const states = new WeakMap<object, Map<string, ContinuationState>>();
 
 /**
  * Whether the active client is the V2 shim, which can carry `delivery` and
- * `resume` on a synthetic continuation. The shim always exposes both
- * `session.synthetic` and `session.todo` (`lib/v2-plugin.ts`), and the V1 SDK
- * client exposes neither, so the surface itself answers the question without a
- * host-version probe.
+ * `resume` on a synthetic continuation. `session.synthetic` is the
+ * discriminator: the V2 shim supplies it, and the V1 SDK client does not
+ * declare it. `session.todo` is required alongside it only because this module
+ * reads todos through the same surface, so a client missing it cannot be the
+ * V2 shim for our purposes.
  */
 function isV2Host(): boolean {
 	const session = getSdkClient()?.session as { synthetic?: unknown; todo?: unknown } | undefined;
