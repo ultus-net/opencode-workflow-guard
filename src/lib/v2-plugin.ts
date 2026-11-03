@@ -74,7 +74,7 @@ import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, re
 import { audit, summarizeInput } from "./audit.ts";
 import { asRecord, isSensitiveEnvKey } from "./utils.ts";
 import { loadedPluginVersion } from "./version.ts";
-import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, markInterrupted, recordUserMessage } from "../policies/continuation.ts";
+import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, markInterrupted, notifySessionRenamed, recordUserMessage } from "../policies/continuation.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, nextRecoveryRun } from "./checkpoint.ts";
 import { buildCompactionContext, guardToolCall } from "./guard-api.ts";
 import { evaluateDogfoodGate } from "./dogfood.ts";
@@ -258,15 +258,20 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 				// definition.args is a V1 zod raw shape (plain object of zod fields);
 				// wrap it so the V2 registry receives a real StandardSchemaV1.
 				input: z.object(definition.args as unknown as z.ZodRawShape),
-				execute: async (rawInput: unknown, toolContext: { sessionID: string; id: string }) => {
+				execute: async (rawInput: unknown, toolContext: { sessionID: string; id: string; signal?: AbortSignal }) => {
 					// Only a session-bound workspace counts as the tool's own
 					// context; an unbound entry is a plugin-instance bootstrap
 					// and must not be presented to the tools as one.
 					const boundWorktree = getSessionBoundWorkspace(toolContext.sessionID);
+					// `signal` aborts when the session is interrupted. Guard tools
+					// pass it to cancellable work so an interrupt stops them
+					// instead of waiting out their own timeouts. V1's tool
+					// context supplies no signal, so the checks there are no-ops.
 					const result = await (definition.execute as (input: unknown, context: unknown) => Promise<unknown>)(rawInput, {
 						sessionID: toolContext.sessionID,
 						...(boundWorktree ? { worktree: boundWorktree } : {}),
 						directory: boundWorktree ?? effectiveRoot,
+						...(toolContext.signal ? { signal: toolContext.signal } : {}),
 					});
 					const text = typeof result === "string" ? result : (result as { output?: string } | undefined)?.output;
 					return {
@@ -710,10 +715,14 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	} catch {}
 
 	// ── Event stream ──
+	// `types` is a host-side filter, so unrelated events never cross the stream
+	// or reach the handler. It must list every literal `handleV2Event` acts on:
+	// the test suite asserts this set matches the handler's comparisons, because
+	// a missing type silently disables its feature instead of failing loudly.
 	const controller = new AbortController();
 	void (async () => {
 		try {
-			for await (const raw of ctx.event.subscribe({ signal: controller.signal })) {
+			for await (const raw of ctx.event.subscribe({ types: V2_EVENT_TYPES, signal: controller.signal })) {
 				const event = raw as { type?: string; data?: unknown };
 				try {
 					await handleV2Event(event, {
@@ -831,6 +840,30 @@ function recordV2ToolOutcome(
 
 // ── Event handling ────────────────────────────────────────────────────────────
 
+/**
+ * Every event type `handleV2Event` acts on.
+ *
+ * The subscription passes this as the host-side `types` filter. Each entry is a
+ * literal the handler compares against, so the two lists must stay identical: a
+ * type missing here is never delivered, and its feature becomes dead code that
+ * still type-checks. The suite asserts the match in both directions.
+ *
+ * Both idle triggers are listed because which one the host publishes is not
+ * settled, and `session.idle` is deprecated but still delivered.
+ */
+export const V2_EVENT_TYPES = [
+	"mcp.status.changed",
+	"session.text.ended",
+	"session.moved",
+	"session.renamed",
+	"session.execution.interrupted",
+	"session.status",
+	"session.idle",
+	"session.deleted",
+	"permission.asked",
+	"permission.replied",
+] as const;
+
 export interface V2EventState {
 	effectiveRoot: string;
 	client: unknown;
@@ -889,6 +922,14 @@ export async function handleV2Event(
 				});
 			}
 		} catch {}
+		return;
+	}
+
+	if (event.type === "session.renamed") {
+		// The async title write landed. A pending continuation waits on this
+		// instead of polling for the full settle interval.
+		const data = event.data as { sessionID?: unknown } | undefined;
+		if (typeof data?.sessionID === "string") notifySessionRenamed(data.sessionID);
 		return;
 	}
 

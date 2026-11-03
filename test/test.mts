@@ -144,6 +144,7 @@ import { prBodyIncludesChangelog } from "../src/policies/changelog.ts";
 import { terminateProcessTree } from "../src/lib/verify.ts";
 import { audit } from "../src/lib/audit.ts";
 import { evaluatePermissionSeat } from "../src/lib/permission-seat.ts";
+import { createCustomTools } from "../src/lib/custom-tools.ts";
 import { isProjectMemoryFreshAsync } from "../src/lib/project-memory.ts";
 import { ToolOutcomeTracker } from "../src/lib/tool-outcomes.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, listRecoveryCheckpoints, restoreRecoveryCheckpoint, setCheckpointGitForTesting } from "../src/lib/checkpoint.ts";
@@ -7906,6 +7907,117 @@ const serverEventTypes = new Set<string>([...EventManifest.ServerDefinitions].ma
 	await Promise.all([firstTrigger, secondTrigger]);
 	check("both idle event types for one transition yield a single continuation prompt", bothPrompts === 1);
 	await runWithRuntimeState(root, bothClient, () => clearContinuationState(bothSession));
+}
+
+// E7: the subscription's `types` filter is a host-side narrowing, so a type
+// missing from the list is never delivered and its feature becomes dead code
+// that still compiles. Assert the list matches the handler's comparisons in
+// both directions, and that every entry is actually delivered.
+{
+	const { V2_EVENT_TYPES } = v2EventModule;
+	const pluginSource = readFileSync("src/lib/v2-plugin.ts", "utf8");
+	const handled = new Set(
+		[...pluginSource.matchAll(/event\??\.type\s*(?:===|!==)\s*"([^"]+)"/g)].map((match) => match[1]),
+	);
+	const subscribed = new Set<string>(V2_EVENT_TYPES);
+	const missingFromFilter = [...handled].filter((type) => !subscribed.has(type));
+	const unusedInHandler = [...subscribed].filter((type) => !handled.has(type));
+	check("the event filter covers every type the handler acts on", missingFromFilter.length === 0);
+	check("the event filter names no type the handler ignores", unusedInHandler.length === 0);
+	if (missingFromFilter.length > 0) console.log(`    not subscribed: ${missingFromFilter.join(", ")}`);
+	if (unusedInHandler.length > 0) console.log(`    subscribed but unhandled: ${unusedInHandler.join(", ")}`);
+	const undeliveredFilter = [...subscribed].filter((type) => !serverEventTypes.has(type));
+	check("every filtered event type is in EventManifest.ServerDefinitions", undeliveredFilter.length === 0);
+	check("the event filter keeps both idle triggers", subscribed.has("session.status") && subscribed.has("session.idle"));
+}
+
+// E8: an interrupted session cancels a guard tool that has not started yet.
+// The host supplies `signal` per call on V2; a tool that ignores it runs to its
+// own timeout after the user has already stopped the session.
+{
+	const abortRoot = mkdtempSync(join(tmpdir(), "wg-tool-signal-"));
+	mkdirSync(join(abortRoot, ".opencode"));
+	const tools = createCustomTools({
+		effectiveRoot: abortRoot,
+		projectMemoryEnabled: false,
+		learningEnabled: false,
+		projectMemory: undefined,
+		followupStore: undefined,
+		portableMemoryPath: join(abortRoot, "memory.jsonl"),
+		learningInterventions: new Map(),
+		client: fakeClient,
+	});
+	const cancel = new AbortController();
+	cancel.abort();
+	const callTool = async (name: string, input: unknown, signal?: AbortSignal) => {
+		const definition = (tools as Record<string, any>)[name];
+		return await definition.execute(input, { sessionID: "s-abort", directory: abortRoot, ...(signal ? { signal } : {}) });
+	};
+	const aborted = await callTool("guard_worktree_create", { branch: "feat/never-created" }, cancel.signal);
+	check("an aborted call cancels a worktree creation before it runs", String(aborted).includes("Cancelled"));
+	const abortedCleanup = await callTool("guard_worktree_cleanup", { worktreePath: join(abortRoot, "nope") }, cancel.signal);
+	check("an aborted call cancels a worktree cleanup before it runs", String(abortedCleanup).includes("Cancelled"));
+	const abortedRubric = await callTool("guard_review_rubric", {}, cancel.signal);
+	check("an aborted call cancels the diff-spawning rubric before it runs", String(abortedRubric).includes("Cancelled"));
+	// A live signal must not change behavior: the guard's own gates still run.
+	const live = new AbortController();
+	const liveRubric = await callTool("guard_review_rubric", {}, live.signal);
+	check("a live signal leaves the rubric path unchanged", !String(liveRubric).includes("Cancelled"));
+	// OpenCode 1 names the same signal `abort`, so honoring only `signal` would
+	// leave an interrupted V1 session running to its timeout.
+	const abortedViaAbortKey = await (tools as Record<string, any>).guard_review_rubric.execute(
+		{},
+		{ sessionID: "s-abort", directory: abortRoot, abort: cancel.signal },
+	);
+	check("an aborted call is cancelled through the V1 `abort` key", String(abortedViaAbortKey).includes("Cancelled"));
+	rmSync(abortRoot, { recursive: true, force: true });
+}
+
+// E9: the title settle wait ends as soon as the host renames the session,
+// instead of always sleeping the full poll interval. `session.renamed` is
+// delivered when the title commits; the model-request `title` hook runs before
+// the write, so it cannot report this.
+{
+	const renameSession = "s-v2-rename-wake";
+	todo(renameSession, item("unfinished work", "pending"));
+	const racedPrompts: string[] = [];
+	// The fake title reflects host state: it stays the placeholder until the
+	// rename event lands, exactly as the real async title generation behaves.
+	let titleSettled = false;
+	let reads = 0;
+	const racedClient = {
+		session: {
+			todo: async ({ path }: { path: { id: string } }) => ({ data: fakeTodos.get(path.id) ?? [] }),
+			get: async ({ path }: { path: { id: string } }) => {
+				reads++;
+				const title = titleSettled ? "Native generated title" : "New session - 2026-08-27T12:00:00.000Z";
+				return { data: { id: path.id, parentID: fakeParents.get(path.id), title } };
+			},
+			promptAsync: async ({ path }: { path: { id: string } }) => { racedPrompts.push(path.id); },
+		},
+	};
+	const racedState = {
+		effectiveRoot: root,
+		client: racedClient,
+		toolLifecycle: new ToolInvocationLifecycle(),
+		toolOutcomes: new ToolOutcomeTracker(),
+	};
+	const started = Date.now();
+	const continuation = handleV2Event(
+		{ type: "session.status", data: { sessionID: renameSession, status: { type: "idle" } } },
+		racedState as any,
+	);
+	// The settle loop reads the session before it waits, so a read means the
+	// waiter is registered. Firing the rename before that would test a gap the
+	// real host cannot hit, because title generation is always slower.
+	while (reads === 0) await new Promise((resolve) => setTimeout(resolve, 1));
+	titleSettled = true;
+	await handleV2Event({ type: "session.renamed", data: { sessionID: renameSession, title: "Native generated title" } }, racedState as any);
+	await continuation;
+	const elapsed = Date.now() - started;
+	check("a session rename wakes the pending title settle", elapsed < 200);
+	check("the woken continuation still delivers its prompt", racedPrompts.join(",") === renameSession);
+	await runWithRuntimeState(root, racedClient, () => clearContinuationState(renameSession));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

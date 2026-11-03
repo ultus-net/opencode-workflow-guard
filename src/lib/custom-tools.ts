@@ -132,6 +132,25 @@ export function buildWorkflowGuardSystemGuidance(options: {
 	return sections.join("\n");
 }
 
+/** Message a tool returns when its session was interrupted mid-call. */
+const ABORTED_MESSAGE = "[workflow-guard] Cancelled: the session was interrupted before this tool finished.";
+
+/**
+ * Stop before starting cancellable work when the session is gone.
+ *
+ * The two hosts name the abort signal differently. OpenCode 2's promise-layer
+ * `ToolContext` adds `signal`, and OpenCode 1's `ToolContext` carries `abort`,
+ * so both are read and either one cancels the call. A subprocess spawned with
+ * `spawnSync` cannot observe an abort mid-flight, so the check is placed before
+ * the work rather than during it: a call that has not started yet is cancelled,
+ * and one already running finishes and reports normally.
+ */
+function abortedMessage(toolContext: unknown): string | undefined {
+	const signals = toolContext as { signal?: AbortSignal; abort?: AbortSignal } | undefined;
+	const aborted = signals?.signal?.aborted || signals?.abort?.aborted;
+	return aborted ? ABORTED_MESSAGE : undefined;
+}
+
 export function createCustomTools(options: {
 	effectiveRoot: string;
 	projectMemoryEnabled: boolean;
@@ -168,7 +187,7 @@ export function createCustomTools(options: {
 	// an instance-derived root must never re-anchor another session's tool
 	// execution.
 	const resolveCallWorkspace = async (
-		toolContext: { sessionID?: string; worktree?: string; directory?: string } | undefined,
+		toolContext: { sessionID?: string; worktree?: string; directory?: string; signal?: AbortSignal } | undefined,
 		explicitDirectory?: string,
 	): Promise<string> => {
 		if (explicitDirectory) {
@@ -531,6 +550,8 @@ export function createCustomTools(options: {
 				directory: tool.schema.string().optional().describe("Target repository directory (defaults to active session directory or workspace root)"),
 			},
 			execute: async (args, toolContext) => {
+				const cancelled = abortedMessage(toolContext);
+				if (cancelled) return cancelled;
 				const sanitizedBase = typeof args.base === "string" && !args.base.startsWith("-") && !/[\s;'"\0]/.test(args.base) ? args.base : undefined;
 				const bases = sanitizedBase ? [sanitizedBase] : ["origin/main", "origin/master", "main", "master"];
 				const rubricWorkspace = await resolveCallWorkspace(toolContext, args?.directory);
@@ -545,6 +566,8 @@ export function createCustomTools(options: {
 		guard_worktree_create: tool({
 			description: "Create an isolated git worktree directory for concurrent subagent execution. Proactively call when launching parallel tasks/subagents to prevent file collision and maintain branch isolation.", args: { branch: tool.schema.string().describe("Branch name for the isolated worktree (e.g. 'feat/subagent-task')"), baseBranch: tool.schema.string().optional().describe("Base branch to branch off of (defaults to HEAD)") },
 			execute: async (args, toolContext) => {
+				const cancelled = abortedMessage(toolContext);
+				if (cancelled) return cancelled;
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree creation with no active todo item. Break the request down with todowrite first, then create worktrees.";
 				const toolRoot = await resolveCallWorkspace(toolContext);
 				// Host first: it honors the operator's configured worktree directory
@@ -586,6 +609,8 @@ export function createCustomTools(options: {
 		guard_worktree_cleanup: tool({
 			description: "Commit a final snapshot and remove an isolated git worktree directory. Call to clean up worktrees created with guard_worktree_create after subagent tasks complete.", args: { worktreePath: tool.schema.string().describe("Path of the worktree directory to clean up") },
 			execute: async (args, toolContext) => {
+				const cancelled = abortedMessage(toolContext);
+				if (cancelled) return cancelled;
 				const todos = await effectiveTodos(toolContext.sessionID); if (todos !== undefined && !hasActiveTodo(todos)) return "[workflow-guard] Blocked: worktree cleanup with no active todo item. Break the request down with todowrite first, then clean up worktrees.";
 				const toolRoot = await resolveCallWorkspace(toolContext);
 				// Removal never delegates to the host: its `remove` takes a `force`

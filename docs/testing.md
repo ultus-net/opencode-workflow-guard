@@ -26,6 +26,8 @@ WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # also run model-driven policy pr
 ```
 Package and loader checks remain deterministic. Live probes explicitly select the first entry in OpenCode's persisted recent-model state (`${XDG_STATE_HOME:-~/.local/state}/opencode/model.json`). They never silently inherit the configured default model. Set `WORKFLOW_GUARD_LIVE_MODEL=provider/model` to override that selection. Provider credentials still come from the normal OpenCode environment. A provider may reject a live prompt before guard behavior can run. That happens when credits, rate limits, capacity, overload, or an unresolvable model make the provider unavailable. Such a case is reported as unavailable rather than as a guard failure. The classifier matches the host's literal `Model unavailable:` error line rather than the bare phrase, so model prose cannot mask a real guard regression. Other live-runtime failures still fail the suite.
 
+The suite needs a temp directory with room for a full `node_modules` copy. On a host whose `os.tmpdir()` is a small tmpfs, a nearly full one fails `npm pack` and `npm install` with `Unknown system error -122` (`EDQUOT`). Point `TMPDIR` at a filesystem-backed directory in that case, for example `TMPDIR=/var/tmp npm run test:install`. The harness stops every managed service it starts before removing its temporary project, so a run no longer leaves a detached server writing into the directory it is deleting.
+
 ### 4. Full Verification Suite
 Runs typecheck, unit tests, and live runtime installation tests in sequence:
 ```bash
