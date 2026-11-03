@@ -22,7 +22,7 @@ import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, re
 import { beginReadObservation, clearReadFingerprints, recordMutationObservation, recordSuccessfulRead, staleWriteReason } from "./policies/stale-write.ts";
 import { ToolInvocationLifecycle } from "./lib/tool-lifecycle.ts";
 import { ToolOutcomeTracker, type ToolOutcomePart } from "./lib/tool-outcomes.ts";
-import { guardToolCallImpl, isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./lib/guard-dispatcher.ts";
+import { isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./lib/guard-dispatcher.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./lib/custom-tools.ts";
 import { evaluateDogfoodGate } from "./lib/dogfood.ts";
 import type { PolicyDecision, TodoSdkClient } from "./lib/types.ts";
@@ -59,7 +59,6 @@ import {
 	setSdkClient,
 	getSdkClient,
 	runWithRuntimeState,
-	lastMutationTimestamp,
 	getLastMutationTimestamp,
 	getMutationCount,
 	getSessionMutationCount,
@@ -163,7 +162,6 @@ export {
 // ── Shared shell/env utilities ───────────────────────────────────────────────
 import {
 	asRecord,
-	extractRecordTargetPath,
 	getCleanEnv,
 	showBlockToast,
 	isSensitiveEnvKey,
@@ -212,12 +210,18 @@ import {
 	persistReviewCache,
 	loadReviewCache,
 	audit,
-	logDecision,
 	summarizeInput,
 } from "./lib/audit.ts";
 
 export { getAuditFilePath, getVerifyCacheFilePath, getReviewCacheFilePath, getDogfoodCacheFilePath, getVerifyHistoryFilePath, persistVerifyCache, loadVerifyCache, persistReviewCache, loadReviewCache, persistDogfoodCache, loadDogfoodCache, getRecentAuditEntries, getRecentVerifyHistory } from "./lib/audit.ts";
 export { summarizeInput };
+
+// The guard entry surface lives in a leaf module so the V2 entrypoint can
+// import it without pulling in this V1 file (and its SDK subtree) through a
+// cycle. Re-exported here because the test harness imports this public surface.
+export { guardToolCall, guardToolDecision, buildCompactionContext } from "./lib/guard-api.ts";
+import { guardToolCall, buildCompactionContext } from "./lib/guard-api.ts";
+import { TODOWRITE_SUFFIX, TODOWRITE_MARKER, EDIT_SUFFIX, EDIT_MARKER, SUBAGENT_SUFFIX, SUBAGENT_MARKER, appendToolDescriptionSuffix } from "./lib/tool-descriptions.ts";
 
 export function managedConfigDiagnostic(platform = process.platform, env: NodeJS.ProcessEnv = process.env): string {
 	const directory = platform === "darwin"
@@ -398,67 +402,8 @@ function logWarn(client: unknown, message: string): void {
 	} catch {}
 }
 
-/**
- * Public guard entry point. Audits every decision (block or allow) to a
- * durable JSONL file before returning.
- */
-export async function guardToolDecision(
-	toolName: string,
-	input: unknown,
-	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
-): Promise<PolicyDecision> {
-	const customRoot = context?.worktree || context?.directory;
-	const runImpl = () => guardToolCallImpl(toolName, input, context);
-	return customRoot
-		? await runWithRuntimeState(customRoot, getSdkClient(), runImpl)
-		: await runImpl();
-}
-
-export async function guardToolCall(
-	toolName: string,
-	input: unknown,
-	context?: { sessionID?: string; callID?: string; worktree?: string; directory?: string; agent?: string },
-): Promise<string | undefined> {
-	const decision = await guardToolDecision(toolName, input, context);
-	const allowLive = process.env.WORKFLOW_GUARD_ALLOW_LIVE === "1";
-	const isMutation = EDIT_TOOL_NAMES.has(toolName);
-	const targetPath = extractRecordTargetPath(input);
-	logDecision(toolName, input, context, decision, {
-		mutation: isMutation,
-		targetPath,
-		allowLive,
-		verification: lastVerify
-			? {
-					command: lastVerify.command,
-					passed: lastVerify.passed,
-					fresh: lastVerify.timestamp >= lastMutationTimestamp,
-					durationMs: lastVerify.durationMs,
-				}
-			: undefined,
-	});
-	return decision.status === "allowed" ? undefined : decision.message;
-}
-
 async function emitBlockFeedback(message: string): Promise<void> {
 	await showBlockToast(message);
-}
-
-export function buildCompactionContext(operationalState: string, priorityBlocks: string[], maxChars = 8_000): string {
-	if (!Number.isFinite(maxChars) || maxChars < 0 || !Number.isInteger(maxChars)) {
-		throw new RangeError("maxChars must be a non-negative finite integer");
-	}
-	const truncate = (value: string, limit: number): string => {
-		let end = Math.min(value.length, limit);
-		if (end > 0 && end < value.length && /[\uD800-\uDBFF]/.test(value[end - 1])) end -= 1;
-		return value.slice(0, end);
-	};
-	let context = truncate(operationalState, maxChars);
-	for (const block of priorityBlocks) {
-		const remaining = maxChars - context.length - 2;
-		if (remaining <= 0) break;
-		context += `\n\n${truncate(block, remaining)}`;
-	}
-	return context;
 }
 
 export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
@@ -839,28 +784,21 @@ export const WorkflowGuard: V1Plugin = async (ctx: Parameters<V1Plugin>[0]) => {
 		// Similarly, mutating tools reflect their active-todo, feature-branch, and prior-read requirements.
 		// Subagent orchestration tools reflect worktree isolation and review expectations.
 		"tool.definition": async (input, output) => {
-			if (input.toolID === "todowrite") {
+			const append = (suffix: string, marker: string) => {
 				const description = typeof output.description === "string" ? output.description : "";
-				if (description.includes("verification evidence")) return;
-				output.description =
-					description +
-					"\n\nWorkflow Guard lifecycle: use todowrite to plan before working - it is the only view of progress the operator has, and every file mutation is gated on it. Each call replaces the complete task list: preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled, and do not omit active tasks when adding new work. A task may be marked completed only after its own work is recorded: the guard blocks a completion that has no file mutation in that task's active window, and one mutation cannot vouch for several completions. If a task is genuinely read-only (review, investigation, reading), append the marker `[read-only]` to its text; every such use is journaled. Use `cancelled` for work that was deliberately dropped. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply. Proactively call guard_next_tasks when planning work to discover existing roadmap/TODOs, and guard_status to check outstanding requirements.";
+				const next = appendToolDescriptionSuffix(description, suffix, marker);
+				if (next !== undefined) output.description = next;
+			};
+			if (input.toolID === "todowrite") {
+				append(TODOWRITE_SUFFIX, TODOWRITE_MARKER);
 				return;
 			}
 			if (EDIT_TOOL_NAMES.has(input.toolID)) {
-				const description = typeof output.description === "string" ? output.description : "";
-				if (description.includes("Workflow Guard requirement")) return;
-				output.description =
-					description +
-					"\n\nWorkflow Guard requirement: Modifications require an active task in todowrite (status pending or in_progress), a feature branch (edits on main/master are blocked), and a prior read of existing files in the current session.";
+				append(EDIT_SUFFIX, EDIT_MARKER);
 				return;
 			}
 			if (input.toolID === "task") {
-				const description = typeof output.description === "string" ? output.description : "";
-				if (description.includes("Workflow Guard subagent guidance")) return;
-				output.description =
-					description +
-					"\n\nWorkflow Guard subagent guidance: When spawning parallel worker subagents, use guard_worktree_create to isolate file mutations in separate worktrees. When conducting code reviews before task completion or PR creation, fetch the rubric with guard_review_rubric and provide it to a reviewer subagent to evaluate and record via record_review.";
+				append(SUBAGENT_SUFFIX, SUBAGENT_MARKER);
 				return;
 			}
 		},

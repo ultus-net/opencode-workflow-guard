@@ -10,7 +10,7 @@
  * - `ctx.command.transform` for the server-side `/guard-status` command
  * - `ctx.permission.hook("evaluate")` for the pre-execution deny seat
  * - `ctx.shell.hook("create.before")` for env scrubbing
- * - `ctx.mcp.list()` plus `mcp.tools.changed` for the guarded-server inventory
+ * - `ctx.mcp.list()` plus `mcp.status.changed` for the guarded-server inventory
  * - `ctx.event.subscribe()` for tool outcomes, session lifecycle, and claims-vs-evidence
  *
  * The V1 SDK client surface (`TodoSdkClient`) is satisfied by an adapter so
@@ -22,7 +22,7 @@ import { Message } from "@opencode/ai/effect";
 import { z } from "zod";
 import { join, resolve } from "node:path";
 import type { TodoSdkClient } from "./types.ts";
-import { detectTodoCapability, recordTodoCapability, recordedTodoCapability, scanSessionTodos, toolPartName } from "./v2-todo.ts";
+import { detectTodoCapability, recordTodoCapability, recordedTodoCapability, scanSessionTodos } from "./v2-todo.ts";
 import { findGitRoot, reloadProjectConfig } from "./project-config.ts";
 import {
 	setWorkspaceRoot,
@@ -60,7 +60,7 @@ import { secretIn } from "../policies/secrets.ts";
 import { createCustomTools, buildWorkflowGuardSystemGuidance } from "./custom-tools.ts";
 import { isMutatingSurfaceTool, isReadOnlyRole, SHELL_TOOL_NAMES } from "./guard-dispatcher.ts";
 import { ToolInvocationLifecycle } from "./tool-lifecycle.ts";
-import { ToolOutcomeTracker, type ToolOutcomePart } from "./tool-outcomes.ts";
+import { ToolOutcomeTracker } from "./tool-outcomes.ts";
 import { EDIT_TOOL_NAMES, fetchParentSession, fetchParentSessionID, effectiveTodos } from "../policies/todo.ts";
 import { currentGitBranch, isProtectedBranchName } from "../policies/git.ts";
 import { checkCompletionClaims } from "../policies/completion.ts";
@@ -72,11 +72,21 @@ import { editTargets, runPostEditValidators, snapshotFile, type FileSnapshot } f
 import { extractCommands, splitShellSegments } from "./shell.ts";
 import { expandShellTargetPath, isPathOutsideWorkspace, OPENCODE_SCRATCH_DIR, redirectMutationsIn } from "../policies/boundary.ts";
 import { audit, summarizeInput } from "./audit.ts";
-import { asRecord, showBlockToast, isSensitiveEnvKey } from "./utils.ts";
+import { asRecord, isSensitiveEnvKey } from "./utils.ts";
 import { loadedPluginVersion } from "./version.ts";
-import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, recordUserMessage } from "../policies/continuation.ts";
+import { clearContinuationState, continueUnfinishedSession, isGeneratedContinuationMessage, markInterrupted, recordUserMessage } from "../policies/continuation.ts";
 import { createRecoveryCheckpoint, finalizeRecoveryCheckpoint, nextRecoveryRun } from "./checkpoint.ts";
-import { buildCompactionContext, evaluateDogfoodGate, guardToolCall } from "../workflow-guard.ts";
+import { buildCompactionContext, guardToolCall } from "./guard-api.ts";
+import { evaluateDogfoodGate } from "./dogfood.ts";
+import {
+	appendToolDescriptionSuffix,
+	EDIT_MARKER,
+	EDIT_SUFFIX,
+	SUBAGENT_MARKER,
+	SUBAGENT_SUFFIX,
+	TODOWRITE_MARKER,
+	TODOWRITE_SUFFIX,
+} from "./tool-descriptions.ts";
 import { registerPluginInstance, releasePluginInstance } from "./plugin-instance.ts";
 import { claimToolCall, releaseToolCallClaim } from "./call-claims.ts";
 import { evaluatePermissionSeat } from "./permission-seat.ts";
@@ -94,11 +104,12 @@ type V2Context = Plugin.Context;
 // capability) so builtin-only sessions are not gated forever. See v2-todo.ts.
 
 function createV2SdkClient(ctx: V2Context): TodoSdkClient {
-	// V2 has no server-side log API or TUI surface, so app.log degrades to
-	// console logging and showBlockToast becomes a no-op. Block reasons still
-	// reach the agent through the thrown tool-hook error; keep this adapter
-	// from logging anything beyond guard decision summaries.
-	return {
+	// V2 has no server-side log API or TUI surface. The client shim supplies
+	// only { app, session, lsp }, so there is no `tui.showToast` to call: block
+	// paths on V2 do not attempt a toast and rely on the thrown hook error,
+	// which is what actually reaches the model. Keep this adapter from logging
+	// anything beyond guard decision summaries.
+	const client: TodoSdkClient = {
 		app: {
 			log: async ({ body }) => {
 				try {
@@ -112,10 +123,32 @@ function createV2SdkClient(ctx: V2Context): TodoSdkClient {
 				const session = await ctx.session.get({ sessionID: path.id });
 				return { data: { parentID: (session as { parentID?: string }).parentID, title: (session as { title?: string }).title } };
 			},
+			// V2 only: forwards a synthetic message with `delivery`/`resume`.
+			// Its presence is also what marks this client as V2 for
+			// `policies/continuation.ts`, which is why the values travel here
+			// instead of through the shared `promptAsync` body type.
+			synthetic: async (opts) => {
+				await ctx.session.synthetic({
+					sessionID: opts.sessionID,
+					text: opts.text,
+					...(opts.delivery ? { delivery: opts.delivery } : {}),
+					...(opts.resume === undefined ? {} : { resume: opts.resume }),
+				});
+			},
 			promptAsync: async (opts) => {
-				for (const part of opts.body.parts) {
+				const body = opts.body as {
+					parts: Array<{ type: "text"; text: string; synthetic?: boolean }>;
+					delivery?: "steer" | "queue";
+					resume?: boolean;
+				};
+				for (const part of body.parts) {
 					if (part.synthetic) {
-						await ctx.session.synthetic({ sessionID: opts.path.id, text: part.text });
+						await client.session!.synthetic!({
+							sessionID: opts.path.id,
+							text: part.text,
+							...(body.delivery ? { delivery: body.delivery } : {}),
+							...(body.resume === undefined ? {} : { resume: body.resume }),
+						});
 					} else {
 						await ctx.session.prompt({ sessionID: opts.path.id, text: part.text });
 					}
@@ -124,18 +157,8 @@ function createV2SdkClient(ctx: V2Context): TodoSdkClient {
 		},
 		lsp: {},
 	};
+	return client;
 }
-
-// ── Builtin tool description enrichment ───────────────────────────────────────
-
-const TODOWRITE_SUFFIX =
-	"\n\nWorkflow Guard lifecycle: use todowrite to plan before working - it is the only view of progress the operator has, and every file mutation is gated on it. Each call replaces the complete task list: preserve every pending/in_progress task in subsequent updates until you explicitly mark it completed or cancelled, and do not omit active tasks when adding new work. A task may be marked completed only after its own work is recorded: the guard blocks a completion that has no file mutation in that task's active window, and one mutation cannot vouch for several completions. If a task is genuinely read-only (review, investigation, reading), append the marker `[read-only]` to its text; every such use is journaled. Use `cancelled` for work that was deliberately dropped. Marking every task completed triggers the finalization gate - fresh verification evidence (test run) is required after the last mutation, and protected-branch/conflict checks apply. Proactively call guard_next_tasks when planning work to discover existing roadmap/TODOs, and guard_status to check outstanding requirements.";
-
-const EDIT_SUFFIX =
-	"\n\nWorkflow Guard requirement: Modifications require an active task in todowrite (status pending or in_progress), a feature branch (edits on main/master are blocked), and a prior read of existing files in the current session.";
-
-const SUBAGENT_SUFFIX =
-	"\n\nWorkflow Guard subagent guidance: When spawning parallel worker subagents, use guard_worktree_create to isolate file mutations in separate worktrees. When conducting code reviews before task completion or PR creation, fetch the rubric with guard_review_rubric and provide it to a reviewer subagent to evaluate and record via record_review.";
 
 // Builtin tool description enrichment. Candidates are matched against the
 // host's tool registry; `ToolEditor.update` ignores missing IDs, so extra
@@ -155,9 +178,9 @@ const SUBAGENT_SUFFIX =
 // - The V1 subagent tool `task` was renamed to `subagent`; both are kept as
 //   candidates for the same reason.
 const ENRICHMENT_TARGETS: Array<{ candidates: string[]; suffix: string; marker: string }> = [
-	{ candidates: ["todowrite"], suffix: TODOWRITE_SUFFIX, marker: "verification evidence" },
-	{ candidates: [...EDIT_TOOL_NAMES], suffix: EDIT_SUFFIX, marker: "Workflow Guard requirement" },
-	{ candidates: ["task", "subagent"], suffix: SUBAGENT_SUFFIX, marker: "Workflow Guard subagent guidance" },
+	{ candidates: ["todowrite"], suffix: TODOWRITE_SUFFIX, marker: TODOWRITE_MARKER },
+	{ candidates: [...EDIT_TOOL_NAMES], suffix: EDIT_SUFFIX, marker: EDIT_MARKER },
+	{ candidates: ["task", "subagent"], suffix: SUBAGENT_SUFFIX, marker: SUBAGENT_MARKER },
 ];
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
@@ -256,8 +279,8 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			for (const id of target.candidates) {
 				editor.update(id, (tool) => {
 					const description = typeof tool.description === "string" ? tool.description : "";
-					if (description.includes(target.marker)) return;
-					tool.description = description + target.suffix;
+					const next = appendToolDescriptionSuffix(description, target.suffix, target.marker);
+					if (next !== undefined) tool.description = next;
 				});
 			}
 		}
@@ -300,7 +323,6 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 			});
 			if (reason !== undefined) {
 				releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
-				await showBlockToast(reason);
 				const failureCount = event.sessionID ? toolOutcomes.getFailureCount(event.sessionID) : 0;
 				const circuitBreakerSuffix = failureCount >= 2
 					? "\n\n[Workflow Guard Circuit Breaker: Repeated failures detected in this session. Stop attempting alternative workarounds or shell laundering. Address the required step above directly, or inspect policy details with guard_status or guard_why.]"
@@ -316,7 +338,6 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 					const researchReason = liveDocsGatingReason(event.sessionID, event.tool, threshold, getResearchToolPatterns(toolWorktree));
 					if (researchReason !== undefined) {
 						releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
-						await showBlockToast(researchReason);
 						console.log(`[workflow-guard] warn: ${researchReason}`);
 						audit({
 							ts: new Date().toISOString(),
@@ -383,19 +404,13 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	await ctx.tool.hook("execute.after", async (event) => {
 		releaseToolCallClaim(instance.key, event.sessionID, event.id, event.tool);
 		const startedAt = toolLifecycle.finish(event.sessionID, event.id);
-		const outcome = toolOutcomes.recordFallbackCompleted(event.sessionID, event.id, event.tool, startedAt === undefined ? undefined : Date.now() - startedAt);
-		if (outcome) {
-			audit({
-				ts: new Date().toISOString(),
-				sessionID: outcome.sessionID,
-				callID: outcome.callID,
-				tool: outcome.tool,
-				decision: "allow",
-				phase: "outcome",
-				durationMs: outcome.durationMs,
-				reason: outcome.status,
-			});
-		}
+		recordV2ToolOutcome(toolOutcomes, effectiveRoot, {
+			tool: event.tool,
+			sessionID: event.sessionID,
+			callID: event.id,
+			status: event.status,
+			error: event.status === "error" ? event.error : undefined,
+		}, startedAt);
 		releaseFileClaims(event.sessionID, event.id);
 		if (event.tool === "read") {
 			const observation = toolLifecycle.takeReadObservation(event.sessionID, event.id);
@@ -721,90 +736,110 @@ export const WorkflowGuardV2 = async (ctx: V2Context) => {
 	};
 };
 
+// ── Tool outcome telemetry ────────────────────────────────────────────────────
+
+/**
+ * Record one tool call's terminal outcome from `execute.after`.
+ *
+ * The former `session.message.content.updated` subscription never fired: that
+ * type is absent from `EventManifest.ServerDefinitions`, so no tool part was
+ * ever mapped and the repeated-failure circuit breaker plus the Policy 25
+ * research floor both read an always-zero count. `execute.after` does fire,
+ * including for a failed call, because the host triggers the hook with
+ * `status: "error"` before it rethrows. The error's own message feeds the
+ * tracker's signature, so repeat detection keys on what the model actually saw.
+ */
+function recordV2ToolOutcome(
+	toolOutcomes: ToolOutcomeTracker,
+	effectiveRoot: string,
+	event: {
+		tool: string;
+		sessionID?: string;
+		callID: string;
+		status?: "completed" | "error";
+		error?: { message?: string } | string;
+	},
+	startedAt?: number,
+): void {
+	const status = event.status;
+	if (status !== "completed" && status !== "error") {
+		// The host's `execute.after` always carries a terminal status. A partial
+		// event from a harness or stub leaves it unknown, so record the
+		// optimistic completion that this hook used to record unconditionally
+		// rather than dropping the call from telemetry entirely.
+		toolOutcomes.recordFallbackCompleted(event.sessionID ?? "", event.callID, event.tool, startedAt === undefined ? undefined : Date.now() - startedAt);
+		return;
+	}
+	const error = typeof event.error === "string" ? event.error : event.error?.message;
+	const outcome = toolOutcomes.record({
+		type: "tool",
+		sessionID: event.sessionID,
+		callID: event.callID,
+		tool: event.tool,
+		state: {
+			status,
+			error,
+			time: startedAt === undefined ? undefined : { start: startedAt, end: Date.now() },
+		},
+	});
+	if (!outcome) return;
+	// Policy 25 research floor (V1 parity): failures accrue debt; successful
+	// live-source lookups clear it. A failed research attempt never accrues
+	// debt, so a flaky lookup cannot deepen the block it was meant to escape.
+	if (isResearchTool(outcome.tool, getResearchToolPatterns(getSessionBoundWorkspace(outcome.sessionID) || effectiveRoot))) {
+		if (outcome.status !== "error") recordResearchLookup(outcome.sessionID);
+	} else if (outcome.status === "error") {
+		recordLiveDocsFailure(outcome.sessionID);
+	}
+	audit({
+		ts: new Date().toISOString(),
+		sessionID: outcome.sessionID,
+		callID: outcome.callID,
+		tool: outcome.tool,
+		decision: "allow",
+		phase: "outcome",
+		durationMs: outcome.durationMs,
+		reason: outcome.status,
+	});
+	if (outcome.status === "error" && outcome.repeatedFailureCount === 3) {
+		audit({
+			ts: new Date().toISOString(),
+			sessionID: outcome.sessionID,
+			callID: outcome.callID,
+			tool: outcome.tool,
+			decision: "allow",
+			phase: "event",
+			reason: "repeated-equivalent-failure:3",
+		});
+		console.log(`[workflow-guard] ${outcome.tool} failed equivalently 3 times in this session; change approach or inspect the underlying failure before retrying.`);
+	}
+}
+
 // ── Event handling ────────────────────────────────────────────────────────────
 
-interface V2EventState {
+export interface V2EventState {
 	effectiveRoot: string;
 	client: unknown;
 	toolLifecycle: ToolInvocationLifecycle;
 	toolOutcomes: ToolOutcomeTracker;
-	/** Re-read the host MCP roster after `mcp.tools.changed`. */
+	/** Re-read the host MCP roster after `mcp.status.changed`. */
 	refreshMcpInventory?: () => Promise<void>;
 }
 
-async function handleV2Event(
+export async function handleV2Event(
 	event: { type?: string; data?: unknown },
 	state: V2EventState,
 ): Promise<void> {
 	const { effectiveRoot, client, toolLifecycle, toolOutcomes } = state;
 
-	if (event.type === "mcp.tools.changed") {
-		// The host's server roster or one server's tool list changed. Re-read it
+	if (event.type === "mcp.status.changed") {
+		// A server's connection status settled (connected, failed, needs_auth,
+		// closed), which is when its tools become callable. Re-read the roster
 		// so a newly connected live-system server is guarded before its tools
-		// are callable. Widen-only: this can add tokens, never remove them.
+		// can be called. Widen-only: this can add tokens, never remove them.
+		// `mcp.resources.changed` is deliberately not a trigger: it reports
+		// resources, not tool availability.
 		await state.refreshMcpInventory?.();
-		return;
-	}
-
-	if (event.type === "session.message.content.updated") {
-		const data = event.data as { sessionID?: unknown; content?: unknown } | undefined;
-		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
-		if (!sessionID || !Array.isArray(data?.content)) return;
-		for (const part of data.content as Array<Record<string, unknown>>) {
-			if (part?.type !== "tool") continue;
-			const toolState = part.state as { status?: unknown; error?: { message?: string } | string } | undefined;
-			const status = toolState?.status;
-			if (status !== "completed" && status !== "error") continue;
-			// V2 keeps timing on the tool part itself (part.time), not inside state.
-			const partTime = part.time as { ran?: unknown; completed?: unknown } | undefined;
-			const start = typeof partTime?.ran === "number" ? partTime.ran : undefined;
-			const end = typeof partTime?.completed === "number" ? partTime.completed : undefined;
-			const mapped: ToolOutcomePart = {
-				type: "tool",
-				sessionID,
-				callID: part.id,
-				tool: toolPartName(part),
-				state: {
-					status,
-					error: typeof toolState?.error === "string" ? toolState.error : toolState?.error?.message,
-					time: { start, end },
-				},
-			};
-			const outcome = toolOutcomes.record(mapped);
-			if (outcome) {
-				// Policy 25 research floor (V1 parity): failures accrue debt;
-				// successful live-source lookups clear it. A failed research
-				// attempt never accrues debt, so a flaky lookup cannot deepen
-				// the block it was meant to escape.
-				if (isResearchTool(outcome.tool, getResearchToolPatterns(getSessionBoundWorkspace(outcome.sessionID) || effectiveRoot))) {
-					if (outcome.status !== "error") recordResearchLookup(outcome.sessionID);
-				} else if (outcome.status === "error") {
-					recordLiveDocsFailure(outcome.sessionID);
-				}
-				audit({
-					ts: new Date().toISOString(),
-					sessionID: outcome.sessionID,
-					callID: outcome.callID,
-					tool: outcome.tool,
-					decision: "allow",
-					phase: "outcome",
-					durationMs: outcome.durationMs,
-					reason: outcome.status,
-				});
-				if (outcome.status === "error" && outcome.repeatedFailureCount === 3) {
-					audit({
-						ts: new Date().toISOString(),
-						sessionID: outcome.sessionID,
-						callID: outcome.callID,
-						tool: outcome.tool,
-						decision: "allow",
-						phase: "event",
-						reason: "repeated-equivalent-failure:3",
-					});
-					console.log(`[workflow-guard] ${outcome.tool} failed equivalently 3 times in this session; change approach or inspect the underlying failure before retrying.`);
-				}
-			}
-		}
 		return;
 	}
 
@@ -860,8 +895,27 @@ async function handleV2Event(
 		return;
 	}
 
-	if (event.type === "session.idle") {
-		const data = event.data as { sessionID?: unknown } | undefined;
+	if (event.type === "session.execution.interrupted") {
+		// `reason` is one of "user" | "shutdown" | "superseded" | "inactivity".
+		// Only "user" is user intent (Esc), so only it suspends automatic
+		// continuation. The other three are host-lifecycle events and must
+		// leave continuation state alone.
+		const data = event.data as { sessionID?: unknown; reason?: unknown } | undefined;
+		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
+		if (sessionID && data?.reason === "user") {
+			// Continuation state is keyed on the SDK client plus project root,
+			// so it must be reached inside the runtime state.
+			await runWithRuntimeState(effectiveRoot, client, () => markInterrupted(sessionID));
+		}
+		return;
+	}
+
+	// `session.idle` is deprecated in the installed schema and superseded by
+	// `session.status` carrying `status.type === "idle"`. The idle side effects
+	// keep their original order and behavior.
+	if (event.type === "session.status") {
+		const data = event.data as { sessionID?: unknown; status?: { type?: unknown } } | undefined;
+		if (data?.status?.type !== "idle") return;
 		const sessionID = typeof data?.sessionID === "string" ? data.sessionID : undefined;
 		if (typeof sessionID === "string") {
 			releaseFileClaims(sessionID);
@@ -906,23 +960,6 @@ async function handleV2Event(
 					? "block"
 					: "allow",
 			input: summarizeInput(event.data),
-		});
-		return;
-	}
-	// `command.executed` exists in the V2 event stream (`data: { name, sessionID,
-	// arguments, messageID }`) and carries what the V1 audit wanted: the slash
-	// command name, its arguments, and the session. It is journaled here rather
-	// than dropped, so a command that mutates workspace state stays attributable.
-	if (event.type === "command.executed") {
-		const data = event.data as { sessionID?: unknown; name?: unknown; arguments?: unknown } | undefined;
-		audit({
-			ts: new Date().toISOString(),
-			sessionID: typeof data?.sessionID === "string" ? data.sessionID : undefined,
-			tool: "command.executed",
-			decision: "allow",
-			phase: "event",
-			reason: typeof data?.name === "string" ? data.name : undefined,
-			input: summarizeInput({ name: data?.name, arguments: data?.arguments }),
 		});
 		return;
 	}
