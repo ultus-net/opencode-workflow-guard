@@ -76,6 +76,11 @@ export function projectConfigPath(root: string): string {
 	return candidates.find(existsSync) ?? candidates[0]!;
 }
 
+/** The project config file actually read for `root`, or undefined when none exists. */
+export function existingProjectConfigPath(root: string): string | undefined {
+	return projectConfigCandidates(root).find(existsSync);
+}
+
 /** Strip JSONC comments and trailing commas without altering string literals. */
 export function stripJsonComments(jsonc: string): string {
 	let insideString = false;

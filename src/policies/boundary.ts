@@ -1,4 +1,4 @@
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import type { ShellMutation } from "../lib/types.ts";
@@ -11,7 +11,8 @@ import { isLeadingEvalSegment, maskDataHeredocBodies, prepareRedirectResidue, pl
 import { isCollaborationInvocation, isProtectedPath, PROTECTED_PATH_REASON } from "./tamper.ts";
 import { isSecretPath, secretIn } from "./secrets.ts";
 import { isGitTreeWriteText, branchGuardReason, onProtectedBranch, parseGitInvocation } from "./git.ts";
-import { isSameGitRepo } from "../lib/project-config.ts";
+import { findGitRoot, isSameGitRepo, projectRootKey } from "../lib/project-config.ts";
+import { canonicalPath } from "./file-claims.ts";
 import {
 	effectiveTodos,
 	effectiveTodoOwnerSessionID,
@@ -81,6 +82,61 @@ export function isEnvironmentScratchTarget(targetPath: string, root: string): bo
 	return resolved === OPENCODE_SCRATCH_DIR || resolved.startsWith(OPENCODE_SCRATCH_DIR + "/");
 }
 
+/**
+ * Real path of the scratch root, or undefined when it is missing or a symlink.
+ *
+ * The scratch allowance is scoped to one real directory. A symlinked root
+ * would make `/tmp/opencode -> /etc` a write grant over `/etc`, so the root
+ * itself must be a real directory; symlinks *inside* it are resolved and
+ * refused below when they leave.
+ */
+function scratchRealRoot(scratchRoot: string): string | undefined {
+	try {
+		const stat = lstatSync(scratchRoot);
+		if (stat.isSymbolicLink() || !stat.isDirectory()) return undefined;
+		return realpathSync(scratchRoot);
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Whether a resolved path is a sanctioned scratch write.
+ *
+ * Writes are allowed only under the exact pre-created scratch directory, only
+ * for a real session (the session id gates the allowance), and only when the
+ * target's canonical location stays inside that directory. Symlinks that
+ * leave it are refused. This is a write allowance only: it does not make the
+ * directory an execution surface and it does not widen the workspace boundary
+ * anywhere else.
+ */
+export function isAllowedScratchPath(
+	resolvedPath: string,
+	sessionID: string | undefined,
+	scratchRoot = OPENCODE_SCRATCH_DIR,
+): boolean {
+	if (!sessionID || !resolvedPath) return false;
+	const scratch = resolve(scratchRoot);
+	if (resolvedPath !== scratch && !resolvedPath.startsWith(scratch + "/")) return false;
+	const realScratch = scratchRealRoot(scratchRoot);
+	if (!realScratch) return false;
+	const canonical = canonicalPath(resolvedPath);
+	return canonical === realScratch || canonical.startsWith(realScratch + "/");
+}
+
+/** Resolve a command's target against its run root, then judge scratch scope. */
+export function isAllowedScratchTarget(
+	targetPath: string,
+	root: string,
+	sessionID: string | undefined,
+	scratchRoot = OPENCODE_SCRATCH_DIR,
+): boolean {
+	if (!sessionID || !targetPath) return false;
+	const expanded = expandShellTargetPath(targetPath);
+	if (expanded === null) return false;
+	return isAllowedScratchPath(resolve(root, expanded), sessionID, scratchRoot);
+}
+
 export function isPathOutsideWorkspace(targetPath: string, root: string): boolean {
 	if (!targetPath) return false;
 	const expanded = expandShellTargetPath(targetPath);
@@ -134,6 +190,42 @@ export function isPathOutsideWorkspace(targetPath: string, root: string): boolea
 	// find the path outside, so a lexically-outside path that canonicalized
 	// inside (a symlink alias of the workspace) is no longer blocked here.
 	return lexicallyOutside && !canonicallyInside;
+}
+
+/**
+ * The linked worktree a target belongs to when the session is bound elsewhere.
+ *
+ * A subagent's workspace is the directory its session opened in, not the
+ * worktree named in its brief. The mutation is still refused (a tool-call path
+ * never re-anchors the boundary), but the block must name the mismatch and the
+ * move, or the agent works around the guard through the shell.
+ */
+export function linkedWorktreeMismatch(targetPath: string, root: string, boundRoot = root): string | undefined {
+	const expanded = expandShellTargetPath(targetPath);
+	if (expanded === null) return undefined;
+	const resolved = resolve(root, expanded);
+	if (!isPathOutsideWorkspace(resolved, boundRoot)) return undefined;
+	let ancestor = resolved;
+	while (true) {
+		try {
+			const stat = lstatSync(ancestor);
+			if (stat.isDirectory() || stat.isFile()) break;
+		} catch {}
+		const parent = dirname(ancestor);
+		if (parent === ancestor) return undefined;
+		ancestor = parent;
+	}
+	const worktreeRoot = findGitRoot(ancestor);
+	if (!worktreeRoot) return undefined;
+	if (projectRootKey(worktreeRoot) === projectRootKey(boundRoot)) return undefined;
+	if (!isSameGitRepo(worktreeRoot, boundRoot)) return undefined;
+	return worktreeRoot;
+}
+
+export function linkedWorktreeMismatchReason(targetPath: string, root: string, boundRoot = root): string | undefined {
+	const worktreeRoot = linkedWorktreeMismatch(targetPath, root, boundRoot);
+	if (!worktreeRoot) return undefined;
+	return `Blocked: file path '${targetPath}' is inside the linked worktree '${worktreeRoot}', but this session is bound to '${boundRoot}'. Move the session with the OpenCode session_move tool (directory: '${worktreeRoot}'), or start the subagent in that worktree, before editing.`;
 }
 
 export function extractPatchPaths(patchText: string): string[] {
@@ -386,6 +478,7 @@ function stripQuotedSpans(segment: string): string {
 export function foreignSegmentMutationReason(
 	segments: ShellSegmentPlan[],
 	workspaceRoot: string,
+	sessionID?: string,
 ): string | undefined {
 	for (const { segment, root } of segments) {
 		const mutation = detectShellMutation(segment);
@@ -393,6 +486,17 @@ export function foreignSegmentMutationReason(
 		if (!mutation && !gitWrite) continue;
 		if (root === undefined) {
 			return `Blocked: the command changes directory to a target that cannot be determined without executing shell expansion, then runs a mutation (${mutation?.what ?? "git write"}). Indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal directory inside the workspace.`;
+		}
+		// A directory change into the sanctioned scratch root is not a foreign
+		// tree. A file mutation there is judged by its target in the per-segment
+		// loop, so a target that leaves the directory gets the right cause. A git
+		// write gets none of that, and scratch is not a repository this session
+		// may mutate.
+		if (isAllowedScratchPath(root, sessionID)) {
+			if (gitWrite) {
+				return `Blocked: a git write runs in ${OPENCODE_SCRATCH_DIR}, the scratch directory, which is not a repository this session may mutate. Run git from the workspace checkout instead.`;
+			}
+			continue;
 		}
 		if (!isPathOutsideWorkspace(root, workspaceRoot) || isSameGitRepo(root, workspaceRoot)) continue;
 		return `Blocked: the command changes into '${root}' and mutates it (${mutation?.what ?? "git write"}), but that directory is outside workspace root (${workspaceRoot}) and is not a linked worktree of this repository. Relative targets there cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`;
@@ -575,6 +679,7 @@ export function nestedPayloadMutationReason(
 	command: string,
 	baseDir: string,
 	workspaceRoot: string,
+	sessionID?: string,
 	depth = 0,
 ): string | undefined {
 	// Nesting deeper than this is not modelled. A launcher chain that deep is
@@ -608,12 +713,12 @@ export function nestedPayloadMutationReason(
 			if (foreignRepo) {
 				return `Blocked: the inline interpreter script runs a git write against '${foreignRepo}', outside workspace root (${workspaceRoot}) and not a linked worktree of this repository. Run the command from inside the workspace instead.`;
 			}
-			const nested = foreignSegmentMutationReason(planShellSegments(payload, launcherRoot), workspaceRoot);
+			const nested = foreignSegmentMutationReason(planShellSegments(payload, launcherRoot), workspaceRoot, sessionID);
 			if (nested) return nested;
 			// A payload can launch another interpreter: `bash -c "bash -c 'cd
 			// <other> && git commit'"` only extracts its own quoted body. Re-plan
 			// each payload until the nesting bottoms out.
-			const inner = nestedPayloadMutationReason(extractPayloads, writesIn, payload, launcherRoot, workspaceRoot, depth + 1);
+			const inner = nestedPayloadMutationReason(extractPayloads, writesIn, payload, launcherRoot, workspaceRoot, sessionID, depth + 1);
 			if (inner) return inner;
 			const declared = payloadWorkingRoot(payload);
 			if (declared.status === "none") continue;
@@ -622,6 +727,13 @@ export function nestedPayloadMutationReason(
 				return `Blocked: the inline interpreter script runs a mutating command in a working directory that cannot be determined without executing the script (${declared.raw}). Indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal directory inside the workspace.`;
 			}
 			const targetRoot = resolve(launcherRoot, declared.root);
+			// A payload whose declared working directory and every detected
+			// write stay inside the sanctioned scratch root is a scratch write,
+			// not a foreign-tree mutation.
+			if (isAllowedScratchPath(targetRoot, sessionID) && !isGitTreeWriteText(payload)) {
+				const scratchWrites = writesIn(payload);
+				if (scratchWrites.length > 0 && scratchWrites.every((write) => isAllowedScratchTarget(write, targetRoot, sessionID))) continue;
+			}
 			if (!isPathOutsideWorkspace(targetRoot, workspaceRoot) || isSameGitRepo(targetRoot, workspaceRoot)) continue;
 			return `Blocked: the inline interpreter script runs a mutating command in '${targetRoot}', outside workspace root (${workspaceRoot}) and not a linked worktree of this repository. Relative targets there cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`;
 		}
@@ -667,7 +779,7 @@ export async function guardShellMutation(
 	// The foreign-tree gate runs here too, so this function is safe when called
 	// on its own: an indeterminate or foreign `cd` is refused instead of silently
 	// falling back to judging relative targets against the wrong tree.
-	const foreignReason = foreignSegmentMutationReason(plan, workspaceRoot);
+	const foreignReason = foreignSegmentMutationReason(plan, workspaceRoot, sessionID);
 	if (foreignReason) return foreignReason;
 	let hasMutation = false;
 	for (const { segment, root: segmentRoot } of plan) {
@@ -722,7 +834,6 @@ export async function guardShellMutation(
 			if (fallbackMutation) mutations.push(fallbackMutation);
 		}
 		for (const mutation of mutations) {
-			hasMutation = true;
 			const secret = secretIn(cleanSegment);
 			if (secret) {
 				return `Blocked: shell file mutation payload appears to contain a ${secret}. Secrets must not be written to disk from agent commands.`;
@@ -731,6 +842,12 @@ export async function guardShellMutation(
 			if (target && isProtectedPath(target)) {
 				return PROTECTED_PATH_REASON;
 			}
+			// A scratch write is sanctioned only for a real session and only
+			// while its canonical target stays inside the pre-created root. It
+			// is not a repository mutation, so it does not advance task evidence
+			// or the feature-branch requirement.
+			if (isAllowedScratchTarget(target, runRoot, sessionID)) continue;
+			hasMutation = true;
 			if (target && outsideWorkspace(target)) {
 				// The workspace boundary has no override: a write outside the
 				// workspace is out of bounds even with WORKFLOW_GUARD_ALLOW_LIVE
@@ -739,8 +856,12 @@ export async function guardShellMutation(
 					return `Blocked: shell mutation '${mutation.what}' targets '${target}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${workspaceRoot}). Use a literal workspace-relative path.`;
 				}
 				if (isEnvironmentScratchTarget(target, runRoot)) {
-					return `Blocked: shell mutation '${mutation.what}' targets '${target}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${workspaceRoot}) instead (for example .tmp-notes.md).`;
+					return sessionID
+						? `Blocked: shell mutation '${mutation.what}' targets '${target}', which is under ${OPENCODE_SCRATCH_DIR} but does not resolve inside it (a symlink leaves the directory, or the root is not a real directory), so the scratch allowance does not cover it. Use a real path inside that directory or inside the workspace root (${workspaceRoot}).`
+						: `Blocked: shell mutation '${mutation.what}' targets '${target}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover without a session; write scratch as an untracked file inside the workspace root (${workspaceRoot}) instead (for example .tmp-notes.md).`;
 				}
+				const mismatch = linkedWorktreeMismatchReason(target, runRoot, workspaceRoot);
+				if (mismatch) return mismatch;
 				return `Blocked: shell mutation '${mutation.what}' targets a path outside the workspace root (${workspaceRoot}). All changes must stay within the workspace.`;
 			}
 			if (onProtectedBranch(runRoot)) {

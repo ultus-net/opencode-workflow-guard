@@ -172,6 +172,10 @@ import { createHostWorktreePort } from "../src/lib/host-worktree.ts";
 import { validateHostWorktreeDirectory } from "../src/lib/worktree.ts";
 import { guardedTokensFromServerName, listHostMcpServerNames, recordHostMcpServers } from "../src/lib/mcp-inventory.ts";
 import { addGuardedMcpTokens, guardedMcpServers, mcpMutationTool, resetGuardedMcpTokensForTesting } from "../src/policies/mcp.ts";
+import { DEFAULT_FILE_CLAIM_TTL_MS, fileClaimTtlMs } from "../src/policies/file-claims.ts";
+import { OPENCODE_SCRATCH_DIR, isAllowedScratchTarget } from "../src/policies/boundary.ts";
+import { existingProjectConfigPath } from "../src/lib/project-config.ts";
+import { verifyCommandSource } from "../src/lib/verify.ts";
 
 let pass = 0;
 let fail = 0;
@@ -916,16 +920,34 @@ const unresolvableMv = await call("bash", { command: "mv $D/foo.txt ./bar.txt" }
 check("mv source with unresolvable $VAR names the variable cause", blocked(unresolvableMv) && String(unresolvableMv).includes("unresolvable variable reference"));
 const unresolvableGit = await call("bash", { command: "git -C $OTHER_REPO commit -m x" }, { sessionID: "s-active" });
 check("git repoDir with unresolvable $VAR names the variable cause", blocked(unresolvableGit) && String(unresolvableGit).includes("unresolvable variable reference"));
-// Scratch-directory cause attribution: /tmp/opencode is the environment's
-// designated scratch space, but the workspace boundary is workspace-absolute
-// and does not cover it; the message explains that instead of reading as a
-// guard bug (6 of the device audit's boundary blocks were this class).
-const scratchWrite = await call("write", { filePath: "/tmp/opencode/scratch.txt", content: "x" }, { sessionID: "s-active" });
-check("scratch-dir write attributes the environment scratch cause", blocked(scratchWrite) && String(scratchWrite).includes("environment scratch directory") && String(scratchWrite).includes("/tmp/opencode") && !String(scratchWrite).includes("unresolvable variable reference"));
-const scratchRedirect = await call("bash", { command: "echo x > /tmp/opencode/out.md" }, { sessionID: "s-active" });
-check("scratch-dir redirect attributes the environment scratch cause", blocked(scratchRedirect) && String(scratchRedirect).includes("environment scratch directory"));
-const scratchPatch = await call("apply_patch", { patchText: "*** Add File: /tmp/opencode/scratch.ts\n+scratch\n" }, { sessionID: "s-active" });
-check("scratch-dir apply_patch attributes the environment scratch cause", blocked(scratchPatch) && String(scratchPatch).includes("environment scratch directory"));
+// Scratch-directory allowance: /tmp/opencode is the environment's designated
+// agent scratch space. Writes there are sanctioned for a real session and only
+// while the canonical target stays inside that exact directory; a symlink that
+// leaves it, a sibling with a shared prefix, and a traversal out of it are all
+// still boundary escapes. Execution itself is unchanged.
+mkdirSync(OPENCODE_SCRATCH_DIR, { recursive: true });
+const scratchTag = `wg-scratch-${process.pid}-${String(Date.now())}`;
+todo("s-scratch", item("write scratch notes", "in_progress"));
+const scratchFile = join(OPENCODE_SCRATCH_DIR, `${scratchTag}.txt`);
+const scratchPatchFile = join(OPENCODE_SCRATCH_DIR, `${scratchTag}.ts`);
+const scratchRedirectFile = join(OPENCODE_SCRATCH_DIR, `${scratchTag}.md`);
+check("scratch-dir write is allowed for a session", allowed(await call("write", { filePath: scratchFile, content: "x" }, { sessionID: "s-scratch" })));
+check("scratch-dir redirect is allowed for a session", allowed(await call("bash", { command: `echo x > ${scratchRedirectFile}` }, { sessionID: "s-scratch" })));
+check("scratch-dir apply_patch is allowed for a session", allowed(await call("apply_patch", { patchText: `*** Add File: ${scratchPatchFile}\n+scratch\n` }, { sessionID: "s-scratch" })));
+check("scratch-dir interpreter payload write is allowed", allowed(await call("bash", { command: `python3 -c "open('${scratchFile}', 'w').write('x')"` }, { sessionID: "s-scratch" })));
+check("scratch-dir cd redirect is allowed", allowed(await call("bash", { command: `cd ${OPENCODE_SCRATCH_DIR} && echo x > ${scratchTag}-cd.md` }, { sessionID: "s-scratch" })));
+const sessionlessScratch = await call("write", { filePath: scratchFile, content: "x" });
+check("scratch-dir write needs a session id", blocked(sessionlessScratch) && String(sessionlessScratch).includes("environment scratch directory"));
+const scratchPrefixPeer = await call("write", { filePath: `${OPENCODE_SCRATCH_DIR}-evil/out.txt`, content: "x" }, { sessionID: "s-scratch" });
+check("a sibling sharing the scratch prefix is still blocked", blocked(scratchPrefixPeer) && String(scratchPrefixPeer).includes("escapes workspace root"));
+const scratchTraversal = await call("write", { filePath: `${OPENCODE_SCRATCH_DIR}/../wg-escape.txt`, content: "x" }, { sessionID: "s-scratch" });
+check("a traversal out of the scratch dir is blocked", blocked(scratchTraversal) && String(scratchTraversal).includes("escapes workspace root"));
+const scratchEscapeDir = mkdtempSync(join(tmpdir(), "wg-scratch-escape-"));
+symlinkSync(scratchEscapeDir, join(OPENCODE_SCRATCH_DIR, `${scratchTag}-link`), "dir");
+const symlinkScratch = await call("write", { filePath: join(OPENCODE_SCRATCH_DIR, `${scratchTag}-link`, "out.txt"), content: "x" }, { sessionID: "s-scratch" });
+check("a symlink out of the scratch dir is blocked", blocked(symlinkScratch) && String(symlinkScratch).includes("scratch allowance does not cover it"));
+rmSync(join(OPENCODE_SCRATCH_DIR, `${scratchTag}-link`), { force: true });
+rmSync(scratchEscapeDir, { recursive: true, force: true });
 const otherOutsideWrite = await call("write", { filePath: "/var/tmp/elsewhere.txt", content: "x" }, { sessionID: "s-active" });
 check("non-scratch outside path keeps the generic escape message", blocked(otherOutsideWrite) && String(otherOutsideWrite).includes("escapes workspace root") && !String(otherOutsideWrite).includes("scratch directory"));
 check("allow apply_patch within workspace", !(await call("apply_patch", { patchText: "*** Update File: src/app.ts\n" }, { sessionID: "s-active" })));
@@ -1112,7 +1134,7 @@ let claimConflict = false;
 try {
 	await claimsBefore?.({ tool: "edit", sessionID: "s-claim-b", callID: "claim-b" }, { args: { filePath: join(claimsDir, "shared-link.ts"), content: "b" } });
 } catch (error) {
-	claimConflict = String(error).includes("claimed by another active session");
+	claimConflict = String(error).includes("is claimed by session");
 }
 check("concurrent file claims block another session through a symlink alias", claimConflict);
 const whyClaimConflict = JSON.parse(String(await claimsHooks.tool?.guard_why?.execute(
@@ -1143,7 +1165,7 @@ let danglingConflict = false;
 try {
 	await claimsBefore?.({ tool: "write", sessionID: "s-claim-b", callID: "claim-dangling-alias" }, { args: { filePath: join(claimsDir, "future-link.ts"), content: "b" } });
 } catch (error) {
-	danglingConflict = String(error).includes("claimed by another active session");
+	danglingConflict = String(error).includes("is claimed by session");
 }
 check("concurrent file claims canonicalize dangling final symlinks", danglingConflict);
 await claimsHooks.event?.({ event: { type: "session.idle", properties: { sessionID: "s-claim-a" } } } as any);
@@ -1162,7 +1184,7 @@ let patchConflict = false;
 try {
 	await claimsBefore?.({ tool: "apply_patch", sessionID: "s-claim-b", callID: "claim-patch" }, { args: { patchText: "*** Begin Patch\n*** Update File: other.ts\n-old\n+new\n*** Update File: shared.ts\n-old\n+new\n*** End Patch" } });
 } catch (error) {
-	patchConflict = String(error).includes("claimed by another active session");
+	patchConflict = String(error).includes("is claimed by session");
 }
 check("apply_patch claims all targets atomically when one target conflicts", patchConflict);
 todo("s-claim-c", item("edit unclaimed file", "in_progress"));
@@ -1237,7 +1259,7 @@ let liveClaimBlocked = false;
 try {
 	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "live-blocked" }, { args: { filePath: join(takeoverDir, "live.ts"), content: "c" } });
 } catch (error) {
-	liveClaimBlocked = String(error).includes("claimed by another active session");
+	liveClaimBlocked = String(error).includes("is claimed by session");
 }
 check("a live owner without an idle timestamp keeps its claim", liveClaimBlocked);
 await takeoverAfter?.({ tool: "edit", sessionID: "s-live-owner", callID: "live-claim", args: {} }, { title: "edit", output: "edited", metadata: {} });
@@ -1256,7 +1278,7 @@ let refreshClaimBlocked = false;
 try {
 	await takeoverBefore?.({ tool: "edit", sessionID: "s-claimant", callID: "refresh-conflict" }, { args: { filePath: join(takeoverDir, "refresh.ts"), content: "f" } });
 } catch (error) {
-	refreshClaimBlocked = String(error).includes("claimed by another active session");
+	refreshClaimBlocked = String(error).includes("is claimed by session");
 }
 check("a same-session re-claim refreshes past the owner's idle so it is not taken over mid-turn", refreshClaimBlocked);
 await takeoverAfter?.({ tool: "edit", sessionID: "s-stale-owner", callID: "refresh-claim-2", args: {} }, { title: "edit", output: "edited", metadata: {} });
@@ -1301,6 +1323,59 @@ await takeoverAfter?.({ tool: "edit", sessionID: "s-claimant", callID: "multi-ta
 const takeoverAudits = getRecentAuditEntries(30).filter((entry) => entry.reason === "stale_claim_takeover" && typeof entry.evidence?.targetPath === "string" && entry.evidence.targetPath.includes("multi-"));
 check("each released stale path has its own audited takeover entry", takeoverAudits.length === 2 && takeoverAudits.every((entry) => entry.evidence?.claimOwnerSessionID === "s-stale-owner"));
 
+// File-claim TTL reclaim (missed idle release with no readable owner record):
+// a claim older than the effective TTL cannot belong to an in-flight call, so
+// it is released with an audited reclaim. A fresh claim still blocks and the
+// block advertises the reclaim step.
+console.log("- File-claim TTL reclaim -");
+const ttlDir = mkdtempSync(join(tmpdir(), "wg-claim-ttl-"));
+writeFileSync(join(ttlDir, "ttl.ts"), "before");
+const ttlHooks = await pluginFn({
+	directory: ttlDir,
+	client: fakeClient as any,
+	project: {} as any,
+	worktree: ttlDir,
+	experimental_workspace: {} as any,
+	serverUrl: new URL("http://localhost:4096"),
+	$: undefined as any,
+});
+const ttlBefore = ttlHooks["tool.execute.before"];
+const ttlAfter = ttlHooks["tool.execute.after"];
+todo("s-ttl-owner", item("edit ttl file", "in_progress"));
+todo("s-ttl-claimant", item("take over ttl claim", "in_progress"));
+await recordRead(ttlBefore, ttlAfter, "s-ttl-owner", join(ttlDir, "ttl.ts"), "ttl-read-owner");
+await ttlBefore?.({ tool: "edit", sessionID: "s-ttl-owner", callID: "ttl-claim" }, { args: { filePath: join(ttlDir, "ttl.ts"), content: "a" } });
+const previousClaimTtl = process.env.WORKFLOW_GUARD_CLAIM_TTL_MS;
+process.env.WORKFLOW_GUARD_CLAIM_TTL_MS = "25";
+check("claim TTL honours the environment override", fileClaimTtlMs(ttlDir) === 25);
+await recordRead(ttlBefore, ttlAfter, "s-ttl-claimant", join(ttlDir, "ttl.ts"), "ttl-read-claimant");
+let freshTtlBlocked = false;
+try {
+	await ttlBefore?.({ tool: "edit", sessionID: "s-ttl-claimant", callID: "ttl-blocked" }, { args: { filePath: join(ttlDir, "ttl.ts"), content: "b" } });
+} catch (error) {
+	freshTtlBlocked = String(error).includes("is claimed by session") && String(error).includes("Reclaim step");
+}
+check("a claim within the TTL still blocks and names the reclaim step", freshTtlBlocked);
+await new Promise((resolve) => setTimeout(resolve, 60));
+let expiredTtlAllowed = true;
+try {
+	await ttlBefore?.({ tool: "edit", sessionID: "s-ttl-claimant", callID: "ttl-reclaimed" }, { args: { filePath: join(ttlDir, "ttl.ts"), content: "c" } });
+} catch {
+	expiredTtlAllowed = false;
+}
+check("an expired claim is reclaimed for the next claimant", expiredTtlAllowed);
+const ttlAudit = getRecentAuditEntries(40).find((entry) => entry.reason === "claim_ttl_expired" && typeof entry.evidence?.targetPath === "string" && entry.evidence.targetPath.endsWith("ttl.ts"));
+check("TTL reclaim is audited with the released path, owner, and age", ttlAudit?.decision === "allow" && ttlAudit.evidence?.claimOwnerSessionID === "s-ttl-owner" && typeof ttlAudit.evidence?.claimAgeMs === "number" && ttlAudit.evidence.claimAgeMs >= 25);
+await ttlAfter?.({ tool: "edit", sessionID: "s-ttl-claimant", callID: "ttl-reclaimed", args: {} }, { title: "edit", output: "edited", metadata: {} });
+if (previousClaimTtl === undefined) delete process.env.WORKFLOW_GUARD_CLAIM_TTL_MS;
+else process.env.WORKFLOW_GUARD_CLAIM_TTL_MS = previousClaimTtl;
+const ttlConfigDir = mkdtempSync(join(tmpdir(), "wg-claim-ttl-cfg-"));
+mkdirSync(join(ttlConfigDir, ".opencode"), { recursive: true });
+writeFileSync(join(ttlConfigDir, ".opencode", "workflow-guard.json"), JSON.stringify({ claimTtlMs: 1234 }));
+reloadProjectConfig(ttlConfigDir);
+check("project config claimTtlMs sets the claim TTL", fileClaimTtlMs(ttlConfigDir) === 1234);
+check("default claim TTL is five minutes", DEFAULT_FILE_CLAIM_TTL_MS === 300_000);
+
 // Fail-closed: no session lookup on the client, and a lookup that throws.
 const noLookupDir = mkdtempSync(join(tmpdir(), "wg-claim-nolookup-"));
 writeFileSync(join(noLookupDir, "file.ts"), "before");
@@ -1316,7 +1391,7 @@ let noLookupBlocked = false;
 try {
 	await noLookupBefore?.({ tool: "edit", sessionID: "s-nolookup-claimant", callID: "nolookup-claimant" }, { args: { filePath: join(noLookupDir, "file.ts"), content: "b" } });
 } catch (error) {
-	noLookupBlocked = String(error).includes("claimed by another active session");
+	noLookupBlocked = String(error).includes("is claimed by session");
 }
 check("stale takeover fails closed when the client has no session lookup", noLookupBlocked);
 
@@ -1334,7 +1409,7 @@ let throwLookupBlocked = false;
 try {
 	await throwLookupBefore?.({ tool: "edit", sessionID: "s-throwlookup-claimant", callID: "throwlookup-claimant" }, { args: { filePath: join(throwLookupDir, "file.ts"), content: "b" } });
 } catch (error) {
-	throwLookupBlocked = String(error).includes("claimed by another active session");
+	throwLookupBlocked = String(error).includes("is claimed by session");
 }
 check("stale takeover fails closed when the session lookup throws", throwLookupBlocked);
 
@@ -3606,6 +3681,17 @@ check("plugin registers guard_audit tool", typeof customPlugin.tool?.guard_audit
 check("plugin registers guard_why tool", typeof customPlugin.tool?.guard_why?.execute === "function");
 check("plugin registers record_review tool", typeof customPlugin.tool?.record_review?.execute === "function");
 
+// G2 regression: record_review is offered to every session regardless of the
+// review gate, so the only thing that can withhold it is the host's per-agent
+// permission list. A reviewer agent with a deny-all list must be granted it in
+// its own frontmatter; the guard cannot inject it past host permissions.
+const noReviewRoot = mkdtempSync(join(tmpdir(), "wg-record-review-gate-off-"));
+mkdirSync(join(noReviewRoot, ".opencode"), { recursive: true });
+writeFileSync(join(noReviewRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ requireReview: false }));
+const noReviewPlugin = await (defaultExport?.server ?? WorkflowGuard)({ directory: noReviewRoot, worktree: noReviewRoot, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+check("record_review stays registered with the review gate off, so only host permissions gate the call", typeof noReviewPlugin.tool?.record_review?.execute === "function" && typeof noReviewPlugin.tool?.record_review?.description === "string");
+rmSync(noReviewRoot, { recursive: true, force: true });
+
 const statusResult = await customPlugin.tool?.guard_status?.execute({}, {} as any);
 check("guard_status executes and returns JSON string", typeof statusResult === "string" && statusResult.includes("workspaceRoot"));
 const parsedStatus = JSON.parse(statusResult as string);
@@ -3625,6 +3711,37 @@ const requirementsPlugin = await (defaultExport?.server ?? WorkflowGuard)({ dire
 setWorkspaceRoot(root);
 const requirementsStatus = JSON.parse(String(await requirementsPlugin.tool?.guard_status?.execute({}, {} as any)));
 check("guard_status reports configured unsatisfied requirements directly", requirementsStatus.workspaceRoot === requirementsRoot && ["verification", "review", "documentation"].every((requirement) => requirementsStatus.outstandingRequirements.includes(requirement)));
+check(
+	"guard_status names the project config file it read",
+	typeof requirementsStatus.projectConfig.configPath === "string" &&
+		requirementsStatus.projectConfig.configPath.endsWith("/.opencode/workflow-guard.json") &&
+		requirementsStatus.projectConfig.verifyCommand === "node -e 'process.exit(0)'" &&
+		requirementsStatus.projectConfig.verifyCommandSource === "project-config",
+);
+
+const noConfigRoot = mkdtempSync(join(tmpdir(), "wg-status-no-config-"));
+spawnSync("git", ["init", "-b", "feature/no-config"], { cwd: noConfigRoot });
+const noConfigPlugin = await (defaultExport?.server ?? WorkflowGuard)({ directory: noConfigRoot, worktree: noConfigRoot, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const noConfigStatus = JSON.parse(String(await noConfigPlugin.tool?.guard_status?.execute({}, {} as any)));
+check(
+	"guard_status distinguishes no config and no detectable verify command",
+	noConfigStatus.projectConfig.configPath === null && noConfigStatus.projectConfig.verifyCommand === null && noConfigStatus.projectConfig.verifyCommandSource === null,
+);
+
+const autoDetectRoot = mkdtempSync(join(tmpdir(), "wg-status-autodetect-"));
+spawnSync("git", ["init", "-b", "feature/autodetect"], { cwd: autoDetectRoot });
+writeFileSync(join(autoDetectRoot, "package.json"), JSON.stringify({ scripts: { test: "node -e 'process.exit(0)'" } }));
+const autoDetectPlugin = await (defaultExport?.server ?? WorkflowGuard)({ directory: autoDetectRoot, worktree: autoDetectRoot, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const autoDetectStatus = JSON.parse(String(await autoDetectPlugin.tool?.guard_status?.execute({}, {} as any)));
+check(
+	"guard_status attributes an auto-detected verify command to detection, not config",
+	autoDetectStatus.projectConfig.configPath === null && autoDetectStatus.projectConfig.verifyCommand === "npm test" && autoDetectStatus.projectConfig.verifyCommandSource === "auto-detected",
+);
+check("verifyCommandSource reports project config directly", verifyCommandSource(requirementsRoot) === "project-config" && verifyCommandSource(autoDetectRoot) === "auto-detected" && verifyCommandSource(noConfigRoot) === null);
+check("existingProjectConfigPath returns null-ish for a repo without config", existingProjectConfigPath(noConfigRoot) === undefined);
+rmSync(noConfigRoot, { recursive: true, force: true });
+rmSync(autoDetectRoot, { recursive: true, force: true });
+reloadProjectConfig(root);
 
 const conflictingConfigRoot = mkdtempSync(join(tmpdir(), "wg-status-conflicting-config-"));
 mkdirSync(join(conflictingConfigRoot, ".opencode"), { recursive: true });
@@ -4582,6 +4699,16 @@ const linkedAbsoluteWrite = await call("bash", { command: `echo x > ${join(wtRep
 check("an absolute target in the primary checkout stays allowed from a linked worktree", !blocked(linkedAbsoluteWrite));
 const linkedOutsideWrite = await call("bash", { command: `echo x > ${join(foreignWtRepo, "outside.txt")}`, workdir: wtLinked }, { sessionID: "s-wt-foreign", worktree: wtRepo, directory: wtRepo });
 check("an absolute target outside both checkouts is still blocked from a linked worktree", blocked(linkedOutsideWrite));
+// A session bound to the primary checkout must not silently edit into a sibling
+// worktree. The mutation still stays refused (a tool-call path never re-anchors
+// the boundary), but the block names the mismatch and the host move, or the
+// agent works around the guard through the shell.
+todo("s-wt-mismatch", item("edit in the linked worktree", "in_progress"));
+const mismatchWrite = await call("write", { filePath: join(wtLinked, "mismatch.ts"), content: "x" }, { sessionID: "s-wt-mismatch", worktree: wtRepo, directory: wtRepo });
+check(
+	"an edit into a linked worktree names the worktree mismatch and the move",
+	blocked(mismatchWrite) && String(mismatchWrite).includes(wtLinked) && String(mismatchWrite).includes("session_move"),
+);
 
 // An in-command `cd` moves the tree later segments run in, so the walk has to
 // follow it. Judging every segment against the shell's initial `workdir` let

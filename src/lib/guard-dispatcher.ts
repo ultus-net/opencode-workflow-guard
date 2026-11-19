@@ -44,7 +44,7 @@ import {
 	resolveVerifyTimeoutMs,
 	snipVerifyOutput,
 } from "./verify.ts";
-import { detectShellMutation, extractPatchPaths, foreignSegmentMutationReason, guardShellMutation, hasUnresolvableVariable, isEnvironmentScratchTarget, isPathOutsideWorkspace, nestedPayloadMutationReason, OPENCODE_SCRATCH_DIR } from "../policies/boundary.ts";
+import { detectShellMutation, extractPatchPaths, foreignSegmentMutationReason, guardShellMutation, hasUnresolvableVariable, isAllowedScratchTarget, isEnvironmentScratchTarget, isPathOutsideWorkspace, linkedWorktreeMismatchReason, nestedPayloadMutationReason, OPENCODE_SCRATCH_DIR } from "../policies/boundary.ts";
 import { branchHasChangelogChange, checkLockfileSync, hasPrCreateInvocation, prBodyHasLiteralLineBreakEscapes, prBodyIncludesChangelog } from "../policies/changelog.ts";
 import { extractEditContent, liveMutationIn } from "../policies/destructive.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
@@ -334,6 +334,7 @@ export async function guardToolCallImpl(
 					logPolicyBlock(`[workflow-guard] blocked apply_patch: secret file path ${patchPath}`);
 					return block("secrets", "secret_write", `Blocked: modifying secret file '${patchPath}' directly is not permitted.`);
 				}
+				if (isAllowedScratchTarget(patchPath, currentRoot, context?.sessionID)) continue;
 				if (isPathOutsideWorkspace(patchPath, currentRoot)) {
 					logPolicyBlock(`[workflow-guard] blocked apply_patch: patch target escapes workspace: ${patchPath}`);
 					return block(
@@ -342,22 +343,27 @@ export async function guardToolCallImpl(
 						hasUnresolvableVariable(patchPath)
 							? `Blocked: patch targets file '${patchPath}', which contains an unresolvable variable reference; indeterminate destinations are treated as outside the workspace root (${currentRoot}). Use a literal workspace-relative path.`
 							: isEnvironmentScratchTarget(patchPath, currentRoot)
-								? `Blocked: patch targets file '${patchPath}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${currentRoot}) instead (for example .tmp-notes.md).`
+								? context?.sessionID
+									? `Blocked: patch targets file '${patchPath}' is under ${OPENCODE_SCRATCH_DIR} but does not resolve inside it (a symlink leaves the directory, or the root is not a real directory), so the scratch allowance does not cover it. Use a real path inside that directory or inside the workspace root (${currentRoot}).`
+									: `Blocked: patch targets file '${patchPath}' under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover without a session; write scratch as an untracked file inside the workspace root (${currentRoot}) instead (for example .tmp-notes.md).`
 								: `Blocked: patch targets file '${patchPath}' outside workspace root (${currentRoot}).`,
 					);
 				}
 			}
 		}
-		if (target && isPathOutsideWorkspace(target, currentRoot)) {
+		if (target && isPathOutsideWorkspace(target, currentRoot) && !isAllowedScratchTarget(target, currentRoot, context?.sessionID)) {
 			logPolicyBlock(`[workflow-guard] blocked ${toolName}: path escapes workspace: ${target}`);
+			const mismatch = linkedWorktreeMismatchReason(target, currentRoot);
 			return block(
 				"boundary",
 				"workspace_escape",
 				hasUnresolvableVariable(target)
 					? `Blocked: file path '${target}' contains an unresolvable variable reference, so the boundary treats it as outside the workspace root (${currentRoot}). Use a literal workspace-relative path; all changes must stay within the workspace.`
 					: isEnvironmentScratchTarget(target, currentRoot)
-						? `Blocked: file path '${target}' is under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover; write scratch as an untracked file inside the workspace root (${currentRoot}) instead (for example .tmp-notes.md).`
-						: `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`,
+						? context?.sessionID
+							? `Blocked: file path '${target}' is under ${OPENCODE_SCRATCH_DIR} but does not resolve inside it (a symlink leaves the directory, or the root is not a real directory), so the scratch allowance does not cover it. Use a real path inside that directory or inside the workspace root (${currentRoot}).`
+							: `Blocked: file path '${target}' is under ${OPENCODE_SCRATCH_DIR}, the environment scratch directory the workspace boundary does not cover without a session; write scratch as an untracked file inside the workspace root (${currentRoot}) instead (for example .tmp-notes.md).`
+						: mismatch ?? `Blocked: file path '${target}' escapes workspace root (${currentRoot}). All changes must stay within the workspace.`,
 			);
 		}
 		for (const content of extractEditContent(input)) {
@@ -413,9 +419,14 @@ export async function guardToolCallImpl(
 				return block("todo", "mutation_budget", reason);
 			}
 		}
+		const editPaths = editTargets(input, currentRoot);
+		// Scratch writes are sanctioned but are not repository mutations: they
+		// must not need a prior read, claim a file against another session, or
+		// count toward task completion evidence.
+		const trackedPaths = editPaths.filter((path) => !isAllowedScratchTarget(path, currentRoot, context?.sessionID));
 		if (context?.sessionID) {
 			if (toolName === "edit" || toolName === "write") {
-				for (const path of editTargets(input, currentRoot)) {
+				for (const path of trackedPaths) {
 					const staleReason = staleWriteReason(path, context.sessionID);
 					if (staleReason) {
 						logPolicyBlock(`[workflow-guard] ${staleReason}`);
@@ -423,22 +434,22 @@ export async function guardToolCallImpl(
 					}
 				}
 			}
-			const targets = editTargets(input, currentRoot);
+			const targets = trackedPaths;
 			if (!context.simulate) {
 				// A missed idle release can leave a finished session's claims
 				// behind; release provably stale ones before claiming. The
 				// simulate path (guard_why) stays read-only.
-				await releaseStaleFileClaims(targets, context.sessionID);
+				await releaseStaleFileClaims(targets, context.sessionID, currentRoot);
 			}
 			const claimReason = context.simulate
-				? fileClaimConflictReason(targets, context.sessionID)
+				? fileClaimConflictReason(targets, context.sessionID, currentRoot)
 				: context.callID ? claimFiles(targets, context.sessionID, context.callID) : undefined;
 			if (claimReason) {
 				logPolicyBlock(`[workflow-guard] ${claimReason}`);
 				return block("file-claims", "file_claim_conflict", claimReason);
 			}
 		}
-		if (!context?.simulate) recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
+		if (!context?.simulate && trackedPaths.length > 0) recordMutation(await effectiveTodoOwnerSessionID(context?.sessionID), context?.sessionID);
 		return allow();
 	}
 
@@ -506,7 +517,7 @@ export async function guardToolCallImpl(
 				`Blocked: the shell's workdir '${requestedShellRoot}' is outside workspace root (${currentRoot}) and is not a linked worktree of this repository, so relative targets cannot be validated against the tree the command would actually change. Run the command from inside the workspace instead.`,
 			);
 		}
-		const foreignSegmentReason = foreignSegmentMutationReason(segmentPlan, currentRoot);
+		const foreignSegmentReason = foreignSegmentMutationReason(segmentPlan, currentRoot, context?.sessionID);
 		if (foreignSegmentReason) {
 			logPolicyBlock(`[workflow-guard] blocked mutation in a directory outside workspace: ${command.slice(0, 120)}`);
 			return block("boundary", "workspace_escape", foreignSegmentReason);
@@ -584,13 +595,13 @@ export async function guardToolCallImpl(
 		// sees one word, so the top-level walk above cannot see it. Plan from
 		// `raw` for the same reason the top-level walk does: a heredoc body's
 		// own lines are real commands to the shell that consumes it.
-		const nestedTreeReason = nestedPayloadMutationReason(extractInterpreterPayload, writePathsInPayload, raw, shellRoot, currentRoot);
+		const nestedTreeReason = nestedPayloadMutationReason(extractInterpreterPayload, writePathsInPayload, raw, shellRoot, currentRoot, context?.sessionID);
 		if (nestedTreeReason) {
 			logPolicyBlock(`[workflow-guard] blocked nested interpreter mutation outside workspace: ${command.slice(0, 120)}`);
 			return block("boundary", "workspace_escape", nestedTreeReason);
 		}
 		for (const payload of extractInterpreterPayload(raw)) {
-			const outsidePath = outsideWritePathInPayload(payload, currentRoot);
+			const outsidePath = outsideWritePathInPayload(payload, currentRoot, (candidate) => isAllowedScratchTarget(candidate, currentRoot, context?.sessionID));
 			if (outsidePath) {
 				logPolicyBlock(`[workflow-guard] blocked interpreter payload writing outside workspace: ${outsidePath}`);
 				return block(
@@ -601,7 +612,10 @@ export async function guardToolCallImpl(
 						: `Blocked: inline interpreter script targets file '${outsidePath}' outside workspace root (${currentRoot}). All changes must stay within the workspace.`,
 				);
 			}
-			const writePaths = writePathsInPayload(payload);
+			// A scratch write is sanctioned, so it does not need an active todo,
+			// a feature branch, or a mutation record. Repository writes in the
+			// same payload still do.
+			const writePaths = writePathsInPayload(payload).filter((path) => !isAllowedScratchTarget(path, currentRoot, context?.sessionID));
 			if (writePaths.length > 0) {
 				if (context?.agent && isReadOnlyRole(context.agent)) return block("subagent-role", "read_only_role", `Blocked: subagent with read-only role '${context.agent}' cannot perform shell file mutations.`);
 				for (const path of writePaths) if (isProtectedPath(path)) return block("tamper", "protected_path", PROTECTED_PATH_REASON);
