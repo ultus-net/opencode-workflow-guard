@@ -137,6 +137,10 @@ export interface ReviewResult {
 	summary: string;
 	timestamp: number;
 	targetSessionID?: string;
+	/** Session that actually called record_review, which may be a relay subagent. */
+	recorderSessionID?: string;
+	/** Lineage of the recorder, so guard_status can show a subagent approval. */
+	recorderRole?: "root" | "subagent";
 	workspace?: string;
 	commitHash?: string;
 	gitStatus?: string;

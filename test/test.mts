@@ -2563,6 +2563,59 @@ writeFileSync(join(verifyRepo, "package.json"), JSON.stringify({ scripts: { test
 await call("bash", { command: "git restore git.ts" }, { sessionID: "s-verify-git" });
 check("git worktree mutation invalidates cached verification", blocked(await call("todowrite", { todos: [item("git work", "completed")] }, { sessionID: "s-verify-git" })));
 
+// G6: a configured verify command must leave visible evidence in guard_status,
+// not only an auto-detected command or an in-memory result. The package.json
+// test script deliberately fails, so a passing run proves the project config
+// wins over detection.
+console.log("- G6: configured verification evidence in guard_status -");
+const prevG6VerifyEnv = process.env.WORKFLOW_GUARD_VERIFY;
+delete process.env.WORKFLOW_GUARD_VERIFY;
+const g6Repo = mkdtempSync(join(tmpdir(), "wg-g6-verify-status-"));
+spawnSync("git", ["init", "-b", "feature/g6"], { cwd: g6Repo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: g6Repo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: g6Repo });
+writeFileSync(join(g6Repo, "package.json"), JSON.stringify({ scripts: { test: "node -e 'process.exit(1)'" } }));
+writeFileSync(join(g6Repo, "code.ts"), "base\n");
+spawnSync("git", ["add", "."], { cwd: g6Repo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: g6Repo });
+mkdirSync(join(g6Repo, ".opencode"), { recursive: true });
+writeFileSync(join(g6Repo, ".opencode", "workflow-guard.json"), JSON.stringify({ verifyCommand: "node -e 'process.exit(0)'" }));
+reloadProjectConfig(g6Repo);
+setWorkspaceRoot(g6Repo);
+resetVerifyState();
+todo("s-g6", item("g6 configured verification", "in_progress"));
+await call("edit", { filePath: join(g6Repo, "code-after.ts"), content: "after\n" }, { sessionID: "s-g6" });
+const g6Pass = await call("todowrite", { todos: [item("g6 configured verification", "completed")] }, { sessionID: "s-g6" });
+check("G6 configured command finalizes when it passes", !blocked(g6Pass));
+const g6Plugin = await (defaultExport?.server ?? WorkflowGuard)({ directory: g6Repo, worktree: g6Repo, client: fakeClient as any, project: {} as any, experimental_workspace: {} as any, serverUrl: new URL("http://localhost:4096"), $: undefined as any });
+const g6Status = JSON.parse(String(await g6Plugin.tool?.guard_status?.execute({}, { sessionID: "s-g6", worktree: g6Repo, directory: g6Repo } as any)));
+check(
+	"G6 guard_status reports the configured command and its source",
+	g6Status.projectConfig.verifyCommand === "node -e 'process.exit(0)'" && g6Status.projectConfig.verifyCommandSource === "project-config",
+);
+check(
+	"G6 guard_status reports lastVerify with a timestamp, duration, and commit hash",
+	typeof g6Status.lastVerify?.timestamp === "number" && g6Status.lastVerify.timestamp > 0 &&
+		typeof g6Status.lastVerify?.durationMs === "number" && g6Status.lastVerify.durationMs >= 0 &&
+		typeof g6Status.lastVerify?.commitHash === "string" && g6Status.lastVerify.commitHash.length === 40 &&
+		g6Status.lastVerify?.fresh === true,
+);
+await call("edit", { filePath: join(g6Repo, "code-stale.ts"), content: "stale\n" }, { sessionID: "s-g6" });
+const g6StaleStatus = JSON.parse(String(await g6Plugin.tool?.guard_status?.execute({}, { sessionID: "s-g6", worktree: g6Repo, directory: g6Repo } as any)));
+check("G6 lastVerify goes not-fresh after a later mutation", g6StaleStatus.lastVerify?.fresh === false);
+writeFileSync(join(g6Repo, ".opencode", "workflow-guard.json"), JSON.stringify({ verifyCommand: "node -e 'process.exit(1)'" }));
+reloadProjectConfig(g6Repo);
+resetVerifyState();
+todo("s-g6-fail", item("g6 failing verification", "in_progress"));
+await call("edit", { filePath: join(g6Repo, "code-fail.ts"), content: "fail\n" }, { sessionID: "s-g6-fail" });
+const g6Fail = await call("todowrite", { todos: [item("g6 failing verification", "completed")] }, { sessionID: "s-g6-fail" });
+check("G6 a deliberately failing configured command blocks finalization", blocked(g6Fail) && String(g6Fail).includes("verification"));
+if (prevG6VerifyEnv !== undefined) process.env.WORKFLOW_GUARD_VERIFY = prevG6VerifyEnv;
+rmSync(g6Repo, { recursive: true, force: true });
+reloadProjectConfig(verifyRepo);
+setWorkspaceRoot(verifyRepo);
+resetVerifyState();
+
 // Ecosystem verification detection
 const rustRepo = mkdtempSync(join(tmpdir(), "wg-rust-"));
 writeFileSync(join(rustRepo, "Cargo.toml"), "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n");
@@ -3738,6 +3791,14 @@ check(
 	autoDetectStatus.projectConfig.configPath === null && autoDetectStatus.projectConfig.verifyCommand === "npm test" && autoDetectStatus.projectConfig.verifyCommandSource === "auto-detected",
 );
 check("verifyCommandSource reports project config directly", verifyCommandSource(requirementsRoot) === "project-config" && verifyCommandSource(autoDetectRoot) === "auto-detected" && verifyCommandSource(noConfigRoot) === null);
+const prevStatusVerifyEnv = process.env.WORKFLOW_GUARD_VERIFY;
+process.env.WORKFLOW_GUARD_VERIFY = "node -e 'process.exit(0)'";
+check(
+	"verify command resolution puts the environment ahead of project config and detection",
+	verifyCommandSource(requirementsRoot) === "environment" && detectVerifyCommand(requirementsRoot) === "node -e 'process.exit(0)'",
+);
+if (prevStatusVerifyEnv === undefined) delete process.env.WORKFLOW_GUARD_VERIFY;
+else process.env.WORKFLOW_GUARD_VERIFY = prevStatusVerifyEnv;
 check("existingProjectConfigPath returns null-ish for a repo without config", existingProjectConfigPath(noConfigRoot) === undefined);
 rmSync(noConfigRoot, { recursive: true, force: true });
 rmSync(autoDetectRoot, { recursive: true, force: true });
@@ -4291,6 +4352,14 @@ const strictSubagentResult = await strictPlugin.tool?.record_review?.execute(
 check("strict mode: subagent recorder records the approval", typeof strictSubagentResult === "string" && strictSubagentResult.includes("APPROVED"));
 const strictStatusAfterSubagent = JSON.parse(String(await strictPlugin.tool?.guard_status?.execute({ directory: strictRepo }, { sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any)));
 check("strict mode: subagent approval satisfies the review gate", !strictStatusAfterSubagent.outstandingRequirements.includes("review") && strictStatusAfterSubagent.lastReview?.fresh === true);
+check(
+	"strict mode: guard_status attributes the approval to the subagent recorder, not its parent",
+	strictStatusAfterSubagent.lastReview?.recorderRole === "subagent" &&
+		strictStatusAfterSubagent.lastReview?.recorderSessionID === "s-strict-reviewer" &&
+		strictStatusAfterSubagent.lastReview?.targetSessionID === "s-strict-root" &&
+		strictStatusAfterSubagent.lastReview?.recorderSessionID !== strictStatusAfterSubagent.lastReview?.targetSessionID &&
+		typeof strictStatusAfterSubagent.lastReview?.timestamp === "number",
+);
 const strictPrAfterSubagent = JSON.parse(String(await strictPlugin.tool?.guard_why?.execute(strictPrProbe, { sessionID: "s-strict-root", worktree: strictRepo, directory: strictRepo } as any)));
 check("strict mode: PR preflight passes after subagent-recorded approval", strictPrAfterSubagent.status !== "blocked" && (strictPrAfterSubagent.status === "allowed" || strictPrAfterSubagent.code === "remote_state_unchecked"));
 if (strictPrAfterSubagent.status === "blocked") console.log("   blocked:", strictPrAfterSubagent.message);
@@ -4707,7 +4776,7 @@ todo("s-wt-mismatch", item("edit in the linked worktree", "in_progress"));
 const mismatchWrite = await call("write", { filePath: join(wtLinked, "mismatch.ts"), content: "x" }, { sessionID: "s-wt-mismatch", worktree: wtRepo, directory: wtRepo });
 check(
 	"an edit into a linked worktree names the worktree mismatch and the move",
-	blocked(mismatchWrite) && String(mismatchWrite).includes(wtLinked) && String(mismatchWrite).includes("session_move"),
+	blocked(mismatchWrite) && String(mismatchWrite).includes(wtLinked) && String(mismatchWrite).includes(wtRepo) && String(mismatchWrite).includes("session_move"),
 );
 
 // An in-command `cd` moves the tree later segments run in, so the walk has to
