@@ -50,15 +50,15 @@
     "prepublishOnly": "npm run typecheck"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "1.19.4",
-    "@opencode/ai": "2.2.0",
-    "@opencode/plugin": "2.2.0",
-    "@opentui/solid": "0.7.0",
+    "@opencode-ai/plugin": "1.19.5",
+    "@opencode/ai": "2.2.5",
+    "@opencode/plugin": "2.2.5",
+    "@opentui/solid": "0.8.1",
     "jsonc-parser": "3.3.1"
   },
   "devDependencies": {
     "@changesets/cli": "3.0.3",
-    "@types/node": "26.6.5",
+    "@types/node": "26.6.6",
     "typescript": "7.0.2"
   },
   "overrides": {
