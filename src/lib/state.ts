@@ -461,6 +461,7 @@ export function recordReviewResult(
 	passed: boolean,
 	targetSessionID?: string,
 	workspace?: string,
+	recorder?: { sessionID?: string; role?: "root" | "subagent" },
 ): ReviewResult {
 	const root = projectRootKey(workspace ?? getWorkspaceRoot());
 	lastReview = {
@@ -469,6 +470,8 @@ export function recordReviewResult(
 		passed,
 		timestamp: Date.now(),
 		targetSessionID,
+		recorderSessionID: recorder?.sessionID,
+		recorderRole: recorder?.role,
 		workspace: root,
 		commitHash: getCurrentGitCommitHash(root),
 		gitStatus: getGitStatusSummary(root),
