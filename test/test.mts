@@ -2594,8 +2594,9 @@ check(
 	g6Status.projectConfig.verifyCommand === "node -e 'process.exit(0)'" && g6Status.projectConfig.verifyCommandSource === "project-config",
 );
 check(
-	"G6 guard_status reports lastVerify with a timestamp and commit hash",
+	"G6 guard_status reports lastVerify with a timestamp, duration, and commit hash",
 	typeof g6Status.lastVerify?.timestamp === "number" && g6Status.lastVerify.timestamp > 0 &&
+		typeof g6Status.lastVerify?.durationMs === "number" && g6Status.lastVerify.durationMs >= 0 &&
 		typeof g6Status.lastVerify?.commitHash === "string" && g6Status.lastVerify.commitHash.length === 40 &&
 		g6Status.lastVerify?.fresh === true,
 );
