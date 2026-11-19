@@ -41,6 +41,12 @@ export interface ProjectConfig {
 	protectedBranches?: string[];
 	verifyCommand?: string;
 	verifyTimeoutMs?: number;
+	/**
+	 * File-claim expiry. A claim older than this cannot belong to an in-flight
+	 * tool call, so a leaked claim from an ended session is released and audited
+	 * instead of blocking every other session. Defaults to 5 minutes.
+	 */
+	claimTtlMs?: number;
 	postEditValidators?: Array<{
 		pattern: string;
 		command: string;
@@ -222,6 +228,8 @@ export interface AuditEntry {
 		targetPath?: string;
 		/** Owner of a released stale file claim (stale_claim_takeover audits). */
 		claimOwnerSessionID?: string;
+		/** Age of a TTL-expired file claim, in milliseconds (claim_ttl_expired audits). */
+		claimAgeMs?: number;
 		verification?: {
 			command: string;
 			passed: boolean;

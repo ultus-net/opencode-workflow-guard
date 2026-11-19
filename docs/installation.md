@@ -231,6 +231,8 @@ Workflow Guard enforces secondary review approval (`requireReview`) by default d
 
 The recorded verdict binds to the reviewed repository content: the commit hash and the tracked-content worktree fingerprint of the directory it was recorded against. The PR preflight accepts any approval whose binding matches the tree the PR would publish. A review recorded by a subagent rooted in a linked git worktree therefore satisfies a `pr create` run from that worktree. That holds even from a different session than the one that spawned the reviewer. Review freshness is scoped to tracked content. Deleting an untracked scratch file does not invalidate an approval, and any tracked edit or new commit does. Reviewer agents are frequently configured with read-only toolsets that exclude `record_review`. The tool therefore accepts recorders of any session type and binds the verdict to the recording session's directory. The audit trail records who recorded it and where it is bound.
 
+`record_review` is registered for every session, independent of `requireReview`. A host with a per-agent permission list can still withhold the call, and an agent that starts from a deny-all list must carry its own explicit allow for `record_review`. The guard cannot widen host permissions, so `guard_status` reporting the gate as required proves nothing about a given reviewer's toolset. Grant the tool in that agent's definition, or relay the verdict through a session that already has it.
+
 To opt out of the PR secondary review gate for a project, set `requireReview: false` in `.opencode/workflow-guard.json`:
 
 ```json
@@ -242,6 +244,20 @@ To opt out of the PR secondary review gate for a project, set `requireReview: fa
 Or set `WORKFLOW_GUARD_REQUIRE_REVIEW=0` in your environment. Conversely, `WORKFLOW_GUARD_REQUIRE_REVIEW=1` enforces the review gate regardless of repository configuration.
 
 For stricter environments, set `requireSubagentReview: true` in `.opencode/workflow-guard.json`. That setting rejects approvals recorded by the root session itself. A passing verdict must then be recorded from a subagent session, which is one with a parent session. The root session can never approve its own work. Changes-requested findings remain relayable from any session. `WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=1` enables the same requirement for any project. `WORKFLOW_GUARD_REQUIRE_SUBAGENT_REVIEW=0` disables it even when project config enables it.
+
+---
+
+## File-Claim Expiry
+
+Direct edits claim each file for the tool-call lifetime so two sessions cannot race it. A leaked claim is reclaimed by two audited rules: the owner's recorded idle timestamp, and a claim TTL. The TTL covers a deleted session or a server restart, where the owner record cannot be read at all. It defaults to five minutes. Set `claimTtlMs` to raise or lower it:
+
+```json
+{
+  "claimTtlMs": 600000
+}
+```
+
+`WORKFLOW_GUARD_CLAIM_TTL_MS` wins over project config. A non-positive or unparseable value falls back to the default, so a typo cannot disable expiry. A reclaim is journaled as `claim_ttl_expired` with the owner and claim age.
 
 ---
 

@@ -53,6 +53,25 @@ export function detectVerifyCommand(root: string): string | undefined {
 	return undefined;
 }
 
+export type VerifyCommandSource = "environment" | "project-config" | "auto-detected" | null;
+
+/**
+ * Where `detectVerifyCommand` got its answer.
+ *
+ * The effective command alone cannot tell an operator which lever to move. A
+ * project that reports `verifyCommand` with no project config is running the
+ * auto-detected command, and a null means no command is configured or
+ * detectable at all.
+ */
+export function verifyCommandSource(root: string): VerifyCommandSource {
+	if (process.env.WORKFLOW_GUARD_VERIFY !== undefined) {
+		return process.env.WORKFLOW_GUARD_VERIFY.trim() ? "environment" : null;
+	}
+	const configured = getProjectConfig(root).verifyCommand;
+	if (typeof configured === "string" && configured.trim()) return "project-config";
+	return detectVerifyCommand(root) ? "auto-detected" : null;
+}
+
 /**
  * Truncates and snips verification stdout/stderr for token efficiency.
  * When a test suite or compiler passes, verbose log lines are trimmed to a

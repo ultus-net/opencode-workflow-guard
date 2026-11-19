@@ -107,7 +107,9 @@ import {
 	resolveSessionBoundWorkspace,
 	resolveEffectiveWorkspace,
 } from "./lib/state.ts";
-import { findGitRoot, isSameGitRepo, loadProjectConfig, reloadProjectConfig, stripJsonComments } from "./lib/project-config.ts";
+import { existingProjectConfigPath, findGitRoot, isSameGitRepo, loadProjectConfig, reloadProjectConfig, stripJsonComments } from "./lib/project-config.ts";
+
+export { existingProjectConfigPath };
 
 export {
 	setWorkspaceRoot,
@@ -247,6 +249,7 @@ import {
 	getGitStatusSummary,
 	getGitWorktreeFingerprint,
 	getTrackedWorktreeFingerprint,
+	verifyCommandSource,
 } from "./lib/verify.ts";
 
 export {
@@ -258,6 +261,7 @@ export {
 	getGitStatusSummary,
 	getGitWorktreeFingerprint,
 	getTrackedWorktreeFingerprint,
+	verifyCommandSource,
 };
 export type { VerifyRun } from "./lib/verify.ts";
 
@@ -348,6 +352,14 @@ export { isProtectedPath };
 import { isSecretPath, secretIn, isEnvFilePath, generateMaskedEnvSchema } from "./policies/secrets.ts";
 
 export { isSecretPath, isEnvFilePath, generateMaskedEnvSchema };
+
+import { isAllowedScratchTarget } from "./policies/boundary.ts";
+
+export { isAllowedScratchTarget, OPENCODE_SCRATCH_DIR };
+
+import { DEFAULT_FILE_CLAIM_TTL_MS, fileClaimTtlMs } from "./policies/file-claims.ts";
+
+export { DEFAULT_FILE_CLAIM_TTL_MS, fileClaimTtlMs };
 
 import {
 	extractInterpreterPayload,

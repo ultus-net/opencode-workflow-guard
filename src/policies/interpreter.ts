@@ -154,7 +154,11 @@ const WRITE_TARGET_PATTERNS: RegExp[] = [
  * workspace root) initiated from inline interpreter payloads. Extracts destination
  * file arguments from file-writing APIs and shell redirects.
  */
-export function outsideWritePathInPayload(payload: string, root: string): string | undefined {
+export function outsideWritePathInPayload(
+	payload: string,
+	root: string,
+	isAllowed: (candidate: string) => boolean = () => false,
+): string | undefined {
 	const candidates = new Set<string>();
 
 	for (const pattern of WRITE_TARGET_PATTERNS) {
@@ -166,7 +170,7 @@ export function outsideWritePathInPayload(payload: string, root: string): string
 
 	for (const candidate of candidates) {
 		if (/^\/dev\/(?:null|stdout|stderr|tty|fd\/\d+)$/.test(candidate)) continue;
-		if (isPathOutsideWorkspace(candidate, root)) {
+		if (isPathOutsideWorkspace(candidate, root) && !isAllowed(candidate)) {
 			return candidate;
 		}
 	}
