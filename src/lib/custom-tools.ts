@@ -44,7 +44,7 @@ import { todoEvidenceReport } from "../policies/todo.ts";
 import { existingProjectConfigPath, findGitRoot, loadProjectConfig, projectRootKey } from "./project-config.ts";
 import { detectVerifyCommand, getCurrentGitCommitHash, getGitWorktreeFingerprint, getTrackedWorktreeFingerprint, verifyCommandSource } from "./verify.ts";
 import { evaluateDogfoodGate } from "./dogfood.ts";
-import { buildReviewRubric } from "./review.ts";
+import { buildReviewRubric, type RubricProvenance } from "./review.ts";
 import { createGitWorktree, cleanupGitWorktree, validateHostWorktreeDirectory } from "./worktree.ts";
 import type { HostWorktreePort } from "./host-worktree.ts";
 import { branchHasDocumentationChange } from "../policies/docs.ts";
@@ -94,7 +94,7 @@ export function buildWorkflowGuardSystemGuidance(options: {
 
 	if (!options.isReadOnly) {
 		sections.push(
-			"- Review & Verification: Before completing tasks or creating PRs, run tests to produce fresh verification evidence, retrieve the review rubric via `guard_review_rubric` (5 core axes: test integrity, task completeness, cleanliness, security, platform), and spawn a reviewer subagent via `task` that records its verdict with `record_review`.",
+			"- Review & Verification: Before completing tasks or creating PRs, run tests to produce fresh verification evidence, retrieve the review rubric via `guard_review_rubric` (5 core axes: test integrity, task completeness, cleanliness, security, platform), and spawn a reviewer subagent via `task`. The calling session records that subagent's verdict with `record_review`: a reviewer agent's own toolset may not carry the tool, so the caller owns the record.",
 			"- Worktree Isolation: When orchestrating parallel subagent tasks with `task`, call `guard_worktree_create` to prevent concurrent file conflicts, and `guard_worktree_cleanup` when finished.",
 		);
 	}
@@ -352,7 +352,7 @@ export function createCustomTools(options: {
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),
 		guard_why: tool({ description: "Simulate and return the structured policy decision for a specific tool call or command. Proactively use before executing questionable or complex commands to check if they would be blocked by guard policies.", args: { tool: tool.schema.string().describe("Tool name (e.g. bash, edit, write, read, apply_patch)"), input: tool.schema.record(tool.schema.string(), tool.schema.any()).optional().describe("Tool input arguments") }, execute: async (args, toolContext) => JSON.stringify(await runWithRuntimeState(await resolveCallWorkspace(toolContext), client, () => guardToolCallImpl(args.tool, args.input ?? {}, { sessionID: toolContext.sessionID, worktree: toolContext.worktree, directory: toolContext.directory, simulate: true })), null, 2) }),
 		record_review: tool({
-			description: "Record a secondary reviewer agent's approval or critique of the current changes. The summary must reference the 5 core review axes from guard_review_rubric (test integrity, task completeness, cleanliness, security, platform). Projects with requireSubagentReview enabled only accept APPROVALS recorded from a subagent session (one with a parent session), never from the root session itself.",
+			description: "Record a secondary reviewer agent's approval or critique of the current changes. Call it from the session that owns the verdict: a reviewer subagent may not carry this tool at all, because host permissions decide an agent's toolset. The summary must reference the 5 core review axes from guard_review_rubric (test integrity, task completeness, cleanliness, security, platform). Projects with requireSubagentReview enabled only accept APPROVALS recorded from a subagent session (one with a parent session), never from the root session itself.",
 			args: {
 				reviewer: tool.schema.string().describe("Identifier/name of the reviewer subagent"),
 				summary: tool.schema.string().describe("Review findings summary across the 5 core review axes"),
@@ -547,7 +547,7 @@ export function createCustomTools(options: {
 		guard_review_followups: tool({ description: "List durable local P2/P3 review follow-ups (technical debt) for this project. Proactively check during planning or before final verification to address open findings.", args: {}, execute: async () => JSON.stringify(followupStore ? listReviewFollowups(followupStore) : [], null, 2) }),
 		guard_review_followup_resolve: tool({ description: "Resolve a durable local review follow-up after the underlying issue has been fixed and verified.", args: { id: tool.schema.string() }, execute: async (args) => followupStore && resolveReviewFollowup(followupStore, args.id) ? `[workflow-guard] Review follow-up ${args.id} resolved.` : `[workflow-guard] Review follow-up ${args.id} was not open or was not found.` }),
 		guard_review_rubric: tool({
-			description: "Get the secondary-review rubric for the current branch diff across 5 core review axes (test integrity, task completeness, cleanliness, security, platform). The orchestrator should call this before finalizing work or creating a PR, then spawn a reviewer subagent with the rubric as the prompt, which records its verdict via record_review.",
+			description: "Get the secondary-review rubric for a branch diff across 5 core review axes (test integrity, task completeness, cleanliness, security, platform). The orchestrator should call this before finalizing work or creating a PR, then spawn a reviewer subagent with the rubric as the prompt. The calling session records that subagent's verdict with record_review. The rubric's first line names the workspace, base ref, and diff size it graded, so check those describe the change under review; pass directory and/or base when the change lives in another checkout.",
 			args: {
 				base: tool.schema.string().optional().describe("Base ref to diff against (default: origin/main, origin/master, main, master)"),
 				directory: tool.schema.string().optional().describe("Target repository directory (defaults to active session directory or workspace root)"),
@@ -559,11 +559,24 @@ export function createCustomTools(options: {
 				const bases = sanitizedBase ? [sanitizedBase] : ["origin/main", "origin/master", "main", "master"];
 				const rubricWorkspace = await resolveCallWorkspace(toolContext, args?.directory);
 				let diffText = "";
+				let usedBase: string | undefined;
 				// Revision before the trailing `--` (LL-001) so the base ref is
 				// always parsed as a revision, never as a pathspec.
-				for (const base of bases) { const res = spawnSync("git", ["diff", "--no-ext-diff", `${base}...HEAD`, "--"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); if (res.status === 0 && res.stdout.trim()) { diffText = res.stdout; break; } }
-				if (!diffText) { const last = spawnSync("git", ["diff", "--no-ext-diff", "HEAD~1", "--"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); diffText = last.status === 0 ? last.stdout : "(no diff available)"; }
-				return buildReviewRubric(diffText);
+				for (const base of bases) { const res = spawnSync("git", ["diff", "--no-ext-diff", `${base}...HEAD`, "--"], { cwd: rubricWorkspace, encoding: "utf8", timeout: 10_000 }); if (res.status === 0 && res.stdout.trim()) { diffText = res.stdout; usedBase = base; break; } }
+				// No listed base produced a diff. Grading a substitute range
+				// returned a rubric over the wrong change and named nothing, so
+				// refuse instead. HEAD~1 is graded only when the caller asks for
+				// it, and then the provenance line says which range was graded.
+				if (!diffText) {
+					return `[workflow-guard] No review diff found: workspace=${rubricWorkspace} bases=${bases.join(", ")} diff=0 bytes. No rubric was produced. Remedy: pass base: "<ref>" naming the base that holds the change (base: "HEAD~1" grades the last commit), and directory: "<absolute checkout>" when the change lives in another worktree.`;
+				}
+				const provenance: RubricProvenance = {
+					workspace: rubricWorkspace,
+					base: usedBase ?? null,
+					diffBytes: Buffer.byteLength(diffText, "utf8"),
+					fallback: usedBase === "HEAD~1" ? "HEAD~1" : "none",
+				};
+				return buildReviewRubric(diffText, undefined, provenance);
 			},
 		}),
 		guard_worktree_create: tool({
