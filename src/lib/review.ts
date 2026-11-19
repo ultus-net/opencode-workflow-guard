@@ -8,8 +8,32 @@ import {
 
 export { recordReviewResult, getLastReviewResult, resetReviewState, lastReview, sessionReviews };
 
-export function buildReviewRubric(diffText: string, taskPrompt?: string): string {
-	return [
+/**
+ * What a rubric actually graded. A session's own checkout and the checkout
+ * holding the change are not always the same tree, so the rubric must name the
+ * tree it read and the base it compared against.
+ */
+export interface RubricProvenance {
+	/** Absolute workspace root the diff was taken from. */
+	workspace: string;
+	/** Base ref actually used, or null when the rubric was not produced. */
+	base: string | null;
+	/** Bytes in the diff the rubric grades, before its own truncation. */
+	diffBytes: number;
+	/**
+	 * `HEAD~1` when the graded range is the last commit rather than a branch
+	 * base. It says which range was graded, not who asked for it: an explicit
+	 * `base: "HEAD~1"` marks it too, because the range is the same either way.
+	 */
+	fallback: "none" | "HEAD~1";
+}
+
+export function rubricProvenanceLine(provenance: RubricProvenance): string {
+	return `Provenance: workspace=${provenance.workspace} base=${provenance.base ?? "none"} diff=${provenance.diffBytes} bytes fallback=${provenance.fallback}`;
+}
+
+export function buildReviewRubric(diffText: string, taskPrompt?: string, provenance?: RubricProvenance): string {
+	const lines = [
 		"# Secondary Review Agent Quality Gate",
 		"",
 		"Evaluate this code change independently with fresh context across these 5 core axes:",
@@ -47,5 +71,7 @@ export function buildReviewRubric(diffText: string, taskPrompt?: string): string
 		"```",
 		"",
 		"Provide your verdict: `[APPROVE]` or `[REQUEST_CHANGES]` with concise, actionable findings ranked by priority (P0-P3).",
-	].join("\n");
+	];
+	if (provenance) lines.unshift(rubricProvenanceLine(provenance), "");
+	return lines.join("\n");
 }

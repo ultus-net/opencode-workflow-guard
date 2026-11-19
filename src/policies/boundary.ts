@@ -12,7 +12,7 @@ import { isCollaborationInvocation, isProtectedPath, PROTECTED_PATH_REASON } fro
 import { isSecretPath, secretIn } from "./secrets.ts";
 import { isGitTreeWriteText, branchGuardReason, onProtectedBranch, parseGitInvocation } from "./git.ts";
 import { findGitRoot, isSameGitRepo, projectRootKey } from "../lib/project-config.ts";
-import { canonicalPath } from "./file-claims.ts";
+import { canonicalPath, fileClaimConflictReason, releaseStaleFileClaims } from "./file-claims.ts";
 import {
 	effectiveTodos,
 	effectiveTodoOwnerSessionID,
@@ -798,6 +798,23 @@ export async function guardShellMutation(
 		// that no command executes is prose, so its lines are not judged either.
 		const masked = maskDataHeredocBodies(segment);
 		const cleanSegment = isCollaborationInvocation(masked) ? stripQuotedSpans(masked) : masked;
+		// Claims are keyed by canonical absolute path, so a relative or
+		// `~`-relative target is resolved against the tree this segment runs in
+		// before comparing. A provably stale claim is released first, exactly as
+		// the edit path does, so the remedy in the conflict message is reachable
+		// from the shell too. Shell writes never acquire a claim.
+		const claimConflictForTarget = async (candidate: string): Promise<string | undefined> => {
+			if (!sessionID) return undefined;
+			const expanded = expandShellTargetPath(candidate);
+			if (expanded === null) return undefined;
+			const claimPath = resolve(runRoot, expanded);
+			let conflict = fileClaimConflictReason([claimPath], sessionID, runRoot);
+			if (conflict && record) {
+				await releaseStaleFileClaims([claimPath], sessionID, runRoot);
+				conflict = fileClaimConflictReason([claimPath], sessionID, runRoot);
+			}
+			return conflict;
+		};
 		const secretSource = secretSourceInFilesystemCommand(cleanSegment);
 		if (secretSource) {
 			return `Blocked: shell command would copy, move, or link sensitive file '${secretSource}' under a non-secret name.`;
@@ -818,6 +835,10 @@ export async function guardShellMutation(
 					}
 					return `Blocked: mv would remove source '${source}' from outside the workspace root (${workspaceRoot}). File mutations must stay within the workspace.`;
 				}
+				// A move removes its source, so a source another session is
+				// editing is a conflict even though the destination is fine.
+				const sourceConflict = await claimConflictForTarget(source);
+				if (sourceConflict) return sourceConflict;
 			}
 		}
 		const simpleMutations = simpleFilesystemMutations(cleanSegment);
@@ -866,6 +887,13 @@ export async function guardShellMutation(
 			}
 			if (onProtectedBranch(runRoot)) {
 				return branchGuardReason();
+			}
+			// A direct edit claims its target for the tool-call lifetime so two
+			// sessions cannot race it. A shell writer changes the same file, so
+			// the same conflict is refused here, with the same reason.
+			if (target) {
+				const claimConflict = await claimConflictForTarget(target);
+				if (claimConflict) return claimConflict;
 			}
 			const todos = await effectiveTodos(sessionID);
 			if (todos !== undefined && !hasActiveTodo(todos)) {

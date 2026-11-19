@@ -1197,6 +1197,70 @@ try {
 }
 check("blocked multi-target patch leaves no partial claims", !partialPatchClaim);
 
+// A shell write mutates the same path a direct edit claims, and the claim was
+// consulted only in the edit branch: `edit` was refused for a path while a
+// redirect to that same file was allowed at the same moment. A shell write is
+// a conflict check only (it never acquires a claim), so it cannot strand one.
+console.log("- Shell mutation claim conflicts -");
+writeFileSync(join(claimsDir, "shell-target.ts"), "before");
+writeFileSync(join(claimsDir, "shell-multi.ts"), "before");
+writeFileSync(join(claimsDir, "shell-multi2.ts"), "before");
+symlinkSync(join(claimsDir, "shell-target.ts"), join(claimsDir, "shell-target-link.ts"));
+await recordRead(claimsBefore, claimsAfter, "s-claim-a", join(claimsDir, "shell-target.ts"), "claim-shell-read-target");
+await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-shell-owner" }, { args: { filePath: join(claimsDir, "shell-target.ts"), content: "a" } });
+const shellBlockReason = async (command: string): Promise<string> => {
+	try {
+		await claimsBefore?.({ tool: "bash", sessionID: "s-claim-b", callID: "claim-shell-attempt" }, { args: { command } });
+		return "";
+	} catch (error) {
+		return String(error);
+	}
+};
+const shellRedirectReason = await shellBlockReason(`echo x > ${join(claimsDir, "shell-target.ts")}`);
+check("a shell redirect into a claimed path is refused with the claim reason", shellRedirectReason.includes("is claimed by session") && shellRedirectReason.includes("Reclaim step"));
+const shellTeeReason = await shellBlockReason(`printf x | tee -a ${join(claimsDir, "shell-target.ts")}`);
+check("a tee append into a claimed path is refused, with the tee flag parsed", shellTeeReason.includes("is claimed by session"));
+const shellSymlinkReason = await shellBlockReason(`echo x > ${join(claimsDir, "shell-target-link.ts")}`);
+check("a shell write through a symlink alias of a claimed path is refused", shellSymlinkReason.includes("is claimed by session"));
+const shellChainedReason = await shellBlockReason(`cd ${claimsDir} && echo x > shell-target.ts`);
+check("a chained shell write into a claimed path is judged in the tree it lands in", shellChainedReason.includes("is claimed by session"));
+await recordRead(claimsBefore, claimsAfter, "s-claim-a", join(claimsDir, "shell-multi2.ts"), "claim-shell-read-multi");
+await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-shell-multi" }, { args: { filePath: join(claimsDir, "shell-multi2.ts"), content: "a" } });
+const shellMultiReason = await shellBlockReason(`rm ${join(claimsDir, "shell-multi.ts")} ${join(claimsDir, "shell-multi2.ts")}`);
+check("a multi-operand shell mutation is refused when any operand is claimed", shellMultiReason.includes("is claimed by session") && shellMultiReason.includes("shell-multi2.ts"));
+const shellSubagentReason = await (async (): Promise<string> => {
+	fakeParents.set("s-claim-subagent", "s-claim-a");
+	try {
+		await claimsBefore?.({ tool: "bash", sessionID: "s-claim-subagent", callID: "claim-shell-subagent" }, { args: { command: `echo x > ${join(claimsDir, "shell-target.ts")}` } });
+		return "";
+	} catch (error) {
+		return String(error);
+	}
+})();
+check("a subagent shell write into a path its parent claimed is refused", shellSubagentReason.includes("is claimed by session"));
+// mv removes its source, so a claimed source is a conflict even when the
+// destination is unclaimed.
+writeFileSync(join(claimsDir, "shell-move-source.ts"), "before");
+await recordRead(claimsBefore, claimsAfter, "s-claim-a", join(claimsDir, "shell-move-source.ts"), "claim-shell-read-move");
+await claimsBefore?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-shell-move" }, { args: { filePath: join(claimsDir, "shell-move-source.ts"), content: "a" } });
+const shellMoveSourceReason = await shellBlockReason(`mv ${join(claimsDir, "shell-move-source.ts")} ${join(claimsDir, "shell-moved-away.ts")}`);
+check("a mv of a claimed source is refused", shellMoveSourceReason.includes("is claimed by session") && shellMoveSourceReason.includes("shell-move-source.ts"));
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-shell-move", args: {} }, { title: "edit", output: "edited", metadata: {} });
+const shellWhy = JSON.parse(String(await claimsHooks.tool?.guard_why?.execute(
+	{ tool: "bash", input: { command: `echo x > ${join(claimsDir, "shell-target.ts")}` } },
+	{ sessionID: "s-claim-b", worktree: claimsDir, directory: claimsDir } as any,
+)));
+check(
+	"guard_why reports a shell claim conflict as a shell mutation",
+	shellWhy.code === "shell_mutation" && String(shellWhy.message).includes("is claimed by session"),
+);
+const shellUnclaimedReason = await shellBlockReason(`echo x > ${join(claimsDir, "shell-multi.ts")}`);
+check("a shell write to an unclaimed path stays allowed", shellUnclaimedReason === "");
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-shell-owner", args: {} }, { title: "edit", output: "edited", metadata: {} });
+await claimsAfter?.({ tool: "edit", sessionID: "s-claim-a", callID: "claim-shell-multi", args: {} }, { title: "edit", output: "edited", metadata: {} });
+const shellAfterReleaseReason = await shellBlockReason(`echo x > ${join(claimsDir, "shell-target.ts")}`);
+check("a shell write is allowed once the owning edit releases its claim", shellAfterReleaseReason === "");
+
 // Stale claim takeover (missed idle release): a claim created BEFORE its
 // owner's last recorded idle timestamp cannot belong to an in-flight tool
 // call, so a leaked claim must not block another session forever. Owners that
@@ -3980,13 +4044,32 @@ check(
 	typeof p0ReviewResult === "string" && p0ReviewResult.includes("P0 or P1 blockers"),
 );
 
-// The rubric tool emits a real prompt with the current diff
+// The rubric tool emits a real prompt with a real diff. A fixture keeps this
+// independent of the checkout the suite runs in: once no base yields a diff the
+// tool now refuses instead of grading a substitute, so an ambient checkout with
+// nothing to review would assert the wrong thing.
 check("plugin registers guard_review_rubric tool", typeof customPlugin.tool?.guard_review_rubric?.execute === "function");
-const rubricOut = await customPlugin.tool?.guard_review_rubric?.execute({}, {} as any);
+const rubricAxesRepo = join(root, "wg-review-rubric-axes");
+mkdirSync(rubricAxesRepo, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: rubricAxesRepo });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: rubricAxesRepo });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: rubricAxesRepo });
+writeFileSync(join(rubricAxesRepo, "axes.txt"), "base\n");
+spawnSync("git", ["add", "axes.txt"], { cwd: rubricAxesRepo });
+spawnSync("git", ["commit", "-m", "base"], { cwd: rubricAxesRepo });
+spawnSync("git", ["switch", "-c", "feature/rubric-axes"], { cwd: rubricAxesRepo });
+writeFileSync(join(rubricAxesRepo, "axes.txt"), "base\nchange\n");
+spawnSync("git", ["add", "axes.txt"], { cwd: rubricAxesRepo });
+spawnSync("git", ["commit", "-m", "change"], { cwd: rubricAxesRepo });
+const rubricOut = await customPlugin.tool?.guard_review_rubric?.execute(
+	{ base: "main", directory: rubricAxesRepo },
+	{ sessionID: "s-rubric-axes", worktree: rubricAxesRepo, directory: rubricAxesRepo } as any,
+);
 check(
 	"guard_review_rubric returns the rubric with axes",
 	typeof rubricOut === "string" && rubricOut.includes("Test Integrity") && rubricOut.includes("Code Diff Under Review"),
 );
+rmSync(rubricAxesRepo, { recursive: true, force: true });
 const rubricOptionFlag = await customPlugin.tool?.guard_review_rubric?.execute({ base: "--output=injected" }, {} as any);
 check("guard_review_rubric sanitizes option flags in base ref", typeof rubricOptionFlag === "string" && !existsSync(join(root, "injected")));
 
@@ -4044,6 +4127,94 @@ check(
 	typeof rubricFallthrough === "string" && rubricFallthrough.includes("diff --git") && rubricFallthrough.includes("fallthrough.txt") && rubricFallthrough.includes("branch marker") && !rubricFallthrough.includes("uncommitted worktree edit"),
 );
 rmSync(rubricNoOrigin, { recursive: true, force: true });
+
+// Provenance: the rubric must name the tree it graded. A session whose own
+// checkout holds unrelated work must be able to grade a linked worktree, and
+// the rubric must say which workspace and base it read. Before this fix the
+// tool returned a rubric over whichever tree it happened to resolve and named
+// neither, so a real review was graded against the wrong diff.
+const rubricWtPrimary = join(root, "wg-rubric-wt-primary");
+mkdirSync(rubricWtPrimary, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: rubricWtPrimary });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: rubricWtPrimary });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: rubricWtPrimary });
+writeFileSync(join(rubricWtPrimary, "seed.txt"), "base\n");
+spawnSync("git", ["add", "seed.txt"], { cwd: rubricWtPrimary });
+spawnSync("git", ["commit", "-m", "base"], { cwd: rubricWtPrimary });
+// The session's own checkout carries unrelated work. Judging THIS tree would
+// put primaryOnlyMarker in the rubric instead of the worktree's change.
+spawnSync("git", ["switch", "-c", "feature/primary-unrelated"], { cwd: rubricWtPrimary });
+writeFileSync(join(rubricWtPrimary, "primary-only.txt"), "primaryOnlyMarker\n");
+spawnSync("git", ["add", "primary-only.txt"], { cwd: rubricWtPrimary });
+spawnSync("git", ["commit", "-m", "unrelated primary work"], { cwd: rubricWtPrimary });
+const rubricWtLinked = join(root, "wg-rubric-wt-linked");
+spawnSync("git", ["worktree", "add", "-q", "-b", "feature/wt-under-review", rubricWtLinked, "main"], { cwd: rubricWtPrimary });
+writeFileSync(join(rubricWtLinked, "worktree-change.txt"), "worktreeOnlyMarker\n");
+spawnSync("git", ["add", "worktree-change.txt"], { cwd: rubricWtLinked });
+spawnSync("git", ["commit", "-m", "worktree change under review"], { cwd: rubricWtLinked });
+const rubricWtRoot = String(spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: rubricWtLinked, encoding: "utf8" }).stdout).trim();
+const rubricWtDiff = String(spawnSync("git", ["diff", "--no-ext-diff", "main...HEAD", "--"], { cwd: rubricWtLinked, encoding: "utf8" }).stdout);
+const rubricWtOut = await customPlugin.tool?.guard_review_rubric?.execute(
+	{ directory: rubricWtLinked },
+	{ sessionID: "s-rubric-wt", worktree: rubricWtPrimary, directory: rubricWtPrimary } as any,
+);
+check(
+	"guard_review_rubric grades the requested worktree and names it in the provenance line",
+	typeof rubricWtOut === "string" &&
+		rubricWtOut.includes(`Provenance: workspace=${rubricWtRoot} base=main `) &&
+		rubricWtOut.includes(`diff=${Buffer.byteLength(rubricWtDiff, "utf8")} bytes`) &&
+		rubricWtOut.includes("worktreeOnlyMarker") &&
+		!rubricWtOut.includes("primaryOnlyMarker"),
+);
+
+// No matching base: refuse. The old code ran `git diff HEAD~1` and printed a
+// rubric over that substitute, so the caller got a confident review of the
+// wrong range with no indication that its base was never found.
+const rubricNoBase = join(root, "wg-rubric-no-base");
+mkdirSync(rubricNoBase, { recursive: true });
+spawnSync("git", ["init", "-b", "main"], { cwd: rubricNoBase });
+spawnSync("git", ["config", "user.email", "test@test.local"], { cwd: rubricNoBase });
+spawnSync("git", ["config", "user.name", "Test Runner"], { cwd: rubricNoBase });
+writeFileSync(join(rubricNoBase, "seed.txt"), "base\n");
+spawnSync("git", ["add", "seed.txt"], { cwd: rubricNoBase });
+spawnSync("git", ["commit", "-m", "base"], { cwd: rubricNoBase });
+writeFileSync(join(rubricNoBase, "last-commit.txt"), "substituteMarker\n");
+spawnSync("git", ["add", "last-commit.txt"], { cwd: rubricNoBase });
+spawnSync("git", ["commit", "-m", "last commit"], { cwd: rubricNoBase });
+const rubricNoBaseRoot = String(spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: rubricNoBase, encoding: "utf8" }).stdout).trim();
+const rubricNoBaseOut = await customPlugin.tool?.guard_review_rubric?.execute(
+	{ directory: rubricNoBase },
+	{ sessionID: "s-rubric-no-base", worktree: rubricNoBase, directory: rubricNoBase } as any,
+);
+check(
+	"guard_review_rubric refuses when no base yields a diff instead of grading a substitute",
+	typeof rubricNoBaseOut === "string" &&
+		rubricNoBaseOut.includes("No review diff found") &&
+		rubricNoBaseOut.includes(`workspace=${rubricNoBaseRoot}`) &&
+		rubricNoBaseOut.includes("bases=origin/main, origin/master, main, master") &&
+		rubricNoBaseOut.includes("Remedy") &&
+		!rubricNoBaseOut.includes("substituteMarker") &&
+		!rubricNoBaseOut.includes("Code Diff Under Review"),
+);
+
+// HEAD~1 is graded only when the caller asks for it, and the provenance line
+// says which range was graded so a reader can tell it is the last commit.
+const rubricHead1Out = await customPlugin.tool?.guard_review_rubric?.execute(
+	{ base: "HEAD~1", directory: rubricNoBase },
+	{ sessionID: "s-rubric-head1", worktree: rubricNoBase, directory: rubricNoBase } as any,
+);
+check(
+	"an explicit HEAD~1 base is honored and named in the provenance line",
+	typeof rubricHead1Out === "string" &&
+		rubricHead1Out.includes("base=HEAD~1") &&
+		rubricHead1Out.includes("fallback=HEAD~1") &&
+		rubricHead1Out.includes("substituteMarker") &&
+		rubricHead1Out.includes("Code Diff Under Review"),
+);
+rmSync(rubricNoBase, { recursive: true, force: true });
+spawnSync("git", ["worktree", "remove", "--force", rubricWtLinked], { cwd: rubricWtPrimary });
+rmSync(rubricWtLinked, { recursive: true, force: true });
+rmSync(rubricWtPrimary, { recursive: true, force: true });
 
 // Reviewer-type agents often lack record_review in their toolset entirely, so
 // the tool accepts recorders of any session type: the verdict binds to the
@@ -6580,6 +6751,16 @@ check("tool.definition todowrite enriches with planning and status guidance", to
 const systemOutput = { system: ["Base system prompt"] };
 await defPlugin["experimental.chat.system.transform"]?.({ model: { id: "gemini-flash" } as any }, systemOutput);
 check("experimental.chat.system.transform adds workflow guard guidance", systemOutput.system.length === 2 && systemOutput.system[1].includes("## Workflow Guard & Operational Tools") && systemOutput.system[1].includes("guard_next_tasks") && systemOutput.system[1].includes("guard_review_rubric"));
+// A reviewer agent that denies every action does not carry record_review, so
+// the injected instruction must name the calling session as the recorder. The
+// old text told the subagent to record its own verdict, which the fleet
+// reviewer could not do.
+check(
+	"injected guidance names the calling session as the review recorder",
+	systemOutput.system[1].includes("The calling session records that subagent's verdict") &&
+		systemOutput.system[1].includes("may not carry the tool") &&
+		!systemOutput.system[1].includes("that records its verdict with `record_review`"),
+);
 const systemOutputIdem = { system: [...systemOutput.system] };
 await defPlugin["experimental.chat.system.transform"]?.({ model: { id: "gemini-flash" } as any }, systemOutputIdem);
 check("experimental.chat.system.transform is idempotent", systemOutputIdem.system.length === 2);
