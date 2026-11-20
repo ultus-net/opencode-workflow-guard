@@ -369,25 +369,39 @@ tamper-evident (hash-chained admission).
 
 - **eval job path:** none. Deterministic verifier, no model in the loop.
 
-- **result (appended after the evaluation run):** GAIN. The five legacy
-  false-positive probes pass (`cp FROM`, `cp FROM` with a `2>/dev/null`
-  redirect, a multi-source `cp` with one guarded source, `ln -s FROM`, and
-  `cp -s FROM`). Restoring the `origin/main` source makes exactly those five
-  fail (1769 passed, 5 failed) and leaves the thirteen true-positive probes
-  green in both directions, which is the pre-change control. The full suite is
-  1774 passed, 0 failed, and `npm run typecheck` is clean. Fact-mode assertions
-  are unchanged. A residual, fail-closed limitation is recorded: `cp -tDIR src`
-  parses the attached short value, while a copy whose destination cannot be
-  identified (one operand) keeps the broad match.
+- **result (appended after the evaluation run):** GAIN. Six legacy allowance
+  probes pass: `cp FROM`, `cp FROM` with a `2>/dev/null` redirect, a
+  multi-source `cp` with one guarded source, `ln -s FROM`, `ln -sfn FROM`, and
+  `cp -s FROM`. Restoring the `origin/main` source makes eight checks fail
+  (1776 passed, 8 failed). Six are those allowance probes. The other two are
+  destination probes that expose a pre-existing hole, recorded below. Every
+  remaining blocked-direction probe is green on both trees, which is the
+  pre-change control. The full suite is 1784 passed, 0 failed, and
+  `npm run typecheck` is clean. Fact-mode assertions are unchanged. A residual,
+  fail-closed limitation is recorded: `cp -tDIR src` parses the attached short
+  value, while a copy whose destination cannot be identified (one operand)
+  keeps the broad match.
 
-- **review-driven amendment (recorded before the PR):** the registered rule
+- **review-driven amendment 1 (recorded before the PR):** the registered rule
   (d) said "`ln` from a guarded path is allowed". That was too broad. A hard
   link is a second writable name for the guarded inode, so a later write to the
   workspace link would mutate the guarded file, and the realpath-based
-  protected-path check cannot see it. The allowance is narrowed to symbolic
-  links: `ln -s`, `cp -s`, and `cp --symbolic-link` are reads, while `ln`
+  protected-path check cannot see it. The accepted result therefore changes the
+  registered `ln` scope from a blanket allowance to a symbolic-link-only
+  allowance: `ln -s`, `cp -s`, and `cp --symbolic-link` are reads, while `ln`
   without `-s`, `cp -l`, and `cp --link` keep the broad any-operand match. The
   tests cover both directions, and the docs and changeset name the carve-out.
+
+- **review-driven amendment 2 (a pre-existing hole, not a regression):** the
+  reviewer asked for proof that a guarded destination cannot hide around an fd
+  duplication. It could. `isSettingsTamper` split on `&`, so
+  `cp src 2>&1 <guarded>` became `cp src 2>` plus `1 <guarded>`, and the second
+  fragment had no verb to match. The base tree allows that command, so the hole
+  predates this change. `isSettingsTamper` now drops `N>&M` and `N>&-` before
+  segmenting, because a descriptor duplication or close never names a write
+  target. A word after `>&` that is not a descriptor is kept, because bash reads
+  it as a file redirect. Two true-positive probes cover it, and both fail on
+  the base tree.
 
 - **keep/revert:** keep.
 

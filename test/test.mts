@@ -8236,6 +8236,16 @@ check("legacy: cp with a guarded source and destination is still blocked", block
 check("legacy: cp INTO a guarded path with a redirect is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md 2>/dev/null`)));
 check("legacy: cp -t a guarded directory is still blocked", blocked(await legacyCpFrom(`cp -t ${livePlane}/agent ./draft.md`)));
 check("legacy: cp --target-directory=a guarded directory is still blocked", blocked(await legacyCpFrom(`cp --target-directory=${livePlane}/agent ./draft.md`)));
+check("legacy: a multi-source cp into a guarded directory is still blocked", blocked(await legacyCpFrom(`cp ./a.md ./b.md ${livePlane}/agent`)));
+check("legacy: a wrapped cp into a guarded path is still blocked", blocked(await legacyCpFrom(`env FOO=1 cp ./draft.md ${livePlane}/agent/x.md`)));
+check("legacy: command-prefixed cp into a guarded path is still blocked", blocked(await legacyCpFrom(`command cp ./draft.md ${livePlane}/agent/x.md`)));
+check("legacy: fd duplication after a guarded cp destination is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md 2>&1`)));
+check("legacy: fd duplication before a guarded cp destination is still blocked", blocked(await legacyCpFrom(`cp ./draft.md 2>&1 ${livePlane}/agent/x.md`)));
+check("legacy: a discarded redirect before a guarded cp destination is still blocked", blocked(await legacyCpFrom(`cp ./draft.md >/dev/null 2>&1 ${livePlane}/agent/x.md`)));
+check("legacy: fd duplication does not mask a guarded redirect", blocked(await legacyCpFrom(`echo x 2>&1 > ${livePlane}/agent/x.md`)));
+check("legacy: fd duplication with no guarded path is allowed", !blocked(await legacyCpFrom(`cp ./draft.md ./copy.md 2>&1`)));
+check("legacy: ln -sfn FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`ln -sfn ${livePlane}/agent/x.md ./draft-link.md`)));
+check("legacy: install -d -t a guarded directory is still blocked", blocked(await legacyCpFrom(`install -d -t ${livePlane}/plugins ./build`)));
 check("legacy: ln INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`ln -s ./draft-link.md ${livePlane}/agent/x.md`)));
 check("legacy: install -d a guarded directory is still blocked", blocked(await legacyCpFrom(`install -d ${livePlane}/plugins`)));
 check("legacy: install -d a workspace directory is allowed", !blocked(await legacyCpFrom(`install -d ./build/out`)));
