@@ -43,12 +43,12 @@ WORKFLOW_GUARD_LIVE_E2E=1 npm run test:install # Also run policy probes with Ope
 
 ## Core Guardrails Overview
 
-The plugin enforces **27 deterministic policy rules** across four main pillars:
+The plugin enforces **28 deterministic policy rules** across four main pillars:
 
 * **Branch & History Protection:** Enforces feature-branch workflows and blocks edits and commits on `main`/`master`. Direct and forced pushes to protected branches are hard-blocked. The guard checks mergeability before PR creation, requires secondary review approval bound to the reviewed worktree content, and requires a PR changelog or changeset. An opt-in dogfood gate can additionally require a recorded run of the change on real hardware before a PR opens. Verdicts follow the tree the command actually runs in: git parsing takes the shell's `workdir` as its base, an in-command `cd`/`pushd`/`popd` and a wrapper `-C`/`-D` move the tree later segments are judged in, and a nested interpreter payload is judged by its own `cd` or `cwd` option. A linked worktree of the same repository is judged rather than boundary-blocked, a PR preflight resolves `--head`/`--source-branch` to the checkout holding that branch, and the V2 permission seat defers cwd-dependent commands to `execute.before` instead of judging the session-bound checkout. A `workdir` in a different repository is not judged: mutations and git writes there are blocked, because relative targets would be validated against the wrong tree.
 * **Task & Verification Discipline:** Gates file mutations on active `todowrite` tasks, which subagents inherit. A task can be marked completed only after its own recorded work. Review and investigation tasks use an audited `[read-only]` marker instead. The guard also blocks concurrent direct edits to the same canonical file across sessions. It requires a same-session fresh read before `edit`/`write` can replace an existing file. Silent task deletion is blocked, and task completion requires fresh test verification evidence. Completion claims and sweeping repository claims are journaled against their evidence. Repeated failures force a live-documentation lookup instead of a guess from training data.
 * **Secrets & Workspace Confinement:** Confines edit tools and recognized shell/git mutations to the workspace root, including symlink and `../` escape checks. Agent subshells have sensitive environment variables scrubbed, and `.env` reads return a safe schema mask. Arbitrary executables are not OS-sandboxed. Use containers or filesystem isolation when hard confinement is required.
-* **Destructive CLI & Environment Safety:** Intercepts destructive cloud, database, and infrastructure commands. Stops script laundering and interpreter evasion, blocks TTY hangs such as `vim`, `nano`, and `sudo`, and guards against dangerous package manager flags.
+* **Destructive CLI, Delegation & Environment Safety:** Intercepts destructive cloud, database, and infrastructure commands. Stops script laundering and interpreter evasion, blocks TTY hangs such as `vim`, `nano`, and `sudo`, and guards against dangerous package manager flags. It also refuses a shell-spawned agent CLI (`claude`, `codex`, `gemini`, `aider`, `opencode run`), because a spawned agent runs outside the guard's hooks; the host's `task` tool is the governed path to a subagent.
 
 For complete policy specifications and override rules, see [docs/policies.md](docs/policies.md).
 
@@ -74,7 +74,7 @@ The context modules are project memory, Socratic learning, and recovery checkpoi
 
 | Guide | Description |
 |---|---|
-| [**Policy Reference**](docs/policies.md) | Specification of all 27 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
+| [**Policy Reference**](docs/policies.md) | Specification of all 28 enforced policies, invariants, and the proactive tool surface (`guard_*`, `project_memory_*`, `learning_*`) |
 | [**Installation & Configuration**](docs/installation.md) | Setup options, global and local install, worktree isolation, and project configuration |
 | [**Static Policy Posture**](docs/policy-posture.md) | How the guard emits host-level policies for invariants a repository cannot lift. Covers both host envelopes (`experimental.policies` on 2.0.x, top-level `policies` on 2.1.x), precedence, and residual risk |
 | [**Managed Deployment**](docs/managed-deployment.md) | Administrator-managed OpenCode policy, platform locations, and startup diagnostics |

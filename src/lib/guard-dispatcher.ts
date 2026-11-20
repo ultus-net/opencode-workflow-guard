@@ -69,6 +69,7 @@ import {
 	pushedProtectedBranchIn,
 	tagRefspecIn,
 } from "../policies/git.ts";
+import { DELEGATION_REASON, delegationSpawnIn } from "../policies/delegation.ts";
 import { extractInterpreterPayload, outsideWritePathInPayload, secretPathInPayload, writePathsInPayload } from "../policies/interpreter.ts";
 import { mcpMutationTool } from "../policies/mcp.ts";
 import { editTargets } from "../policies/post-edit-validation.ts";
@@ -489,6 +490,11 @@ export async function guardToolCallImpl(
 			logPolicyBlock(`[workflow-guard] blocked package supply-chain violation: ${command.slice(0, 100)}`);
 			return block("shell-safety", "package_hygiene", `Blocked: '${command.slice(0, 60)}' is a ${packageCheck.name}. ${packageCheck.advice}`);
 		}
+		const delegated = delegationSpawnIn(raw);
+		if (delegated) {
+			logPolicyBlock(`[workflow-guard] blocked agent delegation via ${delegated}: ${command.slice(0, 100)}`);
+			return block("delegation", "agent_delegation", DELEGATION_REASON);
+		}
 		const normalizedCommand = normalizeGitCommands(command);
 		if (hasUnsafeGitAlias(command)) return block("git", "unsafe_git_alias", "Blocked: per-invocation Git aliases cannot be used because they can hide guarded Git operations.");
 		// Each segment is judged in the directory it actually runs in. A `cd`
@@ -630,6 +636,11 @@ export async function guardToolCallImpl(
 					logPolicyBlock(`[workflow-guard] blocked interpreter payload containing ${liveCheck}`);
 					return block("destructive", "live_mutation_payload", `Blocked: inline interpreter script contains a ${liveCheck}. Interpreter payloads cannot smuggle live destructive commands past the guard.`);
 				}
+			}
+			const delegatedPayload = delegationSpawnIn(payload);
+			if (delegatedPayload) {
+				logPolicyBlock(`[workflow-guard] blocked agent delegation via ${delegatedPayload} in an inline payload`);
+				return block("delegation", "agent_delegation", DELEGATION_REASON);
 			}
 			if (isSettingsTamper(payload)) return block("tamper", "settings_tamper", PROTECTED_PATH_REASON);
 			const secretPath = secretPathInPayload(payload);

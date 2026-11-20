@@ -385,6 +385,10 @@ import { checkSweepingClaims } from "./policies/sweeping-claims.ts";
 
 export { checkSweepingClaims };
 
+import { DELEGATION_REASON, delegationSpawnIn } from "./policies/delegation.ts";
+
+export { DELEGATION_REASON, delegationSpawnIn };
+
 import {
 	clearLiveDocsFloor,
 	isResearchTool,
