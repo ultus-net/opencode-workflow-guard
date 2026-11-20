@@ -172,7 +172,7 @@ export function normalizeGitCommands(command: string): string {
 }
 
 export const GIT_WRITE_RE =
-	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)(?:[^|;&]*\s)?(?:-d\b|--delete\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?(?:-[dDM]\b|--delete\b)/;
+	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)(?:[^|;&]*\s)?(?:-d\b|--delete\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?(?:-[A-Za-z]*[dDM][A-Za-z]*\b|--delete\b)/;
 
 // `pull` is deliberately absent from GIT_WRITE_RE: pulling on a feature branch
 // is how a stale base is refreshed, and that is not a write to protect. On a
@@ -258,9 +258,12 @@ export function isMergedLocalBranchDeletion(text: string, root: string): boolean
 	const tokens = unwrapShellWords(text);
 	if (tokens[0] !== "git" || tokens[1] !== "branch") return false;
 	const args = tokens.slice(2);
-	const deletes = args.some((arg) => arg === "--delete" || /^-[a-zA-Z]*d[a-zA-Z]*$/.test(arg));
+	// Short flags arrive as clusters (`-d`, `-rd`, `-Df`). Read the letters
+	// once so the delete and force rules cannot disagree about a cluster.
+	const shortFlags = args.filter((arg) => /^-[A-Za-z]+$/.test(arg)).join("");
+	const deletes = args.includes("--delete") || shortFlags.includes("d") || shortFlags.includes("D");
 	if (!deletes) return false;
-	if (args.some((arg) => arg === "--force" || /^-[a-zA-Z]*[Df][a-zA-Z]*$/.test(arg))) return false;
+	if (args.includes("--force") || /[Df]/.test(shortFlags)) return false;
 	const names = args.filter((arg) => !arg.startsWith("-"));
 	if (names.length === 0) return false;
 	const protectedBranches = getProtectedBranches(root);

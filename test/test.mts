@@ -919,6 +919,8 @@ check("on main: branch -d --force stays blocked", blocked(await shell("git branc
 check("on main: branch -d of a protected name stays blocked", blocked(await shell("git branch -d main")));
 check("on main: branch --delete of a protected name stays blocked", blocked(await shell("git branch --delete main")));
 check("on main: branch --delete --force stays blocked", blocked(await shell("git branch --delete --force feat/merged")));
+check("on main: branch -fd stays blocked", blocked(await shell("git branch -fd feat/merged")));
+check("on main: branch -rd of a merged branch allowed", !blocked(await shell("git branch -rd feat/merged")));
 check("on main: branch -d with no branch named stays blocked", blocked(await shell("git branch -d")));
 check("on main: ordinary push still blocked from the protected checkout", blocked(await shell("git push origin feat/merged")));
 check("on main: delete of a merged remote branch allowed", !blocked(await shell("git push origin --delete feat/merged")));
@@ -931,6 +933,12 @@ check("on main: push --mirror stays blocked", blocked(await shell("git push --mi
 check("purge helper rejects a plain refspec", !purgesMergedRemoteBranches("git push origin feat/merged", cleanupRepo));
 check("purge helper accepts a merged delete", purgesMergedRemoteBranches("git push origin --delete feat/merged", cleanupRepo));
 check("purge helper rejects a tag refspec", !purgesMergedRemoteBranches("git push origin :refs/tags/feat/merged", cleanupRepo));
+// A tag that shares the branch namespace must not satisfy the merged check.
+// The helper names refs/heads and refs/remotes/origin explicitly, so the tag
+// alone resolves to nothing and the deletion stays blocked.
+ffGit("-C", cleanupRepo, "tag", "feat/onlytag", "main");
+check("purge helper rejects a tag short name with no branch of that name", !purgesMergedRemoteBranches("git push origin :feat/onlytag", cleanupRepo));
+check("on main: delete of a tag short name with no branch stays blocked", blocked(await shell("git push origin --delete feat/onlytag")));
 ffGit("-C", cleanupRepo, "branch", "-D", "feat/merged");
 check("on main: delete of a merged branch whose local ref is gone allowed", !blocked(await shell("git push origin --delete feat/merged")));
 // A configured protected name is protected here too, so the cleanup
@@ -940,6 +948,9 @@ writeFileSync(join(cleanupRepo, ".opencode", "workflow-guard.json"), JSON.string
 reloadProjectConfig(cleanupRepo);
 check("on main: branch -d of a configured protected branch blocked", blocked(await shell("git branch -d feat/merged")));
 check("on main: delete of a configured protected remote branch blocked", blocked(await shell("git push origin --delete feat/merged")));
+// The exemption must not become a way around the destination-side rule that
+// protects a configured branch from ordinary pushes.
+check("on main: ordinary push to a configured protected branch blocked", blocked(await shell("git push origin feat/merged")));
 rmSync(cleanupBase, { recursive: true, force: true });
 setWorkspaceRoot(repo);
 	check("on main: git checkout path mutation blocked", blocked(await shell("git checkout -- tracked.txt")));
