@@ -853,11 +853,41 @@ check("on main: pull without --ff-only still blocked", blocked(await shell("git 
 check("on main: pull --ff-only allowed", !blocked(await shell("git pull --ff-only")));
 check("on main: pull --ff-only under a rebase config allowed", !blocked(await shell("git -c pull.rebase=false pull --ff-only")));
 check("on main: pull of a named remote branch still blocked", blocked(await shell("git pull --ff-only origin main")));
+check("on main: pull --ff-only with a trailing -- blocked", blocked(await shell("git pull --ff-only --")));
+check("on main: pull --ff-only of a rebasing config still allowed", !blocked(await shell("git -c pull.rebase=true pull --ff-only")));
+// One shell word is what the guard reads, so quote concatenation and a quoted
+// subcommand name must reach the same verdict as the plain form.
+check("on main: quote-concatenated pull subcommand still allowed", !blocked(await shell("git pu''ll --ff-only")));
+check("on main: quoted pull subcommand still allowed", !blocked(await shell('git "pull" --ff-only')));
+check("on main: chained pull --ff-only still allowed", !blocked(await shell("git status >/dev/null && git pull --ff-only")));
+check("on main: pull --ff-only in a chained cd is judged in that tree", !blocked(await shell(`cd ${ffRepo} && git pull --ff-only`)));
 check("on main: -C the same checkout still fast-forwards", !blocked(await shell(`git -C ${ffRepo} merge --ff-only origin/main`)));
+check("on main: -C the same checkout allows a pull", !blocked(await shell(`git -C ${ffRepo} pull --ff-only`)));
 ffGit("-C", ffRepo, "commit", "--allow-empty", "-m", "local work");
 check("on main: merge --ff-only blocked once the branch has diverged", blocked(await shell("git merge --ff-only origin/main")));
 check("on main: rebase blocked once the branch has diverged", blocked(await shell("git rebase origin/main")));
+check("on main: pull --ff-only blocked once the branch has diverged", blocked(await shell("git pull --ff-only")));
 rmSync(ffBase, { recursive: true, force: true });
+// A `pull` names no ref, so the guard derives the target from `@{u}`. That
+// derivation must still prove the ref is remote-tracking; a local upstream is
+// not a remote sync and stays blocked.
+const ffLocalBase = mkdtempSync(join(tmpdir(), "wg-ff-local-"));
+const ffLocalRepo = join(ffLocalBase, "repo");
+spawnSync("git", ["init", "-b", "main", ffLocalRepo]);
+writeFileSync(join(ffLocalRepo, "a.txt"), "a\n");
+ffGit("-C", ffLocalRepo, "add", "a.txt");
+ffGit("-C", ffLocalRepo, "commit", "-m", "c1");
+ffGit("-C", ffLocalRepo, "branch", "feat/local-up");
+ffGit("-C", ffLocalRepo, "switch", "feat/local-up");
+writeFileSync(join(ffLocalRepo, "b.txt"), "b\n");
+ffGit("-C", ffLocalRepo, "add", "b.txt");
+ffGit("-C", ffLocalRepo, "commit", "-m", "c2");
+ffGit("-C", ffLocalRepo, "switch", "main");
+ffGit("-C", ffLocalRepo, "branch", "--set-upstream-to=feat/local-up", "main");
+setWorkspaceRoot(ffLocalRepo);
+check("on main: pull --ff-only from a local upstream branch stays blocked", blocked(await shell("git pull --ff-only")));
+check("on main: merge --ff-only from the local upstream stays blocked", blocked(await shell("git merge --ff-only")));
+rmSync(ffLocalBase, { recursive: true, force: true });
 setWorkspaceRoot(repo);
 	check("on main: git checkout path mutation blocked", blocked(await shell("git checkout -- tracked.txt")));
 	check("on main: git checkout path mutation without separator blocked", blocked(await shell("git checkout tracked.txt")));
@@ -7509,6 +7539,17 @@ try {
 	check(
 		"seat defers a cwd-dependent pull instead of judging the session checkout",
 		pullSeat.effect === "abstain" && pullSeat.decision?.code === "repository_unidentified",
+	);
+	// An explicit `-C` puts the repository back in the command text, so the seat
+	// judges it for real: a protected checkout with no upstream is a block, not
+	// a deferral.
+	const explicitPullSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatMainRepo} pull --ff-only`]), sessionID: "s-seat-explicit-pull" },
+		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat still denies an explicitly named protected pull",
+		explicitPullSeat.effect === "deny" && explicitPullSeat.decision?.policy === "git",
 	);
 	// A push whose DESTINATION is protected is a finding in every checkout, so
 	// the workdir cannot change the verdict and the seat keeps its denial.
