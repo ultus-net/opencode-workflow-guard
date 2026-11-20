@@ -405,4 +405,119 @@ tamper-evident (hash-chained admission).
 
 - **keep/revert:** keep.
 
-- prev-chain: sha256:998bc046eece56735087bbaaa86e0b1ac5e481a19ddfbead3816e8ec19682681
+- **chain repair (2026-11-21):** this record's `prev-chain` was computed while
+  n=3 was the last record. `parseRecords` extends the last record's block to
+  end of file, so appending n=4 changed n=3's parsed bytes. The value below is
+  n=3's parsed hash, which is what the parser compares against.
+
+- prev-chain: sha256:9730e53bca265ed97b3094eddc97ff82ce5db06e32a1878fd281ab27d94a1c06
+
+### n=5 — an interactive-tool name in argument position is not a TTY hang (gate, preregistered 2026-11-21)
+
+- **hypothesis (falsifiable, registered before the edit):**
+  `checkInteractiveTtyCommand` (`src/policies/shell-safety.ts:143-155`) applies
+  `INTERACTIVE_COMMAND_PATTERNS` to the raw command text with
+  `regex.test(command)`, while monitors (`containsMonitorCommand:97-118`) and
+  pagers (`containsPagerCommand:126-141`) already match at command position.
+  A pattern word that is only a grep pattern, a printf string, or another
+  program's argument therefore blocks a safe command. Falsified if a
+  data-position `sudo` or `git rebase -i` already passes, or if the journal
+  records no such block.
+
+- **pre-change probe:** the frozen journal holds two `interactive_tty` blocks,
+  both named "sudo with password prompt", in two different sessions
+  (`ses_e07461c9…` at `2026-11-20T11:38:17Z`, `ses_e06fc50b…` at
+  `2026-11-20T12:56:37Z`). The second is `cd … && grep -n "sudo…`, where the
+  matched word is a grep pattern; its resource list contains the bare token
+  `sudo`. During this iteration the same false positive blocked two live
+  commands in this session: a `grep` whose pattern listed `sudo`, and a `grep`
+  whose pattern listed `git rebase -i` (block reason "git interactive rebase").
+  No journal record shows a monitor or pager false positive, which matches the
+  command-position checks those two families already use.
+
+- **prediction (expected gain):** every pattern in the family is judged at
+  command position, the way monitors and pagers already are. A segment's
+  command word comes from `unwrapShellWords`, so wrappers (`env`, `timeout`,
+  `command`, `exec`, `nice`, `nohup`, `stdbuf`, `time`) and leading
+  assignments never become the command. Control-flow prefixes (`do`, `then`,
+  `else`, `elif`, `while`, `for`, `!`, `time`) are skipped, so a loop or
+  conditional body is still judged. The editor names become an executable set.
+  `git rebase -i`, `git add -p`, `npm init` without `-y`, and the
+  apt/yum/dnf install forms become anchored verb patterns. `sudo` is detected
+  from the unwrapper, because unwrapping strips it: a new
+  `shellHasSudoWrapper` reports whether a `sudo` wrapper was consumed.
+  `eval` and shell `-c` payloads recurse. **at-risk regressions:** (i) a
+  command name that reaches a shell as stdin data (`echo 'vim x' | sh`) is no
+  longer matched, joining the indirection class the policy already excludes
+  (`watch`, `xargs`, `man`, `find -exec`, loop bodies); (ii) an unmodelled
+  wrapper that changes the command word is still unmodelled; (iii) a quoted
+  alias or shell function that expands to an editor is unchanged.
+  **non-goals:** no change to the monitor or pager sets, no new editor name, no
+  change to the dispatcher's policy ordering.
+
+- **accept/reject rule:** accept if (a) a `sudo` word in a grep pattern or
+  printf string passes, (b) `journalctl … | grep -i sudo` passes, (c) a
+  `git rebase -i` word in a grep pattern passes, (d) `vim`, `nano`, `sudo
+  apt-get update`, `env A=1 sudo ls`, `timeout 5 sudo ls`, `git rebase -i`,
+  `git add -p`, `npm init`, `apt-get install curl`, and `yum install curl`
+  still block, (e) `sh -c 'vim x'` and `eval 'npm init'` still block, (f) the
+  monitor and pager assertions are unchanged and green, (g) `npm run typecheck`
+  and `npm test` are green. Reject if a command-position true positive stops
+  blocking or a monitor/pager assertion regresses.
+
+- **selection score (5 items, deterministic):** (a) 2 journal `interactive_tty`
+  records, both the same `sudo`-as-data class, in 2 sessions; (b) 2 live
+  reproductions in this campaign session; (c) the repository already defines
+  the intended semantics for monitors and pagers, with tests pinning
+  `echo top` as allowed, so the change aligns the remaining family rather than
+  inventing a mechanism; (d) no existing test covers data position for the
+  editor, `sudo`, `git`, `npm`, or apt/yum patterns, so the gap is silent;
+  (e) the change is one policy file, one shared helper, tests, and docs.
+
+- **held-out score:** 26/26 passed (26 items, never used for selection). The
+  seven probes the base matcher also blocks are the control: with the base
+  `shell-safety.ts` restored they fail and the suite reports 1802 passed, 7
+  failed. The allowance probes are a `sudo` grep pattern, an exact `grep -n
+  sudo file.txt`, a piped `grep -i sudo`, a `git rebase -i` grep pattern, an
+  `npm init` grep pattern, an editor name in a printf string, and a command name
+  fed to a filter. The blocked probes are a chained editor, `sh -c`, `eval`,
+  `env`-wrapped and `timeout`-wrapped `sudo`, `sudo` as a loop body, `command
+  sudo`, `sudo` before an editor, a wrapped `sudo` before an editor, `git add
+  -p`, unconfirmed `yum install` and apt install, an apt install in a `then`
+  body, a nested `bash -lc`, and `busybox vi`. Three `shellHasSudoWrapper`
+  probes bind the helper's two directions.
+
+- **disjointness:** the selection items are the frozen journal records, the two
+  live reproductions, the existing monitor/pager implementation, and the
+  absence of a data-position test. The held-out probes were written after the
+  fix, so they were never used for selection, and they were not used to choose
+  the command-position matcher.
+
+- **eval job path:** none. Deterministic verifier, no model in the loop.
+
+- **result (appended after the evaluation run):** GAIN. Every allowance probe
+  passes and every blocked-direction probe still blocks. The base matcher fails
+  exactly the seven probes it is expected to fail (1802 passed, 7 failed),
+  which is the pre-change control. The full suite is 1809 passed, 0 failed, and
+  `npm run typecheck` is clean. Monitor and pager assertions are unchanged. The
+  shared helper change is additive: `unwrapShellWordsImpl` now also reports
+  whether a `sudo` wrapper was consumed, and `TRANSPARENT_PREFIX` is exported,
+  so no existing caller changes behavior. One residual, accepted regression is
+  recorded above: a command name delivered to a shell as stdin data is no
+  longer read as code, which matches the indirection class the policy already
+  excludes.
+
+- **review round (recorded before the PR):** the secondary reviewer returned
+  APPROVE and named three P2/P3 items. The paired-check item was accepted:
+  `sudo vim notes.txt`, `env A=1 sudo vim notes.txt`, and an exact `grep -n
+  sudo file.txt` were added, which is why the held-out set is 26 rather than
+  23. The docs item was declined with evidence that the reviewer read the
+  Policy 6 text: Policy 22 (`docs/policies.md:190`) already states the
+  command-position rule, the wrapper and control-flow handling, and the
+  stdin-data limitation. The public-surface item was declined: the test suite
+  imports the public helper surface from `src/workflow-guard.ts` by repository
+  convention, and no other production caller is added.
+
+- **keep/revert:** keep.
+
+- prev-chain: sha256:06f156a444fbb946dc13f77d389db3091c5cadb9ad360ac77938760df1346573

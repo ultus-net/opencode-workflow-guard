@@ -401,6 +401,7 @@ export { isResearchTool, liveDocsGatingReason };
 
 export { sendDesktopNotification } from "./policies/shell-safety.ts";
 export { checkInteractiveTtyCommand, checkPackageHygiene, escapeAppleScriptString };
+export { shellHasSudoWrapper } from "./lib/shell.ts";
 
 function logObservation(client: unknown, message: string): void {
 	try {

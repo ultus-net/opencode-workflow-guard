@@ -545,7 +545,7 @@ export function splitShellSegments(command: string): string[] {
 	return segments;
 }
 
-function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: boolean; cwdTarget?: string; assignments: string[] } {
+function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: boolean; cwdTarget?: string; assignments: string[]; sudo: boolean } {
 	let cleanCmd = decodeShellEscapes(command.trim());
 	// Strip outer grouping parentheses/braces if present e.g. ( git commit ) or { git commit; }
 	while (
@@ -569,6 +569,9 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 	// assignment, and treating it as one would claim a repository that the
 	// invocation never named.
 	const assignments: string[] = [];
+	// A `sudo` wrapper is stripped before the command word, so a caller that
+	// needs to know the command runs privileged asks for it here.
+	let sudo = false;
 	while (i < words.length) {
 		const rawWord = words[i]!;
 		const word = rawWord.replace(/^[\({]+/, "").replace(/[\)};]+$/, "");
@@ -635,6 +638,7 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 			continue;
 		}
 		if (word === "sudo" || word === "doas") {
+			if (word === "sudo") sudo = true;
 			i++;
 			const valueOptions = new Set([
 				"-u",
@@ -747,11 +751,16 @@ function unwrapShellWordsImpl(command: string): { words: string[]; changesCwd: b
 	return { words: words
 		.slice(i)
 		.map((w) => w.replace(/^[\({]+/, "").replace(/[\)};]+$/, ""))
-		.filter(Boolean), changesCwd, cwdTarget, assignments };
+		.filter(Boolean), changesCwd, cwdTarget, assignments, sudo };
 }
 
 export function unwrapShellWords(command: string): string[] {
 	return unwrapShellWordsImpl(command).words;
+}
+
+/** True when a `sudo` wrapper was stripped ahead of the command word. */
+export function shellHasSudoWrapper(command: string): boolean {
+	return unwrapShellWordsImpl(command).sudo;
 }
 
 /**
@@ -826,7 +835,7 @@ export function expandCwdTarget(target: string): string | undefined {
 }
 
 /** Words that carry no directory of their own; a control-flow body follows them. */
-const TRANSPARENT_PREFIX = new Set([
+export const TRANSPARENT_PREFIX = new Set([
 	"builtin",
 	"command",
 	"then",

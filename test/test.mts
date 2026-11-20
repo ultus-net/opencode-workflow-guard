@@ -110,6 +110,7 @@ import {
 	getSubagentMutationBudget,
 	isReadOnlyRole,
 	checkInteractiveTtyCommand,
+	shellHasSudoWrapper,
 	checkPackageHygiene,
 	delegationSpawnIn,
 	sendDesktopNotification,
@@ -5951,6 +5952,33 @@ check("checkInteractiveTtyCommand permits npm init --yes", !checkInteractiveTtyC
 check("checkInteractiveTtyCommand detects apt-get install without -y", checkInteractiveTtyCommand("apt-get install curl").isInteractive);
 check("checkInteractiveTtyCommand permits apt-get install -y", !checkInteractiveTtyCommand("apt-get install -y curl").isInteractive);
 check("checkInteractiveTtyCommand permits regular non-interactive command", !checkInteractiveTtyCommand("ls -la && git status").isInteractive);
+// Command position, not raw text: a pattern word in an argument is data.
+check("checkInteractiveTtyCommand permits sudo inside a grep pattern", !checkInteractiveTtyCommand(`grep -rn "sudo" docs/`).isInteractive);
+check("checkInteractiveTtyCommand permits an exact grep for sudo", !checkInteractiveTtyCommand("grep -n sudo file.txt").isInteractive);
+check("checkInteractiveTtyCommand permits sudo in a piped grep pattern", !checkInteractiveTtyCommand("journalctl --user -u x -n 20 --no-pager 2>&1 | grep -i sudo").isInteractive);
+check("checkInteractiveTtyCommand permits an interactive rebase pattern in a grep pattern", !checkInteractiveTtyCommand(`grep -n "git rebase -i" test/test.mts`).isInteractive);
+check("checkInteractiveTtyCommand permits npm init as grep data", !checkInteractiveTtyCommand(`grep -n "npm init" README.md`).isInteractive);
+check("checkInteractiveTtyCommand permits an editor name in a printf string", !checkInteractiveTtyCommand(`printf "%s\\n" "vim is not installed"`).isInteractive);
+check("checkInteractiveTtyCommand permits git log grep for interactive rebase", !checkInteractiveTtyCommand(`git log --grep="rebase -i"`).isInteractive);
+check("checkInteractiveTtyCommand permits a command name fed to a filter", !checkInteractiveTtyCommand(`echo "apt-get install curl" | cat`).isInteractive);
+// The same commands still block at command position.
+check("checkInteractiveTtyCommand still detects a chained editor", checkInteractiveTtyCommand("cd /repo && nano notes.txt").isInteractive);
+check("checkInteractiveTtyCommand still detects a shell -c editor", checkInteractiveTtyCommand("sh -c 'vim notes.txt'").isInteractive);
+check("checkInteractiveTtyCommand still detects eval npm init", checkInteractiveTtyCommand("eval 'npm init'").isInteractive);
+check("checkInteractiveTtyCommand still detects a wrapped sudo", checkInteractiveTtyCommand("env FOO=1 sudo ls").isInteractive);
+check("checkInteractiveTtyCommand still detects sudo before an editor", checkInteractiveTtyCommand("sudo vim notes.txt").isInteractive);
+check("checkInteractiveTtyCommand still detects a wrapped sudo before an editor", checkInteractiveTtyCommand("env A=1 sudo vim notes.txt").isInteractive);
+check("checkInteractiveTtyCommand still detects a timeout-wrapped sudo", checkInteractiveTtyCommand("timeout 5 sudo ls").isInteractive);
+check("checkInteractiveTtyCommand still detects sudo as a loop body", checkInteractiveTtyCommand("while true; do sudo ls; done").isInteractive);
+check("checkInteractiveTtyCommand still detects sudo after command", checkInteractiveTtyCommand("command sudo ls").isInteractive);
+check("checkInteractiveTtyCommand still detects git add -p", checkInteractiveTtyCommand("git add -p").isInteractive);
+check("checkInteractiveTtyCommand still detects yum install without -y", checkInteractiveTtyCommand("yum install curl").isInteractive);
+check("checkInteractiveTtyCommand still detects an apt install in a then body", checkInteractiveTtyCommand("if true; then apt-get install curl; fi").isInteractive);
+check("checkInteractiveTtyCommand still detects an apt install in a nested shell", checkInteractiveTtyCommand("bash -lc 'apt-get install curl'").isInteractive);
+check("checkInteractiveTtyCommand still detects busybox vi", checkInteractiveTtyCommand("busybox vi notes.txt").isInteractive);
+check("shellHasSudoWrapper reports a bare sudo", shellHasSudoWrapper("sudo ls"));
+check("shellHasSudoWrapper reports a sudo behind env", shellHasSudoWrapper("env FOO=1 sudo ls"));
+check("shellHasSudoWrapper ignores sudo as an argument", !shellHasSudoWrapper("grep -n sudo file.txt"));
 
 check("shell tool blocks nano", blocked(await shell("nano README.md")));
 check("shell tool blocks less", blocked(await shell("less package.json")));
