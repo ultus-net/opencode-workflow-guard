@@ -111,6 +111,7 @@ import {
 	isReadOnlyRole,
 	checkInteractiveTtyCommand,
 	checkPackageHygiene,
+	delegationSpawnIn,
 	sendDesktopNotification,
 	escapeAppleScriptString,
 	createGitWorktree,
@@ -703,6 +704,15 @@ check("block docker container prune", blocked(await shell("docker container prun
 check("block docker system prune", blocked(await shell("docker system prune")));
 check("block docker volume rm", blocked(await shell("docker volume rm data")));
 check(["block gh repo ", "delete"].join(""), blocked(await shell(["gh repo ", "delete owner/repo --yes"].join(""))));
+check(["block gh pr ", "merge"].join(""), blocked(await shell(["gh pr ", "merge 42 --squash"].join(""))));
+check("block a wrapped gh pr merge", blocked(await shell(["env FOO=1 gh pr ", "merge 42"].join(""))));
+check("block a chained gh pr merge", blocked(await shell(["cd /tmp && gh pr ", "merge 42"].join(""))));
+check("block gh api DELETE method", blocked(await shell(["gh api -X ", "DELETE repos/o/r"].join(""))));
+check("block gh api long-form DELETE method", blocked(await shell(["gh api --method=", "DELETE repos/o/r"].join(""))));
+check("allow a read-only gh api request", !(await shell("gh api repos/o/r/pulls/42")));
+const azRoleCreate = ["az role ", "assignment ", "create --role Owner --assignee x"].join("");
+check("block az role assignment create", blocked(await shell(azRoleCreate)));
+check("allow az role assignment list", !(await shell("az role assignment list -g rg")));
 check(["block npx prisma ", "migrate reset"].join(""), blocked(await shell(["npx prisma ", "migrate reset --force"].join(""))));
 check("block mkfs.ext4", blocked(await shell(["mk", "fs.ext4 /dev/sdb1"].join(""))));
 check("block wipefs", blocked(await shell(["wipe", "fs -a /dev/sdb"].join(""))));
@@ -755,6 +765,12 @@ const ocCli = ["op", "encode"].join("");
 check("block auth with global flags (--dir)", blocked(await shell(`${ocCli} --dir /path ${"au" + "th"} login`)));
 check("block config with global flags (-d)", blocked(await shell(`${ocCli} -d . ${"con" + "fig"} edit`)));
 check("block permission with global flags (--workspace)", blocked(await shell(`${ocCli} --workspace . ${"perm" + "ission"} grant`)));
+check("block opencode plugin add", blocked(await shell(`${ocCli} plugin add opencode-workflow-guard@1.20.0`)));
+check("block opencode plugin remove", blocked(await shell(`${ocCli} plugin remove opencode-workflow-guard`)));
+check("block opencode plugin add with global flags", blocked(await shell(`${ocCli} --dir /tmp plugin add opencode-workflow-guard`)));
+check("block opencode mcp add", blocked(await shell(`${ocCli} mcp add --url https://example.invalid/mcp`)));
+check("allow opencode plugin list", !(await shell(`${ocCli} plugin list`)));
+check("allow opencode mcp list", !(await shell(`${ocCli} mcp list`)));
 check("allow normal command", !(await shell("ls -la && git status")));
 const ocDir = ".open" + "code/plans/";
 check("allow gh issue create mentioning .opencode paths (not tamper)", !(await shell(`gh issue create --repo example/proj --title t --body 'see <project>/${ocDir}'`)));
@@ -5840,6 +5856,53 @@ check("shell tool blocks npm audit fix --force", blocked(await shell("npm audit 
 check("shell tool blocks global npm install", blocked(await shell("npm i -g tsx")));
 check("shell tool blocks direct npm publish", blocked(await shell("npm publish --access public")));
 check("shell tool allows regular npm install", !(await shell("npm install lodash")));
+
+// 18. Policy 28: Agent Delegation Boundary
+console.log("- Policy 28: Agent Delegation Boundary -");
+check("delegationSpawnIn detects claude", delegationSpawnIn('claude -p "summarise"') === "claude");
+check("delegationSpawnIn detects codex", delegationSpawnIn("codex exec 'run tests'") === "codex");
+check("delegationSpawnIn detects gemini", delegationSpawnIn("gemini -p 'x'") === "gemini");
+check("delegationSpawnIn detects aider", delegationSpawnIn("aider --message 'x'") === "aider");
+check("delegationSpawnIn detects opencode run", delegationSpawnIn("opencode run 'x'") === "opencode run");
+check("delegationSpawnIn detects opencode run behind a global flag", delegationSpawnIn("opencode --dir /tmp run 'x'") === "opencode run");
+check("delegationSpawnIn detects opencode run behind a value flag", delegationSpawnIn("opencode --log-level debug run 'x'") === "opencode run");
+check("delegationSpawnIn permits an opencode help request naming run", delegationSpawnIn("opencode --help run") === undefined);
+check("delegationSpawnIn permits another opencode subcommand", delegationSpawnIn("opencode export ses_abc") === undefined);
+check("delegationSpawnIn does not read a plugin argument as the subcommand", delegationSpawnIn("opencode --model x plugin add run") === undefined);
+check("delegationSpawnIn detects a path-qualified executable", delegationSpawnIn("/usr/local/bin/claude -p x") === "claude");
+check("delegationSpawnIn unwraps env assignments", delegationSpawnIn("env FOO=1 claude -p x") === "claude");
+check("delegationSpawnIn unwraps sudo options", delegationSpawnIn("sudo -u deploy claude -p x") === "claude");
+check("delegationSpawnIn unwraps timeout", delegationSpawnIn("timeout 30 codex exec x") === "codex");
+check("delegationSpawnIn unwraps command builtin", delegationSpawnIn("command claude -p x") === "claude");
+check("delegationSpawnIn detects a chained segment", delegationSpawnIn("echo hi | claude -p x") === "claude");
+check("delegationSpawnIn detects a cd-prefixed segment", delegationSpawnIn("cd /tmp && claude -p x") === "claude");
+check("delegationSpawnIn detects a grouping subshell", delegationSpawnIn("ls && (claude -p x)") === "claude");
+check("delegationSpawnIn detects npx package execution", delegationSpawnIn("npx -y claude-code -p x") === "claude");
+check("delegationSpawnIn detects scoped npx package", delegationSpawnIn("npx @openai/codex exec x") === "codex");
+check("delegationSpawnIn detects bunx package execution", delegationSpawnIn("bunx gemini-cli -p x") === "gemini");
+check("delegationSpawnIn detects a versioned npx package", delegationSpawnIn("npx claude-code@latest -p x") === "claude");
+check("delegationSpawnIn permits an argument-only mention", delegationSpawnIn("grep claude README.md") === undefined);
+check("delegationSpawnIn permits a quoted argument mention", delegationSpawnIn('echo "run claude for details"') === undefined);
+check("delegationSpawnIn permits a git log grep value", delegationSpawnIn("git log --grep=codex") === undefined);
+check("delegationSpawnIn permits an npx plugin flag value", delegationSpawnIn("npx prettier --plugin claude --write src") === undefined);
+check("delegationSpawnIn permits a read-only opencode verb", delegationSpawnIn("opencode plugin list") === undefined);
+
+check("shell tool blocks direct claude spawn", blocked(await shell('claude -p "summarise"')),);
+check("delegation block reason names the escape", ((await shell("claude -p x")) ?? "").includes("outside this session's workflow guard"));
+check("shell tool blocks opencode run", blocked(await shell("opencode run 'do the work'")));
+check("shell tool blocks a wrapped codex spawn", blocked(await shell("env FOO=1 timeout 30 codex exec x")));
+check("shell tool blocks a chained aider spawn", blocked(await shell("git status && aider --message x")));
+check("shell tool blocks an npx claude-code spawn", blocked(await shell("npx -y claude-code -p x")));
+check("shell tool blocks a bash -c claude payload", blocked(await shell("bash -c 'claude -p x'")));
+check("shell tool blocks a sh -lc codex payload", blocked(await shell("sh -lc 'codex exec x'")));
+check("shell tool blocks an eval claude payload", blocked(await shell("eval 'claude -p x'")));
+check("shell tool blocks a heredoc body that runs claude", blocked(await shell("bash <<'EOF'\nclaude -p x\nEOF")));
+check("shell tool blocks delegation for a read-only subagent", blocked(await call("bash", { command: "claude -p x" }, { sessionID: "s-child", agent: "reviewer" })));
+check("shell tool blocks delegation for a worker subagent", blocked(await call("bash", { command: "gemini -p x" }, { sessionID: "s-child", agent: "executor" })));
+check("shell tool allows an argument-only claude mention", !(await shell("grep claude README.md")));
+check("shell tool allows prose quoting a launcher", !(await shell('echo "run claude for details"')));
+check("shell tool allows a prose heredoc mentioning claude", !(await shell("cat > notes.md <<'EOF'\nclaude is an agent CLI\nEOF")));
+check("shell tool allows a read-only subagent to grep a launcher name", !(await call("bash", { command: "grep claude README.md" }, { sessionID: "s-child", agent: "reviewer" })));
 
 // Durable Recovery Checkpoints
 console.log("- Durable Recovery Checkpoints -");

@@ -35,11 +35,13 @@ export const LIVE_MUTATION_PATTERNS: LivePattern[] = [
 	{ re: new RegExp(`\\bdocker\\s+volume\\s+${W_RM}\\b`), what: ["docker ", "volume removal"].join("") },
 	// Cloud CLI deletions
 	{ re: new RegExp(`\\baz\\s+\\S+\\s+(?:${W_DEL}|${W_PURGE})\\b`), what: ["Azure ", "resource deletion"].join("") },
+	{ re: /\baz\s+role\s+assignment\s+(?:create|delete)\b/, what: ["Azure RBAC ", "role-assignment change (privilege escalation)"].join("") },
 	{ re: new RegExp(`\\baz\\s+(?:devops|repos|pipelines|boards|artifacts)\\s+[\\w-]*\\s*(?:${W_DEL}|${W_ABANDON})\\b`), what: ["Azure ", "DevOps deletion"].join("") },
 	{ re: new RegExp(`\\baws\\s+\\S+\\s+(?:${W_DEL}|${W_TERM})-?\\w*\\b`), what: ["AWS ", "resource deletion"].join("") },
 	{ re: new RegExp(`\\bgcloud\\s+\\S+\\s+(?:${W_DEL}|${W_ABANDON})\\b`), what: ["GCP ", "resource deletion"].join("") },
 	// Hosted repo / PR destruction via CLI
-	{ re: new RegExp(`\\bgh\\s+(?:repo|issue|pr|release|secret|variable)\\s+(?:${W_DEL}|close)\\b`), what: ["gh ", "destructive command"].join("") },
+	{ re: new RegExp(`\\bgh\\s+(?:repo|issue|pr|release|secret|variable)\\s+(?:${W_DEL}|close|merge)\\b`), what: ["gh ", "destructive command"].join("") },
+	{ re: new RegExp(`\\bgh\\s+api\\b[^|;&]*(?:-X|--method)\\s*=?\\s*${W_HTTP_DEL}\\b`), what: ["GitHub API ", "DELETE request"].join("") },
 	// Database destruction via CLI clients
 	{ re: new RegExp(`\\b(?:psql|mysql|mariadb|mongosh|mongo|redis-cli|sqlite3)\\b[^|;&]*\\b(?:${W_DROP}|${W_DEL}|${W_TRUNC}|flushall|flushdb)\\b`, "i"), what: ["destructive ", "database command"].join("") },
 	{ re: new RegExp(`\\b(?:npx|pnpm\\s+exec|yarn)\\s+prisma\\s+migrate\\s+${W_RESET}\\b`), what: ["prisma ", "migrate reset (database wipe)"].join("") },

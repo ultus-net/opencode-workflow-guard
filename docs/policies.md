@@ -56,8 +56,8 @@ This is a policy and enforcement layer, not an agent harness. Policies may const
   - Helm: `helm uninstall`, `helm rollback`, `helm delete`
   - IaC: `terraform destroy`, `tofu destroy`, `pulumi destroy`
   - Containers: `docker rm`, `docker container/system/image/volume prune`, `docker volume rm`
-  - Cloud: `az ... delete/purge`, `aws ... delete/terminate`, `gcloud ... delete/abandon`
-  - Hosted Git: `gh repo/issue/pr/release/secret/variable delete|close`
+  - Cloud: `az ... delete/purge`, `aws ... delete/terminate`, `gcloud ... delete/abandon`, and Azure RBAC role-assignment changes (`az role assignment` create/delete), which grant privilege rather than removing a resource
+  - Hosted Git: `gh repo/issue/pr/release/secret/variable delete|close|merge`, and a raw `DELETE` request through `gh api`
   - Databases: `psql/mysql/mariadb/mongosh/redis-cli/sqlite3` drop, delete, truncate, and flushall, plus `prisma migrate reset`
   - Remote HTTP: `curl -X DELETE` against non-localhost endpoints
   - Git: `git push --force`, `git push +refspec`, `git clean -fdx`
@@ -73,7 +73,7 @@ This is a policy and enforcement layer, not an agent harness. Policies may const
 - Prevents the agent from weakening its own permission gates **via shell or edit tools**:
   - Shell writes/redirects to `opencode.json[c]`, `~/.config/opencode/*`, `.opencode/*` (including the `.opencode` directory itself), or the guard's own plugin/TUI files (`~/.config/opencode/plugins/*`, `~/.config/opencode/ui/*`)
   - Direct edits of the same paths through the `edit`/`write`/`apply_patch` tools
-  - Shell commands invoking `opencode auth`, `opencode config`, `opencode permission`, or `opencode run --auto`
+  - Shell commands invoking `opencode auth`, `opencode config`, `opencode permission`, `opencode plugin`, or `opencode mcp` mutations (`add`, `remove`, `install`, and the bare package form), or `opencode run --auto`. Read-only forms such as `opencode plugin list` and `opencode mcp list` stay allowed.
   - Evasion-normalized: quote-concatenation (`open''code.json`), escapes (`open\c\ode`), and glob wildcards (`opencode.jso?`) are stripped before matching.
 - Collaboration commands (`gh issue`, `gh pr`, `glab issue`, `glab pr`, `az repos pr`) and document content mentioning guarded paths are not tampering. Quoted arguments are command data, not shell syntax. The redirect heuristic applies to shell commands only. Write and edit content is guarded by the target path check instead.
 - Quoted data spans are not shell syntax. Pattern matching runs on the quote-stripped residue, where redirect targets are honored quoted or not, and quote-concatenated paths keep normalizing. A quoted span containing a guarded path is never treated as a redirect or command verb. Unquoted redirects into guarded paths stay blocked.
@@ -226,6 +226,13 @@ This is a policy and enforcement layer, not an agent harness. Policies may const
 - **Recursion by refusal, not absence.** The runner sets `WORKFLOW_GUARD_DOGFOOD_ACTOR=1` and `WORKFLOW_GUARD_DOGFOOD_DEPTH` on the session it spawns. Every policy still applies in that session, and the plugin is present and enforcing. The marker only refuses `record_dogfood`, so the tested session cannot certify itself. An unparseable marker fails closed to a non-zero depth.
 - Freshness is content-scoped like the review gate, so a nested run in a linked worktree can inherit the binding for identical tracked content. A record for unrelated content never satisfies the gate.
 - `guard_status` reports `lastDogfood` and adds `dogfood` to `outstandingRequirements` when the gate is unsatisfied, naming the matrix hosts still missing a passing run.
+
+### 28. Agent Delegation Boundary (`shell`)
+- Blocks spawning another AI agent CLI from a shell. The covered executables are `claude` (also `claude-code`), `codex`, `gemini` (also `gemini-cli`), `aider` (also `aider-chat`), and `opencode run`. The Node runner forms (`npx`, `bunx`, `pnpx`) are covered for the same package names.
+- A shell-spawned agent runs outside this session's hooks. Its file mutations, git history changes, verification runs, and live-system calls never reach the guard, so it is a way around every other policy. The host's `task` tool is the governed path: the guard hooks `execute.before` there and enforces role confinement, todo inheritance, and the mutation budget.
+- Detection is command position only. `grep claude README.md`, `echo "run claude for details"`, and a prose heredoc that mentions a launcher stay allowed. Wrappers (`env`, `sudo`, `timeout`, `command`, `nohup`), a chained segment, a grouping subshell, and an inline interpreter payload are unwrapped first, so `env FOO=1 claude -p x`, `echo hi | claude`, `bash -c 'claude -p x'`, and `eval 'claude -p x'` are refused.
+- The policy has no override. `WORKFLOW_GUARD_ALLOW_LIVE=1` covers live-system commands only, and delegation is a workflow-boundary rule rather than a live mutation.
+- Known limit: indirection this walk does not model, such as `xargs claude` or a script file that invokes a launcher, is not detected. That matches the documented known limits for monitors and destructive commands.
 
 ### Tool Description Honesty & Cross-Model Adherence
 - Via the `tool.definition` hook, the guard enriches tool descriptions to keep them honest and proactive across all model families. The families are OpenAI, Gemini, Claude, and open-weights models:
