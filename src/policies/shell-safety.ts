@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { basename } from "node:path";
-import { splitShellSegments, unwrapShellWords } from "../lib/shell.ts";
+import { shellHasSudoWrapper, splitShellSegments, TRANSPARENT_PREFIX, unwrapShellWords } from "../lib/shell.ts";
 
 // AI agents frequently run dangerous package manager flags (e.g. npm audit fix --force,
 // npm install -g, pip install --force-reinstall, agent-driven publish) that introduce
@@ -40,43 +40,40 @@ export function checkPackageHygiene(command: string): { isViolating: boolean; na
 
 // AI agents running in non-interactive terminal subshells hang indefinitely when an
 // interactive prompt (vim, nano, less, top, sudo, npm init without -y, apt without -y,
-// git rebase -i) waits for TTY input. Process monitors are handled separately in
-// checkProcessMonitorCommand because `top` can run in a safe batch mode, while the
-// other monitors cannot.
+// git rebase -i) waits for TTY input. Every one of those names is judged at command
+// position, because the same word in an argument is data: `echo top`, a grep pattern
+// like `grep -n 'sudo'`, or a printf string must not read as a hang. Process monitors
+// and pagers already work that way; the patterns below follow the same rule.
 
-const INTERACTIVE_COMMAND_PATTERNS: Array<{ regex: RegExp; name: string; advice: string }> = [
+const INTERACTIVE_EDITORS = new Set(["nano", "vi", "vim", "emacs", "pico", "joe", "micro"]);
+const EDITOR_ADVICE = "Use the edit, write, or apply_patch tools instead of interactive terminal editors.";
+const SUDO_NAME = "sudo with password prompt";
+const SUDO_ADVICE = "Avoid sudo in agent sessions; run commands directly or request user execution.";
+
+// Anchored on the command word, so a `git rebase -i` inside a grep pattern stays data.
+const INTERACTIVE_VERB_PATTERNS: Array<{ regex: RegExp; name: string; advice: string }> = [
 	{
-		regex: /\b(?:nano|vim?|emacs|pico|joe|micro)\b/i,
-		name: "interactive text editor",
-		advice: "Use the edit, write, or apply_patch tools instead of interactive terminal editors.",
-	},
-	{
-		regex: /\bsudo\b/i,
-		name: "sudo with password prompt",
-		advice: "Avoid sudo in agent sessions; run commands directly or request user execution.",
-	},
-	{
-		regex: /\bgit\s+rebase\s+-[a-zA-Z]*i/i,
+		regex: /^git\s+rebase\s+-[a-zA-Z]*i/i,
 		name: "git interactive rebase",
 		advice: "Use non-interactive git commands or explicit cherry-pick/merge sequences.",
 	},
 	{
-		regex: /\bgit\s+add\s+-[a-zA-Z]*p/i,
+		regex: /^git\s+add\s+-[a-zA-Z]*p/i,
 		name: "git interactive patch",
 		advice: "Use git add <file> or git apply rather than interactive patch selection.",
 	},
 	{
-		regex: /\bnpm\s+init\b(?!\s+(?:-y|--yes|--force))\b/i,
+		regex: /^npm\s+init\b(?!\s+(?:-y|--yes|--force))\b/i,
 		name: "npm init without non-interactive flag",
 		advice: "Add -y or --yes flag: npm init -y",
 	},
 	{
-		regex: /\b(?:apt|apt-get)\s+(?:install|remove|purge|upgrade|dist-upgrade)\b(?!\s+(?:-y|--yes|--assume-yes))\b/i,
+		regex: /^(?:apt|apt-get)\s+(?:install|remove|purge|upgrade|dist-upgrade)\b(?!\s+(?:-y|--yes|--assume-yes))\b/i,
 		name: "apt command without non-interactive flag",
 		advice: "Add -y flag to avoid interactive confirmation prompts (e.g. apt-get install -y <pkg>).",
 	},
 	{
-		regex: /\b(?:yum|dnf)\s+(?:install|remove|upgrade)\b(?!\s+-y)\b/i,
+		regex: /^(?:yum|dnf)\s+(?:install|remove|upgrade)\b(?!\s+-y)\b/i,
 		name: "yum/dnf command without non-interactive flag",
 		advice: "Add -y flag to avoid interactive confirmation prompts (e.g. dnf install -y <pkg>).",
 	},
@@ -140,17 +137,45 @@ function containsPagerCommand(command: string, depth = 0): boolean {
 	return false;
 }
 
+function containsInteractivePattern(command: string, depth = 0): { name: string; advice: string } | undefined {
+	if (depth >= 16) return undefined;
+	for (const segment of splitShellSegments(command)) {
+		// Unwrapping strips `sudo` before the command word, so ask the unwrapper.
+		if (shellHasSudoWrapper(segment)) return { name: SUDO_NAME, advice: SUDO_ADVICE };
+		const words = unwrapShellWords(segment);
+		while (words.length > 0 && (words[0] === "--" || TRANSPARENT_PREFIX.has(words[0]!))) words.shift();
+		if (words[0] === "sudo") return { name: SUDO_NAME, advice: SUDO_ADVICE };
+		const executable = basename(words[0] ?? "").toLowerCase();
+		const busybox = executable === "busybox";
+		const candidate = busybox ? basename(words[1] ?? "").toLowerCase() : executable;
+		if (INTERACTIVE_EDITORS.has(candidate)) return { name: "interactive text editor", advice: EDITOR_ADVICE };
+		const commandText = words.slice(busybox ? 1 : 0).join(" ");
+		for (const { regex, name, advice } of INTERACTIVE_VERB_PATTERNS) {
+			if (regex.test(commandText)) return { name, advice };
+		}
+		if (executable === "eval" && words.length > 1) {
+			const nested = containsInteractivePattern(words.slice(1).join(" "), depth + 1);
+			if (nested) return nested;
+		}
+		if (/^(?:ba|z|da|k)?sh$/i.test(executable)) {
+			const commandFlag = words.findIndex((word, index) => index > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(word));
+			if (commandFlag >= 0 && words[commandFlag + 1]) {
+				const nested = containsInteractivePattern(words[commandFlag + 1]!, depth + 1);
+				if (nested) return nested;
+			}
+		}
+	}
+	return undefined;
+}
+
 export function checkInteractiveTtyCommand(command: string): { isInteractive: boolean; name?: string; advice?: string } {
 	const monitor = checkProcessMonitorCommand(command);
 	if (monitor.isInteractive) return monitor;
 	if (containsPagerCommand(command)) {
 		return { isInteractive: true, name: "terminal pager", advice: PAGER_ADVICE };
 	}
-	for (const { regex, name, advice } of INTERACTIVE_COMMAND_PATTERNS) {
-		if (regex.test(command)) {
-			return { isInteractive: true, name, advice };
-		}
-	}
+	const pattern = containsInteractivePattern(command);
+	if (pattern) return { isInteractive: true, ...pattern };
 	return { isInteractive: false };
 }
 
