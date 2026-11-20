@@ -42,6 +42,8 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 - **Root Cause:** Policy 7 requires all code modifications to happen on a feature branch.
 - **Solution:** Switch to a feature branch (`git switch -c feat/my-feature`) before making changes.
 
+A checkout that is only behind its remote is not blocked. `git merge --ff-only <upstream>`, `git rebase <upstream>`, and `git pull --ff-only` are allowed on the protected branch when the ref is the branch's tracked upstream or the remote default, and `HEAD` is already an ancestor of it. That adds no commit and rewrites none, so a stale primary checkout can sync without a feature branch. `git merge` without `--ff-only`, a bare `git pull`, a local branch target, a different remote branch, a named remote and branch, and a branch with its own commits stay blocked. On a host where `pull.rebase` is set, run `git -c pull.rebase=false pull --ff-only`; the guard accepts that form.
+
 ---
 
 ### 6. Edits Blocked: `Blocked: file path '...' escapes workspace root`

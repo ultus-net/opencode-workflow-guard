@@ -51,6 +51,7 @@ import { branchHasDocumentationChange } from "../policies/docs.ts";
 import { claimFiles, fileClaimConflictReason, releaseStaleFileClaims } from "../policies/file-claims.ts";
 import {
 	GIT_BRANCH_CREATE_RE,
+	GIT_PULL_RE,
 	GIT_WRITE_RE,
 	PUSH_TO_MAIN_RE,
 	branchGuardReason,
@@ -62,6 +63,7 @@ import {
 	hasUnsafeGitAlias,
 	isBranchAlreadyMergedOrClosed,
 	isGitTreeWriteText,
+	isProtectedBranchFastForward,
 	normalizeGitCommands,
 	onProtectedBranch,
 	parseGitInvocation,
@@ -564,7 +566,13 @@ export async function guardToolCallImpl(
 		}
 		for (const invocation of gitInvocations) {
 			if (tagRefspecIn(`git ${invocation.rest}`, invocation.repoDir)) continue;
-			if (GIT_WRITE_RE.test(`git ${invocation.rest}`) && onProtectedBranch(invocation.repoDir)) {
+			// A fast-forward of a protected branch to its tracked upstream adds no
+			// commit and rewrites none, so it is the one history write that cannot
+			// skip review. Refusing it leaves the checkout stale with no safe way
+			// to sync (#145).
+			const gitText = `git ${invocation.rest}`;
+			const protectedWrite = GIT_WRITE_RE.test(gitText) || GIT_PULL_RE.test(gitText);
+			if (protectedWrite && onProtectedBranch(invocation.repoDir) && !isProtectedBranchFastForward(gitText, invocation.repoDir)) {
 				logPolicyBlock(`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`);
 				return block("git", "protected_branch", branchGuardReason());
 			}
