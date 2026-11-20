@@ -127,6 +127,60 @@ function todoTaskLabel(todo: TodoItem): string {
 }
 
 /**
+ * A task key's distinct word tokens, lowercased.
+ *
+ * Refinement is judged on these tokens. A reworded task keeps every token of
+ * its predecessor and adds at least one. Punctuation and repeated words carry
+ * no weight, so only a real addition widens the set.
+ */
+export function todoTaskTokens(key: string): Set<string> {
+	return new Set(key.toLowerCase().match(/[a-z0-9][a-z0-9'_-]*/g) ?? []);
+}
+
+/**
+ * True when `successor` is `predecessor` plus wording: every distinct token of
+ * the predecessor survives and the successor carries more. That is the same
+ * work item sharpened, not a different task. Two distinct tokens is the floor,
+ * so a one-word task always needs an exact match.
+ */
+export function isTodoRefinement(predecessor: string, successor: string): boolean {
+	const before = todoTaskTokens(predecessor);
+	const after = todoTaskTokens(successor);
+	if (before.size < 2 || after.size <= before.size) return false;
+	for (const token of before) if (!after.has(token)) return false;
+	return true;
+}
+
+/**
+ * The active successor that carries a removed task's wording, or undefined.
+ *
+ * `available` bounds each successor to one predecessor, so two removed tasks
+ * cannot both hide behind one retained task. The caller spends the claim.
+ */
+function findTodoRefinementSuccessor(
+	predecessorKey: string,
+	successors: TodoItem[],
+	available: Map<string, number>,
+): TodoItem | undefined {
+	if (todoTaskTokens(predecessorKey).size < 2) return undefined;
+	for (const todo of successors) {
+		const key = todoTaskKey(todo);
+		if (!key || (available.get(key) ?? 0) <= 0) continue;
+		if (!isTodoRefinement(predecessorKey, key)) continue;
+		return todo;
+	}
+	return undefined;
+}
+
+/** A removed active task and the active successor that carries its wording. */
+export interface TodoRefinement {
+	from: string;
+	to: string;
+	fromKey: string;
+	toKey: string;
+}
+
+/**
  * Record when each active task entered its current active window, in the
  * session's mutation count. Completion evidence is judged against this.
  *
@@ -138,10 +192,21 @@ export function recordTodoTaskStarts(
 	previousTodos: TodoItem[] | undefined,
 	nextTodos: TodoItem[],
 	mutationCount: number,
+	refinements: TodoRefinement[] = [],
 ): void {
 	const previouslyActive = new Set<string>();
 	for (const todo of previousTodos ?? []) {
 		if (ACTIVE_TODO_STATUSES.has(String(todo.status ?? ""))) previouslyActive.add(todoTaskKey(todo));
+	}
+	// A reworded task is the same work item, so it keeps the mutations already
+	// recorded for its predecessor instead of starting a fresh window. The
+	// pairing comes from the accepted lifecycle verdict, so one predecessor's
+	// window can move at most once and cannot be guessed twice.
+	const carried = new Map<string, number>();
+	for (const refinement of refinements) {
+		if (!starts.has(refinement.fromKey)) continue;
+		if (previouslyActive.has(refinement.toKey) || starts.has(refinement.toKey)) continue;
+		carried.set(refinement.toKey, starts.get(refinement.fromKey)!);
 	}
 	const live = new Set<string>();
 	for (const todo of nextTodos) {
@@ -152,7 +217,7 @@ export function recordTodoTaskStarts(
 			// A task keeps its original window across rewrites and status
 			// changes within the active set. A task returning to active after
 			// finishing starts a fresh window.
-			if (!previouslyActive.has(key) || !starts.has(key)) starts.set(key, mutationCount);
+			if (!previouslyActive.has(key) || !starts.has(key)) starts.set(key, carried.get(key) ?? mutationCount);
 		}
 	}
 	// Finished or dropped tasks close their window; a later task with the
@@ -184,6 +249,7 @@ export function unverifiedTodoCompletions(
 	nextTodos: TodoItem[],
 	starts: Map<string, number>,
 	mutationCount: number,
+	refinements: TodoRefinement[] = [],
 ): string[] {
 	// Each prior occurrence can absorb at most one new item of the same key. A
 	// prior `completed` occurrence absorbs a new `completed` item silently; any
@@ -197,6 +263,12 @@ export function unverifiedTodoCompletions(
 		if (String(todo.status ?? "") === "completed") {
 			absorbCompleted.set(key, (absorbCompleted.get(key) ?? 0) + 1);
 		}
+	}
+	// Completion evidence is judged before the window map moves, so a reworded
+	// task reads its predecessor's start from the same accepted pairing.
+	const inheritedStarts = new Map<string, number>();
+	for (const refinement of refinements) {
+		if (starts.has(refinement.fromKey)) inheritedStarts.set(refinement.toKey, starts.get(refinement.fromKey)!);
 	}
 
 	const claimed: Array<{ task: string; start: number }> = [];
@@ -215,7 +287,8 @@ export function unverifiedTodoCompletions(
 		const remaining = absorbable.get(key) ?? 0;
 		if (remaining > 0) absorbable.set(key, remaining - 1);
 		if (isReadOnlyTodo(todo)) continue;
-		claimed.push({ task: todoTaskLabel(todo), start: starts.get(key) ?? 0 });
+		const start = starts.get(key) ?? inheritedStarts.get(key) ?? 0;
+		claimed.push({ task: todoTaskLabel(todo), start });
 	}
 
 	if (claimed.length === 0) return [];
@@ -309,64 +382,97 @@ export async function todoEvidenceReport(sessionID: string | undefined): Promise
 	};
 }
 
+export interface TodoLifecycleVerdict {
+	error?: string;
+	refinements: TodoRefinement[];
+}
+
+/**
+ * The full lifecycle verdict: what would block the write, and which removed
+ * active tasks were accepted as refinements. `validateTodoLifecycle` keeps the
+ * string-only shape for callers that only need the gate.
+ */
+export function inspectTodoLifecycle(
+	newTodos: TodoItem[],
+	existingTodos: TodoItem[] | undefined,
+): TodoLifecycleVerdict {
+	const refinements: TodoLifecycleVerdict["refinements"] = [];
+	// Rule: No silent task deletion while active work remains
+	// (single-focus rule removed: multiple tasks may be in_progress to allow
+	// concurrent subagent work on different tasks)
+	if (!existingTodos || existingTodos.length === 0) return { refinements };
+	const activeExisting = existingTodos.filter((t) => {
+		const s = String(t.status ?? "");
+		return s === "pending" || s === "in_progress";
+	});
+	if (activeExisting.length === 0) return { refinements };
+	const activeNew = newTodos.filter((t) => ACTIVE_TODO_STATUSES.has(String(t.status ?? "")));
+	const reviewObligation = /\b(?:secondary\s+review|re-?review|reviewer|(?:run|perform|request|obtain|complete)\s+(?:an?\s+)?review)\b/i;
+	const remediationAction = /\b(?:address|fix|resolve|remediate)\b/i;
+	const reviewReference = /\b(?:secondary\s+review|re-?review|reviewer|review)\b/i;
+	const remediationSubject = /\b(?:findings?|feedback|comments?|issues?)\b/i;
+	const isReviewObligation = (content: string) => reviewObligation.test(content) && !(remediationAction.test(content) && reviewReference.test(content) && remediationSubject.test(content));
+	const newContentCounts = new Map<string, number>();
+	for (const todo of newTodos) {
+		const content = todoTaskKey(todo);
+		newContentCounts.set(content, (newContentCounts.get(content) ?? 0) + 1);
+	}
+	// Each active occurrence can absorb one predecessor. An exact-text match
+	// spends its own occurrence above, so it cannot also hide reworded work.
+	const successorCounts = new Map<string, number>();
+	for (const todo of activeNew) {
+		const content = todoTaskKey(todo);
+		if (content) successorCounts.set(content, (successorCounts.get(content) ?? 0) + 1);
+	}
+	const retainedReviewCounts = new Map<string, number>();
+	for (const todo of activeNew) {
+		const content = todoTaskKey(todo);
+		retainedReviewCounts.set(content, (retainedReviewCounts.get(content) ?? 0) + 1);
+	}
+	let retainedReviewObligations = 0;
+	for (const todo of activeExisting) {
+		const content = todoTaskKey(todo);
+		const remaining = retainedReviewCounts.get(content) ?? 0;
+		if (remaining > 0 && isReviewObligation(content)) {
+			retainedReviewCounts.set(content, remaining - 1);
+			retainedReviewObligations++;
+		}
+	}
+	let replacementReviewObligations = activeNew.filter((t) => isReviewObligation(todoTaskKey(t))).length - retainedReviewObligations;
+	const missing = activeExisting.find((todo) => {
+		const content = todoTaskKey(todo);
+		const remaining = newContentCounts.get(content) ?? 0;
+		if (remaining === 0) {
+			if (isReviewObligation(content) && replacementReviewObligations > 0) {
+				replacementReviewObligations--;
+				return false;
+			}
+			const successor = findTodoRefinementSuccessor(content, activeNew, successorCounts);
+			if (successor) {
+				const successorKey = todoTaskKey(successor);
+				successorCounts.set(successorKey, (successorCounts.get(successorKey) ?? 0) - 1);
+				refinements.push({ from: todoTaskLabel(todo), to: todoTaskLabel(successor), fromKey: content, toKey: successorKey });
+				return false;
+			}
+			return true;
+		}
+		newContentCounts.set(content, remaining - 1);
+		const availableSuccessors = successorCounts.get(content) ?? 0;
+		if (availableSuccessors > 0) successorCounts.set(content, availableSuccessors - 1);
+		return false;
+	});
+	if (!missing) return { refinements };
+	return {
+		refinements,
+		error:
+			`Blocked todowrite: active task '${String(missing.content ?? "")}' was removed ` +
+			"without being marked completed or cancelled. Tasks cannot silently disappear.",
+	};
+}
+
 export function validateTodoLifecycle(
 	newTodos: TodoItem[],
 	existingTodos: TodoItem[] | undefined,
 ): string | undefined {
-	// Rule: No silent task deletion while active work remains
-	// (single-focus rule removed: multiple tasks may be in_progress to allow
-	// concurrent subagent work on different tasks)
-	if (existingTodos && existingTodos.length > 0) {
-		const activeExisting = existingTodos.filter((t) => {
-			const s = String(t.status ?? "");
-			return s === "pending" || s === "in_progress";
-		});
-		if (activeExisting.length > 0) {
-			const activeNew = newTodos.filter((t) => ACTIVE_TODO_STATUSES.has(String(t.status ?? "")));
-			const reviewObligation = /\b(?:secondary\s+review|re-?review|reviewer|(?:run|perform|request|obtain|complete)\s+(?:an?\s+)?review)\b/i;
-			const remediationAction = /\b(?:address|fix|resolve|remediate)\b/i;
-			const reviewReference = /\b(?:secondary\s+review|re-?review|reviewer|review)\b/i;
-			const remediationSubject = /\b(?:findings?|feedback|comments?|issues?)\b/i;
-			const isReviewObligation = (content: string) => reviewObligation.test(content) && !(remediationAction.test(content) && reviewReference.test(content) && remediationSubject.test(content));
-			const newContentCounts = new Map<string, number>();
-			for (const todo of newTodos) {
-				const content = todoTaskKey(todo);
-				newContentCounts.set(content, (newContentCounts.get(content) ?? 0) + 1);
-			}
-			const retainedReviewCounts = new Map<string, number>();
-			for (const todo of activeNew) {
-				const content = todoTaskKey(todo);
-				retainedReviewCounts.set(content, (retainedReviewCounts.get(content) ?? 0) + 1);
-			}
-			let retainedReviewObligations = 0;
-			for (const todo of activeExisting) {
-				const content = todoTaskKey(todo);
-				const remaining = retainedReviewCounts.get(content) ?? 0;
-				if (remaining > 0 && isReviewObligation(content)) {
-					retainedReviewCounts.set(content, remaining - 1);
-					retainedReviewObligations++;
-				}
-			}
-			let replacementReviewObligations = activeNew.filter((t) => isReviewObligation(todoTaskKey(t))).length - retainedReviewObligations;
-			const missing = activeExisting.find((todo) => {
-				const content = todoTaskKey(todo);
-				const remaining = newContentCounts.get(content) ?? 0;
-				if (remaining === 0 && isReviewObligation(content) && replacementReviewObligations > 0) {
-					replacementReviewObligations--;
-					return false;
-				}
-				if (remaining === 0) return true;
-				newContentCounts.set(content, remaining - 1);
-				return false;
-			});
-			if (missing) {
-				return (
-					`Blocked todowrite: active task '${String(missing.content ?? "")}' was removed ` +
-					"without being marked completed or cancelled. Tasks cannot silently disappear."
-				);
-			}
-		}
-	}
-
-	return undefined;
+	return inspectTodoLifecycle(newTodos, existingTodos).error;
 }

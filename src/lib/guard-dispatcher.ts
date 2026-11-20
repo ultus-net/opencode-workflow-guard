@@ -85,12 +85,12 @@ import {
 	effectiveTodos,
 	fetchSessionTodos,
 	hasActiveTodo,
+	inspectTodoLifecycle,
 	readOnlyTodoCompletions,
 	recordTodoTaskStarts,
 	subagentMutationBudgetReason,
 	todoCompletionBlockReason,
 	unverifiedTodoCompletions,
-	validateTodoLifecycle,
 } from "../policies/todo.ts";
 import { recordedTodoCapability, reportTodoGateFailOpen } from "./v2-todo.ts";
 
@@ -228,10 +228,10 @@ export async function guardToolCallImpl(
 		if (Array.isArray(rawTodos)) {
 			const newTodos = rawTodos;
 			const existingTodos = context?.sessionID ? await fetchSessionTodos(context.sessionID) : undefined;
-			const err = validateTodoLifecycle(newTodos, existingTodos);
-			if (err) {
-				logPolicyBlock(`[workflow-guard] ${err}`);
-				return block("todo", "todo_lifecycle", err);
+			const lifecycle = inspectTodoLifecycle(newTodos, existingTodos);
+			if (lifecycle.error) {
+				logPolicyBlock(`[workflow-guard] ${lifecycle.error}`);
+				return block("todo", "todo_lifecycle", lifecycle.error);
 			}
 			// Per-task completion evidence. Every task may enter `completed`
 			// only after the session mutated inside that task's window. The
@@ -241,7 +241,7 @@ export async function guardToolCallImpl(
 			if (context?.sessionID) {
 				const starts = todoTaskStarts(context.sessionID);
 				const total = getSessionMutationCount(context.sessionID);
-				const unverified = unverifiedTodoCompletions(existingTodos, newTodos, starts, total);
+				const unverified = unverifiedTodoCompletions(existingTodos, newTodos, starts, total, lifecycle.refinements);
 				if (unverified.length > 0) {
 					const reason = todoCompletionBlockReason(unverified);
 					logPolicyBlock(`[workflow-guard] ${reason}`);
@@ -297,7 +297,18 @@ export async function guardToolCallImpl(
 			// Only an accepted write becomes the task list, so task windows move
 			// and read-only marker use is journaled after every gate has passed.
 			if (context?.sessionID && !context.simulate) {
-				recordTodoTaskStarts(todoTaskStarts(context.sessionID), existingTodos, newTodos, getSessionMutationCount(context.sessionID));
+				recordTodoTaskStarts(todoTaskStarts(context.sessionID), existingTodos, newTodos, getSessionMutationCount(context.sessionID), lifecycle.refinements);
+				if (lifecycle.refinements.length > 0) {
+					audit({
+						ts: new Date().toISOString(),
+						sessionID: context.sessionID,
+						tool: "todowrite",
+						decision: "allow",
+						phase: "event",
+						reason: "todo_refined",
+						input: { refinements: lifecycle.refinements.map(({ from, to }) => ({ from, to })) },
+					});
+				}
 				if (readOnlyCompleted.length > 0) {
 					audit({
 						ts: new Date().toISOString(),

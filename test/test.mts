@@ -153,7 +153,7 @@ import { WorkflowGuardTui, WorkflowGuardTuiV2, formatBadge, readProjectOption, r
 import { scanSessionTodos, toolPartName, detectTodoCapability, recordedTodoCapability, recordTodoCapability, reportTodoGateFailOpen, resetTodoCapabilityForTesting } from "../src/lib/v2-todo.ts";
 import { buildPolicyPosture, renderPolicyPosture } from "../src/lib/policy-posture.ts";
 import { pluginKeyFor, preparePluginUpdate } from "../src/lib/config-writer.mjs";
-import { effectiveTodosWithOwner, isReadOnlyTodo, readOnlyTodoCompletions, recordTodoTaskStarts, todoEvidenceReport, unverifiedTodoCompletions, validateTodoLifecycle } from "../src/policies/todo.ts";
+import { effectiveTodosWithOwner, inspectTodoLifecycle, isReadOnlyTodo, readOnlyTodoCompletions, recordTodoTaskStarts, todoEvidenceReport, unverifiedTodoCompletions, validateTodoLifecycle } from "../src/policies/todo.ts";
 import {
 	LiveDocsResearchFloor,
 	clearLiveDocsFloor,
@@ -412,6 +412,58 @@ check("completion evidence: a task that is only the marker has no identity and i
 check("lifecycle: appending the read-only marker to a planned task is not a silent deletion", !validateTodoLifecycle([item("Review the diff [read-only]", "completed")], [item("Review the diff", "in_progress")]));
 check("lifecycle: appending the marker to a still-active task retains it", !validateTodoLifecycle([item("Review the diff [read-only]", "in_progress")], [item("Review the diff", "in_progress")]));
 
+// A sharpened task is the same work item, not a dropped one. A removed active
+// task whose tokens all survive in an active successor is a refinement. The
+// three shapes below are lifted from the audit journal's todo_lifecycle reasons.
+check("lifecycle: added wording in a reworded task is a refinement", !validateTodoLifecycle([item("Verify the doc change, pass review, and open its PR", "in_progress")], [item("Verify the doc change and open its PR", "in_progress")]));
+check("lifecycle: a reworded PR task with a new preposition is a refinement", !validateTodoLifecycle([item("Push the branch, open PR for #245 with Fixes #245", "in_progress")], [item("Push the branch, open PR #245 with Fixes #245", "in_progress")]));
+check("lifecycle: a prefixed clause on an existing task is a refinement", !validateTodoLifecycle([item("Re-run review, record verdict, open PR for issue #42 and clean up the branch", "in_progress")], [item("Open PR for issue #42 and clean up the branch", "in_progress")]));
+// The strict boundary still holds: no token superset means no refinement.
+check("lifecycle: an unrelated equal-length replacement still blocks", !!validateTodoLifecycle([item("Run the test suite", "in_progress")], [item("Write the release notes", "in_progress")]));
+check("lifecycle: a removed task with no successor still blocks", !!validateTodoLifecycle([item("other work", "in_progress")], [item("Write the release notes", "in_progress")]));
+check("lifecycle: a one-word reword stays strict", !!validateTodoLifecycle([item("tests", "in_progress")], [item("tests please", "in_progress")]));
+check("lifecycle: one successor cannot absorb two removed tasks", !!validateTodoLifecycle([item("deploy the service", "in_progress")], [item("write the fix, then deploy the service", "in_progress"), item("deploy the service", "in_progress")]));
+
+// A refinement keeps the predecessor's mutation window, so recorded work still
+// vouches for the reworded task. The pairing is the lifecycle verdict's, so the
+// window carry and the completion gate cannot disagree about it.
+const refinePrev = [item("Verify the doc change and open its PR", "in_progress")];
+const refineNext = [item("Verify the doc change, pass review, and open its PR", "in_progress")];
+const refinePairing = inspectTodoLifecycle(refineNext, refinePrev).refinements;
+check("lifecycle: the refinement verdict names its predecessor and successor", refinePairing.length === 1 && refinePairing[0]!.from === "Verify the doc change and open its PR" && refinePairing[0]!.to === "Verify the doc change, pass review, and open its PR");
+const refineStarts = new Map<string, number>();
+recordTodoTaskStarts(refineStarts, undefined, refinePrev, 0);
+recordTodoTaskStarts(refineStarts, refinePrev, refineNext, 3, refinePairing);
+check("refinement: the reworded task inherits the predecessor's window", refineStarts.get("Verify the doc change, pass review, and open its PR") === 0 && !refineStarts.has("Verify the doc change and open its PR"));
+const refinedComplete = [item("Verify the doc change, pass review, and open its PR", "completed")];
+check("refinement: the carried window vouches for the refined completion", unverifiedTodoCompletions(refinePrev, refinedComplete, refineStarts, 1, refinePairing).length === 0);
+const preCarry = new Map([["Verify the doc change and open its PR", 2]]);
+check("refinement: completion evidence sees the inherited window before the map moves", unverifiedTodoCompletions(refinePrev, refinedComplete, preCarry, 3, refinePairing).length === 0);
+check("refinement: a carried window still needs a mutation inside it", JSON.stringify(unverifiedTodoCompletions(refinePrev, refinedComplete, preCarry, 2, refinePairing)) === JSON.stringify(["Verify the doc change, pass review, and open its PR"]));
+const lateCarry = new Map([["Verify the doc change and open its PR", 5]]);
+check("refinement: mutations before the inherited window never count", JSON.stringify(unverifiedTodoCompletions(refinePrev, refinedComplete, lateCarry, 5, refinePairing)) === JSON.stringify(["Verify the doc change, pass review, and open its PR"]));
+check("refinement: a reword with no recorded work does not complete freely", JSON.stringify(unverifiedTodoCompletions(refinePrev, refinedComplete, new Map(), 0, refinePairing)) === JSON.stringify(["Verify the doc change, pass review, and open its PR"]));
+
+// One predecessor cannot carry its window to two successors. The verdict pairs
+// it once, and the window map follows that pairing rather than guessing again.
+const splitPrev = [item("add the retry loop", "in_progress")];
+const splitNext = [item("add the retry loop for uploads", "in_progress"), item("add the retry loop for downloads", "in_progress")];
+const splitPairing = inspectTodoLifecycle(splitNext, splitPrev).refinements;
+check("lifecycle: one predecessor pairs with one successor", splitPairing.length === 1 && splitPairing[0]!.toKey === "add the retry loop for uploads");
+const splitStarts = new Map([["add the retry loop", 4]]);
+recordTodoTaskStarts(splitStarts, splitPrev, splitNext, 9, splitPairing);
+check("refinement: one predecessor's window carries to one successor only", splitStarts.get("add the retry loop for uploads") === 4 && splitStarts.get("add the retry loop for downloads") === 9);
+
+// Two predecessors and two successors pair one-to-one, so neither window is
+// guessed from the other. Each successor is matched by its own tokens.
+const pairPrev = [item("write the parser", "in_progress"), item("run the parser tests", "in_progress")];
+const pairNext = [item("write the parser and add fixtures", "in_progress"), item("run the parser tests and triage failures", "in_progress")];
+const pairVerdict = inspectTodoLifecycle(pairNext, pairPrev).refinements;
+check("lifecycle: two reworded tasks pair with two distinct successors", pairVerdict.length === 2 && new Set(pairVerdict.map((r) => r.fromKey)).size === 2 && new Set(pairVerdict.map((r) => r.toKey)).size === 2);
+const pairStarts = new Map([["write the parser", 1], ["run the parser tests", 6]]);
+recordTodoTaskStarts(pairStarts, pairPrev, pairNext, 8, pairVerdict);
+check("refinement: each predecessor's window moves to its own successor", pairStarts.get("write the parser and add fixtures") === 1 && pairStarts.get("run the parser tests and triage failures") === 6);
+
 // Marker escape, and the transitions that are not new claims.
 check("completion evidence: the read-only marker is recognized", isReadOnlyTodo(item("Review the diff [read-only]", "completed")) && !isReadOnlyTodo(item("Review the diff", "completed")));
 check("completion evidence: a marked read-only task completes with no mutation", unverifiedTodoCompletions([item("Review the diff [read-only]", "in_progress")], [item("Review the diff [read-only]", "completed")], new Map(), 0).length === 0);
@@ -447,6 +499,15 @@ todo("s-evidence-audit-order", item("real work", "in_progress"));
 const auditBeforeBlocked = getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only").length;
 await call("todowrite", { todos: [item("real work [read-only]", "completed"), item("brand new", "completed")] }, { sessionID: "s-evidence-audit-order" });
 check("a blocked todowrite does not journal a read-only completion", getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_completed_read_only").length === auditBeforeBlocked);
+
+// End to end: reworded work passes the lifecycle gate and leaves a trail, while
+// a genuine removal is still refused.
+todo("s-refine", item("Verify the doc change and open its PR", "in_progress"));
+check("dispatcher allows a reworded active task", !(await call("todowrite", { todos: [item("Verify the doc change, pass review, and open its PR", "in_progress")] }, { sessionID: "s-refine" })));
+const refineAudit = getRecentAuditEntries(50).filter((entry) => entry.reason === "todo_refined");
+check("dispatcher journals the refinement", refineAudit.length > 0 && JSON.stringify((refineAudit.at(-1)?.input as { refinements?: unknown })?.refinements) === JSON.stringify([{ from: "Verify the doc change and open its PR", to: "Verify the doc change, pass review, and open its PR" }]));
+todo("s-refine-drop", item("Write the release notes", "in_progress"));
+check("dispatcher still blocks a genuine task removal", blocked(await call("todowrite", { todos: [item("Publish the release", "in_progress")] }, { sessionID: "s-refine-drop" })));
 
 // guard_status surfaces the requirement before it bites.
 todo("s-evidence-report", item("write the fix", "in_progress"), item("Review the diff [read-only]", "in_progress"), item("done already", "completed"));
