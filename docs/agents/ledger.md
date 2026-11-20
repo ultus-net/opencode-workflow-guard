@@ -308,3 +308,216 @@ tamper-evident (hash-chained admission).
   change-type in the archived candidate set.
 
 - prev-chain: sha256:856438a0ed76a918a6acb324f0130adf0a2569c248a42229613120f330d775c2
+
+### n=4 — a copy source under a config path is not a settings mutation (security, preregistered 2026-11-21)
+
+- **hypothesis (falsifiable, registered before the edit):** in legacy mode
+  (no `liveControlPlanePaths` declared), `isSettingsTamper`
+  (`src/policies/tamper.ts:61-78`) applies `PATH_PATTERNS` to the whole command
+  segment, so any guarded path operand after `cp`, `ln`, or `install` blocks
+  the command, including a read-only source. The live-control-plane fact mode
+  already decides by the mutation target and allows the same copy
+  (`test/test.mts:8219-8233` pins both directions). Falsified if a guarded `cp`
+  source already passes without declared roots, or if a guarded destination
+  already blocks for a reason other than this pattern.
+
+- **pre-change probe:** `test/test.mts` names the false positive "legacy: cp
+  FROM a .config/opencode source is blocked without live roots" and calls it
+  "the F3 false positive, pinned as current behavior". A live `cp` from
+  `~/.config/opencode/templates/rsi/` into a workspace draft was refused with
+  `PROTECTED_PATH_REASON` during this campaign.
+
+- **prediction (expected gain):** legacy mode classifies `cp`, `ln`, and
+  `install` operands by role. The destination (last operand, or the `-t` /
+  `--target-directory` value) is checked against the guarded-path patterns; a
+  guarded source alone is allowed, matching fact mode and Policy 6's read-only
+  allowance. `mv`, `rm`, `tee`, `sed -i`, `chmod`, `chown`, `truncate`, `dd`,
+  `patch`, and `perl -i` keep the broad any-operand match, because each mutates
+  every operand it names. **at-risk regressions:** (i) a destination hidden in
+  a flag value (`--suffix .config/opencode`) is treated as an operand and could
+  be skipped; it is not a write target, so the residual risk is a missed
+  non-writing mention, not a write; (ii) an unrecognized copy-like program
+  (`rsync`) is out of scope and keeps its current behaviour; (iii) `mv` must
+  stay blocked even when the guarded path is the source, because the move
+  removes it. **non-goals:** no change to fact mode, no new path pattern, no
+  change to the redirect rules, no change to `isProtectedPath`.
+
+- **accept/reject rule:** accept if (a) the legacy copy-source probe now
+  passes, (b) a copy into a guarded path still blocks, (c) `mv` from a guarded
+  path still blocks, (d) `ln` from a guarded path is allowed and `ln` into one
+  blocks, (e) `cp -t <guarded>` and `install -d <guarded>` block, (f) the
+  facts-mode tests are unchanged and green, (g) `npm run typecheck` and
+  `npm test` are green. Reject if any guarded destination passes, if `mv`
+  loosens, or if a fact-mode assertion regresses.
+
+- **selection score (5 items, deterministic):** (a) the false positive is
+  pinned by an existing test and named finding F3; (b) fact mode already
+  defines the intended semantics, so this aligns two modes instead of
+  inventing a rule; (c) the change is one policy file plus tests and docs;
+  (d) a live reproduction failed in this campaign; (e) the true-positive set
+  is enumerable (`mv`, redirects, destinations).
+
+- **held-out score:** pass. The full `npm test` suite is green, and every
+  held-out probe from the bank behaves as predicted: `--target-directory=` and
+  `-t` destinations block, `install -d <guarded>` blocks while `install -d
+  ./build/out` passes, a multi-source `cp` with one guarded source passes, and
+  a guarded source with a guarded destination blocks.
+
+- **disjointness:** the selection items are the existing test and the live
+  reproduction. The held-out probes are written after the fix. Neither was
+  used to choose the operand parser.
+
+- **eval job path:** none. Deterministic verifier, no model in the loop.
+
+- **result (appended after the evaluation run):** GAIN. Six legacy allowance
+  probes pass: `cp FROM`, `cp FROM` with a `2>/dev/null` redirect, a
+  multi-source `cp` with one guarded source, `ln -s FROM`, `ln -sfn FROM`, and
+  `cp -s FROM`. Restoring the `origin/main` source makes eight checks fail
+  (1776 passed, 8 failed). Six are those allowance probes. The other two are
+  destination probes that expose a pre-existing hole, recorded below. Every
+  remaining blocked-direction probe is green on both trees, which is the
+  pre-change control. The full suite is 1784 passed, 0 failed, and
+  `npm run typecheck` is clean. Fact-mode assertions are unchanged. A residual,
+  fail-closed limitation is recorded: `cp -tDIR src` parses the attached short
+  value, while a copy whose destination cannot be identified (one operand)
+  keeps the broad match.
+
+- **review-driven amendment 1 (recorded before the PR):** the registered rule
+  (d) said "`ln` from a guarded path is allowed". That was too broad. A hard
+  link is a second writable name for the guarded inode, so a later write to the
+  workspace link would mutate the guarded file, and the realpath-based
+  protected-path check cannot see it. The accepted result therefore changes the
+  registered `ln` scope from a blanket allowance to a symbolic-link-only
+  allowance: `ln -s`, `cp -s`, and `cp --symbolic-link` are reads, while `ln`
+  without `-s`, `cp -l`, and `cp --link` keep the broad any-operand match. The
+  tests cover both directions, and the docs and changeset name the carve-out.
+
+- **review-driven amendment 2 (a pre-existing hole, not a regression):** the
+  reviewer asked for proof that a guarded destination cannot hide around an fd
+  duplication. It could. `isSettingsTamper` split on `&`, so
+  `cp src 2>&1 <guarded>` became `cp src 2>` plus `1 <guarded>`, and the second
+  fragment had no verb to match. The base tree allows that command, so the hole
+  predates this change. `isSettingsTamper` now drops `N>&M` and `N>&-` before
+  segmenting, because a descriptor duplication or close never names a write
+  target. A word after `>&` that is not a descriptor is kept, because bash reads
+  it as a file redirect. Two true-positive probes cover it, and both fail on
+  the base tree.
+
+- **keep/revert:** keep.
+
+- **chain repair (2026-11-21):** this record's `prev-chain` was computed while
+  n=3 was the last record. `parseRecords` extends the last record's block to
+  end of file, so appending n=4 changed n=3's parsed bytes. The value below is
+  n=3's parsed hash, which is what the parser compares against.
+
+- prev-chain: sha256:9730e53bca265ed97b3094eddc97ff82ce5db06e32a1878fd281ab27d94a1c06
+
+### n=5 — an interactive-tool name in argument position is not a TTY hang (gate, preregistered 2026-11-21)
+
+- **hypothesis (falsifiable, registered before the edit):**
+  `checkInteractiveTtyCommand` (`src/policies/shell-safety.ts:143-155`) applies
+  `INTERACTIVE_COMMAND_PATTERNS` to the raw command text with
+  `regex.test(command)`, while monitors (`containsMonitorCommand:97-118`) and
+  pagers (`containsPagerCommand:126-141`) already match at command position.
+  A pattern word that is only a grep pattern, a printf string, or another
+  program's argument therefore blocks a safe command. Falsified if a
+  data-position `sudo` or `git rebase -i` already passes, or if the journal
+  records no such block.
+
+- **pre-change probe:** the frozen journal holds two `interactive_tty` blocks,
+  both named "sudo with password prompt", in two different sessions
+  (`ses_e07461c9…` at `2026-11-20T11:38:17Z`, `ses_e06fc50b…` at
+  `2026-11-20T12:56:37Z`). The second is `cd … && grep -n "sudo…`, where the
+  matched word is a grep pattern; its resource list contains the bare token
+  `sudo`. During this iteration the same false positive blocked two live
+  commands in this session: a `grep` whose pattern listed `sudo`, and a `grep`
+  whose pattern listed `git rebase -i` (block reason "git interactive rebase").
+  No journal record shows a monitor or pager false positive, which matches the
+  command-position checks those two families already use.
+
+- **prediction (expected gain):** every pattern in the family is judged at
+  command position, the way monitors and pagers already are. A segment's
+  command word comes from `unwrapShellWords`, so wrappers (`env`, `timeout`,
+  `command`, `exec`, `nice`, `nohup`, `stdbuf`, `time`) and leading
+  assignments never become the command. Control-flow prefixes (`do`, `then`,
+  `else`, `elif`, `while`, `for`, `!`, `time`) are skipped, so a loop or
+  conditional body is still judged. The editor names become an executable set.
+  `git rebase -i`, `git add -p`, `npm init` without `-y`, and the
+  apt/yum/dnf install forms become anchored verb patterns. `sudo` is detected
+  from the unwrapper, because unwrapping strips it: a new
+  `shellHasSudoWrapper` reports whether a `sudo` wrapper was consumed.
+  `eval` and shell `-c` payloads recurse. **at-risk regressions:** (i) a
+  command name that reaches a shell as stdin data (`echo 'vim x' | sh`) is no
+  longer matched, joining the indirection class the policy already excludes
+  (`watch`, `xargs`, `man`, `find -exec`, loop bodies); (ii) an unmodelled
+  wrapper that changes the command word is still unmodelled; (iii) a quoted
+  alias or shell function that expands to an editor is unchanged.
+  **non-goals:** no change to the monitor or pager sets, no new editor name, no
+  change to the dispatcher's policy ordering.
+
+- **accept/reject rule:** accept if (a) a `sudo` word in a grep pattern or
+  printf string passes, (b) `journalctl … | grep -i sudo` passes, (c) a
+  `git rebase -i` word in a grep pattern passes, (d) `vim`, `nano`, `sudo
+  apt-get update`, `env A=1 sudo ls`, `timeout 5 sudo ls`, `git rebase -i`,
+  `git add -p`, `npm init`, `apt-get install curl`, and `yum install curl`
+  still block, (e) `sh -c 'vim x'` and `eval 'npm init'` still block, (f) the
+  monitor and pager assertions are unchanged and green, (g) `npm run typecheck`
+  and `npm test` are green. Reject if a command-position true positive stops
+  blocking or a monitor/pager assertion regresses.
+
+- **selection score (5 items, deterministic):** (a) 2 journal `interactive_tty`
+  records, both the same `sudo`-as-data class, in 2 sessions; (b) 2 live
+  reproductions in this campaign session; (c) the repository already defines
+  the intended semantics for monitors and pagers, with tests pinning
+  `echo top` as allowed, so the change aligns the remaining family rather than
+  inventing a mechanism; (d) no existing test covers data position for the
+  editor, `sudo`, `git`, `npm`, or apt/yum patterns, so the gap is silent;
+  (e) the change is one policy file, one shared helper, tests, and docs.
+
+- **held-out score:** 26/26 passed (26 items, never used for selection). The
+  seven probes the base matcher also blocks are the control: with the base
+  `shell-safety.ts` restored they fail and the suite reports 1802 passed, 7
+  failed. The allowance probes are a `sudo` grep pattern, an exact `grep -n
+  sudo file.txt`, a piped `grep -i sudo`, a `git rebase -i` grep pattern, an
+  `npm init` grep pattern, an editor name in a printf string, and a command name
+  fed to a filter. The blocked probes are a chained editor, `sh -c`, `eval`,
+  `env`-wrapped and `timeout`-wrapped `sudo`, `sudo` as a loop body, `command
+  sudo`, `sudo` before an editor, a wrapped `sudo` before an editor, `git add
+  -p`, unconfirmed `yum install` and apt install, an apt install in a `then`
+  body, a nested `bash -lc`, and `busybox vi`. Three `shellHasSudoWrapper`
+  probes bind the helper's two directions.
+
+- **disjointness:** the selection items are the frozen journal records, the two
+  live reproductions, the existing monitor/pager implementation, and the
+  absence of a data-position test. The held-out probes were written after the
+  fix, so they were never used for selection, and they were not used to choose
+  the command-position matcher.
+
+- **eval job path:** none. Deterministic verifier, no model in the loop.
+
+- **result (appended after the evaluation run):** GAIN. Every allowance probe
+  passes and every blocked-direction probe still blocks. The base matcher fails
+  exactly the seven probes it is expected to fail (1802 passed, 7 failed),
+  which is the pre-change control. The full suite is 1809 passed, 0 failed, and
+  `npm run typecheck` is clean. Monitor and pager assertions are unchanged. The
+  shared helper change is additive: `unwrapShellWordsImpl` now also reports
+  whether a `sudo` wrapper was consumed, and `TRANSPARENT_PREFIX` is exported,
+  so no existing caller changes behavior. One residual, accepted regression is
+  recorded above: a command name delivered to a shell as stdin data is no
+  longer read as code, which matches the indirection class the policy already
+  excludes.
+
+- **review round (recorded before the PR):** the secondary reviewer returned
+  APPROVE and named three P2/P3 items. The paired-check item was accepted:
+  `sudo vim notes.txt`, `env A=1 sudo vim notes.txt`, and an exact `grep -n
+  sudo file.txt` were added, which is why the held-out set is 26 rather than
+  23. The docs item was declined with evidence that the reviewer read the
+  Policy 6 text: Policy 22 (`docs/policies.md:190`) already states the
+  command-position rule, the wrapper and control-flow handling, and the
+  stdin-data limitation. The public-surface item was declined: the test suite
+  imports the public helper surface from `src/workflow-guard.ts` by repository
+  convention, and no other production caller is added.
+
+- **keep/revert:** keep.
+
+- prev-chain: sha256:06f156a444fbb946dc13f77d389db3091c5cadb9ad360ac77938760df1346573
