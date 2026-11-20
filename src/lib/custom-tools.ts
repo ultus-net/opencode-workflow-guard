@@ -346,7 +346,36 @@ export function createCustomTools(options: {
 				}
 				const ralphOutcome = runWithRuntimeState(root, client, () => getRalphOutcome(toolContext.sessionID));
 				const taskEvidence = await runWithRuntimeState(root, client, () => todoEvidenceReport(toolContext.sessionID));
-				return JSON.stringify({ pluginVersion: loadedPluginVersion() ?? null, qualifiedHostVersion: qualifiedHostVersion() ?? null, hostVersion: hostVersion?.() ?? null, workspaceRoot: root, branch, onProtectedBranch: isProtected, todoCapability: todoCapability ? todoCapability() : "available", taskEvidence, outstandingRequirements, recommendedActions, lastMutationTimestamp: lastMut, mutationCount: getWorkspaceMutationCount(root), lastVerify: lastV && verifyEvidence ? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash, timestamp: lastV.timestamp, durationMs: lastV.durationMs ?? null } : null, lastReview: lastR && reviewEvidenceRecord ? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id, timestamp: lastR.timestamp, targetSessionID: lastR.targetSessionID ?? null, recorderSessionID: lastR.recorderSessionID ?? null, recorderRole: lastR.recorderRole ?? null } : null, lastDogfood: lastD && lastDogfoodEvidence ? { scenarioId: lastD.scenarioId, verdict: lastD.verdict, host: lastD.host.label, taxonomyClass: lastD.taxonomyClass ?? null, runCount: lastD.runCount, fresh: dogfoodGate.required ? dogfoodFresh : null, evidenceId: lastDogfoodEvidence.id, missingHosts: dogfoodGate.missingHosts, coveredHosts: (dogfoodGate.matchedRecords ?? []).map((record) => record.host.label) } : null, ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null }, projectConfig: { configPath: existingProjectConfigPath(root) ?? null, profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, verifyCommandSource: verifySource, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), requireDogfood: dogfoodGate.required, dogfoodDeployMatrix: dogfoodGate.required ? getDogfoodDeployMatrix(root) : [], recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) }, gitHygiene: gitHygieneSnapshot(root) ?? null }, null, 2);
+				const verifySnapshot = lastV && verifyEvidence
+					? { command: lastV.command, passed: lastV.passed, fresh: verifyFresh, evidenceId: verifyEvidence.id, commitHash: lastV.commitHash, timestamp: lastV.timestamp, durationMs: lastV.durationMs ?? null }
+					: null;
+				const reviewSnapshot = lastR && reviewEvidenceRecord
+					? { reviewer: lastR.reviewer, passed: lastR.passed, summary: lastR.summary, fresh: reviewFresh, evidenceId: reviewEvidenceRecord.id, timestamp: lastR.timestamp, targetSessionID: lastR.targetSessionID ?? null, recorderSessionID: lastR.recorderSessionID ?? null, recorderRole: lastR.recorderRole ?? null }
+					: null;
+				const dogfoodSnapshot = lastD && lastDogfoodEvidence
+					? { scenarioId: lastD.scenarioId, verdict: lastD.verdict, host: lastD.host.label, taxonomyClass: lastD.taxonomyClass ?? null, runCount: lastD.runCount, fresh: dogfoodGate.required ? dogfoodFresh : null, evidenceId: lastDogfoodEvidence.id, missingHosts: dogfoodGate.missingHosts, coveredHosts: (dogfoodGate.matchedRecords ?? []).map((record) => record.host.label) }
+					: null;
+				const statusSnapshot = {
+					pluginVersion: loadedPluginVersion() ?? null,
+					qualifiedHostVersion: qualifiedHostVersion() ?? null,
+					hostVersion: hostVersion?.() ?? null,
+					workspaceRoot: root,
+					branch,
+					onProtectedBranch: isProtected,
+					todoCapability: todoCapability ? todoCapability() : "available",
+					taskEvidence,
+					outstandingRequirements,
+					recommendedActions,
+					lastMutationTimestamp: lastMut,
+					mutationCount: getWorkspaceMutationCount(root),
+					lastVerify: verifySnapshot,
+					lastReview: reviewSnapshot,
+					lastDogfood: dogfoodSnapshot,
+					ralph: { enabled: isRalphModeEnabled(root), maxIterations: getRalphMaxIterations(root), outcome: ralphOutcome ?? null },
+					projectConfig: { configPath: existingProjectConfigPath(root) ?? null, profile: getOperationProfile(root), protectedBranches: cfg.protectedBranches ?? ["main", "master"], verifyCommand: verifyCommand ?? null, verifyCommandSource: verifySource, requireReview: reviewRequired, requireDocumentation: documentationRequired, requireSubagentReview: isSubagentReviewRequired(root), requireDogfood: dogfoodGate.required, dogfoodDeployMatrix: dogfoodGate.required ? getDogfoodDeployMatrix(root) : [], recoveryCheckpoints: isRecoveryCheckpointsEnabled(root) },
+					gitHygiene: gitHygieneSnapshot(root) ?? null,
+				};
+				return JSON.stringify(statusSnapshot, null, 2);
 			},
 		}),
 		guard_audit: tool({ description: "View recent audit entries recorded by opencode-workflow-guard. Use to diagnose policy decisions, blocked commands, or outcome telemetry.", args: { limit: tool.schema.number().optional().describe("Maximum entries to return (default 10)") }, execute: async (args) => JSON.stringify(getRecentAuditEntries(typeof args?.limit === "number" ? Math.min(args.limit, 50) : 10), null, 2) }),
