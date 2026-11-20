@@ -29,7 +29,7 @@
 
 import { guardToolCallImpl } from "./guard-dispatcher.ts";
 import { getSessionBoundWorkspace, runWithRuntimeState } from "./state.ts";
-import { GIT_BRANCH_CREATE_RE, GIT_WRITE_RE, PUSH_TO_MAIN_RE, parseGitInvocation } from "../policies/git.ts";
+import { GIT_BRANCH_CREATE_RE, GIT_PULL_RE, GIT_WRITE_RE, PUSH_TO_MAIN_RE, parseGitInvocation } from "../policies/git.ts";
 import { hasPrCreateInvocation } from "../policies/changelog.ts";
 import { splitShellSegments } from "./shell.ts";
 import { mcpMutationTool } from "../policies/mcp.ts";
@@ -93,9 +93,13 @@ function repositoryDependent(command: string): boolean {
 		const rest = `git ${parsed.rest}`;
 		if (parsed.explicitRepoDir) continue;
 		if (PUSH_TO_MAIN_RE.test(rest)) continue;
+		// `pull` belongs here because on a protected branch it is a history
+		// write, and whether the checkout is protected is exactly the fact this
+		// seat cannot see.
 		const repositorySensitive =
 			/\bgit\s+push\b/.test(rest) ||
 			GIT_WRITE_RE.test(rest) ||
+			GIT_PULL_RE.test(rest) ||
 			GIT_BRANCH_CREATE_RE.test(rest);
 		if (repositorySensitive) return true;
 	}

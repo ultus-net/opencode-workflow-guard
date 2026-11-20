@@ -174,6 +174,12 @@ export function normalizeGitCommands(command: string): string {
 export const GIT_WRITE_RE =
 	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)(?:[^|;&]*\s)?(?:-d\b|--delete\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?-[dDM]\b/;
 
+// `pull` is deliberately absent from GIT_WRITE_RE: pulling on a feature branch
+// is how a stale base is refreshed, and that is not a write to protect. On a
+// protected branch it is a history write, so the branch guard tests it there and
+// only `--ff-only` passes.
+export const GIT_PULL_RE = /\bgit\s+pull\b/;
+
 /**
  * True when `text` invokes git in a way that changes a tree's refs or content.
  *
@@ -183,6 +189,100 @@ export const GIT_WRITE_RE =
  */
 export function isGitTreeWriteText(text: string): boolean {
 	return GIT_WRITE_RE.test(text) || GIT_BRANCH_CREATE_RE.test(text) || /\bgit\s+push\b/.test(text);
+}
+
+/**
+ * True when `text` only fast-forwards the current protected branch to a remote
+ * ref it is behind: `git merge --ff-only [<ref>]`, `git rebase <ref>`, or
+ * `git pull --ff-only`.
+ *
+ * The branch guard blocks history writes on a protected branch because a local
+ * commit has had no review. A fast-forward adds no commit and rewrites none, so
+ * refusing it leaves a stale checkout with no way to sync, which is the defect
+ * in #145. Two extra facts keep the exemption narrow. The target must be a
+ * remote-tracking ref that is the branch's upstream or the remote default, so
+ * `merge --ff-only feat/local` cannot move `main` onto unreviewed local work.
+ * And `HEAD` must be an ancestor of that ref, so a diverged branch stays
+ * blocked, where a rebase would rewrite local commits.
+ */
+export function isProtectedBranchFastForward(text: string, root: string): boolean {
+	const tokens = unwrapShellWords(text);
+	if (tokens[0] !== "git") return false;
+	const subcommand = tokens[1];
+	let ref: string | undefined;
+	if (subcommand === "merge") {
+		const args = tokens.slice(2);
+		if (!args.includes("--ff-only")) return false;
+		const positional = args.filter((arg) => arg !== "--ff-only");
+		if (positional.length > 1) return false;
+		if (positional.some((arg) => arg.startsWith("-"))) return false;
+		ref = positional[0];
+	} else if (subcommand === "rebase") {
+		const args = tokens.slice(2);
+		if (args.length > 1) return false;
+		if (args.some((arg) => arg.startsWith("-"))) return false;
+		ref = args[0];
+	} else if (subcommand === "pull") {
+		// `--ff-only` alone, and nothing else: an explicit remote and branch, or
+		// a rebasing pull, is not the sync this exemption covers.
+		const args = tokens.slice(2);
+		if (args.length !== 1 || args[0] !== "--ff-only") return false;
+		ref = undefined;
+	} else {
+		return false;
+	}
+	const target = ref ?? gitUpstreamRef(root);
+	if (!target) return false;
+	if (!isRemoteTrackingRef(target, root)) return false;
+	if (!isUpstreamOrRemoteDefault(target, root)) return false;
+	const ancestor = spawnSync("git", ["merge-base", "--is-ancestor", "HEAD", target], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	return ancestor.status === 0;
+}
+
+/** The ref the current branch tracks, or undefined when it tracks nothing. */
+function gitUpstreamRef(root: string): string | undefined {
+	const upstream = spawnSync("git", ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	if (upstream.status !== 0) return undefined;
+	const name = upstream.stdout.trim();
+	return name && name.includes("/") ? name : undefined;
+}
+
+function gitRefExists(ref: string, root: string): boolean {
+	const resolved = spawnSync("git", ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	return resolved.status === 0;
+}
+
+function isRemoteTrackingRef(ref: string, root: string): boolean {
+	const symbolic = spawnSync("git", ["rev-parse", "--symbolic-full-name", ref], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	if (symbolic.status !== 0) return false;
+	return symbolic.stdout.trim().startsWith("refs/remotes/") && gitRefExists(ref, root);
+}
+
+function isUpstreamOrRemoteDefault(ref: string, root: string): boolean {
+	const upstream = gitUpstreamRef(root);
+	if (upstream === ref) return true;
+	const defaultBranch = spawnSync("git", ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], {
+		cwd: root,
+		encoding: "utf8",
+		timeout: 5_000,
+	});
+	return defaultBranch.status === 0 && defaultBranch.stdout.trim() === ref;
 }
 
 export function currentGitBranch(root: string): string | undefined {
