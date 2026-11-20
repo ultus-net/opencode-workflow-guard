@@ -8223,7 +8223,13 @@ const legacyCpFrom = (command: string) => call("bash", { command }, { sessionID:
 check("legacy: cp FROM a .config/opencode source is allowed without live roots", !blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ./draft.md`)));
 check("legacy: cp FROM a .config/opencode source with a redirect is allowed", !blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ./draft.md 2>/dev/null`)));
 check("legacy: a multi-source cp with one guarded source is allowed", !blocked(await legacyCpFrom(`cp ./notes.md ${livePlane}/agent/x.md ./draft.md`)));
-check("legacy: ln FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`ln -s ${livePlane}/agent/x.md ./draft-link.md`)));
+check("legacy: ln -s FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`ln -s ${livePlane}/agent/x.md ./draft-link.md`)));
+check("legacy: cp -s FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`cp -s ${livePlane}/agent/x.md ./draft-link.md`)));
+// A hard link is a second writable name for the guarded inode, so it stays a
+// mutation of the guarded file even when the link lands in the workspace.
+check("legacy: a hard link FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`ln ${livePlane}/agent/x.md ./hard-link.md`)));
+check("legacy: cp -l FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`cp -l ${livePlane}/agent/x.md ./hard-link.md`)));
+check("legacy: cp --link FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`cp --link ${livePlane}/agent/x.md ./hard-link.md`)));
 // The true positives hold: a guarded destination is still a mutation.
 check("legacy: cp INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md`)));
 check("legacy: cp with a guarded source and destination is still blocked", blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ${livePlane}/agent/y.md`)));

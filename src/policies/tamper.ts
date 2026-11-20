@@ -104,6 +104,17 @@ function classifyCopyInvocation(invocation: string): { safe: boolean; tamper: bo
 	if (verb === "install" && args.some((arg) => /^-[a-zA-Z]*d[a-zA-Z0-9]*$/.test(arg))) {
 		return { safe: false, tamper: operands.some(guarded) };
 	}
+	// A hard link is a second writable name for the source inode, so a later
+	// write to the workspace link would mutate the guarded file. Only a
+	// symbolic link keeps the guarded path behind a resolution the guard can
+	// follow, so `ln -s` and `cp -s` are reads while `ln`, `cp -l`, and
+	// `cp --link` stay on the fail-closed any-operand match.
+	const shortFlag = (letter: string) => new RegExp(`^-[a-zA-Z]*${letter}[a-zA-Z]*$`);
+	const hardLink =
+		verb === "ln"
+			? !args.some((arg) => arg === "--symbolic" || shortFlag("s").test(arg))
+			: verb === "cp" && args.some((arg) => arg === "--link" || shortFlag("l").test(arg));
+	if (hardLink) return { safe: false, tamper: operands.some(guarded) };
 	const destination = targetDir ?? (operands.length >= 2 ? operands[operands.length - 1] : undefined);
 	if (destination === undefined) return { safe: false, tamper: false };
 	if (guarded(destination)) return { safe: false, tamper: true };
