@@ -816,6 +816,79 @@ setWorkspaceRoot(repo); // point the guard at the repo
 check("on main: edit blocked (branch reason, todos active)", ((await call("edit", { filePath: join(repo, "a.ts"), content: "x" }, { sessionID: "s-active" })) ?? "").includes("protected branch"));
 check("on main: git commit blocked", blocked(await shell("git commit -m test")));
 check("on main: git merge blocked", blocked(await shell("git merge feature/x")));
+// A fast-forward to the tracked upstream is the one history write that adds no
+// unreviewed commit, so it must be allowed or a stale primary checkout can never
+// sync (#145). The control cases keep the exemption narrow.
+const ffBase = mkdtempSync(join(tmpdir(), "wg-ff-"));
+const ffRemote = join(ffBase, "remote.git");
+const ffRepo = join(ffBase, "repo");
+const ffPeer = join(ffBase, "peer");
+const ffGit = (...args: string[]) => spawnSync("git", ["-c", "user.name=t", "-c", "user.email=t@example.invalid", ...args], { encoding: "utf8" });
+mkdirSync(ffRemote, { recursive: true });
+spawnSync("git", ["init", "--bare", "-b", "main", ffRemote]);
+spawnSync("git", ["init", "-b", "main", ffRepo]);
+writeFileSync(join(ffRepo, "a.txt"), "a\n");
+ffGit("-C", ffRepo, "add", "a.txt");
+ffGit("-C", ffRepo, "commit", "-m", "init");
+ffGit("-C", ffRepo, "remote", "add", "origin", ffRemote);
+ffGit("-C", ffRepo, "push", "-u", "origin", "main");
+spawnSync("git", ["clone", ffRemote, ffPeer]);
+writeFileSync(join(ffPeer, "b.txt"), "b\n");
+ffGit("-C", ffPeer, "add", "b.txt");
+ffGit("-C", ffPeer, "commit", "-m", "advance");
+ffGit("-C", ffPeer, "push", "origin", "main");
+ffGit("-C", ffPeer, "branch", "side");
+ffGit("-C", ffPeer, "push", "origin", "side");
+ffGit("-C", ffRepo, "fetch", "origin");
+ffGit("-C", ffRepo, "remote", "set-head", "origin", "main");
+ffGit("-C", ffRepo, "branch", "feat/local");
+setWorkspaceRoot(ffRepo);
+check("on main: merge --ff-only of the tracked upstream allowed", !blocked(await shell("git merge --ff-only origin/main")));
+check("on main: merge without --ff-only still blocked", blocked(await shell("git merge origin/main")));
+check("on main: merge --ff-only of a local branch still blocked", blocked(await shell("git merge --ff-only feat/local")));
+check("on main: merge --ff-only of a non-default remote branch still blocked", blocked(await shell("git merge --ff-only origin/side")));
+check("on main: merge --ff-only with two operands blocked", blocked(await shell("git merge --ff-only origin/main origin/side")));
+check("on main: rebase onto the tracked upstream allowed", !blocked(await shell("git rebase origin/main")));
+check("on main: pull without --ff-only still blocked", blocked(await shell("git pull")));
+check("on main: pull --ff-only allowed", !blocked(await shell("git pull --ff-only")));
+check("on main: pull --ff-only under a rebase config allowed", !blocked(await shell("git -c pull.rebase=false pull --ff-only")));
+check("on main: pull of a named remote branch still blocked", blocked(await shell("git pull --ff-only origin main")));
+check("on main: pull --ff-only with a trailing -- blocked", blocked(await shell("git pull --ff-only --")));
+check("on main: pull --ff-only of a rebasing config still allowed", !blocked(await shell("git -c pull.rebase=true pull --ff-only")));
+// One shell word is what the guard reads, so quote concatenation and a quoted
+// subcommand name must reach the same verdict as the plain form.
+check("on main: quote-concatenated pull subcommand still allowed", !blocked(await shell("git pu''ll --ff-only")));
+check("on main: quoted pull subcommand still allowed", !blocked(await shell('git "pull" --ff-only')));
+check("on main: chained pull --ff-only still allowed", !blocked(await shell("git status >/dev/null && git pull --ff-only")));
+check("on main: pull --ff-only in a chained cd is judged in that tree", !blocked(await shell(`cd ${ffRepo} && git pull --ff-only`)));
+check("on main: -C the same checkout still fast-forwards", !blocked(await shell(`git -C ${ffRepo} merge --ff-only origin/main`)));
+check("on main: -C the same checkout allows a pull", !blocked(await shell(`git -C ${ffRepo} pull --ff-only`)));
+ffGit("-C", ffRepo, "commit", "--allow-empty", "-m", "local work");
+check("on main: merge --ff-only blocked once the branch has diverged", blocked(await shell("git merge --ff-only origin/main")));
+check("on main: rebase blocked once the branch has diverged", blocked(await shell("git rebase origin/main")));
+check("on main: pull --ff-only blocked once the branch has diverged", blocked(await shell("git pull --ff-only")));
+rmSync(ffBase, { recursive: true, force: true });
+// A `pull` names no ref, so the guard derives the target from `@{u}`. That
+// derivation must still prove the ref is remote-tracking; a local upstream is
+// not a remote sync and stays blocked.
+const ffLocalBase = mkdtempSync(join(tmpdir(), "wg-ff-local-"));
+const ffLocalRepo = join(ffLocalBase, "repo");
+spawnSync("git", ["init", "-b", "main", ffLocalRepo]);
+writeFileSync(join(ffLocalRepo, "a.txt"), "a\n");
+ffGit("-C", ffLocalRepo, "add", "a.txt");
+ffGit("-C", ffLocalRepo, "commit", "-m", "c1");
+ffGit("-C", ffLocalRepo, "branch", "feat/local-up");
+ffGit("-C", ffLocalRepo, "switch", "feat/local-up");
+writeFileSync(join(ffLocalRepo, "b.txt"), "b\n");
+ffGit("-C", ffLocalRepo, "add", "b.txt");
+ffGit("-C", ffLocalRepo, "commit", "-m", "c2");
+ffGit("-C", ffLocalRepo, "switch", "main");
+ffGit("-C", ffLocalRepo, "branch", "--set-upstream-to=feat/local-up", "main");
+setWorkspaceRoot(ffLocalRepo);
+check("on main: pull --ff-only from a local upstream branch stays blocked", blocked(await shell("git pull --ff-only")));
+check("on main: merge --ff-only from the local upstream stays blocked", blocked(await shell("git merge --ff-only")));
+rmSync(ffLocalBase, { recursive: true, force: true });
+setWorkspaceRoot(repo);
 	check("on main: git checkout path mutation blocked", blocked(await shell("git checkout -- tracked.txt")));
 	check("on main: git checkout path mutation without separator blocked", blocked(await shell("git checkout tracked.txt")));
 	check("on main: git checkout -B reset blocked", blocked(await shell("git checkout -B main HEAD~1")));
@@ -7455,6 +7528,28 @@ try {
 	check(
 		"seat no longer denies a cwd-dependent push from a protected session checkout",
 		protectedCheckoutSeat.effect === "abstain" && protectedCheckoutSeat.decision?.code === "repository_unidentified",
+	);
+	// `pull` is a history write only on a protected branch, and the seat cannot
+	// see which checkout the command runs in, so it defers rather than blocking
+	// a sync that a linked feature worktree would allow.
+	const pullSeat = await evaluatePermissionSeat(
+		{ ...seatEvent(["git pull --ff-only"]), sessionID: "s-seat-pull" },
+		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat defers a cwd-dependent pull instead of judging the session checkout",
+		pullSeat.effect === "abstain" && pullSeat.decision?.code === "repository_unidentified",
+	);
+	// An explicit `-C` puts the repository back in the command text, so the seat
+	// judges it for real: a protected checkout with no upstream is a block, not
+	// a deferral.
+	const explicitPullSeat = await evaluatePermissionSeat(
+		{ ...seatEvent([`git -C ${seatMainRepo} pull --ff-only`]), sessionID: "s-seat-explicit-pull" },
+		{ workspaceRoot: seatMainRepo, client: fakeClient as unknown },
+	);
+	check(
+		"seat still denies an explicitly named protected pull",
+		explicitPullSeat.effect === "deny" && explicitPullSeat.decision?.policy === "git",
 	);
 	// A push whose DESTINATION is protected is a finding in every checkout, so
 	// the workdir cannot change the verdict and the seat keeps its denial.
