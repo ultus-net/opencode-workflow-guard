@@ -172,7 +172,7 @@ export function normalizeGitCommands(command: string): string {
 }
 
 export const GIT_WRITE_RE =
-	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)(?:[^|;&]*\s)?(?:-d\b|--delete\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?-[dDM]\b/;
+	/\bgit\s+(add|rm|mv|commit|merge|rebase|cherry-pick|revert|stash\s+pop|apply|am|restore|reset|update-ref|filter-branch)\b|\bgit\s+tag\s+(?!--?list\b|-l\b)(?:[^|;&]*\s)?(?:-d\b|--delete\b)|\bgit\s+checkout\s+(?!-b\b)|\bgit\s+branch\s+(?:[^|;&]*\s)?(?:-[dDM]\b|--delete\b)/;
 
 // `pull` is deliberately absent from GIT_WRITE_RE: pulling on a feature branch
 // is how a stale base is refreshed, and that is not a write to protect. On a
@@ -241,6 +241,84 @@ export function isProtectedBranchFastForward(text: string, root: string): boolea
 		timeout: 5_000,
 	});
 	return ancestor.status === 0;
+}
+
+/**
+ * True when `text` deletes local branches with git's merged-only form,
+ * `git branch -d`. `-D` and `--force` stay blocked, because they can drop
+ * unmerged commits. `-d` cannot: the manual states the branch "must be fully
+ * merged" in its upstream, or in HEAD when no upstream is set, so git refuses
+ * the deletion itself and the protected-branch rule has nothing to protect.
+ *
+ * This is the local half of the cleanup a merged PR requires. It was blocked
+ * whenever the checkout sat on the protected branch that receives the merge,
+ * which left the operator as the only actor who could finish it.
+ */
+export function isMergedLocalBranchDeletion(text: string, root: string): boolean {
+	const tokens = unwrapShellWords(text);
+	if (tokens[0] !== "git" || tokens[1] !== "branch") return false;
+	const args = tokens.slice(2);
+	const deletes = args.some((arg) => arg === "--delete" || /^-[a-zA-Z]*d[a-zA-Z]*$/.test(arg));
+	if (!deletes) return false;
+	if (args.some((arg) => arg === "--force" || /^-[a-zA-Z]*[Df][a-zA-Z]*$/.test(arg))) return false;
+	const names = args.filter((arg) => !arg.startsWith("-"));
+	if (names.length === 0) return false;
+	const protectedBranches = getProtectedBranches(root);
+	return names.every((name) => !protectedBranches.has(name));
+}
+
+/**
+ * True when `text` pushes nothing but deletions of remote branches that are
+ * already merged into the remote default: `git push <remote> --delete <branch>`
+ * or a `:<branch>` refspec.
+ *
+ * Deleting a merged branch's remote ref publishes no commit, so it is the other
+ * half of the cleanup a merged PR requires. The rules stay narrow. Every named
+ * branch must be an ancestor of the remote default, so an unmerged branch keeps
+ * its commits reachable. Protected names are refused. Options that delete more
+ * than the named refs (`--prune`, `--mirror`, `--force`) and any ordinary
+ * refspec keep the push blocked. The branch resolves through `refs/heads/`
+ * first, then `refs/remotes/origin/<branch>`, because deleting the local ref
+ * first is the normal order. Both namespaces are explicit, so a local branch
+ * whose remote ref is already gone stays blocked instead of guessing.
+ */
+export function purgesMergedRemoteBranches(text: string, root: string): boolean {
+	const tokens = unwrapShellWords(text);
+	if (tokens[0] !== "git" || tokens[1] !== "push") return false;
+	const args = tokens.slice(2);
+	const targets: string[] = [];
+	let deleteFlag = false;
+	let remoteSeen = false;
+	for (const arg of args) {
+		if (arg.startsWith("-")) {
+			if (arg === "-d" || arg === "--delete") {
+				deleteFlag = true;
+				continue;
+			}
+			return false;
+		}
+		if (!remoteSeen && !arg.startsWith(":")) {
+			remoteSeen = true;
+			continue;
+		}
+		const name = arg.startsWith(":") ? arg.slice(1) : deleteFlag ? arg : "";
+		if (!name) return false;
+		// A fully-qualified ref is only a branch refspec under refs/heads/.
+		// Deleting a tag, or any other namespace, stays blocked.
+		if (name.startsWith("refs/") && !name.startsWith("refs/heads/")) return false;
+		const branch = name.replace(/^refs\/heads\//, "");
+		if (!branch || getProtectedBranches(root).has(branch)) return false;
+		targets.push(branch);
+	}
+	if (targets.length === 0) return false;
+	return targets.every((branch) => {
+		// Name the ref namespaces explicitly. A bare short name also matches a
+		// tag of the same name, and a tag deletion is not branch cleanup.
+		const localRef = `refs/heads/${branch}`;
+		const ref = gitRefExists(localRef, root) ? localRef : `refs/remotes/origin/${branch}`;
+		if (!gitRefExists(ref, root)) return false;
+		return isBranchAlreadyMergedOrClosed(root, ref, false).merged;
+	});
 }
 
 /** The ref the current branch tracks, or undefined when it tracks nothing. */

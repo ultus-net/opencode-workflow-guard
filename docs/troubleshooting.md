@@ -44,6 +44,8 @@ Common issues, root causes, and solutions when using `opencode-workflow-guard`.
 
 A checkout that is only behind its remote is not blocked. `git merge --ff-only <upstream>`, `git rebase <upstream>`, and `git pull --ff-only` are allowed on the protected branch when the ref is the branch's tracked upstream or the remote default, and `HEAD` is already an ancestor of it. That adds no commit and rewrites none, so a stale primary checkout can sync without a feature branch. `git merge` without `--ff-only`, a bare `git pull`, a local branch target, a different remote branch, a named remote and branch, and a branch with its own commits stay blocked. On a host where `pull.rebase` is set, run `git -c pull.rebase=false pull --ff-only`; the guard accepts that form.
 
+The cleanup a merged PR requires is also allowed on the protected branch. `git branch -d <branch>` and `git branch --delete <branch>` pass, because git itself refuses them unless the branch is fully merged. A remote branch that is already merged can be deleted with `git push origin --delete <branch>` or `git push origin :<branch>`. A forced deletion, `git branch -D`, a protected branch name, an unmerged branch, and the options that delete more than the named branches (`--prune`, `--mirror`) stay blocked.
+
 ---
 
 ### 6. Edits Blocked: `Blocked: file path '...' escapes workspace root`
