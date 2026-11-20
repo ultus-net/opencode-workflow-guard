@@ -51,9 +51,9 @@
   },
   "dependencies": {
     "@opencode-ai/plugin": "1.19.5",
-    "@opencode/ai": "2.2.5",
-    "@opencode/plugin": "2.2.5",
-    "@opentui/solid": "0.8.1",
+    "@opencode/ai": "2.3.0",
+    "@opencode/plugin": "2.3.0",
+    "@opentui/solid": "0.9.2",
     "jsonc-parser": "3.3.1"
   },
   "devDependencies": {
