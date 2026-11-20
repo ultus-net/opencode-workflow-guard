@@ -111,6 +111,7 @@ import {
 	getSubagentMutationBudget,
 	isReadOnlyRole,
 	checkInteractiveTtyCommand,
+	shellHasSudoWrapper,
 	checkPackageHygiene,
 	delegationSpawnIn,
 	sendDesktopNotification,
@@ -6015,6 +6016,33 @@ check("checkInteractiveTtyCommand permits npm init --yes", !checkInteractiveTtyC
 check("checkInteractiveTtyCommand detects apt-get install without -y", checkInteractiveTtyCommand("apt-get install curl").isInteractive);
 check("checkInteractiveTtyCommand permits apt-get install -y", !checkInteractiveTtyCommand("apt-get install -y curl").isInteractive);
 check("checkInteractiveTtyCommand permits regular non-interactive command", !checkInteractiveTtyCommand("ls -la && git status").isInteractive);
+// Command position, not raw text: a pattern word in an argument is data.
+check("checkInteractiveTtyCommand permits sudo inside a grep pattern", !checkInteractiveTtyCommand(`grep -rn "sudo" docs/`).isInteractive);
+check("checkInteractiveTtyCommand permits an exact grep for sudo", !checkInteractiveTtyCommand("grep -n sudo file.txt").isInteractive);
+check("checkInteractiveTtyCommand permits sudo in a piped grep pattern", !checkInteractiveTtyCommand("journalctl --user -u x -n 20 --no-pager 2>&1 | grep -i sudo").isInteractive);
+check("checkInteractiveTtyCommand permits an interactive rebase pattern in a grep pattern", !checkInteractiveTtyCommand(`grep -n "git rebase -i" test/test.mts`).isInteractive);
+check("checkInteractiveTtyCommand permits npm init as grep data", !checkInteractiveTtyCommand(`grep -n "npm init" README.md`).isInteractive);
+check("checkInteractiveTtyCommand permits an editor name in a printf string", !checkInteractiveTtyCommand(`printf "%s\\n" "vim is not installed"`).isInteractive);
+check("checkInteractiveTtyCommand permits git log grep for interactive rebase", !checkInteractiveTtyCommand(`git log --grep="rebase -i"`).isInteractive);
+check("checkInteractiveTtyCommand permits a command name fed to a filter", !checkInteractiveTtyCommand(`echo "apt-get install curl" | cat`).isInteractive);
+// The same commands still block at command position.
+check("checkInteractiveTtyCommand still detects a chained editor", checkInteractiveTtyCommand("cd /repo && nano notes.txt").isInteractive);
+check("checkInteractiveTtyCommand still detects a shell -c editor", checkInteractiveTtyCommand("sh -c 'vim notes.txt'").isInteractive);
+check("checkInteractiveTtyCommand still detects eval npm init", checkInteractiveTtyCommand("eval 'npm init'").isInteractive);
+check("checkInteractiveTtyCommand still detects a wrapped sudo", checkInteractiveTtyCommand("env FOO=1 sudo ls").isInteractive);
+check("checkInteractiveTtyCommand still detects sudo before an editor", checkInteractiveTtyCommand("sudo vim notes.txt").isInteractive);
+check("checkInteractiveTtyCommand still detects a wrapped sudo before an editor", checkInteractiveTtyCommand("env A=1 sudo vim notes.txt").isInteractive);
+check("checkInteractiveTtyCommand still detects a timeout-wrapped sudo", checkInteractiveTtyCommand("timeout 5 sudo ls").isInteractive);
+check("checkInteractiveTtyCommand still detects sudo as a loop body", checkInteractiveTtyCommand("while true; do sudo ls; done").isInteractive);
+check("checkInteractiveTtyCommand still detects sudo after command", checkInteractiveTtyCommand("command sudo ls").isInteractive);
+check("checkInteractiveTtyCommand still detects git add -p", checkInteractiveTtyCommand("git add -p").isInteractive);
+check("checkInteractiveTtyCommand still detects yum install without -y", checkInteractiveTtyCommand("yum install curl").isInteractive);
+check("checkInteractiveTtyCommand still detects an apt install in a then body", checkInteractiveTtyCommand("if true; then apt-get install curl; fi").isInteractive);
+check("checkInteractiveTtyCommand still detects an apt install in a nested shell", checkInteractiveTtyCommand("bash -lc 'apt-get install curl'").isInteractive);
+check("checkInteractiveTtyCommand still detects busybox vi", checkInteractiveTtyCommand("busybox vi notes.txt").isInteractive);
+check("shellHasSudoWrapper reports a bare sudo", shellHasSudoWrapper("sudo ls"));
+check("shellHasSudoWrapper reports a sudo behind env", shellHasSudoWrapper("env FOO=1 sudo ls"));
+check("shellHasSudoWrapper ignores sudo as an argument", !shellHasSudoWrapper("grep -n sudo file.txt"));
 
 check("shell tool blocks nano", blocked(await shell("nano README.md")));
 check("shell tool blocks less", blocked(await shell("less package.json")));
@@ -8280,9 +8308,43 @@ const ocJson = "open" + "code.json";
 const ocJsonc = "open" + "code.jsonc";
 setWorkspaceRoot(root);
 
-// Legacy (no live roots configured): the copy SOURCE under a config path alone
-// blocks the command — the F3 false positive, pinned as current behavior.
-check("legacy: cp FROM a .config/opencode source is blocked without live roots", blocked(await call("bash", { command: `cp ${livePlane}/agent/x.md ./draft.md` }, { sessionID: "s-active" })));
+// Legacy (no live roots configured): a copy-like verb reads its sources and
+// writes only its destination, so a guarded SOURCE alone is a read. This is the
+// F3 false positive, now allowed in both modes.
+const legacyCpFrom = (command: string) => call("bash", { command }, { sessionID: "s-active" });
+check("legacy: cp FROM a .config/opencode source is allowed without live roots", !blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ./draft.md`)));
+check("legacy: cp FROM a .config/opencode source with a redirect is allowed", !blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ./draft.md 2>/dev/null`)));
+check("legacy: a multi-source cp with one guarded source is allowed", !blocked(await legacyCpFrom(`cp ./notes.md ${livePlane}/agent/x.md ./draft.md`)));
+check("legacy: ln -s FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`ln -s ${livePlane}/agent/x.md ./draft-link.md`)));
+check("legacy: cp -s FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`cp -s ${livePlane}/agent/x.md ./draft-link.md`)));
+// A hard link is a second writable name for the guarded inode, so it stays a
+// mutation of the guarded file even when the link lands in the workspace.
+check("legacy: a hard link FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`ln ${livePlane}/agent/x.md ./hard-link.md`)));
+check("legacy: cp -l FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`cp -l ${livePlane}/agent/x.md ./hard-link.md`)));
+check("legacy: cp --link FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`cp --link ${livePlane}/agent/x.md ./hard-link.md`)));
+// The true positives hold: a guarded destination is still a mutation.
+check("legacy: cp INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md`)));
+check("legacy: cp with a guarded source and destination is still blocked", blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ${livePlane}/agent/y.md`)));
+check("legacy: cp INTO a guarded path with a redirect is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md 2>/dev/null`)));
+check("legacy: cp -t a guarded directory is still blocked", blocked(await legacyCpFrom(`cp -t ${livePlane}/agent ./draft.md`)));
+check("legacy: cp --target-directory=a guarded directory is still blocked", blocked(await legacyCpFrom(`cp --target-directory=${livePlane}/agent ./draft.md`)));
+check("legacy: a multi-source cp into a guarded directory is still blocked", blocked(await legacyCpFrom(`cp ./a.md ./b.md ${livePlane}/agent`)));
+check("legacy: a wrapped cp into a guarded path is still blocked", blocked(await legacyCpFrom(`env FOO=1 cp ./draft.md ${livePlane}/agent/x.md`)));
+check("legacy: command-prefixed cp into a guarded path is still blocked", blocked(await legacyCpFrom(`command cp ./draft.md ${livePlane}/agent/x.md`)));
+check("legacy: fd duplication after a guarded cp destination is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md 2>&1`)));
+check("legacy: fd duplication before a guarded cp destination is still blocked", blocked(await legacyCpFrom(`cp ./draft.md 2>&1 ${livePlane}/agent/x.md`)));
+check("legacy: a discarded redirect before a guarded cp destination is still blocked", blocked(await legacyCpFrom(`cp ./draft.md >/dev/null 2>&1 ${livePlane}/agent/x.md`)));
+check("legacy: fd duplication does not mask a guarded redirect", blocked(await legacyCpFrom(`echo x 2>&1 > ${livePlane}/agent/x.md`)));
+check("legacy: fd duplication with no guarded path is allowed", !blocked(await legacyCpFrom(`cp ./draft.md ./copy.md 2>&1`)));
+check("legacy: ln -sfn FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`ln -sfn ${livePlane}/agent/x.md ./draft-link.md`)));
+check("legacy: install -d -t a guarded directory is still blocked", blocked(await legacyCpFrom(`install -d -t ${livePlane}/plugins ./build`)));
+check("legacy: ln INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`ln -s ./draft-link.md ${livePlane}/agent/x.md`)));
+check("legacy: install -d a guarded directory is still blocked", blocked(await legacyCpFrom(`install -d ${livePlane}/plugins`)));
+check("legacy: install -d a workspace directory is allowed", !blocked(await legacyCpFrom(`install -d ./build/out`)));
+// mv removes its source, so a guarded source stays a mutation.
+check("legacy: mv FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`mv ${livePlane}/agent/x.md ./draft.md`)));
+check("legacy: tee INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`echo x | tee ${livePlane}/agent/x.md`)));
+check("legacy: a redirect INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`echo x > ${livePlane}/agent/x.md`)));
 
 // Declare the live control plane via project config, then reload.
 writeFileSync(join(lcpRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ liveControlPlanePaths: [livePlane] }));
