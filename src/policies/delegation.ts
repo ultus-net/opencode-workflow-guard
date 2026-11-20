@@ -39,8 +39,33 @@ const AGENT_CLI_BASENAMES = new Map<string, string>([
 // `npx claude-code` delegates exactly like `claude` does.
 const NODE_RUNNERS = new Set(["npx", "bunx", "pnpx"]);
 
+// OpenCode global flags that consume the following word. The subcommand is the
+// first non-flag word, so the value of one of these must not be read as it.
+const OPENCODE_VALUE_FLAGS = new Set(["-d", "--dir", "-m", "--model", "-l", "--log-level"]);
+// A help or version request runs nothing, so a word after it is data.
+const OPENCODE_INFO_FLAGS = new Set(["-h", "--help", "-v", "--version"]);
+
 function executableName(word: string): string {
 	return basename(word).toLowerCase();
+}
+
+function opencodeSubcommand(words: readonly string[]): string | undefined {
+	let i = 1;
+	while (i < words.length) {
+		const word = words[i]!;
+		if (word === "--") {
+			i += 1;
+			continue;
+		}
+		if (word.startsWith("-")) {
+			const name = word.split("=", 1)[0]!;
+			if (OPENCODE_INFO_FLAGS.has(name)) return undefined;
+			i += word.includes("=") || !OPENCODE_VALUE_FLAGS.has(name) ? 1 : 2;
+			continue;
+		}
+		return word;
+	}
+	return undefined;
 }
 
 function packageName(word: string): string {
@@ -75,7 +100,7 @@ function agentCliIn(words: readonly string[]): string | undefined {
 	// `opencode run` is a delegated agent turn. Its other verbs are read-only
 	// or covered by the settings-tamper policy, so they are not this policy.
 	if (executable === "opencode") {
-		return words.slice(1).some((word) => word === "run") ? "opencode run" : undefined;
+		return opencodeSubcommand(words) === "run" ? "opencode run" : undefined;
 	}
 	if (NODE_RUNNERS.has(executable)) return npxAgentIn(words);
 	return undefined;

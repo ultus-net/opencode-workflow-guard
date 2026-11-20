@@ -5865,6 +5865,10 @@ check("delegationSpawnIn detects gemini", delegationSpawnIn("gemini -p 'x'") ===
 check("delegationSpawnIn detects aider", delegationSpawnIn("aider --message 'x'") === "aider");
 check("delegationSpawnIn detects opencode run", delegationSpawnIn("opencode run 'x'") === "opencode run");
 check("delegationSpawnIn detects opencode run behind a global flag", delegationSpawnIn("opencode --dir /tmp run 'x'") === "opencode run");
+check("delegationSpawnIn detects opencode run behind a value flag", delegationSpawnIn("opencode --log-level debug run 'x'") === "opencode run");
+check("delegationSpawnIn permits an opencode help request naming run", delegationSpawnIn("opencode --help run") === undefined);
+check("delegationSpawnIn permits another opencode subcommand", delegationSpawnIn("opencode export ses_abc") === undefined);
+check("delegationSpawnIn does not read a plugin argument as the subcommand", delegationSpawnIn("opencode --model x plugin add run") === undefined);
 check("delegationSpawnIn detects a path-qualified executable", delegationSpawnIn("/usr/local/bin/claude -p x") === "claude");
 check("delegationSpawnIn unwraps env assignments", delegationSpawnIn("env FOO=1 claude -p x") === "claude");
 check("delegationSpawnIn unwraps sudo options", delegationSpawnIn("sudo -u deploy claude -p x") === "claude");
