@@ -1,5 +1,15 @@
 # Changelog
 
+## 1.20.2
+
+### Patch Changes
+
+- 69991e8: Let the agent finish the cleanup a merged PR requires. `git branch -d <branch>` and `git branch --delete <branch>` are now permitted while the checkout sits on the protected branch, and a remote branch already merged into the remote default can be deleted with `git push <remote> --delete <branch>` or a `:<branch>` refspec.
+
+    Both halves used to be blocked, so every merge ended with the operator running two commands by hand. The exemption stays narrow. Git refuses `-d` unless the branch is fully merged, so the deletion cannot drop an unreviewed commit. `git branch -D`, a forced refspec, `--prune`, `--mirror`, a protected branch name, an unmerged branch, and any fully-qualified refspec outside `refs/heads/` all stay blocked. Remote deletion resolves the branch through `refs/heads/<branch>` or `refs/remotes/origin/<branch>` explicitly, so a tag that shares the name cannot satisfy the merged check.
+
+- 0bd33de: A reworded active task is a refinement, not a silent deletion, when its text keeps every word of the original and adds at least one more. The write now passes, the task keeps its original mutation window, and the acceptance is journaled as `todo_refined`. A reword that drops or substitutes a word still blocks, and a one-word task still needs an exact match.
+
 ## 1.20.1
 
 ### Patch Changes
