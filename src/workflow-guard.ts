@@ -325,6 +325,7 @@ import {
 	findWorktreeForBranch,
 	parseGitInvocation,
 	prSourceBranch,
+	purgesMergedRemoteBranches,
 } from "./policies/git.ts";
 
 export {
@@ -335,6 +336,7 @@ export {
 	findWorktreeForBranch,
 	parseGitInvocation,
 	prSourceBranch,
+	purgesMergedRemoteBranches,
 };
 
 import {

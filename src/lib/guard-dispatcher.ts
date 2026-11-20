@@ -63,11 +63,13 @@ import {
 	hasUnsafeGitAlias,
 	isBranchAlreadyMergedOrClosed,
 	isGitTreeWriteText,
+	isMergedLocalBranchDeletion,
 	isProtectedBranchFastForward,
 	normalizeGitCommands,
 	onProtectedBranch,
 	parseGitInvocation,
 	prSourceBranch,
+	purgesMergedRemoteBranches,
 	pushedProtectedBranchIn,
 	tagRefspecIn,
 } from "../policies/git.ts";
@@ -572,7 +574,7 @@ export async function guardToolCallImpl(
 			// to sync (#145).
 			const gitText = `git ${invocation.rest}`;
 			const protectedWrite = GIT_WRITE_RE.test(gitText) || GIT_PULL_RE.test(gitText);
-			if (protectedWrite && onProtectedBranch(invocation.repoDir) && !isProtectedBranchFastForward(gitText, invocation.repoDir)) {
+			if (protectedWrite && onProtectedBranch(invocation.repoDir) && !isProtectedBranchFastForward(gitText, invocation.repoDir) && !isMergedLocalBranchDeletion(gitText, invocation.repoDir)) {
 				logPolicyBlock(`[workflow-guard] blocked git write on protected branch: ${command.slice(0, 120)}`);
 				return block("git", "protected_branch", branchGuardReason());
 			}
@@ -698,8 +700,16 @@ export async function guardToolCallImpl(
 			}
 		}
 		for (const invocation of gitInvocations) {
-			if (!/\bgit\s+push\b/.test(`git ${invocation.rest}`)) continue;
-			if (tagRefspecIn(`git ${invocation.rest}`, invocation.repoDir)) continue;
+			const pushText = `git ${invocation.rest}`;
+			if (!/\bgit\s+push\b/.test(pushText)) continue;
+			if (tagRefspecIn(pushText, invocation.repoDir)) continue;
+			// A push that only deletes remote branches already merged into the
+			// remote default publishes no commit. That is the remote half of the
+			// cleanup a merged PR requires, so neither the protected checkout nor
+			// the merged-current-branch rule has anything to protect. Every other
+			// push, including --prune, --mirror, a forced refspec, and an unmerged
+			// branch, stays blocked below.
+			if (purgesMergedRemoteBranches(pushText, invocation.repoDir)) continue;
 			if (onProtectedBranch(invocation.repoDir)) {
 				logPolicyBlock(`[workflow-guard] blocked push from protected branch: ${command}`);
 				return block("git", "protected_branch", branchGuardReason());
