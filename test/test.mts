@@ -8216,9 +8216,27 @@ const ocJson = "open" + "code.json";
 const ocJsonc = "open" + "code.jsonc";
 setWorkspaceRoot(root);
 
-// Legacy (no live roots configured): the copy SOURCE under a config path alone
-// blocks the command — the F3 false positive, pinned as current behavior.
-check("legacy: cp FROM a .config/opencode source is blocked without live roots", blocked(await call("bash", { command: `cp ${livePlane}/agent/x.md ./draft.md` }, { sessionID: "s-active" })));
+// Legacy (no live roots configured): a copy-like verb reads its sources and
+// writes only its destination, so a guarded SOURCE alone is a read. This is the
+// F3 false positive, now allowed in both modes.
+const legacyCpFrom = (command: string) => call("bash", { command }, { sessionID: "s-active" });
+check("legacy: cp FROM a .config/opencode source is allowed without live roots", !blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ./draft.md`)));
+check("legacy: cp FROM a .config/opencode source with a redirect is allowed", !blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ./draft.md 2>/dev/null`)));
+check("legacy: a multi-source cp with one guarded source is allowed", !blocked(await legacyCpFrom(`cp ./notes.md ${livePlane}/agent/x.md ./draft.md`)));
+check("legacy: ln FROM a .config/opencode source is allowed", !blocked(await legacyCpFrom(`ln -s ${livePlane}/agent/x.md ./draft-link.md`)));
+// The true positives hold: a guarded destination is still a mutation.
+check("legacy: cp INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md`)));
+check("legacy: cp with a guarded source and destination is still blocked", blocked(await legacyCpFrom(`cp ${livePlane}/agent/x.md ${livePlane}/agent/y.md`)));
+check("legacy: cp INTO a guarded path with a redirect is still blocked", blocked(await legacyCpFrom(`cp ./draft.md ${livePlane}/agent/x.md 2>/dev/null`)));
+check("legacy: cp -t a guarded directory is still blocked", blocked(await legacyCpFrom(`cp -t ${livePlane}/agent ./draft.md`)));
+check("legacy: cp --target-directory=a guarded directory is still blocked", blocked(await legacyCpFrom(`cp --target-directory=${livePlane}/agent ./draft.md`)));
+check("legacy: ln INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`ln -s ./draft-link.md ${livePlane}/agent/x.md`)));
+check("legacy: install -d a guarded directory is still blocked", blocked(await legacyCpFrom(`install -d ${livePlane}/plugins`)));
+check("legacy: install -d a workspace directory is allowed", !blocked(await legacyCpFrom(`install -d ./build/out`)));
+// mv removes its source, so a guarded source stays a mutation.
+check("legacy: mv FROM a .config/opencode path is still blocked", blocked(await legacyCpFrom(`mv ${livePlane}/agent/x.md ./draft.md`)));
+check("legacy: tee INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`echo x | tee ${livePlane}/agent/x.md`)));
+check("legacy: a redirect INTO a .config/opencode path is still blocked", blocked(await legacyCpFrom(`echo x > ${livePlane}/agent/x.md`)));
 
 // Declare the live control plane via project config, then reload.
 writeFileSync(join(lcpRoot, ".opencode", "workflow-guard.json"), JSON.stringify({ liveControlPlanePaths: [livePlane] }));

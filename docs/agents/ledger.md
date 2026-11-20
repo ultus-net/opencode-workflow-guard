@@ -308,3 +308,78 @@ tamper-evident (hash-chained admission).
   change-type in the archived candidate set.
 
 - prev-chain: sha256:856438a0ed76a918a6acb324f0130adf0a2569c248a42229613120f330d775c2
+
+### n=4 — a copy source under a config path is not a settings mutation (security, preregistered 2026-11-21)
+
+- **hypothesis (falsifiable, registered before the edit):** in legacy mode
+  (no `liveControlPlanePaths` declared), `isSettingsTamper`
+  (`src/policies/tamper.ts:61-78`) applies `PATH_PATTERNS` to the whole command
+  segment, so any guarded path operand after `cp`, `ln`, or `install` blocks
+  the command, including a read-only source. The live-control-plane fact mode
+  already decides by the mutation target and allows the same copy
+  (`test/test.mts:8219-8233` pins both directions). Falsified if a guarded `cp`
+  source already passes without declared roots, or if a guarded destination
+  already blocks for a reason other than this pattern.
+
+- **pre-change probe:** `test/test.mts` names the false positive "legacy: cp
+  FROM a .config/opencode source is blocked without live roots" and calls it
+  "the F3 false positive, pinned as current behavior". A live `cp` from
+  `~/.config/opencode/templates/rsi/` into a workspace draft was refused with
+  `PROTECTED_PATH_REASON` during this campaign.
+
+- **prediction (expected gain):** legacy mode classifies `cp`, `ln`, and
+  `install` operands by role. The destination (last operand, or the `-t` /
+  `--target-directory` value) is checked against the guarded-path patterns; a
+  guarded source alone is allowed, matching fact mode and Policy 6's read-only
+  allowance. `mv`, `rm`, `tee`, `sed -i`, `chmod`, `chown`, `truncate`, `dd`,
+  `patch`, and `perl -i` keep the broad any-operand match, because each mutates
+  every operand it names. **at-risk regressions:** (i) a destination hidden in
+  a flag value (`--suffix .config/opencode`) is treated as an operand and could
+  be skipped; it is not a write target, so the residual risk is a missed
+  non-writing mention, not a write; (ii) an unrecognized copy-like program
+  (`rsync`) is out of scope and keeps its current behaviour; (iii) `mv` must
+  stay blocked even when the guarded path is the source, because the move
+  removes it. **non-goals:** no change to fact mode, no new path pattern, no
+  change to the redirect rules, no change to `isProtectedPath`.
+
+- **accept/reject rule:** accept if (a) the legacy copy-source probe now
+  passes, (b) a copy into a guarded path still blocks, (c) `mv` from a guarded
+  path still blocks, (d) `ln` from a guarded path is allowed and `ln` into one
+  blocks, (e) `cp -t <guarded>` and `install -d <guarded>` block, (f) the
+  facts-mode tests are unchanged and green, (g) `npm run typecheck` and
+  `npm test` are green. Reject if any guarded destination passes, if `mv`
+  loosens, or if a fact-mode assertion regresses.
+
+- **selection score (5 items, deterministic):** (a) the false positive is
+  pinned by an existing test and named finding F3; (b) fact mode already
+  defines the intended semantics, so this aligns two modes instead of
+  inventing a rule; (c) the change is one policy file plus tests and docs;
+  (d) a live reproduction failed in this campaign; (e) the true-positive set
+  is enumerable (`mv`, redirects, destinations).
+
+- **held-out score:** pass. The full `npm test` suite is green, and every
+  held-out probe from the bank behaves as predicted: `--target-directory=` and
+  `-t` destinations block, `install -d <guarded>` blocks while `install -d
+  ./build/out` passes, a multi-source `cp` with one guarded source passes, and
+  a guarded source with a guarded destination blocks.
+
+- **disjointness:** the selection items are the existing test and the live
+  reproduction. The held-out probes are written after the fix. Neither was
+  used to choose the operand parser.
+
+- **eval job path:** none. Deterministic verifier, no model in the loop.
+
+- **result (appended after the evaluation run):** GAIN. The four legacy
+  false-positive probes pass (`cp FROM`, `cp FROM` with a `2>/dev/null`
+  redirect, a multi-source `cp` with one guarded source, and `ln -s FROM`).
+  Restoring the `origin/main` source makes exactly those four fail and leaves
+  the eleven true-positive probes green in both directions, which is the
+  pre-change control. The full suite is 1770 passed, 0 failed, and
+  `npm run typecheck` is clean. Fact-mode assertions are unchanged. A
+  residual, fail-closed limitation is recorded: `cp -tDIR src` parses the
+  attached short value, while a copy whose destination cannot be identified
+  (one operand) keeps the broad match.
+
+- **keep/revert:** keep.
+
+- prev-chain: sha256:998bc046eece56735087bbaaa86e0b1ac5e481a19ddfbead3816e8ec19682681
