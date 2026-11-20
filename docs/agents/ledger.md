@@ -474,14 +474,15 @@ tamper-evident (hash-chained admission).
   editor, `sudo`, `git`, `npm`, or apt/yum patterns, so the gap is silent;
   (e) the change is one policy file, one shared helper, tests, and docs.
 
-- **held-out score:** 23/23 passed (23 items, never used for selection). The six
-  probes the base matcher also blocks are the control: with the base
-  `shell-safety.ts` restored they fail and the suite reports 1800 passed, 6
-  failed. The allowance probes are a `sudo` grep pattern, a piped
-  `grep -i sudo`, a `git rebase -i` grep pattern, an `npm init` grep pattern, an
-  editor name in a printf string, and a command name fed to a filter. The
-  blocked probes are a chained editor, `sh -c`, `eval`, `env`-wrapped and
-  `timeout`-wrapped `sudo`, `sudo` as a loop body, `command sudo`, `git add
+- **held-out score:** 26/26 passed (26 items, never used for selection). The
+  seven probes the base matcher also blocks are the control: with the base
+  `shell-safety.ts` restored they fail and the suite reports 1802 passed, 7
+  failed. The allowance probes are a `sudo` grep pattern, an exact `grep -n
+  sudo file.txt`, a piped `grep -i sudo`, a `git rebase -i` grep pattern, an
+  `npm init` grep pattern, an editor name in a printf string, and a command name
+  fed to a filter. The blocked probes are a chained editor, `sh -c`, `eval`,
+  `env`-wrapped and `timeout`-wrapped `sudo`, `sudo` as a loop body, `command
+  sudo`, `sudo` before an editor, a wrapped `sudo` before an editor, `git add
   -p`, unconfirmed `yum install` and apt install, an apt install in a `then`
   body, a nested `bash -lc`, and `busybox vi`. Three `shellHasSudoWrapper`
   probes bind the helper's two directions.
@@ -496,8 +497,8 @@ tamper-evident (hash-chained admission).
 
 - **result (appended after the evaluation run):** GAIN. Every allowance probe
   passes and every blocked-direction probe still blocks. The base matcher fails
-  exactly the six probes it is expected to fail (1800 passed, 6 failed), which
-  is the pre-change control. The full suite is 1806 passed, 0 failed, and
+  exactly the seven probes it is expected to fail (1802 passed, 7 failed),
+  which is the pre-change control. The full suite is 1809 passed, 0 failed, and
   `npm run typecheck` is clean. Monitor and pager assertions are unchanged. The
   shared helper change is additive: `unwrapShellWordsImpl` now also reports
   whether a `sudo` wrapper was consumed, and `TRANSPARENT_PREFIX` is exported,
@@ -505,6 +506,17 @@ tamper-evident (hash-chained admission).
   recorded above: a command name delivered to a shell as stdin data is no
   longer read as code, which matches the indirection class the policy already
   excludes.
+
+- **review round (recorded before the PR):** the secondary reviewer returned
+  APPROVE and named three P2/P3 items. The paired-check item was accepted:
+  `sudo vim notes.txt`, `env A=1 sudo vim notes.txt`, and an exact `grep -n
+  sudo file.txt` were added, which is why the held-out set is 26 rather than
+  23. The docs item was declined with evidence that the reviewer read the
+  Policy 6 text: Policy 22 (`docs/policies.md:190`) already states the
+  command-position rule, the wrapper and control-flow handling, and the
+  stdin-data limitation. The public-surface item was declined: the test suite
+  imports the public helper surface from `src/workflow-guard.ts` by repository
+  convention, and no other production caller is added.
 
 - **keep/revert:** keep.
 
